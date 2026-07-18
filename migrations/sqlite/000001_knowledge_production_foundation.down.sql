@@ -1,3 +1,5 @@
+DROP TRIGGER IF EXISTS trg_production_document_types_prevent_active_definition_update;
+
 DROP TABLE IF EXISTS production_idempotency_keys;
 DROP TABLE IF EXISTS production_document_types;
 DROP TABLE IF EXISTS production_project_members;

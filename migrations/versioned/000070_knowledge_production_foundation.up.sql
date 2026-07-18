@@ -55,6 +55,34 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_production_document_types_active_code
     ON production_document_types (tenant_id, code)
     WHERE status = 'active' AND deleted_at IS NULL;
 
+CREATE OR REPLACE FUNCTION prevent_active_production_document_type_definition_update()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF OLD.status = 'active' AND (
+        NEW.tenant_id IS DISTINCT FROM OLD.tenant_id OR
+        NEW.code IS DISTINCT FROM OLD.code OR
+        NEW.name IS DISTINCT FROM OLD.name OR
+        NEW.description IS DISTINCT FROM OLD.description OR
+        NEW.schema_version IS DISTINCT FROM OLD.schema_version OR
+        NEW.block_schema IS DISTINCT FROM OLD.block_schema OR
+        NEW.source_requirements IS DISTINCT FROM OLD.source_requirements OR
+        NEW.skill_bindings IS DISTINCT FROM OLD.skill_bindings OR
+        NEW.quality_rules IS DISTINCT FROM OLD.quality_rules OR
+        NEW.review_policy IS DISTINCT FROM OLD.review_policy OR
+        NEW.publication_policy IS DISTINCT FROM OLD.publication_policy OR
+        NEW.created_by IS DISTINCT FROM OLD.created_by
+    ) THEN
+        RAISE EXCEPTION 'active production document type definitions are immutable';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_production_document_types_prevent_active_definition_update
+    BEFORE UPDATE ON production_document_types
+    FOR EACH ROW
+    EXECUTE FUNCTION prevent_active_production_document_type_definition_update();
+
 CREATE TABLE IF NOT EXISTS production_idempotency_keys (
     id VARCHAR(36) PRIMARY KEY,
     tenant_id BIGINT NOT NULL,
