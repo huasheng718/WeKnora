@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -95,8 +96,9 @@ func (s *productionDocumentService) CreateDocument(
 			return nil, err
 		}
 	}
-	if strings.TrimSpace(input.Title) == "" {
-		return nil, errors.New("production document title is required")
+	title := strings.TrimSpace(input.Title)
+	if title == "" || utf8.RuneCountInString(title) > 255 {
+		return nil, errors.New("production document title must contain 1 to 255 characters")
 	}
 
 	sourceSet, err := s.sources.GetSet(ctx, tenantID, input.SourceSetID)
@@ -120,9 +122,9 @@ func (s *productionDocumentService) CreateDocument(
 	document := &types.ProductionDocument{
 		ID: uuid.NewString(), TenantID: tenantID, ProjectID: input.ProjectID,
 		DocumentTypeID: input.DocumentTypeID, DocumentTypeSchemaVersion: documentType.SchemaVersion,
-		Title: strings.TrimSpace(input.Title), Status: types.ProductionDocumentDraft, CreatedBy: userID,
+		Title: title, Status: types.ProductionDocumentDraft, CreatedBy: userID,
 	}
-	if err := s.documents.CreateDocument(ctx, document); err != nil {
+	if err := s.documents.CreateDocument(ctx, document, input.SourceSetID); err != nil {
 		return nil, err
 	}
 	return document, nil

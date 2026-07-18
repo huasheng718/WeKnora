@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -139,6 +140,32 @@ func TestProductionDocumentServiceDerivesTenantSchemaAndActor(t *testing.T) {
 	require.Equal(t, []types.ProductionRole{types.ProductionRoleProjectOwner, types.ProductionRoleAuthor}, authorizer.roles)
 }
 
+func TestProductionDocumentServiceTrimsAndBoundsTitle(t *testing.T) {
+	t.Run("accepts exactly 255 characters", func(t *testing.T) {
+		svc, _, _, _ := newProductionDocumentServiceFixture(t)
+		title := strings.Repeat("a", 255)
+		document, err := svc.CreateDocument(productionDocumentContext(7), interfaces.CreateProductionDocumentInput{
+			ProjectID: documentServiceProjectID, DocumentTypeID: documentServiceTypeID,
+			SourceSetID: documentServiceSetID, Title: "  " + title + "  ",
+		})
+		require.NoError(t, err)
+		require.Equal(t, title, document.Title)
+	})
+
+	t.Run("rejects 256 characters", func(t *testing.T) {
+		svc, _, db, _ := newProductionDocumentServiceFixture(t)
+		document, err := svc.CreateDocument(productionDocumentContext(7), interfaces.CreateProductionDocumentInput{
+			ProjectID: documentServiceProjectID, DocumentTypeID: documentServiceTypeID,
+			SourceSetID: documentServiceSetID, Title: strings.Repeat("a", 256),
+		})
+		require.Nil(t, document)
+		require.ErrorContains(t, err, "255")
+		var count int64
+		require.NoError(t, db.Model(&types.ProductionDocument{}).Count(&count).Error)
+		require.Zero(t, count)
+	})
+}
+
 func TestProductionDocumentServiceRequiresOwnerOrAuthorForMutations(t *testing.T) {
 	svc, _, _, authorizer := newProductionDocumentServiceFixture(t)
 	authorizer.err = types.ErrProductionForbidden
@@ -178,20 +205,22 @@ func TestProductionDocumentServiceRecordsSplitAndMergeLineage(t *testing.T) {
 	document := createServiceDocument(t, svc)
 	first, err := svc.AppendVersion(productionDocumentContext(7), document.ID, interfaces.AppendProductionVersionInput{
 		SourceSetID: documentServiceSetID, Origin: types.ProductionDocumentOriginHuman,
-		Blocks: []types.ProductionDocumentBlockInput{serviceParagraph("block-a", `"a"`), serviceParagraph("block-b", `"b"`)},
+		Blocks: []types.ProductionDocumentBlockInput{
+			serviceParagraph("block-a", `"a"`), serviceParagraph("block-b", `"b"`), serviceParagraph("block-c", `"c"`),
+		},
 	})
 	require.NoError(t, err)
 
 	second, err := svc.AppendVersion(productionDocumentContext(7), document.ID, interfaces.AppendProductionVersionInput{
 		ParentVersionID: first.ID, SourceSetID: documentServiceSetID, Origin: types.ProductionDocumentOriginMixed,
 		Blocks: []types.ProductionDocumentBlockInput{
-			serviceParagraph("block-a-1", `"a1"`), serviceParagraph("block-a-2", `"a2"`), serviceParagraph("block-ab", `"ab"`),
+			serviceParagraph("block-a-1", `"a1"`), serviceParagraph("block-a-2", `"a2"`), serviceParagraph("block-bc", `"bc"`),
 		},
 		Lineage: []types.ProductionBlockLineageInput{
 			{FromLogicalBlockID: "block-a", ToLogicalBlockID: "block-a-1", Relation: types.ProductionBlockRelationSplit},
 			{FromLogicalBlockID: "block-a", ToLogicalBlockID: "block-a-2", Relation: types.ProductionBlockRelationSplit},
-			{FromLogicalBlockID: "block-a", ToLogicalBlockID: "block-ab", Relation: types.ProductionBlockRelationMerged},
-			{FromLogicalBlockID: "block-b", ToLogicalBlockID: "block-ab", Relation: types.ProductionBlockRelationMerged},
+			{FromLogicalBlockID: "block-b", ToLogicalBlockID: "block-bc", Relation: types.ProductionBlockRelationMerged},
+			{FromLogicalBlockID: "block-c", ToLogicalBlockID: "block-bc", Relation: types.ProductionBlockRelationMerged},
 		},
 	})
 

@@ -35,13 +35,21 @@ func translateProductionDocumentError(err error) error {
 	}
 }
 
-func (r *productionDocumentRepository) CreateDocument(ctx context.Context, document *types.ProductionDocument) error {
-	if document == nil {
-		return errors.New("production document is required")
+func (r *productionDocumentRepository) CreateDocument(
+	ctx context.Context,
+	document *types.ProductionDocument,
+	sourceSetID string,
+) error {
+	if document == nil || sourceSetID == "" {
+		return errors.New("production document and source set id are required")
 	}
-	return translateProductionDocumentError(
-		database.DBFromContext(ctx, r.db).WithContext(ctx).Create(document).Error,
-	)
+	return database.WithTransactionContext(ctx, r.db, func(txCtx context.Context) error {
+		db := database.DBFromContext(txCtx, r.db).WithContext(txCtx)
+		if err := lockProductionCreateDependencies(db, document, sourceSetID); err != nil {
+			return err
+		}
+		return translateProductionDocumentError(db.Create(document).Error)
+	})
 }
 
 func (r *productionDocumentRepository) GetDocument(
@@ -125,6 +133,11 @@ func validateProductionLineage(
 			newBlocks[block.LogicalBlockID] = struct{}{}
 		}
 	}
+	fromRelations := make(map[string]map[types.ProductionBlockRelation]struct{})
+	toRelations := make(map[string]map[types.ProductionBlockRelation]struct{})
+	fromTargets := make(map[string]map[string]struct{})
+	toSources := make(map[string]map[string]struct{})
+	edges := make(map[string]struct{}, len(lineage))
 	for _, edge := range lineage {
 		if edge == nil || edge.ID == "" || !edge.Relation.IsValid() {
 			return types.ErrProductionBlockLineageInvalid
@@ -141,8 +154,46 @@ func validateProductionLineage(
 		if _, ok := newBlocks[edge.ToLogicalBlockID]; !ok {
 			return types.ErrProductionBlockLineageInvalid
 		}
+		edgeKey := edge.FromLogicalBlockID + "\x00" + edge.ToLogicalBlockID
+		if _, duplicate := edges[edgeKey]; duplicate {
+			return types.ErrProductionBlockLineageInvalid
+		}
+		edges[edgeKey] = struct{}{}
+		if fromRelations[edge.FromLogicalBlockID] == nil {
+			fromRelations[edge.FromLogicalBlockID] = make(map[types.ProductionBlockRelation]struct{})
+			fromTargets[edge.FromLogicalBlockID] = make(map[string]struct{})
+		}
+		if toRelations[edge.ToLogicalBlockID] == nil {
+			toRelations[edge.ToLogicalBlockID] = make(map[types.ProductionBlockRelation]struct{})
+			toSources[edge.ToLogicalBlockID] = make(map[string]struct{})
+		}
+		fromRelations[edge.FromLogicalBlockID][edge.Relation] = struct{}{}
+		toRelations[edge.ToLogicalBlockID][edge.Relation] = struct{}{}
+		fromTargets[edge.FromLogicalBlockID][edge.ToLogicalBlockID] = struct{}{}
+		toSources[edge.ToLogicalBlockID][edge.FromLogicalBlockID] = struct{}{}
 		edge.FromVersionID = parentID
 		edge.ToVersionID = version.ID
+	}
+	for _, edge := range lineage {
+		switch edge.Relation {
+		case types.ProductionBlockRelationSame:
+			if len(fromRelations[edge.FromLogicalBlockID]) != 1 || len(toRelations[edge.ToLogicalBlockID]) != 1 ||
+				len(fromTargets[edge.FromLogicalBlockID]) != 1 || len(toSources[edge.ToLogicalBlockID]) != 1 {
+				return types.ErrProductionBlockLineageInvalid
+			}
+		case types.ProductionBlockRelationSplit:
+			if len(fromRelations[edge.FromLogicalBlockID]) != 1 || len(fromTargets[edge.FromLogicalBlockID]) < 2 ||
+				len(toRelations[edge.ToLogicalBlockID]) != 1 || len(toSources[edge.ToLogicalBlockID]) != 1 {
+				return types.ErrProductionBlockLineageInvalid
+			}
+		case types.ProductionBlockRelationMerged:
+			if len(toRelations[edge.ToLogicalBlockID]) != 1 || len(toSources[edge.ToLogicalBlockID]) < 2 ||
+				len(fromRelations[edge.FromLogicalBlockID]) != 1 || len(fromTargets[edge.FromLogicalBlockID]) != 1 {
+				return types.ErrProductionBlockLineageInvalid
+			}
+		default:
+			return types.ErrProductionBlockLineageInvalid
+		}
 	}
 	return nil
 }
@@ -182,6 +233,42 @@ func validateProductionAppendDependencies(
 		return err
 	}
 	return nil
+}
+
+func lockProductionCreateDependencies(
+	db *gorm.DB,
+	document *types.ProductionDocument,
+	sourceSetID string,
+) error {
+	if db.Dialector.Name() != "postgres" {
+		// SQLite has one writer. Lock the dependencies in the same type-then-source
+		// order as PostgreSQL before their authoritative lifecycle reads.
+		typeLock := db.Model(&types.ProductionDocumentType{}).
+			Where(
+				"id = ? AND tenant_id = ? AND schema_version = ?",
+				document.DocumentTypeID, document.TenantID, document.DocumentTypeSchemaVersion,
+			).
+			UpdateColumn("status", gorm.Expr("status"))
+		if typeLock.Error != nil {
+			return translateProductionDocumentError(typeLock.Error)
+		}
+		if typeLock.RowsAffected != 1 {
+			return types.ErrProductionDocumentTypeInactive
+		}
+		sourceLock := db.Model(&types.ProductionSourceSet{}).
+			Where(
+				"id = ? AND tenant_id = ? AND project_id = ? AND document_type_id = ?",
+				sourceSetID, document.TenantID, document.ProjectID, document.DocumentTypeID,
+			).
+			UpdateColumn("status", gorm.Expr("status"))
+		if sourceLock.Error != nil {
+			return translateProductionDocumentError(sourceLock.Error)
+		}
+		if sourceLock.RowsAffected != 1 {
+			return types.ErrProductionDocumentSourceSetInvalid
+		}
+	}
+	return validateProductionAppendDependencies(db, document, sourceSetID)
 }
 
 func prepareProductionBlocks(version *types.ProductionDocumentVersion, blocks []*types.ProductionDocumentBlock) error {

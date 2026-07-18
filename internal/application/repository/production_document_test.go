@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"fmt"
 	"regexp"
 	"sort"
 	"sync"
@@ -72,7 +73,7 @@ func productionVersion(id string, parent *string, blocks ...*types.ProductionDoc
 
 func createDocumentAndFirstVersion(t *testing.T, repo interfaces.ProductionDocumentRepository) *types.ProductionDocumentVersion {
 	t.Helper()
-	require.NoError(t, repo.CreateDocument(context.Background(), productionDocumentFixture()))
+	require.NoError(t, repo.CreateDocument(context.Background(), productionDocumentFixture(), sourceSetID))
 	version := productionVersion(firstVersionID, nil, productionBlock("block-row-1", "block-a", `"first"`))
 	require.NoError(t, repo.AppendVersion(context.Background(), version, version.Blocks, nil))
 	return version
@@ -184,7 +185,7 @@ func TestProductionDocumentRepositoryRejectsWrongProjectSourceSet(t *testing.T) 
 		ID: otherSourceSetID, TenantID: 7, ProjectID: otherProjectID, DocumentTypeID: sourceTypeID,
 		Status: types.ProductionSourceSetFrozen, CreatedBy: "author", FrozenAt: timePointer(time.Now().UTC()),
 	}))
-	require.NoError(t, repo.CreateDocument(context.Background(), productionDocumentFixture()))
+	require.NoError(t, repo.CreateDocument(context.Background(), productionDocumentFixture(), sourceSetID))
 	version := productionVersion(firstVersionID, nil, productionBlock("block-row-1", "block-a", `"wrong source"`))
 	version.SourceSetID = otherSourceSetID
 
@@ -198,28 +199,98 @@ func TestProductionDocumentRepositoryRejectsWrongProjectSourceSet(t *testing.T) 
 
 func TestProductionDocumentRepositoryPersistsSplitAndMergedLineage(t *testing.T) {
 	repo, _, _ := newProductionDocumentRepoFixture(t)
-	require.NoError(t, repo.CreateDocument(context.Background(), productionDocumentFixture()))
+	require.NoError(t, repo.CreateDocument(context.Background(), productionDocumentFixture(), sourceSetID))
 	first := productionVersion(firstVersionID, nil,
 		productionBlock("block-row-1", "block-a", `"a"`),
 		productionBlock("block-row-2", "block-b", `"b"`),
+		productionBlock("block-row-6", "block-c", `"c"`),
 	)
 	require.NoError(t, repo.AppendVersion(context.Background(), first, first.Blocks, nil))
 	second := productionVersion(secondVersionID, stringPointer(first.ID),
 		productionBlock("block-row-3", "block-a-1", `"a1"`),
 		productionBlock("block-row-4", "block-a-2", `"a2"`),
-		productionBlock("block-row-5", "block-ab", `"ab"`),
+		productionBlock("block-row-5", "block-bc", `"bc"`),
 	)
 	lineage := []*types.ProductionBlockLineage{
 		{ID: "lineage-1", FromVersionID: first.ID, FromLogicalBlockID: "block-a", ToVersionID: second.ID, ToLogicalBlockID: "block-a-1", Relation: types.ProductionBlockRelationSplit},
 		{ID: "lineage-2", FromVersionID: first.ID, FromLogicalBlockID: "block-a", ToVersionID: second.ID, ToLogicalBlockID: "block-a-2", Relation: types.ProductionBlockRelationSplit},
-		{ID: "lineage-3", FromVersionID: first.ID, FromLogicalBlockID: "block-a", ToVersionID: second.ID, ToLogicalBlockID: "block-ab", Relation: types.ProductionBlockRelationMerged},
-		{ID: "lineage-4", FromVersionID: first.ID, FromLogicalBlockID: "block-b", ToVersionID: second.ID, ToLogicalBlockID: "block-ab", Relation: types.ProductionBlockRelationMerged},
+		{ID: "lineage-3", FromVersionID: first.ID, FromLogicalBlockID: "block-b", ToVersionID: second.ID, ToLogicalBlockID: "block-bc", Relation: types.ProductionBlockRelationMerged},
+		{ID: "lineage-4", FromVersionID: first.ID, FromLogicalBlockID: "block-c", ToVersionID: second.ID, ToLogicalBlockID: "block-bc", Relation: types.ProductionBlockRelationMerged},
 	}
 
 	require.NoError(t, repo.AppendVersion(context.Background(), second, second.Blocks, lineage))
 	got, err := repo.GetVersion(context.Background(), 7, second.ID)
 	require.NoError(t, err)
 	require.Len(t, got.Lineage, 4)
+}
+
+func TestProductionDocumentRepositoryRejectsInvalidLineageGraphShapes(t *testing.T) {
+	testCases := []struct {
+		name  string
+		edges []types.ProductionBlockLineageInput
+	}{
+		{name: "single split", edges: []types.ProductionBlockLineageInput{{FromLogicalBlockID: "block-a", ToLogicalBlockID: "block-x", Relation: types.ProductionBlockRelationSplit}}},
+		{name: "single merged", edges: []types.ProductionBlockLineageInput{{FromLogicalBlockID: "block-a", ToLogicalBlockID: "block-x", Relation: types.ProductionBlockRelationMerged}}},
+		{name: "duplicate edge", edges: []types.ProductionBlockLineageInput{
+			{FromLogicalBlockID: "block-a", ToLogicalBlockID: "block-x", Relation: types.ProductionBlockRelationSame},
+			{FromLogicalBlockID: "block-a", ToLogicalBlockID: "block-x", Relation: types.ProductionBlockRelationSame},
+		}},
+		{name: "many to many", edges: []types.ProductionBlockLineageInput{
+			{FromLogicalBlockID: "block-a", ToLogicalBlockID: "block-x", Relation: types.ProductionBlockRelationSplit},
+			{FromLogicalBlockID: "block-a", ToLogicalBlockID: "block-y", Relation: types.ProductionBlockRelationSplit},
+			{FromLogicalBlockID: "block-b", ToLogicalBlockID: "block-x", Relation: types.ProductionBlockRelationSplit},
+			{FromLogicalBlockID: "block-b", ToLogicalBlockID: "block-z", Relation: types.ProductionBlockRelationSplit},
+		}},
+		{name: "mixed source relation", edges: []types.ProductionBlockLineageInput{
+			{FromLogicalBlockID: "block-a", ToLogicalBlockID: "block-x", Relation: types.ProductionBlockRelationSplit},
+			{FromLogicalBlockID: "block-a", ToLogicalBlockID: "block-y", Relation: types.ProductionBlockRelationSplit},
+			{FromLogicalBlockID: "block-a", ToLogicalBlockID: "block-z", Relation: types.ProductionBlockRelationMerged},
+			{FromLogicalBlockID: "block-b", ToLogicalBlockID: "block-z", Relation: types.ProductionBlockRelationMerged},
+		}},
+		{name: "mixed target relation", edges: []types.ProductionBlockLineageInput{
+			{FromLogicalBlockID: "block-a", ToLogicalBlockID: "block-z", Relation: types.ProductionBlockRelationMerged},
+			{FromLogicalBlockID: "block-b", ToLogicalBlockID: "block-z", Relation: types.ProductionBlockRelationMerged},
+			{FromLogicalBlockID: "block-c", ToLogicalBlockID: "block-z", Relation: types.ProductionBlockRelationSplit},
+			{FromLogicalBlockID: "block-c", ToLogicalBlockID: "block-x", Relation: types.ProductionBlockRelationSplit},
+		}},
+		{name: "same endpoint conflict", edges: []types.ProductionBlockLineageInput{
+			{FromLogicalBlockID: "block-a", ToLogicalBlockID: "block-x", Relation: types.ProductionBlockRelationSame},
+			{FromLogicalBlockID: "block-a", ToLogicalBlockID: "block-y", Relation: types.ProductionBlockRelationSplit},
+			{FromLogicalBlockID: "block-a", ToLogicalBlockID: "block-z", Relation: types.ProductionBlockRelationSplit},
+		}},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, _, db := newProductionDocumentRepoFixture(t)
+			require.NoError(t, repo.CreateDocument(context.Background(), productionDocumentFixture(), sourceSetID))
+			first := productionVersion(firstVersionID, nil,
+				productionBlock("block-row-1", "block-a", `"a"`),
+				productionBlock("block-row-2", "block-b", `"b"`),
+				productionBlock("block-row-3", "block-c", `"c"`),
+			)
+			require.NoError(t, repo.AppendVersion(context.Background(), first, first.Blocks, nil))
+			second := productionVersion(secondVersionID, stringPointer(first.ID),
+				productionBlock("block-row-4", "block-x", `"x"`),
+				productionBlock("block-row-5", "block-y", `"y"`),
+				productionBlock("block-row-6", "block-z", `"z"`),
+			)
+			lineage := make([]*types.ProductionBlockLineage, 0, len(tc.edges))
+			for i, edge := range tc.edges {
+				lineage = append(lineage, &types.ProductionBlockLineage{
+					ID: fmt.Sprintf("lineage-%d", i), FromVersionID: first.ID,
+					FromLogicalBlockID: edge.FromLogicalBlockID, ToVersionID: second.ID,
+					ToLogicalBlockID: edge.ToLogicalBlockID, Relation: edge.Relation,
+				})
+			}
+
+			err := repo.AppendVersion(context.Background(), second, second.Blocks, lineage)
+			require.ErrorIs(t, err, types.ErrProductionBlockLineageInvalid)
+			var count int64
+			require.NoError(t, db.Model(&types.ProductionDocumentVersion{}).Count(&count).Error)
+			require.Equal(t, int64(1), count)
+		})
+	}
 }
 
 func TestProductionDocumentRepositoryRejectsMissingLineageEndpointAndRollsBack(t *testing.T) {
@@ -272,11 +343,37 @@ func TestProductionDocumentRepositoryRollsBackOnBlockOrLineageInsertFailure(t *t
 	}
 }
 
+func TestProductionDocumentRepositoryRollsBackOnFinalHeadUpdateFailure(t *testing.T) {
+	repo, _, db := newProductionDocumentRepoFixture(t)
+	require.NoError(t, repo.CreateDocument(context.Background(), productionDocumentFixture(), sourceSetID))
+	require.NoError(t, db.Exec(`
+CREATE TRIGGER fail_production_document_final_head_update
+BEFORE UPDATE OF current_version_id ON production_documents
+FOR EACH ROW
+WHEN NEW.current_version_id IS NOT OLD.current_version_id
+BEGIN
+    SELECT RAISE(ABORT, 'forced final head update failure');
+END`).Error)
+	version := productionVersion(firstVersionID, nil, productionBlock("block-row-1", "block-a", `"first"`))
+
+	err := repo.AppendVersion(context.Background(), version, version.Blocks, nil)
+
+	require.ErrorContains(t, err, "forced final head update failure")
+	var versionCount, blockCount int64
+	require.NoError(t, db.Model(&types.ProductionDocumentVersion{}).Count(&versionCount).Error)
+	require.NoError(t, db.Model(&types.ProductionDocumentBlock{}).Count(&blockCount).Error)
+	require.Zero(t, versionCount)
+	require.Zero(t, blockCount)
+	document, err := repo.GetDocument(context.Background(), 7, documentID)
+	require.NoError(t, err)
+	require.Nil(t, document.CurrentVersionID)
+}
+
 func TestProductionDocumentRepositoryJoinsSharedTransactionContext(t *testing.T) {
 	repo, _, db := newProductionDocumentRepoFixture(t)
 	errRollback := context.Canceled
 	err := database.WithTransactionContext(context.Background(), db, func(txCtx context.Context) error {
-		require.NoError(t, repo.CreateDocument(txCtx, productionDocumentFixture()))
+		require.NoError(t, repo.CreateDocument(txCtx, productionDocumentFixture(), sourceSetID))
 		version := productionVersion(firstVersionID, nil, productionBlock("block-row-1", "block-a", `"first"`))
 		require.NoError(t, repo.AppendVersion(txCtx, version, version.Blocks, nil))
 		return errRollback
@@ -285,6 +382,53 @@ func TestProductionDocumentRepositoryJoinsSharedTransactionContext(t *testing.T)
 	var count int64
 	require.NoError(t, db.Model(&types.ProductionDocument{}).Count(&count).Error)
 	require.Zero(t, count)
+}
+
+func TestProductionDocumentRepositoryCreateRejectsRetiredTypeAtomically(t *testing.T) {
+	repo, _, db := newProductionDocumentRepoFixture(t)
+	require.NoError(t, db.Model(&types.ProductionDocumentType{}).
+		Where("id = ?", sourceTypeID).
+		UpdateColumn("status", types.ProductionDocumentTypeRetired).Error)
+
+	err := repo.CreateDocument(context.Background(), productionDocumentFixture(), sourceSetID)
+
+	require.ErrorIs(t, err, types.ErrProductionDocumentTypeInactive)
+	var count int64
+	require.NoError(t, db.Model(&types.ProductionDocument{}).Count(&count).Error)
+	require.Zero(t, count)
+}
+
+func TestProductionDocumentRepositoryPostgresCreateLocksDependenciesAndRollsBack(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	document := productionDocumentFixture()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT \* FROM "production_document_types" WHERE .*status = \$4.*FOR SHARE`).
+		WithArgs(sourceTypeID, uint64(7), 1, types.ProductionDocumentTypeActive, 1).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "schema_version", "status"}).
+			AddRow(sourceTypeID, 7, 1, string(types.ProductionDocumentTypeActive)))
+	mock.ExpectQuery(`SELECT \* FROM "production_source_sets" WHERE .*status = \$5.*FOR SHARE`).
+		WithArgs(sourceSetID, uint64(7), sourceProjectID, sourceTypeID, types.ProductionSourceSetFrozen, 1).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "project_id", "document_type_id", "status"}).
+			AddRow(sourceSetID, 7, sourceProjectID, sourceTypeID, string(types.ProductionSourceSetFrozen)))
+	forced := errors.New("forced document insert failure")
+	mock.ExpectExec(`INSERT INTO "production_documents"`).
+		WithArgs(
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+		).
+		WillReturnError(forced)
+	mock.ExpectRollback()
+
+	err = NewProductionDocumentRepository(db).CreateDocument(context.Background(), document, sourceSetID)
+
+	require.ErrorIs(t, err, forced)
+	require.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestProductionDocumentVersionAndBlockRowsAreDatabaseImmutable(t *testing.T) {
@@ -311,6 +455,54 @@ func TestProductionDocumentRepositoryPostgresLocksHeadForUpdate(t *testing.T) {
 	locked, err := lockProductionDocumentHead(db, documentID)
 	require.NoError(t, err)
 	require.Equal(t, documentID, locked.ID)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestProductionDocumentRepositoryPostgresRollsBackOnFinalHeadUpdateFailure(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	repo := NewProductionDocumentRepository(db)
+	version := productionVersion(firstVersionID, nil, productionBlock("block-row-1", "block-a", `"first"`))
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT \* FROM "production_documents" WHERE id = \$1.*FOR UPDATE`).
+		WithArgs(documentID, 1).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "tenant_id", "project_id", "document_type_id", "document_type_schema_version", "title", "status", "created_by", "created_at", "updated_at",
+		}).AddRow(documentID, 7, sourceProjectID, sourceTypeID, 1, "Baseline", string(types.ProductionDocumentDraft), "author", time.Now(), time.Now()))
+	mock.ExpectQuery(`SELECT \* FROM "production_document_types" WHERE .*status = \$4.*FOR SHARE`).
+		WithArgs(sourceTypeID, uint64(7), 1, types.ProductionDocumentTypeActive, 1).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "schema_version", "status"}).
+			AddRow(sourceTypeID, 7, 1, string(types.ProductionDocumentTypeActive)))
+	mock.ExpectQuery(`SELECT \* FROM "production_source_sets" WHERE .*status = \$5.*FOR SHARE`).
+		WithArgs(sourceSetID, uint64(7), sourceProjectID, sourceTypeID, types.ProductionSourceSetFrozen, 1).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "project_id", "document_type_id", "status"}).
+			AddRow(sourceSetID, 7, sourceProjectID, sourceTypeID, string(types.ProductionSourceSetFrozen)))
+	mock.ExpectExec(`INSERT INTO "production_document_versions"`).
+		WithArgs(
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+		).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`INSERT INTO "production_document_blocks"`).
+		WithArgs(
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+		).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	forced := errors.New("forced final head update failure")
+	mock.ExpectExec(`UPDATE "production_documents" SET "current_version_id"=\$1 WHERE id = \$2 AND current_version_id IS NULL`).
+		WithArgs(firstVersionID, documentID).
+		WillReturnError(forced)
+	mock.ExpectRollback()
+
+	err = repo.AppendVersion(context.Background(), version, version.Blocks, nil)
+
+	require.ErrorIs(t, err, forced)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 

@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math/big"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -177,11 +179,83 @@ func canonicalProductionDigestJSON(value JSON, fallback string) json.RawMessage 
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return json.RawMessage(strconv.Quote(string(value)))
 	}
+	decoded = normalizeProductionDigestNumbers(decoded)
 	canonical, err := json.Marshal(decoded)
 	if err != nil {
 		return json.RawMessage(strconv.Quote(string(value)))
 	}
 	return canonical
+}
+
+type canonicalProductionNumber string
+
+func (number canonicalProductionNumber) MarshalJSON() ([]byte, error) {
+	return []byte(number), nil
+}
+
+func normalizeProductionDigestNumbers(value any) any {
+	switch typed := value.(type) {
+	case json.Number:
+		if normalized, ok := normalizeProductionJSONNumber(typed.String()); ok {
+			return canonicalProductionNumber(normalized)
+		}
+		return typed
+	case map[string]any:
+		for key, nested := range typed {
+			typed[key] = normalizeProductionDigestNumbers(nested)
+		}
+		return typed
+	case []any:
+		for index, nested := range typed {
+			typed[index] = normalizeProductionDigestNumbers(nested)
+		}
+		return typed
+	default:
+		return value
+	}
+}
+
+func normalizeProductionJSONNumber(value string) (string, bool) {
+	negative := strings.HasPrefix(value, "-")
+	if negative {
+		value = value[1:]
+	}
+	exponentText := "0"
+	if separator := strings.IndexAny(value, "eE"); separator >= 0 {
+		exponentText = value[separator+1:]
+		value = value[:separator]
+	}
+	exponent, ok := new(big.Int).SetString(exponentText, 10)
+	if !ok {
+		return "", false
+	}
+	fractionDigits := 0
+	if point := strings.IndexByte(value, '.'); point >= 0 {
+		fractionDigits = len(value) - point - 1
+		value = value[:point] + value[point+1:]
+	}
+	digits := strings.TrimLeft(value, "0")
+	if digits == "" {
+		return "0", true
+	}
+	exponent.Sub(exponent, big.NewInt(int64(fractionDigits)))
+	trimmedDigits := strings.TrimRight(digits, "0")
+	exponent.Add(exponent, big.NewInt(int64(len(digits)-len(trimmedDigits))))
+	digits = trimmedDigits
+
+	scientificExponent := new(big.Int).Set(exponent)
+	scientificExponent.Add(scientificExponent, big.NewInt(int64(len(digits)-1)))
+	coefficient := digits[:1]
+	if len(digits) > 1 {
+		coefficient += "." + digits[1:]
+	}
+	if negative {
+		coefficient = "-" + coefficient
+	}
+	if scientificExponent.Sign() != 0 {
+		coefficient += "e" + scientificExponent.String()
+	}
+	return coefficient, true
 }
 
 func productionSHA256(value any) string {
