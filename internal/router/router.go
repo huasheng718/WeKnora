@@ -91,6 +91,9 @@ type RouterParams struct {
 	DataSourceCredentialsHandler *handler.DataSourceCredentialsHandler
 	WeKnoraCloudHandler          *handler.WeKnoraCloudHandler
 	WikiPageHandler              *handler.WikiPageHandler
+	ProductionProjectHandler     *handler.ProductionProjectHandler
+	ProductionDocTypeHandler     *handler.ProductionDocumentTypeHandler
+	ProductionIdempotency        *middleware.ProductionIdempotencyMiddleware
 }
 
 // NewRouter 创建新的路由
@@ -112,7 +115,7 @@ func NewRouter(params RouterParams) *gin.Engine {
 	r.Use(cors.New(cors.Config{
 		AllowOrigins:     []string{"*"},
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization", "X-API-Key", "X-Request-ID", "X-Tenant-ID", "X-Embed-Session", "X-External-User-ID", "X-External-User-Token"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization", "X-API-Key", "X-Request-ID", "X-Tenant-ID", "X-Embed-Session", "X-External-User-ID", "X-External-User-Token", "Idempotency-Key"},
 		ExposeHeaders:    []string{"Content-Length", "Access-Control-Allow-Origin"},
 		AllowCredentials: true,
 		MaxAge:           12 * time.Hour,
@@ -268,6 +271,13 @@ func NewRouter(params RouterParams) *gin.Engine {
 		RegisterWeKnoraCloudRoutes(v1, params.WeKnoraCloudHandler, rbacGuards)
 		RegisterWikiPageRoutes(v1, params.WikiPageHandler, rbacGuards)
 		RegisterChunkerDebugRoutes(v1, rbacGuards)
+		RegisterProductionRoutes(
+			v1,
+			params.ProductionProjectHandler,
+			params.ProductionDocTypeHandler,
+			rbacGuards,
+			params.ProductionIdempotency,
+		)
 
 		// Fail fast if any declared API-key policy points at a route
 		// template that does not actually exist (typo / path drift). A
@@ -277,6 +287,26 @@ func NewRouter(params RouterParams) *gin.Engine {
 	}
 
 	return r
+}
+
+// RegisterProductionRoutes wires the tenant-scoped knowledge-production
+// foundation. Route RBAC is the coarse gate; the services perform the
+// authoritative tenant and project-role checks.
+func RegisterProductionRoutes(
+	r *gin.RouterGroup,
+	projectHandler *handler.ProductionProjectHandler,
+	documentTypeHandler *handler.ProductionDocumentTypeHandler,
+	g *rbacGuards,
+	idempotency *middleware.ProductionIdempotencyMiddleware,
+) {
+	production := r.Group("/production")
+	production.GET("/projects", g.Viewer(), projectHandler.List)
+	production.POST("/projects", g.Contributor(), idempotency.Require(), projectHandler.Create)
+	production.POST("/projects/:id/members", g.Contributor(), idempotency.Require(), projectHandler.AssignRole)
+	production.DELETE("/projects/:id/members/:user_id/:role", g.Contributor(), idempotency.Require(), projectHandler.RemoveRole)
+	production.GET("/document-types", g.Viewer(), documentTypeHandler.List)
+	production.POST("/document-types", g.Admin(), idempotency.Require(), documentTypeHandler.Create)
+	production.PUT("/document-types/:id/activate", g.Admin(), idempotency.Require(), documentTypeHandler.Activate)
 }
 
 // RegisterChunkerDebugRoutes wires the read-only chunker preview endpoint
