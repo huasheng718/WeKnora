@@ -47,10 +47,10 @@ type ProductionDocumentType struct {
 	DeletedAt          gorm.DeletedAt               `json:"deleted_at" gorm:"index"`
 }
 
-// CanMutateDefinition rejects edits to active rows, matching the database
-// trigger installed by the production foundation migration.
+// CanMutateDefinition rejects edits once a definition has been activated,
+// including after that version is retired.
 func (d *ProductionDocumentType) CanMutateDefinition() error {
-	if d != nil && d.Status == ProductionDocumentTypeActive {
+	if d != nil && (d.Status == ProductionDocumentTypeActive || d.Status == ProductionDocumentTypeRetired) {
 		return ErrProductionDocumentTypeImmutable
 	}
 	return nil

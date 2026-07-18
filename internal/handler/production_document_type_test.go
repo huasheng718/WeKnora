@@ -2,7 +2,10 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
+	"math"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/Tencent/WeKnora/internal/types"
@@ -60,6 +63,61 @@ func TestProductionDocumentTypeHandlerCreatesAndListsDefinitions(t *testing.T) {
 	require.JSONEq(t, `{"type":"object"}`, string(service.created.BlockSchema))
 	require.Equal(t, http.StatusOK, listRecorder.Code)
 	require.Contains(t, listRecorder.Body.String(), productionDocumentTypeID)
+}
+
+func productionDocumentTypeRequestBody(t *testing.T, code, name string, schemaVersion int64) string {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"code": code, "name": name, "schema_version": schemaVersion,
+		"block_schema": map[string]any{}, "source_requirements": map[string]any{},
+		"skill_bindings": map[string]any{}, "quality_rules": map[string]any{},
+		"review_policy": map[string]any{}, "publication_policy": map[string]any{},
+	})
+	require.NoError(t, err)
+	return string(body)
+}
+
+func TestProductionDocumentTypeHandlerEnforcesDefinitionBounds(t *testing.T) {
+	t.Run("accepts maximum code name and schema version", func(t *testing.T) {
+		service := &productionDocumentTypeServiceStub{}
+		h := NewProductionDocumentTypeHandler(service)
+		value := strings.Repeat("d", 255)
+
+		response := performProductionHandlerRequest(
+			http.MethodPost, "/production/document-types", "/production/document-types",
+			productionDocumentTypeRequestBody(t, "  "+value+"  ", "  "+value+"  ", math.MaxInt32), h.Create,
+		)
+
+		require.Equal(t, http.StatusCreated, response.Code)
+		require.Equal(t, value, service.created.Code)
+		require.Equal(t, value, service.created.Name)
+		require.Equal(t, math.MaxInt32, service.created.SchemaVersion)
+	})
+
+	tests := []struct {
+		name          string
+		code          string
+		displayName   string
+		schemaVersion int64
+	}{
+		{name: "code overflow", code: strings.Repeat("c", 256), displayName: "Baseline", schemaVersion: 1},
+		{name: "name overflow", code: "baseline", displayName: strings.Repeat("n", 256), schemaVersion: 1},
+		{name: "schema version overflow", code: "baseline", displayName: "Baseline", schemaVersion: int64(math.MaxInt32) + 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service := &productionDocumentTypeServiceStub{}
+			h := NewProductionDocumentTypeHandler(service)
+
+			response := performProductionHandlerRequest(
+				http.MethodPost, "/production/document-types", "/production/document-types",
+				productionDocumentTypeRequestBody(t, test.code, test.displayName, test.schemaVersion), h.Create,
+			)
+
+			require.Equal(t, http.StatusBadRequest, response.Code)
+			require.Empty(t, service.created.Code)
+		})
+	}
 }
 
 func TestProductionDocumentTypeHandlerActivatesVersionAddressedByID(t *testing.T) {

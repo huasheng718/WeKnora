@@ -35,7 +35,7 @@ func (r *productionProjectRepository) Create(
 		Role:       types.ProductionRoleProjectOwner,
 		AssignedBy: owner.AssignedBy,
 	}
-	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return productionDB(ctx, r.db).WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(project).Error; err != nil {
 			return err
 		}
@@ -49,7 +49,7 @@ func (r *productionProjectRepository) GetByID(
 	projectID string,
 ) (*types.ProductionProject, error) {
 	var project types.ProductionProject
-	err := r.db.WithContext(ctx).
+	err := productionDB(ctx, r.db).WithContext(ctx).
 		Where("tenant_id = ? AND id = ?", tenantID, projectID).
 		First(&project).Error
 	if err != nil {
@@ -64,7 +64,7 @@ func (r *productionProjectRepository) ListByUser(
 	userID string,
 ) ([]*types.ProductionProject, error) {
 	var projects []*types.ProductionProject
-	err := r.db.WithContext(ctx).
+	err := productionDB(ctx, r.db).WithContext(ctx).
 		Model(&types.ProductionProject{}).
 		Distinct("production_projects.*").
 		Joins("JOIN production_project_members ON production_project_members.project_id = production_projects.id").
@@ -86,7 +86,7 @@ func (r *productionProjectRepository) AssignRole(
 	if member == nil {
 		return errors.New("production project member is required")
 	}
-	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := productionDB(ctx, r.db).WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var project types.ProductionProject
 		if err := tx.Select("id").
 			Where("tenant_id = ? AND id = ?", tenantID, member.ProjectID).
@@ -95,6 +95,7 @@ func (r *productionProjectRepository) AssignRole(
 		}
 		return tx.Create(member).Error
 	})
+	return translateProductionWriteError(err)
 }
 
 func (r *productionProjectRepository) RemoveRole(
@@ -103,10 +104,11 @@ func (r *productionProjectRepository) RemoveRole(
 	projectID, userID string,
 	role types.ProductionRole,
 ) error {
-	tenantProjects := r.db.Model(&types.ProductionProject{}).
+	db := productionDB(ctx, r.db).WithContext(ctx)
+	tenantProjects := db.Model(&types.ProductionProject{}).
 		Select("id").
 		Where("tenant_id = ? AND id = ?", tenantID, projectID)
-	result := r.db.WithContext(ctx).
+	result := db.
 		Where("project_id IN (?) AND user_id = ? AND role = ?", tenantProjects, userID, role).
 		Delete(&types.ProductionProjectMember{})
 	if result.Error != nil {
@@ -124,7 +126,7 @@ func (r *productionProjectRepository) ListRoles(
 	projectID, userID string,
 ) ([]types.ProductionRole, error) {
 	var roles []types.ProductionRole
-	err := r.db.WithContext(ctx).
+	err := productionDB(ctx, r.db).WithContext(ctx).
 		Model(&types.ProductionProjectMember{}).
 		Select("production_project_members.role").
 		Joins("JOIN production_projects ON production_projects.id = production_project_members.project_id").

@@ -235,6 +235,17 @@ func TestProductionDocumentTypeMutationFailuresDoNotEmitSuccessAudit(t *testing.
 	})
 }
 
+func TestProductionDocumentTypeCreatePreservesConflictSentinel(t *testing.T) {
+	svc, repo, _, audit := newProductionDocumentTypeServiceFixture(types.TenantRoleAdmin)
+	repo.createErr = types.ErrProductionConflict
+
+	created, err := svc.CreateDocumentType(ctxForUser(7, "actor"), 7, productionDocumentTypeInput())
+
+	require.Nil(t, created)
+	require.ErrorIs(t, err, types.ErrProductionConflict)
+	require.Empty(t, audit.entries)
+}
+
 func TestProductionDocumentTypeAuditFailureDoesNotRollBackSuccessfulMutation(t *testing.T) {
 	svc, repo, _, audit := newProductionDocumentTypeServiceFixture(types.TenantRoleAdmin)
 	audit.err = errors.New("audit unavailable")

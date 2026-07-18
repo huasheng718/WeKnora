@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -59,6 +60,41 @@ func TestProductionIdempotencyReserveReturnsExistingRecord(t *testing.T) {
 	var count int64
 	require.NoError(t, db.Model(&types.ProductionIdempotencyKey{}).Count(&count).Error)
 	require.Equal(t, int64(1), count, "the database unique key must arbitrate duplicate reservations")
+}
+
+func TestProductionFoundationRepositoriesShareIdempotencyTransaction(t *testing.T) {
+	idempotencyRepo, db := newProductionIdempotencyRepoTestDB(t)
+	projectRepo := NewProductionProjectRepository(db)
+	documentTypeRepo := NewProductionDocumentTypeRepository(db)
+	ctx := productionTenantContext(7)
+
+	err := idempotencyRepo.WithinTransaction(ctx, func(txCtx context.Context) error {
+		_, created, err := idempotencyRepo.Reserve(
+			txCtx, idempotencyRecord(7, "author-1", "/production/projects", "request-1", "digest-a"),
+		)
+		require.NoError(t, err)
+		require.True(t, created)
+		require.NoError(t, projectRepo.Create(txCtx, &types.ProductionProject{
+			ID: "project-transaction", TenantID: 7, Name: "Foundation", OwnerUserID: "author-1",
+			Status: types.ProductionProjectActive,
+		}, &types.ProductionProjectMember{AssignedBy: "author-1"}))
+		require.NoError(t, documentTypeRepo.Create(txCtx, productionDocumentType(
+			"type-transaction", 7, "baseline", 1,
+		)))
+		return errors.New("force rollback")
+	})
+	require.ErrorContains(t, err, "force rollback")
+
+	for _, model := range []any{
+		&types.ProductionIdempotencyKey{},
+		&types.ProductionProject{},
+		&types.ProductionProjectMember{},
+		&types.ProductionDocumentType{},
+	} {
+		var count int64
+		require.NoError(t, db.Model(model).Count(&count).Error)
+		require.Zero(t, count)
+	}
 }
 
 func TestProductionIdempotencyReserveRejectsNilRecord(t *testing.T) {

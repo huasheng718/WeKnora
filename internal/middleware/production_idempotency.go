@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -32,7 +33,13 @@ const (
 	productionFoundationMaxBodyBytes = 1 << 20 // 1 MiB
 )
 
-var errProductionRequestBodyTooLarge = errors.New("production request body exceeds limit")
+var (
+	errProductionRequestBodyTooLarge       = errors.New("production request body exceeds limit")
+	errProductionTerminalResponse          = errors.New("production handler returned a terminal response")
+	errProductionHandlerResponseMissing    = errors.New("production handler did not write a response")
+	errProductionIdempotencyReserveFailed  = errors.New("production idempotency reservation failed")
+	errProductionIdempotencyCompleteFailed = errors.New("production idempotency completion failed")
+)
 
 // ProductionIdempotencyMiddleware provides durable replay semantics for all
 // production write routes.
@@ -93,43 +100,45 @@ func (m *ProductionIdempotencyMiddleware) Require() gin.HandlerFunc {
 			IdempotencyKey: key,
 			RequestDigest:  digest,
 		}
-		reserved, created, err := m.repo.Reserve(ctx, reservation)
-		if err != nil {
-			logger.Errorf(ctx, "production idempotency reservation failed: %v", err)
-			abortProductionIdempotency(c, http.StatusInternalServerError, productionIdempotencyUnavailable,
-				"idempotency reservation failed", true)
-			return
-		}
-		if !created {
-			m.replayOrReject(c, reserved, digest)
-			return
-		}
-		if reserved == nil {
-			abortProductionIdempotency(c, http.StatusInternalServerError, productionIdempotencyUnavailable,
-				"idempotency reservation is unavailable", true)
-			return
-		}
-		reservationID := reserved.ID
-
 		original := c.Writer
 		capture := newProductionResponseCapture(original)
-		func() {
+		var reserved *types.ProductionIdempotencyKey
+		var created bool
+		transactionErr := m.repo.WithinTransaction(ctx, func(txCtx context.Context) error {
+			var err error
+			reserved, created, err = m.repo.Reserve(txCtx, reservation)
+			if err != nil {
+				return fmt.Errorf("%w: %v", errProductionIdempotencyReserveFailed, err)
+			}
+			if !created {
+				return nil
+			}
+			if reserved == nil {
+				return fmt.Errorf("%w: reservation is unavailable", errProductionIdempotencyReserveFailed)
+			}
+
+			originalRequest := c.Request
 			c.Writer = capture
+			c.Request = originalRequest.WithContext(txCtx)
 			defer func() {
 				c.Writer = original
-				if recovered := recover(); recovered != nil {
-					m.releaseReservation(ctx, reservationID)
-					panic(recovered)
-				}
+				c.Request = originalRequest
 			}()
 			c.Next()
-		}()
-		if !capture.hasResponse() {
-			m.releaseReservation(ctx, reservationID)
-			return
-		}
 
-		if isSuccessfulJSONResponse(capture) {
+			if len(c.Errors) > 0 {
+				m.releaseReservation(txCtx, reserved.ID)
+				return errProductionHandlerResponseMissing
+			}
+			if !capture.hasResponse() {
+				m.releaseReservation(txCtx, reserved.ID)
+				return errProductionHandlerResponseMissing
+			}
+			if !isSuccessfulJSONResponse(capture) {
+				m.releaseReservation(txCtx, reserved.ID)
+				return errProductionTerminalResponse
+			}
+
 			responseBody := capture.body.Bytes()
 			if canonical, ok := canonicalProductionJSON(responseBody); ok {
 				capture.body.Reset()
@@ -137,17 +146,37 @@ func (m *ProductionIdempotencyMiddleware) Require() gin.HandlerFunc {
 				capture.size = len(canonical)
 				responseBody = canonical
 			}
-			if err := m.repo.Complete(ctx, reservationID, capture.Status(), types.JSON(responseBody)); err != nil {
-				logger.Errorf(ctx, "production idempotency completion failed: %v", err)
-				m.releaseReservation(ctx, reservationID)
+			if err := m.repo.Complete(txCtx, reserved.ID, capture.Status(), types.JSON(responseBody)); err != nil {
+				return fmt.Errorf("%w: %v", errProductionIdempotencyCompleteFailed, err)
+			}
+			return nil
+		})
+
+		if transactionErr != nil {
+			switch {
+			case errors.Is(transactionErr, errProductionTerminalResponse):
+				capture.flushTo(original)
+			case errors.Is(transactionErr, errProductionHandlerResponseMissing):
+				return
+			case errors.Is(transactionErr, errProductionIdempotencyReserveFailed):
+				logger.Errorf(ctx, "production idempotency reservation failed: %v", transactionErr)
+				writeProductionIdempotencyResponse(original, http.StatusInternalServerError,
+					productionIdempotencyUnavailable, "idempotency reservation failed", true)
+			case errors.Is(transactionErr, errProductionIdempotencyCompleteFailed):
+				logger.Errorf(ctx, "production idempotency completion failed: %v", transactionErr)
 				writeProductionIdempotencyResponse(original, http.StatusInternalServerError,
 					productionIdempotencyUnavailable, "idempotency completion failed", true)
-				return
+			default:
+				logger.Errorf(ctx, "production idempotency transaction failed: %v", transactionErr)
+				writeProductionIdempotencyResponse(original, http.StatusInternalServerError,
+					productionIdempotencyUnavailable, "idempotency transaction failed", true)
 			}
-			capture.flushTo(original)
 			return
 		}
-		m.releaseReservation(ctx, reservationID)
+		if !created {
+			m.replayOrReject(c, reserved, digest)
+			return
+		}
 		capture.flushTo(original)
 	}
 }
@@ -262,6 +291,7 @@ func writeProductionIdempotencyResponse(
 
 type productionResponseCapture struct {
 	gin.ResponseWriter
+	header    http.Header
 	body      bytes.Buffer
 	status    int
 	size      int
@@ -269,8 +299,15 @@ type productionResponseCapture struct {
 }
 
 func newProductionResponseCapture(w gin.ResponseWriter) *productionResponseCapture {
-	return &productionResponseCapture{ResponseWriter: w, status: http.StatusOK, size: -1}
+	return &productionResponseCapture{
+		ResponseWriter: w,
+		header:         w.Header().Clone(),
+		status:         http.StatusOK,
+		size:           -1,
+	}
 }
+
+func (w *productionResponseCapture) Header() http.Header { return w.header }
 
 func (w *productionResponseCapture) WriteHeader(code int) {
 	if code > 0 && !w.Written() {
@@ -312,6 +349,12 @@ func (w *productionResponseCapture) hasResponse() bool {
 }
 
 func (w *productionResponseCapture) flushTo(destination gin.ResponseWriter) {
+	for key := range destination.Header() {
+		destination.Header().Del(key)
+	}
+	for key, values := range w.header {
+		destination.Header()[key] = append([]string(nil), values...)
+	}
 	destination.WriteHeader(w.status)
 	if w.body.Len() > 0 {
 		_, _ = destination.Write(w.body.Bytes())

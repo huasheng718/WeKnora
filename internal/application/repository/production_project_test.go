@@ -204,3 +204,36 @@ func TestProductionProjectRepositoryAssignRoleRejectsNilMember(t *testing.T) {
 	})
 	require.ErrorContains(t, err, "project member")
 }
+
+func TestProductionProjectRepositoryDuplicateLiveRoleReturnsConflict(t *testing.T) {
+	repo, db := newProductionRepoTestDB(t)
+	seedProductionProject(t, db, "project-1", 7)
+	member := &types.ProductionProjectMember{
+		ProjectID: "project-1", UserID: "user-1", Role: types.ProductionRoleAuthor, AssignedBy: "owner-1",
+	}
+	require.NoError(t, repo.AssignRole(context.Background(), 7, member))
+
+	err := repo.AssignRole(context.Background(), 7, &types.ProductionProjectMember{
+		ProjectID: "project-1", UserID: "user-1", Role: types.ProductionRoleAuthor, AssignedBy: "owner-1",
+	})
+
+	require.ErrorIs(t, err, types.ErrProductionConflict)
+}
+
+func TestProductionProjectRepositoryNonUniqueFailureIsNotConflict(t *testing.T) {
+	repo, db := newProductionRepoTestDB(t)
+	seedProductionProject(t, db, "project-1", 7)
+	require.NoError(t, db.Exec(`
+CREATE TRIGGER fail_production_member_write
+BEFORE INSERT ON production_project_members
+BEGIN
+    SELECT RAISE(ABORT, 'forced non-unique write failure');
+END`).Error)
+
+	err := repo.AssignRole(context.Background(), 7, &types.ProductionProjectMember{
+		ProjectID: "project-1", UserID: "user-1", Role: types.ProductionRoleAuthor, AssignedBy: "owner-1",
+	})
+
+	require.Error(t, err)
+	require.NotErrorIs(t, err, types.ErrProductionConflict)
+}

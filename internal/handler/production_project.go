@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"unicode/utf8"
 
 	apperrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -54,6 +55,10 @@ func (h *ProductionProjectHandler) Create(c *gin.Context) {
 	request.Name = strings.TrimSpace(request.Name)
 	if request.Name == "" {
 		c.Error(apperrors.NewValidationError("project name is required"))
+		return
+	}
+	if utf8.RuneCountInString(request.Name) > 255 {
+		c.Error(apperrors.NewValidationError("project name must be at most 255 characters"))
 		return
 	}
 	project, err := h.service.CreateProject(c.Request.Context(), interfaces.CreateProductionProjectInput{
@@ -135,6 +140,8 @@ func handleProductionServiceError(c *gin.Context, err error, message string) {
 	switch {
 	case errors.Is(err, types.ErrProductionForbidden):
 		c.Error(apperrors.NewForbiddenError("production operation forbidden"))
+	case errors.Is(err, types.ErrProductionConflict):
+		c.Error(apperrors.NewConflictError("production resource already exists"))
 	case errors.Is(err, gorm.ErrRecordNotFound):
 		c.Error(apperrors.NewNotFoundError("production resource not found"))
 	default:

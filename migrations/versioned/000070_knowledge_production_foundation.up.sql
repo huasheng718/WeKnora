@@ -58,7 +58,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_production_document_types_active_code
 CREATE OR REPLACE FUNCTION prevent_active_production_document_type_definition_update()
 RETURNS TRIGGER AS $$
 BEGIN
-    IF OLD.status = 'active' AND (
+    IF OLD.status = 'retired' AND NEW.status = 'draft' THEN
+        RAISE EXCEPTION 'retired production document type cannot return to draft';
+    END IF;
+    IF OLD.status IN ('active', 'retired') AND (
         NEW.tenant_id IS DISTINCT FROM OLD.tenant_id OR
         NEW.code IS DISTINCT FROM OLD.code OR
         NEW.name IS DISTINCT FROM OLD.name OR

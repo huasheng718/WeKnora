@@ -60,7 +60,7 @@ CREATE TRIGGER IF NOT EXISTS trg_production_document_types_prevent_active_defini
         source_requirements, skill_bindings, quality_rules, review_policy,
         publication_policy, created_by ON production_document_types
     FOR EACH ROW
-    WHEN OLD.status = 'active' AND (
+    WHEN OLD.status IN ('active', 'retired') AND (
         NEW.tenant_id IS NOT OLD.tenant_id OR
         NEW.code IS NOT OLD.code OR
         NEW.name IS NOT OLD.name OR
@@ -76,6 +76,14 @@ CREATE TRIGGER IF NOT EXISTS trg_production_document_types_prevent_active_defini
     )
 BEGIN
     SELECT RAISE(ABORT, 'active production document type definitions are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_production_document_types_prevent_retired_to_draft
+    BEFORE UPDATE OF status ON production_document_types
+    FOR EACH ROW
+    WHEN OLD.status = 'retired' AND NEW.status = 'draft'
+BEGIN
+    SELECT RAISE(ABORT, 'retired production document type cannot return to draft');
 END;
 
 CREATE TABLE IF NOT EXISTS production_idempotency_keys (

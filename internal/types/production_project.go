@@ -11,6 +11,10 @@ import (
 // project-scoped authority for a production operation.
 var ErrProductionForbidden = errors.New("production operation forbidden")
 
+// ErrProductionConflict is returned when a production write violates a
+// domain uniqueness invariant.
+var ErrProductionConflict = errors.New("production resource conflict")
+
 // ProductionRole is a project-scoped production responsibility. It is
 // intentionally separate from TenantRole, which controls tenant-wide access.
 type ProductionRole string

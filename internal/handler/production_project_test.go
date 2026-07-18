@@ -2,6 +2,8 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -84,6 +86,40 @@ func TestProductionProjectHandlerCreatesProject(t *testing.T) {
 	require.Equal(t, http.StatusCreated, recorder.Code)
 	require.Equal(t, "Baseline", service.created.Name)
 	require.JSONEq(t, `{"success":true,"data":{"id":"11111111-1111-4111-8111-111111111111","tenant_id":7,"name":"Baseline","description":"Core docs","owner_user_id":"author-1","status":"active","created_at":"0001-01-01T00:00:00Z","updated_at":"0001-01-01T00:00:00Z","deleted_at":null}}`, recorder.Body.String())
+}
+
+func TestProductionProjectHandlerEnforcesTrimmedNameCharacterLimit(t *testing.T) {
+	makeBody := func(name string) string {
+		body, err := json.Marshal(map[string]string{"name": name})
+		require.NoError(t, err)
+		return string(body)
+	}
+
+	t.Run("accepts 255 trimmed characters", func(t *testing.T) {
+		service := &productionProjectServiceStub{}
+		h := NewProductionProjectHandler(service)
+		name := strings.Repeat("n", 255)
+
+		response := performProductionHandlerRequest(
+			http.MethodPost, "/production/projects", "/production/projects", makeBody("  "+name+"  "), h.Create,
+		)
+
+		require.Equal(t, http.StatusCreated, response.Code)
+		require.Equal(t, name, service.created.Name)
+	})
+
+	t.Run("rejects 256 trimmed characters", func(t *testing.T) {
+		service := &productionProjectServiceStub{}
+		h := NewProductionProjectHandler(service)
+
+		response := performProductionHandlerRequest(
+			http.MethodPost, "/production/projects", "/production/projects",
+			makeBody(strings.Repeat("n", 256)), h.Create,
+		)
+
+		require.Equal(t, http.StatusBadRequest, response.Code)
+		require.Empty(t, service.created.Name)
+	})
 }
 
 func TestProductionProjectHandlerListsOnlyContextTenantAndUser(t *testing.T) {
@@ -192,6 +228,50 @@ func TestProductionProjectHandlerRejectsMalformedResourceAndUserIDs(t *testing.T
 	}
 	require.Empty(t, service.assigned.projectID)
 	require.Empty(t, service.removed.projectID)
+}
+
+func TestProductionHandlersMapConflictsAndUnexpectedFailures(t *testing.T) {
+	t.Run("duplicate project role is conflict", func(t *testing.T) {
+		service := &productionProjectServiceStub{err: types.ErrProductionConflict}
+		h := NewProductionProjectHandler(service)
+		response := performProductionHandlerRequest(
+			http.MethodPost,
+			"/production/projects/:id/members",
+			"/production/projects/"+productionProjectID+"/members",
+			`{"user_id":"`+productionReviewerID+`","role":"author"}`,
+			h.AssignRole,
+		)
+
+		require.Equal(t, http.StatusConflict, response.Code)
+	})
+
+	t.Run("duplicate document type version is conflict", func(t *testing.T) {
+		service := &productionDocumentTypeServiceStub{err: types.ErrProductionConflict}
+		h := NewProductionDocumentTypeHandler(service)
+		response := performProductionHandlerRequest(
+			http.MethodPost,
+			"/production/document-types",
+			"/production/document-types",
+			productionDocumentTypeRequestBody(t, "baseline", "Baseline", 1),
+			h.Create,
+		)
+
+		require.Equal(t, http.StatusConflict, response.Code)
+	})
+
+	t.Run("non conflict failure remains internal error", func(t *testing.T) {
+		service := &productionProjectServiceStub{err: errors.New("database unavailable")}
+		h := NewProductionProjectHandler(service)
+		response := performProductionHandlerRequest(
+			http.MethodPost,
+			"/production/projects/:id/members",
+			"/production/projects/"+productionProjectID+"/members",
+			`{"user_id":"`+productionReviewerID+`","role":"author"}`,
+			h.AssignRole,
+		)
+
+		require.Equal(t, http.StatusInternalServerError, response.Code)
+	})
 }
 
 var _ interfaces.ProductionProjectService = (*productionProjectServiceStub)(nil)

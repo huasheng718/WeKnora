@@ -311,6 +311,18 @@ func TestProductionProjectMutationFailureDoesNotEmitSuccessAudit(t *testing.T) {
 	})
 }
 
+func TestProductionProjectAssignRolePreservesConflictSentinel(t *testing.T) {
+	svc, repo, _, audit := newProductionProjectServiceFixture(t, types.TenantRoleAdmin, nil)
+	repo.assignErr = types.ErrProductionConflict
+
+	err := svc.AssignRole(
+		ctxForUser(7, "author-user"), "project-1", "reviewer", types.ProductionRoleAuthor,
+	)
+
+	require.ErrorIs(t, err, types.ErrProductionConflict)
+	require.Empty(t, audit.entries)
+}
+
 func TestProductionProjectCreatePersistsCallerOwnerAtomicallyAndAudits(t *testing.T) {
 	svc, repo, _, audit := newProductionProjectServiceFixture(t, types.TenantRoleContributor, nil)
 

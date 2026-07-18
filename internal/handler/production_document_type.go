@@ -1,8 +1,10 @@
 package handler
 
 import (
+	"math"
 	"net/http"
 	"strings"
+	"unicode/utf8"
 
 	apperrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -61,6 +63,14 @@ func (h *ProductionDocumentTypeHandler) Create(c *gin.Context) {
 	request.Name = strings.TrimSpace(request.Name)
 	if request.Code == "" || request.Name == "" {
 		c.Error(apperrors.NewValidationError("document type code and name are required"))
+		return
+	}
+	if utf8.RuneCountInString(request.Code) > 255 || utf8.RuneCountInString(request.Name) > 255 {
+		c.Error(apperrors.NewValidationError("document type code and name must be at most 255 characters"))
+		return
+	}
+	if request.SchemaVersion > math.MaxInt32 {
+		c.Error(apperrors.NewValidationError("schema_version must fit a positive PostgreSQL INTEGER"))
 		return
 	}
 	documentType, err := h.service.CreateDocumentType(c.Request.Context(), tenantID,

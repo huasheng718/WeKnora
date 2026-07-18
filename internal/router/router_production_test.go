@@ -24,6 +24,13 @@ func newProductionRouterIdempotencyRepo() *productionRouterIdempotencyRepo {
 	return &productionRouterIdempotencyRepo{records: make(map[string]*types.ProductionIdempotencyKey)}
 }
 
+func (r *productionRouterIdempotencyRepo) WithinTransaction(
+	ctx context.Context,
+	fn func(context.Context) error,
+) error {
+	return fn(ctx)
+}
+
 func (r *productionRouterIdempotencyRepo) Reserve(
 	_ context.Context,
 	record *types.ProductionIdempotencyKey,

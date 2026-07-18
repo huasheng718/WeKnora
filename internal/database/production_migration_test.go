@@ -60,6 +60,21 @@ func TestProductionFoundationSQLiteMigrationPreventsActiveDefinitionUpdates(t *t
 	require.NoError(t, err)
 }
 
+func TestProductionFoundationSQLiteMigrationFreezesRetiredDocumentTypes(t *testing.T) {
+	db := openProductionFoundationSQLite(t)
+	insertProductionDocumentType(t, db, "type-retired", "baseline", 1, "draft")
+
+	_, err := db.Exec("UPDATE production_document_types SET status = 'active' WHERE id = 'type-retired'")
+	require.NoError(t, err)
+	_, err = db.Exec("UPDATE production_document_types SET status = 'retired' WHERE id = 'type-retired'")
+	require.NoError(t, err)
+
+	_, err = db.Exec("UPDATE production_document_types SET name = 'Changed' WHERE id = 'type-retired'")
+	require.ErrorContains(t, err, "immutable")
+	_, err = db.Exec("UPDATE production_document_types SET status = 'draft' WHERE id = 'type-retired'")
+	require.ErrorContains(t, err, "retired")
+}
+
 func TestProductionFoundationPostgreSQLMigrationDeclaresEquivalentStructure(t *testing.T) {
 	postgres := mustReadMigration(t, "../../migrations/versioned/000070_knowledge_production_foundation.up.sql")
 	_, err := pg_query.Parse(postgres)
@@ -72,6 +87,8 @@ func TestProductionFoundationPostgreSQLMigrationDeclaresEquivalentStructure(t *t
 		"CREATE UNIQUE INDEX IF NOT EXISTS uq_production_document_types_active_code",
 		"CREATE OR REPLACE FUNCTION prevent_active_production_document_type_definition_update()",
 		"CREATE TRIGGER trg_production_document_types_prevent_active_definition_update",
+		"OLD.status IN ('active', 'retired')",
+		"OLD.status = 'retired' AND NEW.status = 'draft'",
 	} {
 		require.Contains(t, postgres, declaration)
 	}

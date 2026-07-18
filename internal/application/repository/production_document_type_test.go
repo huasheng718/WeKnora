@@ -123,3 +123,12 @@ func TestDocumentTypeRepositoryActiveLookupRejectsCrossTenantRead(t *testing.T) 
 	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
 	require.Nil(t, got)
 }
+
+func TestProductionDocumentTypeRepositoryDuplicateLiveVersionReturnsConflict(t *testing.T) {
+	repo, _ := newProductionDocumentTypeRepoTestDB(t)
+	require.NoError(t, repo.Create(context.Background(), productionDocumentType("type-1", 7, "baseline", 1)))
+
+	err := repo.Create(context.Background(), productionDocumentType("type-2", 7, "baseline", 1))
+
+	require.ErrorIs(t, err, types.ErrProductionConflict)
+}

@@ -3,24 +3,34 @@ package middleware
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 
+	apprepository "github.com/Tencent/WeKnora/internal/application/repository"
 	apperrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 type productionIdempotencyRepoStub struct {
 	mu                  sync.Mutex
+	txMu                sync.Mutex
 	records             map[string]*types.ProductionIdempotencyKey
 	normalizeOnComplete bool
 	releaseCalls        int
+	transactionErr      error
 }
 
 func newProductionIdempotencyRepoStub() *productionIdempotencyRepoStub {
@@ -90,8 +100,105 @@ func (r *productionIdempotencyRepoStub) Release(ctx context.Context, id string) 
 	return nil
 }
 
+func (r *productionIdempotencyRepoStub) WithinTransaction(
+	ctx context.Context,
+	fn func(context.Context) error,
+) error {
+	r.txMu.Lock()
+	defer r.txMu.Unlock()
+
+	r.mu.Lock()
+	snapshot := make(map[string]*types.ProductionIdempotencyKey, len(r.records))
+	for key, record := range r.records {
+		copy := *record
+		copy.ResponseBody = append(types.JSON(nil), record.ResponseBody...)
+		snapshot[key] = &copy
+	}
+	r.mu.Unlock()
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		r.mu.Lock()
+		r.records = snapshot
+		r.mu.Unlock()
+	}()
+
+	err := fn(ctx)
+	if err == nil {
+		err = r.transactionErr
+	}
+	if err == nil {
+		committed = true
+	}
+	return err
+}
+
+type productionTransactionMarker struct{}
+
+type barrierProductionIdempotencyRepo struct {
+	*productionIdempotencyRepoStub
+	attempts chan struct{}
+}
+
+func (r *barrierProductionIdempotencyRepo) WithinTransaction(
+	ctx context.Context,
+	fn func(context.Context) error,
+) error {
+	r.attempts <- struct{}{}
+	return r.productionIdempotencyRepoStub.WithinTransaction(
+		context.WithValue(ctx, productionTransactionMarker{}, true), fn,
+	)
+}
+
+func (r *barrierProductionIdempotencyRepo) Reserve(
+	ctx context.Context,
+	record *types.ProductionIdempotencyKey,
+) (*types.ProductionIdempotencyKey, bool, error) {
+	if active, _ := ctx.Value(productionTransactionMarker{}).(bool); !active {
+		return nil, false, errors.New("reservation executed outside transaction")
+	}
+	return r.productionIdempotencyRepoStub.Reserve(ctx, record)
+}
+
+type completionFailingProductionIdempotencyRepo struct {
+	interfaces.ProductionIdempotencyRepository
+	mu       sync.Mutex
+	failNext bool
+}
+
+func (r *completionFailingProductionIdempotencyRepo) Complete(
+	ctx context.Context,
+	id string,
+	statusCode int,
+	responseBody types.JSON,
+) error {
+	r.mu.Lock()
+	if r.failNext {
+		r.failNext = false
+		r.mu.Unlock()
+		return errors.New("forced idempotency completion failure")
+	}
+	r.mu.Unlock()
+	return r.ProductionIdempotencyRepository.Complete(ctx, id, statusCode, responseBody)
+}
+
+func (r *completionFailingProductionIdempotencyRepo) WithinTransaction(
+	ctx context.Context,
+	fn func(context.Context) error,
+) error {
+	txRepo, ok := r.ProductionIdempotencyRepository.(interface {
+		WithinTransaction(context.Context, func(context.Context) error) error
+	})
+	if !ok {
+		return errors.New("idempotency repository has no transaction boundary")
+	}
+	return txRepo.WithinTransaction(ctx, fn)
+}
+
 func newProductionIdempotencyTestEngine(
-	repo *productionIdempotencyRepoStub,
+	repo interfaces.ProductionIdempotencyRepository,
 	handler gin.HandlerFunc,
 	outer ...gin.HandlerFunc,
 ) *gin.Engine {
@@ -277,7 +384,7 @@ func TestProductionIdempotencyRestoresWriterBeforeOuterRecovery(t *testing.T) {
 	require.Equal(t, http.StatusInternalServerError, second.Code)
 	require.Contains(t, first.Body.String(), "Internal Server Error")
 	require.Equal(t, 2, calls)
-	require.Equal(t, 2, repo.releaseCalls)
+	require.Empty(t, repo.records)
 }
 
 func TestProductionIdempotencyScopesReservationToConcreteResourcePath(t *testing.T) {
@@ -310,4 +417,108 @@ func TestProductionIdempotencyScopesReservationToConcreteResourcePath(t *testing
 	require.Equal(t, http.StatusOK, second.Code)
 	require.Equal(t, 2, calls)
 	require.Contains(t, second.Body.String(), "project-2")
+}
+
+func TestProductionIdempotencyRollsBackBusinessMutationWhenCompletionFails(t *testing.T) {
+	dsn := "file:" + strings.NewReplacer("/", "_", " ", "_").Replace(t.Name()) +
+		"?mode=memory&cache=shared&_foreign_keys=1&_busy_timeout=5000"
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	migration, err := os.ReadFile("../../migrations/sqlite/000001_knowledge_production_foundation.up.sql")
+	require.NoError(t, err)
+	require.NoError(t, db.Exec(string(migration)).Error)
+
+	projectRepo := apprepository.NewProductionProjectRepository(db)
+	idempotencyRepo := &completionFailingProductionIdempotencyRepo{
+		ProductionIdempotencyRepository: apprepository.NewProductionIdempotencyRepository(db),
+		failNext:                        true,
+	}
+	projectCalls := 0
+	engine := newProductionIdempotencyTestEngine(idempotencyRepo, func(c *gin.Context) {
+		projectCalls++
+		projectID := fmt.Sprintf("project-%d", projectCalls)
+		err := projectRepo.Create(c.Request.Context(), &types.ProductionProject{
+			ID: projectID, TenantID: 7, Name: "Foundation", OwnerUserID: "author-1",
+			Status: types.ProductionProjectActive,
+		}, &types.ProductionProjectMember{AssignedBy: "author-1"})
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false})
+			return
+		}
+		c.JSON(http.StatusCreated, gin.H{"success": true, "data": gin.H{"id": projectID}})
+	})
+
+	failed := performProductionIdempotencyRequest(engine, "request-1", `{"name":"Foundation"}`)
+	require.Equal(t, http.StatusInternalServerError, failed.Code)
+	var projectCount int64
+	require.NoError(t, db.Model(&types.ProductionProject{}).Count(&projectCount).Error)
+	require.Zero(t, projectCount, "completion failure must roll back the business mutation")
+
+	retry := performProductionIdempotencyRequest(engine, "request-1", `{"name":"Foundation"}`)
+	require.Equal(t, http.StatusCreated, retry.Code)
+	require.NoError(t, db.Model(&types.ProductionProject{}).Count(&projectCount).Error)
+	require.Equal(t, int64(1), projectCount)
+	require.Equal(t, 2, projectCalls)
+}
+
+func TestProductionIdempotencyDoesNotFlushSuccessWhenTransactionCommitFails(t *testing.T) {
+	repo := newProductionIdempotencyRepoStub()
+	repo.transactionErr = errors.New("forced commit failure")
+	engine := newProductionIdempotencyTestEngine(repo, func(c *gin.Context) {
+		c.Header("X-Production-Project", "project-1")
+		c.JSON(http.StatusCreated, gin.H{"success": true})
+	})
+
+	response := performProductionIdempotencyRequest(engine, "request-1", `{"name":"Foundation"}`)
+
+	require.Equal(t, http.StatusInternalServerError, response.Code)
+	require.Contains(t, response.Body.String(), productionIdempotencyUnavailable)
+	require.NotContains(t, response.Body.String(), `"success":true`)
+	require.Empty(t, response.Header().Get("X-Production-Project"))
+	require.Empty(t, repo.records)
+}
+
+func TestProductionIdempotencyConcurrentRequestsExecuteHandlerOnce(t *testing.T) {
+	repo := &barrierProductionIdempotencyRepo{
+		productionIdempotencyRepoStub: newProductionIdempotencyRepoStub(),
+		attempts:                      make(chan struct{}, 2),
+	}
+	handlerStarted := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	var calls int
+	engine := newProductionIdempotencyTestEngine(repo, func(c *gin.Context) {
+		calls++
+		close(handlerStarted)
+		<-releaseHandler
+		c.JSON(http.StatusCreated, gin.H{"success": true, "data": gin.H{"id": "project-1"}})
+	})
+
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		firstDone <- performProductionIdempotencyRequest(engine, "request-1", `{"name":"Foundation"}`)
+	}()
+	select {
+	case <-handlerStarted:
+	case response := <-firstDone:
+		t.Fatalf("first request completed before handler barrier: status=%d body=%s", response.Code, response.Body.String())
+	}
+	<-repo.attempts
+
+	secondDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		secondDone <- performProductionIdempotencyRequest(engine, "request-1", `{"name":"Foundation"}`)
+	}()
+	<-repo.attempts
+	close(releaseHandler)
+
+	first := <-firstDone
+	second := <-secondDone
+	require.Equal(t, 1, calls)
+	require.Equal(t, http.StatusCreated, first.Code)
+	require.Equal(t, first.Code, second.Code)
+	require.Equal(t, first.Body.String(), second.Body.String())
 }

@@ -25,7 +25,9 @@ func (r *productionDocumentTypeRepository) Create(
 	if documentType == nil {
 		return errors.New("production document type is required")
 	}
-	return r.db.WithContext(ctx).Create(documentType).Error
+	return translateProductionWriteError(
+		productionDB(ctx, r.db).WithContext(ctx).Create(documentType).Error,
+	)
 }
 
 func (r *productionDocumentTypeRepository) Activate(
@@ -35,7 +37,7 @@ func (r *productionDocumentTypeRepository) Activate(
 	schemaVersion int,
 ) (*types.ProductionDocumentType, error) {
 	var activated types.ProductionDocumentType
-	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := productionDB(ctx, r.db).WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(&types.ProductionDocumentType{}).
 			Where("tenant_id = ? AND code = ? AND status = ?", tenantID, code, types.ProductionDocumentTypeActive).
 			Update("status", types.ProductionDocumentTypeRetired).Error; err != nil {
@@ -71,7 +73,7 @@ func (r *productionDocumentTypeRepository) GetByID(
 	documentTypeID string,
 ) (*types.ProductionDocumentType, error) {
 	var documentType types.ProductionDocumentType
-	err := r.db.WithContext(ctx).
+	err := productionDB(ctx, r.db).WithContext(ctx).
 		Where("tenant_id = ? AND id = ?", tenantID, documentTypeID).
 		First(&documentType).Error
 	if err != nil {
@@ -86,7 +88,7 @@ func (r *productionDocumentTypeRepository) GetActiveByCode(
 	code string,
 ) (*types.ProductionDocumentType, error) {
 	var documentType types.ProductionDocumentType
-	err := r.db.WithContext(ctx).
+	err := productionDB(ctx, r.db).WithContext(ctx).
 		Where("tenant_id = ? AND code = ? AND status = ?", tenantID, code, types.ProductionDocumentTypeActive).
 		First(&documentType).Error
 	if err != nil {
@@ -100,7 +102,7 @@ func (r *productionDocumentTypeRepository) List(
 	tenantID uint64,
 ) ([]*types.ProductionDocumentType, error) {
 	var documentTypes []*types.ProductionDocumentType
-	err := r.db.WithContext(ctx).
+	err := productionDB(ctx, r.db).WithContext(ctx).
 		Where("tenant_id = ?", tenantID).
 		Order("code ASC, schema_version DESC, id ASC").
 		Find(&documentTypes).Error
