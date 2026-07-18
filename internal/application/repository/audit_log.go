@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/database"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"gorm.io/gorm"
@@ -28,7 +29,9 @@ func NewAuditLogRepository(db *gorm.DB) interfaces.AuditLogRepository {
 // the database default if zero. Service-layer Log() fills both before
 // calling here so this is mostly a pass-through.
 func (r *auditLogRepository) Create(ctx context.Context, entry *types.AuditLog) error {
-	return r.db.WithContext(ctx).Create(entry).Error
+	return database.WithSavepointIfTransaction(ctx, r.db, func(db *gorm.DB) error {
+		return db.Create(entry).Error
+	})
 }
 
 // auditLogListLimitMax is the hard ceiling regardless of caller input.
@@ -53,7 +56,7 @@ func (r *auditLogRepository) List(
 		limit = auditLogListLimitMax
 	}
 
-	tx := r.db.WithContext(ctx).
+	tx := database.DBFromContext(ctx, r.db).WithContext(ctx).
 		Where("tenant_id = ?", tenantID)
 	if q != nil {
 		if q.AfterID > 0 {
@@ -94,7 +97,7 @@ func (r *auditLogRepository) CountSinceForDedup(
 	since time.Time,
 ) (int64, error) {
 	var count int64
-	err := r.db.WithContext(ctx).
+	err := database.DBFromContext(ctx, r.db).WithContext(ctx).
 		Model(&types.AuditLog{}).
 		Where("tenant_id = ?", tenantID).
 		Where("actor_user_id = ?", actorUserID).
@@ -118,7 +121,7 @@ func (r *auditLogRepository) CountSinceForDedup(
 // outcome at INFO. Errors propagate verbatim — the caller decides
 // whether they're terminal or transient.
 func (r *auditLogRepository) DeleteOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
-	res := r.db.WithContext(ctx).
+	res := database.DBFromContext(ctx, r.db).WithContext(ctx).
 		Where("created_at < ?", cutoff).
 		Delete(&types.AuditLog{})
 	if res.Error != nil {

@@ -54,10 +54,6 @@ func TestProductionFoundationSQLiteMigrationPreventsActiveDefinitionUpdates(t *t
 
 	_, err = db.Exec("UPDATE production_document_types SET status = 'retired' WHERE id = 'type-1'")
 	require.NoError(t, err)
-
-	insertProductionDocumentType(t, db, "type-2", "baseline-2", 1, "active")
-	_, err = db.Exec("UPDATE production_document_types SET status = 'archived' WHERE id = 'type-2'")
-	require.NoError(t, err)
 }
 
 func TestProductionFoundationSQLiteMigrationFreezesRetiredDocumentTypes(t *testing.T) {
@@ -72,7 +68,42 @@ func TestProductionFoundationSQLiteMigrationFreezesRetiredDocumentTypes(t *testi
 	_, err = db.Exec("UPDATE production_document_types SET name = 'Changed' WHERE id = 'type-retired'")
 	require.ErrorContains(t, err, "immutable")
 	_, err = db.Exec("UPDATE production_document_types SET status = 'draft' WHERE id = 'type-retired'")
-	require.ErrorContains(t, err, "retired")
+	require.ErrorContains(t, err, "invalid production document type status transition")
+}
+
+func TestProductionFoundationSQLiteMigrationRejectsInvalidStatuses(t *testing.T) {
+	db := openProductionFoundationSQLite(t)
+
+	_, err := db.Exec(`INSERT INTO production_projects (id, tenant_id, name, owner_user_id, status) VALUES ('project-invalid', 1, 'Project', 'owner-1', 'draft')`)
+	require.Error(t, err)
+	_, err = db.Exec(`INSERT INTO production_document_types (id, tenant_id, code, name, schema_version, status, created_by) VALUES ('type-invalid', 1, 'baseline', 'Baseline', 1, 'unknown', 'owner-1')`)
+	require.Error(t, err)
+}
+
+func TestProductionFoundationSQLiteMigrationRejectsActivatedStatusEscapes(t *testing.T) {
+	tests := []struct {
+		name, oldStatus, newStatus string
+	}{
+		{name: "active to draft", oldStatus: "active", newStatus: "draft"},
+		{name: "active to unknown", oldStatus: "active", newStatus: "unknown"},
+		{name: "retired to draft", oldStatus: "retired", newStatus: "draft"},
+		{name: "retired to active", oldStatus: "retired", newStatus: "active"},
+		{name: "retired to unknown", oldStatus: "retired", newStatus: "unknown"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := openProductionFoundationSQLite(t)
+			insertProductionDocumentType(t, db, "type-1", "baseline", 1, test.oldStatus)
+
+			_, transitionErr := db.Exec(
+				"UPDATE production_document_types SET status = ? WHERE id = 'type-1'", test.newStatus,
+			)
+			require.Error(t, transitionErr)
+			_, definitionErr := db.Exec("UPDATE production_document_types SET name = 'Bypassed' WHERE id = 'type-1'")
+			require.ErrorContains(t, definitionErr, "immutable")
+		})
+	}
 }
 
 func TestProductionFoundationPostgreSQLMigrationDeclaresEquivalentStructure(t *testing.T) {
@@ -88,7 +119,10 @@ func TestProductionFoundationPostgreSQLMigrationDeclaresEquivalentStructure(t *t
 		"CREATE OR REPLACE FUNCTION prevent_active_production_document_type_definition_update()",
 		"CREATE TRIGGER trg_production_document_types_prevent_active_definition_update",
 		"OLD.status IN ('active', 'retired')",
-		"OLD.status = 'retired' AND NEW.status = 'draft'",
+		"CONSTRAINT chk_production_projects_status CHECK (status IN ('active', 'archived'))",
+		"CONSTRAINT chk_production_document_types_status CHECK (status IN ('draft', 'active', 'retired'))",
+		"OLD.status = 'active' AND NEW.status NOT IN ('active', 'retired')",
+		"OLD.status = 'retired' AND NEW.status <> 'retired'",
 	} {
 		require.Contains(t, postgres, declaration)
 	}
@@ -141,6 +175,8 @@ func TestProductionFoundationMigrationsApplySQLiteConstraintsAndRollback(t *test
 		require.NotEmpty(t, sqliteMasterSQL(t, db, "index", index))
 	}
 	require.Contains(t, sqliteMasterSQL(t, db, "trigger", "trg_production_document_types_prevent_active_definition_update"), "BEFORE UPDATE")
+	require.Contains(t, sqliteMasterSQL(t, db, "table", "production_projects"), "chk_production_projects_status")
+	require.Contains(t, sqliteMasterSQL(t, db, "table", "production_document_types"), "chk_production_document_types_status")
 
 	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000001_knowledge_production_foundation.down.sql"))
 	require.NoError(t, err)

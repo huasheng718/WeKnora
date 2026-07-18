@@ -7,7 +7,8 @@ CREATE TABLE IF NOT EXISTS production_projects (
     status VARCHAR(20) NOT NULL DEFAULT 'active',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    deleted_at TIMESTAMP NULL
+    deleted_at TIMESTAMP NULL,
+    CONSTRAINT chk_production_projects_status CHECK (status IN ('active', 'archived'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_production_projects_tenant
@@ -44,7 +45,8 @@ CREATE TABLE IF NOT EXISTS production_document_types (
     created_by VARCHAR(36) NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    deleted_at TIMESTAMP NULL
+    deleted_at TIMESTAMP NULL,
+    CONSTRAINT chk_production_document_types_status CHECK (status IN ('draft', 'active', 'retired'))
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_production_document_types_live_version
@@ -58,8 +60,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_production_document_types_active_code
 CREATE OR REPLACE FUNCTION prevent_active_production_document_type_definition_update()
 RETURNS TRIGGER AS $$
 BEGIN
-    IF OLD.status = 'retired' AND NEW.status = 'draft' THEN
-        RAISE EXCEPTION 'retired production document type cannot return to draft';
+    IF (OLD.status = 'active' AND NEW.status NOT IN ('active', 'retired')) OR
+        (OLD.status = 'retired' AND NEW.status <> 'retired') THEN
+        RAISE EXCEPTION 'invalid production document type status transition';
     END IF;
     IF OLD.status IN ('active', 'retired') AND (
         NEW.tenant_id IS DISTINCT FROM OLD.tenant_id OR

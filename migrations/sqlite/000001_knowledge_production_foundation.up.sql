@@ -7,7 +7,8 @@ CREATE TABLE IF NOT EXISTS production_projects (
     status VARCHAR(20) NOT NULL DEFAULT 'active',
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    deleted_at DATETIME NULL
+    deleted_at DATETIME NULL,
+    CONSTRAINT chk_production_projects_status CHECK (status IN ('active', 'archived'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_production_projects_tenant
@@ -44,7 +45,8 @@ CREATE TABLE IF NOT EXISTS production_document_types (
     created_by VARCHAR(36) NOT NULL,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    deleted_at DATETIME NULL
+    deleted_at DATETIME NULL,
+    CONSTRAINT chk_production_document_types_status CHECK (status IN ('draft', 'active', 'retired'))
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_production_document_types_live_version
@@ -78,12 +80,13 @@ BEGIN
     SELECT RAISE(ABORT, 'active production document type definitions are immutable');
 END;
 
-CREATE TRIGGER IF NOT EXISTS trg_production_document_types_prevent_retired_to_draft
+CREATE TRIGGER IF NOT EXISTS trg_production_document_types_enforce_status_transition
     BEFORE UPDATE OF status ON production_document_types
     FOR EACH ROW
-    WHEN OLD.status = 'retired' AND NEW.status = 'draft'
+    WHEN (OLD.status = 'active' AND NEW.status NOT IN ('active', 'retired')) OR
+        (OLD.status = 'retired' AND NEW.status <> 'retired')
 BEGIN
-    SELECT RAISE(ABORT, 'retired production document type cannot return to draft');
+    SELECT RAISE(ABORT, 'invalid production document type status transition');
 END;
 
 CREATE TABLE IF NOT EXISTS production_idempotency_keys (

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/database"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"gorm.io/gorm"
@@ -31,7 +32,7 @@ func (r *productionIdempotencyRepository) WithinTransaction(
 	if fn == nil {
 		return errors.New("production transaction callback is required")
 	}
-	return withinProductionTransaction(ctx, r.db, fn)
+	return database.WithTransactionContext(ctx, r.db, fn)
 }
 
 func (r *productionIdempotencyRepository) Reserve(
@@ -41,7 +42,7 @@ func (r *productionIdempotencyRepository) Reserve(
 	if record == nil {
 		return nil, false, errors.New("production idempotency record is required")
 	}
-	result := productionDB(ctx, r.db).WithContext(ctx).
+	result := database.DBFromContext(ctx, r.db).WithContext(ctx).
 		Clauses(clause.OnConflict{
 			Columns: []clause.Column{
 				{Name: "tenant_id"},
@@ -66,7 +67,7 @@ func (r *productionIdempotencyRepository) Reserve(
 	// Rotating the primary-key ID fences the expired owner out of Complete and
 	// Release, both of which require the current reservation ID.
 	now := time.Now()
-	reclaimed := productionDB(ctx, r.db).WithContext(ctx).
+	reclaimed := database.DBFromContext(ctx, r.db).WithContext(ctx).
 		Model(&types.ProductionIdempotencyKey{}).
 		Where(
 			"tenant_id = ? AND actor_user_id = ? AND route = ? AND idempotency_key = ? AND request_digest = ?",
@@ -85,7 +86,7 @@ func (r *productionIdempotencyRepository) Reserve(
 	}
 
 	var existing types.ProductionIdempotencyKey
-	err := productionDB(ctx, r.db).WithContext(ctx).
+	err := database.DBFromContext(ctx, r.db).WithContext(ctx).
 		Where(
 			"tenant_id = ? AND actor_user_id = ? AND route = ? AND idempotency_key = ?",
 			record.TenantID, record.ActorUserID, record.Route, record.IdempotencyKey,
@@ -108,7 +109,7 @@ func (r *productionIdempotencyRepository) Complete(
 		return errors.New("production idempotency completion requires tenant context")
 	}
 	now := time.Now()
-	result := productionDB(ctx, r.db).WithContext(ctx).
+	result := database.DBFromContext(ctx, r.db).WithContext(ctx).
 		Model(&types.ProductionIdempotencyKey{}).
 		Where("tenant_id = ? AND id = ? AND completed_at IS NULL", tenantID, id).
 		Updates(map[string]any{
@@ -121,7 +122,7 @@ func (r *productionIdempotencyRepository) Complete(
 	}
 	if result.RowsAffected == 0 {
 		var count int64
-		if err := productionDB(ctx, r.db).WithContext(ctx).
+		if err := database.DBFromContext(ctx, r.db).WithContext(ctx).
 			Model(&types.ProductionIdempotencyKey{}).
 			Where("tenant_id = ? AND id = ?", tenantID, id).
 			Count(&count).Error; err != nil {
@@ -139,7 +140,7 @@ func (r *productionIdempotencyRepository) Release(ctx context.Context, id string
 	if !ok || tenantID == 0 {
 		return errors.New("production idempotency release requires tenant context")
 	}
-	result := productionDB(ctx, r.db).WithContext(ctx).
+	result := database.DBFromContext(ctx, r.db).WithContext(ctx).
 		Where("tenant_id = ? AND id = ? AND completed_at IS NULL", tenantID, id).
 		Delete(&types.ProductionIdempotencyKey{})
 	if result.Error != nil {
@@ -150,7 +151,7 @@ func (r *productionIdempotencyRepository) Release(ctx context.Context, id string
 	}
 
 	var count int64
-	if err := productionDB(ctx, r.db).WithContext(ctx).
+	if err := database.DBFromContext(ctx, r.db).WithContext(ctx).
 		Model(&types.ProductionIdempotencyKey{}).
 		Where("tenant_id = ? AND id = ?", tenantID, id).
 		Count(&count).Error; err != nil {
