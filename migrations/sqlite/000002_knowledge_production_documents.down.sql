@@ -10,9 +10,7 @@ DROP TRIGGER IF EXISTS trg_production_evidence_snapshots_prevent_update;
 DROP TRIGGER IF EXISTS trg_production_source_items_prevent_frozen_accepted_replace;
 DROP TRIGGER IF EXISTS trg_production_source_items_prevent_frozen_accepted_delete;
 DROP TRIGGER IF EXISTS trg_production_source_items_prevent_frozen_accepted_update;
-DROP TRIGGER IF EXISTS trg_production_documents_validate_version_source_sets;
-DROP TRIGGER IF EXISTS trg_production_document_versions_validate_source_set;
-DROP TRIGGER IF EXISTS trg_production_source_sets_validate_document_versions;
+DROP TRIGGER IF EXISTS trg_production_source_sets_prevent_frozen_replace;
 DROP TRIGGER IF EXISTS trg_production_source_sets_prevent_frozen_delete;
 DROP TRIGGER IF EXISTS trg_production_source_sets_prevent_reopen;
 

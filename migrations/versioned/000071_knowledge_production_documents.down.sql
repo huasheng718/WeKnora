@@ -14,14 +14,8 @@ DROP TRIGGER IF EXISTS trg_production_source_items_prevent_frozen_accepted_repla
 DROP FUNCTION IF EXISTS prevent_frozen_production_source_item_replace();
 DROP TRIGGER IF EXISTS trg_production_source_items_prevent_frozen_accepted_mutation ON production_source_items;
 DROP FUNCTION IF EXISTS prevent_frozen_production_source_item_mutation();
-DROP TRIGGER IF EXISTS trg_production_documents_validate_version_source_sets ON production_documents;
-DROP FUNCTION IF EXISTS validate_production_document_source_sets_on_update();
-DROP TRIGGER IF EXISTS trg_production_document_versions_validate_source_set ON production_document_versions;
-DROP FUNCTION IF EXISTS validate_production_document_version_source_set();
 DROP TRIGGER IF EXISTS trg_production_source_sets_prevent_frozen_delete ON production_source_sets;
 DROP FUNCTION IF EXISTS prevent_frozen_production_source_set_delete();
-DROP TRIGGER IF EXISTS trg_production_source_sets_validate_document_versions ON production_source_sets;
-DROP FUNCTION IF EXISTS validate_production_source_set_versions_on_update();
 DROP TRIGGER IF EXISTS trg_production_source_sets_prevent_reopen ON production_source_sets;
 DROP FUNCTION IF EXISTS prevent_frozen_production_source_set_reopen();
 

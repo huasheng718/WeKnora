@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS production_source_sets (
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     frozen_at DATETIME NULL,
     CONSTRAINT chk_production_source_sets_status CHECK (status IN ('collecting', 'ready', 'failed', 'frozen')),
+    UNIQUE(id, tenant_id, project_id),
     FOREIGN KEY (project_id, tenant_id) REFERENCES production_projects(id, tenant_id) ON DELETE RESTRICT,
     FOREIGN KEY (document_type_id, tenant_id) REFERENCES production_document_types(id, tenant_id) ON DELETE RESTRICT
 );
@@ -40,18 +41,14 @@ BEGIN
     SELECT RAISE(ABORT, 'frozen source sets cannot be deleted');
 END;
 
-CREATE TRIGGER IF NOT EXISTS trg_production_source_sets_validate_document_versions
-    BEFORE UPDATE OF tenant_id, project_id ON production_source_sets
+CREATE TRIGGER IF NOT EXISTS trg_production_source_sets_prevent_frozen_replace
+    BEFORE INSERT ON production_source_sets
     FOR EACH ROW
     WHEN EXISTS (
-        SELECT 1
-        FROM production_document_versions v
-        JOIN production_documents d ON d.id = v.document_id
-        WHERE v.source_set_id = OLD.id
-            AND (d.tenant_id <> NEW.tenant_id OR d.project_id <> NEW.project_id)
+        SELECT 1 FROM production_source_sets WHERE id = NEW.id AND status = 'frozen'
     )
 BEGIN
-    SELECT RAISE(ABORT, 'source set tenant and project must match existing document versions');
+    SELECT RAISE(ABORT, 'frozen source sets cannot be replaced');
 END;
 
 CREATE TABLE IF NOT EXISTS production_source_items (
@@ -106,6 +103,7 @@ CREATE TABLE IF NOT EXISTS production_documents (
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT chk_production_documents_status CHECK (status IN ('draft', 'annotating', 'in_review', 'approved', 'publishing', 'published', 'archived')),
+    UNIQUE(id, tenant_id, project_id),
     FOREIGN KEY (project_id, tenant_id) REFERENCES production_projects(id, tenant_id) ON DELETE RESTRICT,
     FOREIGN KEY (document_type_id, tenant_id) REFERENCES production_document_types(id, tenant_id) ON DELETE RESTRICT,
     FOREIGN KEY (current_version_id, id) REFERENCES production_document_versions(id, document_id) ON DELETE RESTRICT,
@@ -121,10 +119,12 @@ CREATE INDEX IF NOT EXISTS idx_production_documents_document_type
 
 CREATE TABLE IF NOT EXISTS production_document_versions (
     id VARCHAR(36) PRIMARY KEY,
-    document_id VARCHAR(36) NOT NULL REFERENCES production_documents(id) ON DELETE CASCADE,
+    document_id VARCHAR(36) NOT NULL,
+    tenant_id INTEGER NOT NULL,
+    project_id VARCHAR(36) NOT NULL,
     version_number INTEGER NOT NULL,
     parent_version_id VARCHAR(36) NULL,
-    source_set_id VARCHAR(36) NOT NULL REFERENCES production_source_sets(id) ON DELETE RESTRICT,
+    source_set_id VARCHAR(36) NOT NULL,
     origin VARCHAR(20) NOT NULL,
     change_summary TEXT NOT NULL DEFAULT '',
     content_digest VARCHAR(64) NOT NULL,
@@ -134,42 +134,15 @@ CREATE TABLE IF NOT EXISTS production_document_versions (
     CONSTRAINT chk_production_document_versions_origin CHECK (origin IN ('ai', 'human', 'mixed', 'rollback')),
     UNIQUE(document_id, version_number),
     UNIQUE(id, document_id),
-    FOREIGN KEY (parent_version_id, document_id) REFERENCES production_document_versions(id, document_id) ON DELETE RESTRICT
+    FOREIGN KEY (parent_version_id, document_id) REFERENCES production_document_versions(id, document_id) ON DELETE RESTRICT,
+    FOREIGN KEY (document_id, tenant_id, project_id) REFERENCES production_documents(id, tenant_id, project_id) ON DELETE CASCADE,
+    FOREIGN KEY (source_set_id, tenant_id, project_id) REFERENCES production_source_sets(id, tenant_id, project_id) ON DELETE RESTRICT
 );
 
 CREATE INDEX IF NOT EXISTS idx_production_document_versions_document
-    ON production_document_versions (document_id, version_number);
+    ON production_document_versions (document_id, tenant_id, project_id, version_number);
 CREATE INDEX IF NOT EXISTS idx_production_document_versions_source_set
-    ON production_document_versions (source_set_id);
-
-CREATE TRIGGER IF NOT EXISTS trg_production_document_versions_validate_source_set
-    BEFORE INSERT ON production_document_versions
-    FOR EACH ROW
-    WHEN NOT EXISTS (
-        SELECT 1
-        FROM production_documents d
-        JOIN production_source_sets s ON s.id = NEW.source_set_id
-        WHERE d.id = NEW.document_id
-            AND s.tenant_id = d.tenant_id
-            AND s.project_id = d.project_id
-    )
-BEGIN
-    SELECT RAISE(ABORT, 'document version source set must match the document tenant and project');
-END;
-
-CREATE TRIGGER IF NOT EXISTS trg_production_documents_validate_version_source_sets
-    BEFORE UPDATE OF tenant_id, project_id ON production_documents
-    FOR EACH ROW
-    WHEN EXISTS (
-        SELECT 1
-        FROM production_document_versions v
-        JOIN production_source_sets s ON s.id = v.source_set_id
-        WHERE v.document_id = OLD.id
-            AND (s.tenant_id <> NEW.tenant_id OR s.project_id <> NEW.project_id)
-    )
-BEGIN
-    SELECT RAISE(ABORT, 'document tenant and project must match existing version source sets');
-END;
+    ON production_document_versions (source_set_id, tenant_id, project_id);
 
 CREATE TABLE IF NOT EXISTS production_document_blocks (
     id VARCHAR(36) PRIMARY KEY,
@@ -275,7 +248,11 @@ END;
 CREATE TRIGGER IF NOT EXISTS trg_production_document_versions_prevent_replace
     BEFORE INSERT ON production_document_versions
     FOR EACH ROW
-    WHEN EXISTS (SELECT 1 FROM production_document_versions WHERE id = NEW.id)
+    WHEN EXISTS (
+        SELECT 1
+        FROM production_document_versions
+        WHERE id = NEW.id OR (document_id = NEW.document_id AND version_number = NEW.version_number)
+    )
 BEGIN
     SELECT RAISE(ABORT, 'document versions are append-only');
 END;
