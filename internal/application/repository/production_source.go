@@ -11,6 +11,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type productionSourceRepository struct{ db *gorm.DB }
@@ -57,6 +58,19 @@ func (r *productionSourceRepository) GetSet(ctx context.Context, tenantID uint64
 }
 
 func lockProductionSourceSet(db *gorm.DB, tenantID uint64, sourceSetID string) (*types.ProductionSourceSet, error) {
+	if db.Dialector.Name() == "postgres" {
+		var sourceSet types.ProductionSourceSet
+		err := db.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("tenant_id = ? AND id = ?", tenantID, sourceSetID).
+			First(&sourceSet).Error
+		if err != nil {
+			return nil, translateProductionSourceError(err)
+		}
+		return &sourceSet, nil
+	}
+
+	// SQLite has no SELECT FOR UPDATE. Entering the write lock before the
+	// authoritative read serializes this source set against freeze/mutations.
 	result := db.Model(&types.ProductionSourceSet{}).
 		Where("tenant_id = ? AND id = ?", tenantID, sourceSetID).
 		UpdateColumn("status", gorm.Expr("status"))
@@ -68,6 +82,49 @@ func lockProductionSourceSet(db *gorm.DB, tenantID uint64, sourceSetID string) (
 	}
 	var sourceSet types.ProductionSourceSet
 	if err := db.Where("tenant_id = ? AND id = ?", tenantID, sourceSetID).First(&sourceSet).Error; err != nil {
+		return nil, err
+	}
+	return &sourceSet, nil
+}
+
+func lockProductionSourceSetForItem(
+	db *gorm.DB,
+	tenantID uint64,
+	itemID string,
+) (*types.ProductionSourceSet, error) {
+	if db.Dialector.Name() == "postgres" {
+		var sourceSet types.ProductionSourceSet
+		err := db.Table("production_source_sets AS source_set").
+			Select("source_set.*").
+			Joins("JOIN production_source_items AS item ON item.source_set_id = source_set.id").
+			Where("source_set.tenant_id = ? AND item.id = ?", tenantID, itemID).
+			Clauses(clause.Locking{Strength: "UPDATE", Table: clause.Table{Name: "source_set"}}).
+			First(&sourceSet).Error
+		if err != nil {
+			return nil, translateProductionSourceError(err)
+		}
+		return &sourceSet, nil
+	}
+
+	sourceSetID := db.Table("production_source_items").
+		Select("source_set_id").
+		Where("id = ?", itemID)
+	result := db.Model(&types.ProductionSourceSet{}).
+		Where("tenant_id = ? AND id IN (?)", tenantID, sourceSetID).
+		UpdateColumn("status", gorm.Expr("status"))
+	if result.Error != nil {
+		return nil, translateProductionSourceError(result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return nil, gorm.ErrRecordNotFound
+	}
+	var sourceSet types.ProductionSourceSet
+	err := db.Table("production_source_sets AS source_set").
+		Select("source_set.*").
+		Joins("JOIN production_source_items AS item ON item.source_set_id = source_set.id").
+		Where("source_set.tenant_id = ? AND item.id = ?", tenantID, itemID).
+		First(&sourceSet).Error
+	if err != nil {
 		return nil, err
 	}
 	return &sourceSet, nil
@@ -118,22 +175,6 @@ func (r *productionSourceRepository) GetItem(
 	return &item, &sourceSet, nil
 }
 
-func sourceSetIDForItem(db *gorm.DB, tenantID uint64, itemID string) (string, error) {
-	var sourceSetID string
-	err := db.Table("production_source_items AS item").
-		Select("item.source_set_id").
-		Joins("JOIN production_source_sets AS source_set ON source_set.id = item.source_set_id").
-		Where("source_set.tenant_id = ? AND item.id = ?", tenantID, itemID).
-		Scan(&sourceSetID).Error
-	if err != nil {
-		return "", err
-	}
-	if sourceSetID == "" {
-		return "", gorm.ErrRecordNotFound
-	}
-	return sourceSetID, nil
-}
-
 func (r *productionSourceRepository) DecideItem(
 	ctx context.Context,
 	tenantID uint64,
@@ -142,11 +183,7 @@ func (r *productionSourceRepository) DecideItem(
 ) error {
 	return database.WithTransactionContext(ctx, r.db, func(txCtx context.Context) error {
 		db := database.DBFromContext(txCtx, r.db).WithContext(txCtx)
-		sourceSetID, err := sourceSetIDForItem(db, tenantID, itemID)
-		if err != nil {
-			return err
-		}
-		sourceSet, err := lockProductionSourceSet(db, tenantID, sourceSetID)
+		sourceSet, err := lockProductionSourceSetForItem(db, tenantID, itemID)
 		if err != nil {
 			return err
 		}
@@ -154,7 +191,7 @@ func (r *productionSourceRepository) DecideItem(
 			return types.ErrProductionSourceSetFrozen
 		}
 		result := db.Model(&types.ProductionSourceItem{}).
-			Where("id = ? AND source_set_id = ?", itemID, sourceSetID).
+			Where("id = ? AND source_set_id = ?", itemID, sourceSet.ID).
 			UpdateColumn("status", decision)
 		if result.Error != nil {
 			return translateProductionSourceError(result.Error)
@@ -180,11 +217,7 @@ func (r *productionSourceRepository) CreateEvidence(
 	}
 	return database.WithTransactionContext(ctx, r.db, func(txCtx context.Context) error {
 		db := database.DBFromContext(txCtx, r.db).WithContext(txCtx)
-		sourceSetID, err := sourceSetIDForItem(db, tenantID, itemID)
-		if err != nil {
-			return err
-		}
-		sourceSet, err := lockProductionSourceSet(db, tenantID, sourceSetID)
+		sourceSet, err := lockProductionSourceSetForItem(db, tenantID, itemID)
 		if err != nil {
 			return err
 		}

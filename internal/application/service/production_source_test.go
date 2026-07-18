@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	serviceProjectID = "11111111-1111-4111-8111-111111111111"
+	serviceProjectID = "aaaaaaaa-1111-4111-8111-111111111111"
 	serviceTypeID    = "22222222-2222-4222-8222-222222222222"
 	serviceSetID     = "33333333-3333-4333-8333-333333333333"
 	serviceItemID    = "44444444-4444-4444-8444-444444444444"
@@ -164,6 +164,30 @@ func TestProductionSourceServiceCreatesUUIDsAndDerivesTenantAndActor(t *testing.
 	require.Equal(t, serviceProjectID, authorizer.project)
 }
 
+func TestProductionSourceServiceRejectsNonCanonicalAggregateUUIDsBeforeRepositoryUse(t *testing.T) {
+	canonical := serviceProjectID
+	variants := map[string]string{
+		"raw":       strings.ReplaceAll(canonical, "-", ""),
+		"braced":    "{" + canonical + "}",
+		"uppercase": strings.ToUpper(canonical),
+		"urn":       "urn:uuid:" + canonical,
+	}
+	for name, value := range variants {
+		t.Run(name, func(t *testing.T) {
+			svc, _, db, authorizer, _ := newProductionSourceServiceFixture(t)
+			created, err := svc.CreateSet(sourceServiceContext(7), interfaces.CreateProductionSourceSetInput{
+				ProjectID: value, DocumentTypeID: serviceTypeID,
+			})
+			require.Nil(t, created)
+			require.ErrorContains(t, err, "canonical UUID")
+			require.Zero(t, authorizer.calls)
+			var count int64
+			require.NoError(t, db.Model(&types.ProductionSourceSet{}).Count(&count).Error)
+			require.Zero(t, count)
+		})
+	}
+}
+
 func TestProductionSourceServiceRejectsCrossTenantSourceIDsBeforeAuthorization(t *testing.T) {
 	svc, repo, _, authorizer, _ := newProductionSourceServiceFixture(t)
 	createServiceSourceSet(t, repo, types.ProductionSourceSetCollecting)
@@ -221,6 +245,34 @@ func TestProductionSourceServiceRejectsNonUUIDRunReference(t *testing.T) {
 	require.ErrorContains(t, err, "run id must be a UUID")
 }
 
+func TestProductionSourceServiceNormalizesRunReferenceBeforePersistence(t *testing.T) {
+	canonical := "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	variants := map[string]string{
+		"raw":       strings.ReplaceAll(canonical, "-", ""),
+		"braced":    "{" + canonical + "}",
+		"uppercase": strings.ToUpper(canonical),
+		"urn":       "urn:uuid:" + canonical,
+	}
+	for name, value := range variants {
+		t.Run(name, func(t *testing.T) {
+			svc, repo, db, _, _ := newProductionSourceServiceFixture(t)
+			createServiceSourceSet(t, repo, types.ProductionSourceSetCollecting)
+			createServiceSourceItem(t, repo, types.ProductionSourceItemAccepted)
+			snapshot, err := svc.AttachEvidence(sourceServiceContext(7), serviceItemID, interfaces.CreateEvidenceSnapshotInput{
+				SnapshotType:  types.ProductionEvidenceSnapshotText,
+				InlineContent: types.JSON(`"evidence"`), CapturedByRunID: value,
+			})
+			require.NoError(t, err)
+			require.Equal(t, canonical, snapshot.CapturedByRunID)
+			require.Len(t, snapshot.CapturedByRunID, 36)
+
+			var persisted types.ProductionEvidenceSnapshot
+			require.NoError(t, db.First(&persisted, "id = ?", snapshot.ID).Error)
+			require.Equal(t, canonical, persisted.CapturedByRunID)
+		})
+	}
+}
+
 func TestProductionSourceServiceResolvesTenantScopedResourceReferenceAndUsesRegistryDigest(t *testing.T) {
 	svc, repo, _, _, resources := newProductionSourceServiceFixture(t)
 	createServiceSourceSet(t, repo, types.ProductionSourceSetCollecting)
@@ -239,6 +291,29 @@ func TestProductionSourceServiceResolvesTenantScopedResourceReferenceAndUsesRegi
 	require.Equal(t, reference, snapshot.StoragePath)
 	require.Equal(t, strings.Repeat("c", 64), snapshot.ContentDigest)
 	require.Equal(t, reference, resources.resolved)
+}
+
+func TestProductionSourceServiceCanonicalizesResourceReferenceBeforeResolveAndPersistence(t *testing.T) {
+	svc, repo, db, _, resources := newProductionSourceServiceFixture(t)
+	createServiceSourceSet(t, repo, types.ProductionSourceSetCollecting)
+	createServiceSourceItem(t, repo, types.ProductionSourceItemAccepted)
+	resources.resource = &types.StoredResource{
+		ID: "resource-id", Handle: strings.Repeat("a", types.ResourceHandleLength), TenantID: 7,
+		ContentHash: strings.Repeat("c", 64), State: types.ResourceStateActive,
+		Lifecycle: types.ResourceLifecyclePersistent,
+	}
+	canonical := types.BuildResourcePath(resources.resource.Handle)
+
+	snapshot, err := svc.AttachEvidence(sourceServiceContext(7), serviceItemID, interfaces.CreateEvidenceSnapshotInput{
+		SnapshotType: types.ProductionEvidenceSnapshotFile, ResourceReference: "  " + canonical + "  ",
+	})
+	require.NoError(t, err)
+	require.Equal(t, canonical, resources.resolved)
+	require.Equal(t, canonical, snapshot.StoragePath)
+
+	var persisted types.ProductionEvidenceSnapshot
+	require.NoError(t, db.First(&persisted, "id = ?", snapshot.ID).Error)
+	require.Equal(t, canonical, persisted.StoragePath)
 }
 
 func TestProductionSourceServiceRejectsPhysicalPathsMutableResourcesAndCrossTenantResources(t *testing.T) {

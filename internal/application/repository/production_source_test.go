@@ -4,15 +4,20 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/Tencent/WeKnora/internal/database"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -205,6 +210,141 @@ func TestProductionSourceRepositorySerializesFreezeAgainstAcceptDecision(t *test
 		require.Equal(t, types.ProductionSourceItemAccepted, item.Status)
 		require.NotEqual(t, types.ProductionSourceSetFrozen, set.Status)
 	}
+}
+
+type productionSourceLockBarrierContextKey struct{}
+
+type productionSourceLockBarrierState struct {
+	entered chan struct{}
+	release chan struct{}
+	claimed atomic.Bool
+}
+
+func productionSourceLockBarrier(t *testing.T, db *gorm.DB) (context.Context, <-chan struct{}, func()) {
+	t.Helper()
+	state := &productionSourceLockBarrierState{entered: make(chan struct{}), release: make(chan struct{})}
+	callbackName := "production-source-lock-barrier-" + strings.NewReplacer("/", "-", " ", "-").Replace(t.Name())
+	require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		barrier, _ := tx.Statement.Context.Value(productionSourceLockBarrierContextKey{}).(*productionSourceLockBarrierState)
+		if barrier == nil || tx.Statement.Table != "production_source_sets" || !barrier.claimed.CompareAndSwap(false, true) {
+			return
+		}
+		close(barrier.entered)
+		<-barrier.release
+	}))
+	t.Cleanup(func() { db.Callback().Update().Remove(callbackName) })
+	ctx := context.WithValue(context.Background(), productionSourceLockBarrierContextKey{}, state)
+	return ctx, state.entered, func() { close(state.release) }
+}
+
+func TestProductionSourceRepositorySerializesFreezeAgainstAdd(t *testing.T) {
+	t.Run("freeze wins", func(t *testing.T) {
+		repo, db := newProductionSourceRepoTestDB(t)
+		createProductionSourceSet(t, repo, types.ProductionSourceSetCollecting)
+		blockedCtx, entered, release := productionSourceLockBarrier(t, db)
+		addDone := make(chan error, 1)
+		go func() {
+			addDone <- repo.CreateItem(blockedCtx, 7, sourceSetID, &types.ProductionSourceItem{
+				ID: sourceItemID, SourceKind: types.ProductionSourceKindManual, Title: "Source",
+				MimeType: "text/plain", ContentDigest: testDigest, CapturedAt: time.Now().UTC(),
+				Metadata: types.JSON(`{}`), Status: types.ProductionSourceItemCandidate,
+			})
+		}()
+		<-entered
+		require.NoError(t, repo.Freeze(context.Background(), 7, sourceSetID))
+		release()
+		require.ErrorIs(t, <-addDone, types.ErrProductionSourceSetFrozen)
+
+		var count int64
+		require.NoError(t, db.Model(&types.ProductionSourceItem{}).Count(&count).Error)
+		require.Zero(t, count)
+	})
+
+	t.Run("add wins", func(t *testing.T) {
+		repo, db := newProductionSourceRepoTestDB(t)
+		createProductionSourceSet(t, repo, types.ProductionSourceSetCollecting)
+		blockedCtx, entered, release := productionSourceLockBarrier(t, db)
+		freezeDone := make(chan error, 1)
+		go func() { freezeDone <- repo.Freeze(blockedCtx, 7, sourceSetID) }()
+		<-entered
+		require.NoError(t, repo.CreateItem(context.Background(), 7, sourceSetID, &types.ProductionSourceItem{
+			ID: sourceItemID, SourceKind: types.ProductionSourceKindManual, Title: "Source",
+			MimeType: "text/plain", ContentDigest: testDigest, CapturedAt: time.Now().UTC(),
+			Metadata: types.JSON(`{}`), Status: types.ProductionSourceItemCandidate,
+		}))
+		release()
+		require.NoError(t, <-freezeDone)
+
+		var count int64
+		require.NoError(t, db.Model(&types.ProductionSourceItem{}).Count(&count).Error)
+		require.Equal(t, int64(1), count)
+	})
+}
+
+func TestProductionSourceRepositorySerializesFreezeAgainstEvidence(t *testing.T) {
+	t.Run("freeze wins before evidence lock", func(t *testing.T) {
+		repo, db := newProductionSourceRepoTestDB(t)
+		createProductionSourceSet(t, repo, types.ProductionSourceSetCollecting)
+		createProductionSourceItem(t, repo, types.ProductionSourceItemCandidate)
+		blockedCtx, entered, release := productionSourceLockBarrier(t, db)
+		evidenceDone := make(chan error, 1)
+		go func() {
+			evidenceDone <- repo.CreateEvidence(blockedCtx, 7, sourceItemID, &types.ProductionEvidenceSnapshot{
+				ID: evidenceID, SnapshotType: types.ProductionEvidenceSnapshotText,
+				InlineContent: types.JSON(`"snapshot"`), ContentDigest: testDigest, RedactionMetadata: types.JSON(`{}`),
+			})
+		}()
+		<-entered
+		require.NoError(t, repo.Freeze(context.Background(), 7, sourceSetID))
+		release()
+		require.ErrorIs(t, <-evidenceDone, types.ErrProductionSourceSetFrozen)
+
+		var count int64
+		require.NoError(t, db.Model(&types.ProductionEvidenceSnapshot{}).Count(&count).Error)
+		require.Zero(t, count)
+	})
+
+	t.Run("evidence wins", func(t *testing.T) {
+		repo, db := newProductionSourceRepoTestDB(t)
+		createProductionSourceSet(t, repo, types.ProductionSourceSetCollecting)
+		createProductionSourceItem(t, repo, types.ProductionSourceItemAccepted)
+		blockedCtx, entered, release := productionSourceLockBarrier(t, db)
+		freezeDone := make(chan error, 1)
+		go func() { freezeDone <- repo.Freeze(blockedCtx, 7, sourceSetID) }()
+		<-entered
+		require.NoError(t, repo.CreateEvidence(context.Background(), 7, sourceItemID, &types.ProductionEvidenceSnapshot{
+			ID: evidenceID, SnapshotType: types.ProductionEvidenceSnapshotText,
+			InlineContent: types.JSON(`"snapshot"`), ContentDigest: testDigest, RedactionMetadata: types.JSON(`{}`),
+		}))
+		release()
+		require.NoError(t, <-freezeDone)
+
+		var count int64
+		require.NoError(t, db.Model(&types.ProductionEvidenceSnapshot{}).Count(&count).Error)
+		require.Equal(t, int64(1), count)
+	})
+}
+
+func TestProductionSourceRepositoryPostgresLocksSourceSetForUpdate(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err)
+
+	query := regexp.QuoteMeta(`SELECT * FROM "production_source_sets" WHERE tenant_id = $1 AND id = $2 ORDER BY "production_source_sets"."id" LIMIT $3 FOR UPDATE`)
+	mock.ExpectQuery(query).
+		WithArgs(uint64(7), sourceSetID, 1).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "tenant_id", "project_id", "document_type_id", "status", "created_by", "created_at",
+		}).AddRow(sourceSetID, 7, sourceProjectID, sourceTypeID, string(types.ProductionSourceSetCollecting), "author", time.Now()))
+
+	locked, err := lockProductionSourceSet(db, 7, sourceSetID)
+	require.NoError(t, err)
+	require.Equal(t, sourceSetID, locked.ID)
+	require.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestProductionEvidenceSnapshotDatabaseRowsAreImmutable(t *testing.T) {

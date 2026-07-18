@@ -31,11 +31,21 @@ func NewProductionSourceService(
 	return &productionSourceService{repo: repo, projects: projects, resources: resources}
 }
 
-func requireProductionSourceID(value, name string) error {
-	if _, err := uuid.Parse(strings.TrimSpace(value)); err != nil {
-		return fmt.Errorf("%s must be a UUID: %w", name, err)
+func canonicalProductionSourceID(value, name string, rejectNonCanonical bool) (string, error) {
+	parsed, err := uuid.Parse(value)
+	if err != nil {
+		return "", fmt.Errorf("%s must be a UUID: %w", name, err)
 	}
-	return nil
+	canonical := parsed.String()
+	if rejectNonCanonical && value != canonical {
+		return "", fmt.Errorf("%s must be a canonical UUID", name)
+	}
+	return canonical, nil
+}
+
+func requireProductionSourceID(value, name string) error {
+	_, err := canonicalProductionSourceID(value, name, true)
+	return err
 }
 
 func requireProductionSourceAuthor(ctx context.Context, projects interfaces.ProductionProjectAuthorizer, projectID string) error {
@@ -207,8 +217,10 @@ func (s *productionSourceService) AttachEvidence(
 	if !input.SnapshotType.IsValid() {
 		return nil, errors.New("invalid production evidence snapshot type")
 	}
+	runID := ""
 	if input.CapturedByRunID != "" {
-		if err := requireProductionSourceID(input.CapturedByRunID, "run id"); err != nil {
+		runID, err = canonicalProductionSourceID(input.CapturedByRunID, "run id", false)
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -222,13 +234,15 @@ func (s *productionSourceService) AttachEvidence(
 	}
 	snapshot := &types.ProductionEvidenceSnapshot{
 		ID: uuid.NewString(), SourceItemID: itemID, SnapshotType: input.SnapshotType,
-		RedactionMetadata: redaction, CapturedByRunID: input.CapturedByRunID,
+		RedactionMetadata: redaction, CapturedByRunID: runID,
 	}
 	if input.ResourceReference != "" {
-		if _, ok := types.ParseResourcePath(input.ResourceReference); !ok || s.resources == nil {
+		handle, ok := types.ParseResourcePath(input.ResourceReference)
+		if !ok || s.resources == nil {
 			return nil, types.ErrProductionEvidenceResourceInvalid
 		}
-		resource, resolveErr := s.resources.Resolve(ctx, input.ResourceReference)
+		canonicalReference := types.BuildResourcePath(handle)
+		resource, resolveErr := s.resources.Resolve(ctx, canonicalReference)
 		if resolveErr != nil {
 			return nil, resolveErr
 		}
@@ -248,7 +262,7 @@ func (s *productionSourceService) AttachEvidence(
 		if input.ContentDigest != "" && !strings.EqualFold(strings.TrimSpace(input.ContentDigest), digest) {
 			return nil, types.ErrProductionEvidenceDigestMismatch
 		}
-		snapshot.StoragePath = input.ResourceReference
+		snapshot.StoragePath = canonicalReference
 		snapshot.ContentDigest = digest
 	} else {
 		canonical, canonicalErr := canonicalProductionJSON(input.InlineContent, "")
