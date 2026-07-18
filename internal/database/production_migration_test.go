@@ -166,13 +166,32 @@ func TestProductionDocumentsPostgreSQLMigrationDeclaresEquivalentStructure(t *te
 		"ai_provenance JSONB NOT NULL",
 		"content_digest VARCHAR(64) NOT NULL",
 		"UNIQUE(version_id, logical_block_id)",
+		"ADD CONSTRAINT uq_production_projects_id_tenant UNIQUE (id, tenant_id)",
+		"ADD CONSTRAINT uq_production_document_types_id_tenant UNIQUE (id, tenant_id)",
+		"UNIQUE(id, document_id)",
+		"FOREIGN KEY (project_id, tenant_id) REFERENCES production_projects(id, tenant_id)",
+		"FOREIGN KEY (document_type_id, tenant_id) REFERENCES production_document_types(id, tenant_id)",
+		"FOREIGN KEY (current_version_id, id) REFERENCES production_document_versions(id, document_id)",
+		"FOREIGN KEY (latest_approved_version_id, id) REFERENCES production_document_versions(id, document_id)",
+		"FOREIGN KEY (parent_version_id, document_id) REFERENCES production_document_versions(id, document_id)",
 		"CREATE INDEX IF NOT EXISTS idx_production_source_sets_project",
+		"CREATE INDEX IF NOT EXISTS idx_production_source_sets_document_type",
 		"CREATE INDEX IF NOT EXISTS idx_production_documents_tenant",
+		"CREATE INDEX IF NOT EXISTS idx_production_document_versions_source_set",
+		"CREATE INDEX IF NOT EXISTS idx_production_block_lineage_from_version",
+		"CREATE INDEX IF NOT EXISTS idx_production_block_lineage_to_version",
+		"CREATE TRIGGER trg_production_source_sets_prevent_frozen_delete",
+		"CREATE TRIGGER trg_production_source_sets_validate_document_versions",
+		"CREATE TRIGGER trg_production_document_versions_validate_source_set",
+		"CREATE TRIGGER trg_production_evidence_snapshots_prevent_replace",
+		"CREATE TRIGGER trg_production_document_versions_prevent_replace",
+		"CREATE TRIGGER trg_production_document_blocks_prevent_replace",
 		"CREATE TRIGGER trg_production_document_versions_prevent_mutation",
 		"CREATE TRIGGER trg_production_document_blocks_prevent_mutation",
 	} {
 		require.Contains(t, postgres, declaration)
 	}
+	require.Equal(t, 4, strings.Count(postgres, "content_digest VARCHAR(64) NOT NULL"))
 
 	postgresDown := mustReadMigration(t, "../../migrations/versioned/000071_knowledge_production_documents.down.sql")
 	_, err = pg_query.Parse(postgresDown)
@@ -246,7 +265,7 @@ func TestProductionDocumentsSQLiteMigrationEnforcesIntegrityAndRollback(t *testi
 	insertProductionDocumentType(t, db, "type-1", "baseline", 1, "active")
 	_, err := db.Exec(`INSERT INTO production_projects (id, tenant_id, name, owner_user_id) VALUES ('project-1', 1, 'Project', 'owner-1')`)
 	require.NoError(t, err)
-	_, err = db.Exec(`INSERT INTO production_source_sets (id, project_id, document_type_id, created_by) VALUES ('source-set-1', 'project-1', 'type-1', 'owner-1')`)
+	_, err = db.Exec(`INSERT INTO production_source_sets (id, tenant_id, project_id, document_type_id, created_by) VALUES ('source-set-1', 1, 'project-1', 'type-1', 'owner-1')`)
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO production_source_items (id, source_set_id, source_kind, title, mime_type, content_digest, captured_at, metadata, status) VALUES ('source-item-1', 'source-set-1', 'manual', 'Source', 'text/plain', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', CURRENT_TIMESTAMP, '{}', 'accepted')`)
 	require.NoError(t, err)
@@ -297,14 +316,25 @@ func TestProductionDocumentsSQLiteMigrationEnforcesIntegrityAndRollback(t *testi
 	}
 	for _, index := range []string{
 		"idx_production_source_sets_project",
+		"idx_production_source_sets_document_type",
 		"idx_production_source_items_source_set",
 		"idx_production_evidence_snapshots_source_item",
 		"idx_production_documents_tenant",
 		"idx_production_documents_project",
 		"idx_production_document_versions_document",
+		"idx_production_document_versions_source_set",
 		"idx_production_document_blocks_version",
+		"idx_production_block_lineage_from_version",
+		"idx_production_block_lineage_to_version",
 	} {
 		require.NotEmpty(t, sqliteMasterSQL(t, db, "index", index))
+	}
+	for _, digestColumn := range []struct{ table, column string }{
+		{"production_evidence_snapshots", "content_digest"},
+		{"production_document_versions", "content_digest"},
+		{"production_document_blocks", "content_digest"},
+	} {
+		require.Equal(t, "varchar(64)", sqliteColumnType(t, db, digestColumn.table, digestColumn.column))
 	}
 
 	rollbackDB := openProductionDocumentsSQLite(t)
@@ -320,6 +350,134 @@ func TestProductionDocumentsSQLiteMigrationEnforcesIntegrityAndRollback(t *testi
 		"production_block_lineage",
 	} {
 		require.Empty(t, sqliteMasterSQL(t, rollbackDB, "table", table))
+	}
+}
+
+func TestProductionDocumentsSQLiteMigrationGuardsRelationshipsAndReplacements(t *testing.T) {
+	db := openProductionDocumentsSQLite(t)
+	insertProductionDocumentType(t, db, "type-1", "baseline", 1, "active")
+	_, err := db.Exec(`INSERT INTO production_document_types (id, tenant_id, code, name, schema_version, status, created_by) VALUES ('type-2', 2, 'baseline', 'Baseline', 1, 'active', 'owner-2')`)
+	require.NoError(t, err)
+	for _, project := range []struct {
+		id       string
+		tenantID int
+	}{
+		{"project-1", 1},
+		{"project-2", 1},
+		{"project-3", 2},
+	} {
+		_, err = db.Exec(`INSERT INTO production_projects (id, tenant_id, name, owner_user_id) VALUES (?, ?, 'Project', 'owner-1')`, project.id, project.tenantID)
+		require.NoError(t, err)
+	}
+
+	_, err = db.Exec(`INSERT INTO production_source_sets (id, tenant_id, project_id, document_type_id, created_by) VALUES ('source-set-1', 1, 'project-1', 'type-1', 'owner-1')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_source_sets (id, tenant_id, project_id, document_type_id, created_by) VALUES ('source-set-tenant-mismatch', 1, 'project-3', 'type-1', 'owner-1')`)
+	require.Error(t, err)
+	_, err = db.Exec(`INSERT INTO production_source_sets (id, tenant_id, project_id, document_type_id, created_by) VALUES ('source-set-type-mismatch', 1, 'project-1', 'type-2', 'owner-1')`)
+	require.Error(t, err)
+	_, err = db.Exec(`INSERT INTO production_source_sets (id, tenant_id, project_id, document_type_id, created_by) VALUES ('source-set-2', 1, 'project-2', 'type-1', 'owner-1')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_source_sets (id, tenant_id, project_id, document_type_id, created_by) VALUES ('source-set-3', 2, 'project-3', 'type-2', 'owner-2')`)
+	require.NoError(t, err)
+
+	_, err = db.Exec(`INSERT INTO production_documents (id, tenant_id, project_id, document_type_id, document_type_schema_version, title, created_by) VALUES ('document-project-mismatch', 1, 'project-3', 'type-1', 1, 'Document', 'owner-1')`)
+	require.Error(t, err)
+	_, err = db.Exec(`INSERT INTO production_documents (id, tenant_id, project_id, document_type_id, document_type_schema_version, title, created_by) VALUES ('document-type-mismatch', 1, 'project-1', 'type-2', 1, 'Document', 'owner-1')`)
+	require.Error(t, err)
+	_, err = db.Exec(`INSERT INTO production_documents (id, tenant_id, project_id, document_type_id, document_type_schema_version, title, created_by) VALUES ('document-1', 1, 'project-1', 'type-1', 1, 'Document', 'owner-1')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_documents (id, tenant_id, project_id, document_type_id, document_type_schema_version, title, created_by) VALUES ('document-2', 1, 'project-2', 'type-1', 1, 'Document', 'owner-1')`)
+	require.NoError(t, err)
+
+	insertProductionVersion(t, db, "version-1", "document-1", 1, "source-set-1", "")
+	insertProductionVersion(t, db, "version-2", "document-2", 1, "source-set-2", "")
+	_, err = db.Exec(`UPDATE production_source_sets SET project_id = 'project-2' WHERE id = 'source-set-1'`)
+	require.Error(t, err)
+	_, err = db.Exec(`INSERT INTO production_document_versions (id, document_id, version_number, source_set_id, origin, content_digest, created_by) VALUES ('version-cross-project', 'document-1', 2, 'source-set-2', 'human', 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', 'owner-1')`)
+	require.Error(t, err)
+	_, err = db.Exec(`INSERT INTO production_document_versions (id, document_id, version_number, source_set_id, origin, content_digest, created_by) VALUES ('version-cross-tenant', 'document-1', 2, 'source-set-3', 'human', 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', 'owner-1')`)
+	require.Error(t, err)
+	_, err = db.Exec(`UPDATE production_documents SET current_version_id = 'version-2' WHERE id = 'document-1'`)
+	require.Error(t, err)
+	_, err = db.Exec(`UPDATE production_documents SET latest_approved_version_id = 'version-2' WHERE id = 'document-1'`)
+	require.Error(t, err)
+	_, err = db.Exec(`INSERT INTO production_document_versions (id, document_id, version_number, parent_version_id, source_set_id, origin, content_digest, created_by) VALUES ('version-cross-document-parent', 'document-1', 2, 'version-2', 'source-set-1', 'human', 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', 'owner-1')`)
+	require.Error(t, err)
+	_, err = db.Exec(`UPDATE production_documents SET project_id = 'project-2' WHERE id = 'document-1'`)
+	require.Error(t, err)
+
+	insertProductionBlock(t, db, "block-1", "version-1", "block-a")
+	insertProductionBlock(t, db, "block-2", "version-2", "block-b")
+	_, err = db.Exec(`INSERT INTO production_block_lineage (id, from_version_id, from_logical_block_id, to_version_id, to_logical_block_id, relation) VALUES ('lineage-1', 'version-1', 'block-a', 'version-2', 'block-b', 'same')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_block_lineage (id, from_version_id, from_logical_block_id, to_version_id, to_logical_block_id, relation) VALUES ('lineage-duplicate', 'version-1', 'block-a', 'version-2', 'block-b', 'same')`)
+	require.Error(t, err)
+	_, err = db.Exec(`INSERT INTO production_block_lineage (id, from_version_id, from_logical_block_id, to_version_id, to_logical_block_id, relation) VALUES ('lineage-missing', 'missing', 'block-a', 'version-2', 'block-b', 'same')`)
+	require.Error(t, err)
+
+	_, err = db.Exec(`INSERT INTO production_source_items (id, source_set_id, source_kind, title, mime_type, content_digest, captured_at, metadata, status) VALUES ('source-item-1', 'source-set-1', 'manual', 'Source', 'text/plain', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', CURRENT_TIMESTAMP, '{}', 'accepted')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_evidence_snapshots (id, source_item_id, snapshot_type, inline_content, content_digest, redaction_metadata) VALUES ('evidence-1', 'source-item-1', 'text', '{"text":"evidence"}', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', '{}')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_source_sets SET status = 'frozen' WHERE id = 'source-set-1'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`DELETE FROM production_source_sets WHERE id = 'source-set-1'`)
+	require.ErrorContains(t, err, "frozen source sets cannot be deleted")
+	_, err = db.Exec(`DELETE FROM production_projects WHERE id = 'project-1'`)
+	require.Error(t, err)
+
+	_, err = db.Exec(`INSERT OR REPLACE INTO production_source_items (id, source_set_id, source_kind, title, mime_type, content_digest, captured_at, metadata, status) VALUES ('source-item-1', 'source-set-1', 'manual', 'Replaced', 'text/plain', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', CURRENT_TIMESTAMP, '{}', 'accepted')`)
+	require.ErrorContains(t, err, "accepted source items are immutable")
+	_, err = db.Exec(`INSERT OR REPLACE INTO production_evidence_snapshots (id, source_item_id, snapshot_type, inline_content, content_digest, redaction_metadata) VALUES ('evidence-1', 'source-item-1', 'text', '{"text":"replacement"}', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', '{}')`)
+	require.ErrorContains(t, err, "evidence snapshots are immutable")
+	_, err = db.Exec(`INSERT OR REPLACE INTO production_document_versions (id, document_id, version_number, source_set_id, origin, content_digest, created_by) VALUES ('version-1', 'document-1', 1, 'source-set-1', 'human', 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', 'owner-1')`)
+	require.ErrorContains(t, err, "document versions are append-only")
+	_, err = db.Exec(`INSERT OR REPLACE INTO production_document_blocks (id, version_id, logical_block_id, block_type, position, content, attributes, evidence_refs, ai_provenance, content_digest) VALUES ('block-1', 'version-1', 'block-a', 'paragraph', 1, '{"text":"replacement"}', '{}', '[]', '{}', 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd')`)
+	require.ErrorContains(t, err, "document blocks are append-only")
+	_, err = db.Exec(`INSERT OR REPLACE INTO production_document_blocks (id, version_id, logical_block_id, block_type, position, content, attributes, evidence_refs, ai_provenance, content_digest) VALUES ('block-replacement', 'version-1', 'block-a', 'paragraph', 1, '{"text":"replacement"}', '{}', '[]', '{}', 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd')`)
+	require.ErrorContains(t, err, "document blocks are append-only")
+
+	_, err = db.Exec(`INSERT INTO production_source_sets (id, tenant_id, project_id, document_type_id, created_by) VALUES ('source-set-cleanup', 1, 'project-2', 'type-1', 'owner-1')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`DELETE FROM production_source_sets WHERE id = 'source-set-cleanup'`)
+	require.NoError(t, err)
+}
+
+func TestProductionDocumentsSQLiteMigrationRollsBackPopulatedSchema(t *testing.T) {
+	db := openProductionDocumentsSQLite(t)
+	insertProductionDocumentType(t, db, "type-1", "baseline", 1, "active")
+	_, err := db.Exec(`INSERT INTO production_projects (id, tenant_id, name, owner_user_id) VALUES ('project-1', 1, 'Project', 'owner-1')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_source_sets (id, tenant_id, project_id, document_type_id, created_by) VALUES ('source-set-1', 1, 'project-1', 'type-1', 'owner-1')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_source_items (id, source_set_id, source_kind, title, mime_type, content_digest, captured_at, metadata) VALUES ('source-item-1', 'source-set-1', 'manual', 'Source', 'text/plain', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', CURRENT_TIMESTAMP, '{}')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_evidence_snapshots (id, source_item_id, snapshot_type, inline_content, content_digest, redaction_metadata) VALUES ('evidence-1', 'source-item-1', 'text', '{"text":"evidence"}', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', '{}')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_documents (id, tenant_id, project_id, document_type_id, document_type_schema_version, title, created_by) VALUES ('document-1', 1, 'project-1', 'type-1', 1, 'Document', 'owner-1')`)
+	require.NoError(t, err)
+	insertProductionVersion(t, db, "version-1", "document-1", 1, "source-set-1", "")
+	insertProductionVersion(t, db, "version-2", "document-1", 2, "source-set-1", "version-1")
+	insertProductionBlock(t, db, "block-1", "version-1", "block-a")
+	insertProductionBlock(t, db, "block-2", "version-2", "block-b")
+	_, err = db.Exec(`INSERT INTO production_block_lineage (id, from_version_id, from_logical_block_id, to_version_id, to_logical_block_id, relation) VALUES ('lineage-1', 'version-1', 'block-a', 'version-2', 'block-b', 'same')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_documents SET current_version_id = 'version-2', latest_approved_version_id = 'version-2' WHERE id = 'document-1'`)
+	require.NoError(t, err)
+
+	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000002_knowledge_production_documents.down.sql"))
+	require.NoError(t, err)
+	for _, table := range []string{
+		"production_source_sets",
+		"production_source_items",
+		"production_evidence_snapshots",
+		"production_documents",
+		"production_document_versions",
+		"production_document_blocks",
+		"production_block_lineage",
+	} {
+		require.Empty(t, sqliteMasterSQL(t, db, "table", table))
 	}
 }
 
@@ -362,6 +520,32 @@ func insertProductionDocumentType(t *testing.T, db *sql.DB, id, code string, sch
 		code,
 		schemaVersion,
 		status,
+	)
+	require.NoError(t, err)
+}
+
+func insertProductionVersion(t *testing.T, db *sql.DB, id, documentID string, versionNumber int, sourceSetID, parentVersionID string) {
+	t.Helper()
+
+	_, err := db.Exec(
+		`INSERT INTO production_document_versions (id, document_id, version_number, parent_version_id, source_set_id, origin, content_digest, created_by) VALUES (?, ?, ?, NULLIF(?, ''), ?, 'human', 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', 'owner-1')`,
+		id,
+		documentID,
+		versionNumber,
+		parentVersionID,
+		sourceSetID,
+	)
+	require.NoError(t, err)
+}
+
+func insertProductionBlock(t *testing.T, db *sql.DB, id, versionID, logicalBlockID string) {
+	t.Helper()
+
+	_, err := db.Exec(
+		`INSERT INTO production_document_blocks (id, version_id, logical_block_id, block_type, position, content, attributes, evidence_refs, ai_provenance, content_digest) VALUES (?, ?, ?, 'paragraph', 1, '{"text":"block"}', '{}', '[]', '{}', 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd')`,
+		id,
+		versionID,
+		logicalBlockID,
 	)
 	require.NoError(t, err)
 }

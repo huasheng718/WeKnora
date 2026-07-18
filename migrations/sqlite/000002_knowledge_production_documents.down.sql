@@ -1,12 +1,32 @@
+DROP TRIGGER IF EXISTS trg_production_document_blocks_prevent_replace;
 DROP TRIGGER IF EXISTS trg_production_document_blocks_prevent_delete;
 DROP TRIGGER IF EXISTS trg_production_document_blocks_prevent_update;
+DROP TRIGGER IF EXISTS trg_production_document_versions_prevent_replace;
 DROP TRIGGER IF EXISTS trg_production_document_versions_prevent_delete;
 DROP TRIGGER IF EXISTS trg_production_document_versions_prevent_update;
+DROP TRIGGER IF EXISTS trg_production_evidence_snapshots_prevent_replace;
 DROP TRIGGER IF EXISTS trg_production_evidence_snapshots_prevent_delete;
 DROP TRIGGER IF EXISTS trg_production_evidence_snapshots_prevent_update;
+DROP TRIGGER IF EXISTS trg_production_source_items_prevent_frozen_accepted_replace;
 DROP TRIGGER IF EXISTS trg_production_source_items_prevent_frozen_accepted_delete;
 DROP TRIGGER IF EXISTS trg_production_source_items_prevent_frozen_accepted_update;
+DROP TRIGGER IF EXISTS trg_production_documents_validate_version_source_sets;
+DROP TRIGGER IF EXISTS trg_production_document_versions_validate_source_set;
+DROP TRIGGER IF EXISTS trg_production_source_sets_validate_document_versions;
+DROP TRIGGER IF EXISTS trg_production_source_sets_prevent_frozen_delete;
 DROP TRIGGER IF EXISTS trg_production_source_sets_prevent_reopen;
+
+UPDATE production_documents
+SET current_version_id = NULL, latest_approved_version_id = NULL;
+UPDATE production_document_versions
+SET parent_version_id = NULL;
+DELETE FROM production_block_lineage;
+DELETE FROM production_document_blocks;
+DELETE FROM production_document_versions;
+DELETE FROM production_documents;
+DELETE FROM production_evidence_snapshots;
+DELETE FROM production_source_items;
+DELETE FROM production_source_sets;
 
 DROP TABLE IF EXISTS production_block_lineage;
 DROP TABLE IF EXISTS production_document_blocks;
@@ -15,3 +35,6 @@ DROP TABLE IF EXISTS production_documents;
 DROP TABLE IF EXISTS production_evidence_snapshots;
 DROP TABLE IF EXISTS production_source_items;
 DROP TABLE IF EXISTS production_source_sets;
+
+DROP INDEX IF EXISTS uq_production_document_types_id_tenant;
+DROP INDEX IF EXISTS uq_production_projects_id_tenant;

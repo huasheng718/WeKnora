@@ -1,11 +1,27 @@
+DROP TRIGGER IF EXISTS trg_production_document_blocks_prevent_replace ON production_document_blocks;
+DROP FUNCTION IF EXISTS prevent_production_document_block_replace();
 DROP TRIGGER IF EXISTS trg_production_document_blocks_prevent_mutation ON production_document_blocks;
 DROP FUNCTION IF EXISTS prevent_production_document_block_mutation();
+DROP TRIGGER IF EXISTS trg_production_document_versions_prevent_replace ON production_document_versions;
+DROP FUNCTION IF EXISTS prevent_production_document_version_replace();
 DROP TRIGGER IF EXISTS trg_production_document_versions_prevent_mutation ON production_document_versions;
 DROP FUNCTION IF EXISTS prevent_production_document_version_mutation();
+DROP TRIGGER IF EXISTS trg_production_evidence_snapshots_prevent_replace ON production_evidence_snapshots;
+DROP FUNCTION IF EXISTS prevent_production_evidence_snapshot_replace();
 DROP TRIGGER IF EXISTS trg_production_evidence_snapshots_prevent_mutation ON production_evidence_snapshots;
 DROP FUNCTION IF EXISTS prevent_production_evidence_snapshot_mutation();
+DROP TRIGGER IF EXISTS trg_production_source_items_prevent_frozen_accepted_replace ON production_source_items;
+DROP FUNCTION IF EXISTS prevent_frozen_production_source_item_replace();
 DROP TRIGGER IF EXISTS trg_production_source_items_prevent_frozen_accepted_mutation ON production_source_items;
 DROP FUNCTION IF EXISTS prevent_frozen_production_source_item_mutation();
+DROP TRIGGER IF EXISTS trg_production_documents_validate_version_source_sets ON production_documents;
+DROP FUNCTION IF EXISTS validate_production_document_source_sets_on_update();
+DROP TRIGGER IF EXISTS trg_production_document_versions_validate_source_set ON production_document_versions;
+DROP FUNCTION IF EXISTS validate_production_document_version_source_set();
+DROP TRIGGER IF EXISTS trg_production_source_sets_prevent_frozen_delete ON production_source_sets;
+DROP FUNCTION IF EXISTS prevent_frozen_production_source_set_delete();
+DROP TRIGGER IF EXISTS trg_production_source_sets_validate_document_versions ON production_source_sets;
+DROP FUNCTION IF EXISTS validate_production_source_set_versions_on_update();
 DROP TRIGGER IF EXISTS trg_production_source_sets_prevent_reopen ON production_source_sets;
 DROP FUNCTION IF EXISTS prevent_frozen_production_source_set_reopen();
 
@@ -19,3 +35,6 @@ DROP TABLE IF EXISTS production_documents;
 DROP TABLE IF EXISTS production_evidence_snapshots;
 DROP TABLE IF EXISTS production_source_items;
 DROP TABLE IF EXISTS production_source_sets;
+
+ALTER TABLE production_document_types DROP CONSTRAINT IF EXISTS uq_production_document_types_id_tenant;
+ALTER TABLE production_projects DROP CONSTRAINT IF EXISTS uq_production_projects_id_tenant;
