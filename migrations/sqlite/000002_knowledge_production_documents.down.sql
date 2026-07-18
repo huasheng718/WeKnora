@@ -1,0 +1,17 @@
+DROP TRIGGER IF EXISTS trg_production_document_blocks_prevent_delete;
+DROP TRIGGER IF EXISTS trg_production_document_blocks_prevent_update;
+DROP TRIGGER IF EXISTS trg_production_document_versions_prevent_delete;
+DROP TRIGGER IF EXISTS trg_production_document_versions_prevent_update;
+DROP TRIGGER IF EXISTS trg_production_evidence_snapshots_prevent_delete;
+DROP TRIGGER IF EXISTS trg_production_evidence_snapshots_prevent_update;
+DROP TRIGGER IF EXISTS trg_production_source_items_prevent_frozen_accepted_delete;
+DROP TRIGGER IF EXISTS trg_production_source_items_prevent_frozen_accepted_update;
+DROP TRIGGER IF EXISTS trg_production_source_sets_prevent_reopen;
+
+DROP TABLE IF EXISTS production_block_lineage;
+DROP TABLE IF EXISTS production_document_blocks;
+DROP TABLE IF EXISTS production_document_versions;
+DROP TABLE IF EXISTS production_documents;
+DROP TABLE IF EXISTS production_evidence_snapshots;
+DROP TABLE IF EXISTS production_source_items;
+DROP TABLE IF EXISTS production_source_sets;
