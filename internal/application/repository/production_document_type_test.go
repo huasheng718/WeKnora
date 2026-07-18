@@ -82,10 +82,10 @@ func TestDocumentTypeRepositoryActivatesOneVersion(t *testing.T) {
 	require.NoError(t, db.Create(v2).Error)
 	require.NoError(t, db.Create(otherTenant).Error)
 
-	require.NoError(t, repo.Activate(context.Background(), 7, "baseline", 2))
-
-	active, err := repo.GetActiveByCode(context.Background(), 7, "baseline")
+	active, err := repo.Activate(context.Background(), 7, "baseline", 2)
 	require.NoError(t, err)
+	require.Equal(t, v2.ID, active.ID)
+	require.Equal(t, types.ProductionDocumentTypeActive, active.Status)
 	require.Equal(t, 2, active.SchemaVersion)
 
 	var retired types.ProductionDocumentType
@@ -103,7 +103,9 @@ func TestDocumentTypeRepositoryActivationRollsBackWhenDraftDoesNotExist(t *testi
 	v1.Status = types.ProductionDocumentTypeActive
 	require.NoError(t, db.Create(v1).Error)
 
-	require.ErrorIs(t, repo.Activate(context.Background(), 7, "baseline", 2), gorm.ErrRecordNotFound)
+	activated, err := repo.Activate(context.Background(), 7, "baseline", 2)
+	require.Nil(t, activated)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
 
 	var persisted types.ProductionDocumentType
 	require.NoError(t, db.First(&persisted, "id = ?", v1.ID).Error)

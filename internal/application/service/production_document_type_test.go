@@ -18,6 +18,7 @@ type productionDocumentTypeRepoStub struct {
 	getErr      error
 	listErr     error
 	activeErr   error
+	activeCalls int
 	created     *types.ProductionDocumentType
 	activated   struct {
 		tenantID      uint64
@@ -42,9 +43,9 @@ func (r *productionDocumentTypeRepoStub) Create(_ context.Context, documentType 
 	return nil
 }
 
-func (r *productionDocumentTypeRepoStub) Activate(_ context.Context, tenantID uint64, code string, schemaVersion int) error {
+func (r *productionDocumentTypeRepoStub) Activate(_ context.Context, tenantID uint64, code string, schemaVersion int) (*types.ProductionDocumentType, error) {
 	if r.activateErr != nil {
-		return r.activateErr
+		return nil, r.activateErr
 	}
 	r.activated.tenantID, r.activated.code, r.activated.schemaVersion = tenantID, code, schemaVersion
 	for _, row := range r.rows[tenantID] {
@@ -55,10 +56,10 @@ func (r *productionDocumentTypeRepoStub) Activate(_ context.Context, tenantID ui
 	for _, row := range r.rows[tenantID] {
 		if row.Code == code && row.SchemaVersion == schemaVersion && row.Status == types.ProductionDocumentTypeDraft {
 			row.Status = types.ProductionDocumentTypeActive
-			return nil
+			return row, nil
 		}
 	}
-	return gorm.ErrRecordNotFound
+	return nil, gorm.ErrRecordNotFound
 }
 
 func (r *productionDocumentTypeRepoStub) GetByID(_ context.Context, tenantID uint64, documentTypeID string) (*types.ProductionDocumentType, error) {
@@ -72,6 +73,7 @@ func (r *productionDocumentTypeRepoStub) GetByID(_ context.Context, tenantID uin
 }
 
 func (r *productionDocumentTypeRepoStub) GetActiveByCode(_ context.Context, tenantID uint64, code string) (*types.ProductionDocumentType, error) {
+	r.activeCalls++
 	if r.activeErr != nil {
 		return nil, r.activeErr
 	}
@@ -180,6 +182,23 @@ func TestProductionDocumentTypeActivateReturnsActiveImmutableDefinitionAndAudits
 	require.Len(t, audit.entries, 1)
 	require.Equal(t, types.AuditActionProductionDocumentTypeActivated, audit.entries[0].Action)
 	require.Equal(t, "type-1", audit.entries[0].TargetID)
+}
+
+func TestProductionDocumentTypeActivateHasNoPostCommitRetrievalBoundary(t *testing.T) {
+	svc, repo, _, audit := newProductionDocumentTypeServiceFixture(types.TenantRoleAdmin)
+	repo.add(&types.ProductionDocumentType{
+		ID: "type-atomic", TenantID: 7, Code: "baseline", Name: "Baseline", SchemaVersion: 3,
+		Status: types.ProductionDocumentTypeDraft, CreatedBy: "actor",
+	})
+	repo.activeErr = errors.New("post-commit read failed")
+
+	activated, err := svc.ActivateDocumentType(ctxForUser(7, "actor"), 7, "baseline", 3)
+
+	require.NoError(t, err)
+	require.Equal(t, "type-atomic", activated.ID)
+	require.Zero(t, repo.activeCalls)
+	require.Len(t, audit.entries, 1)
+	require.Equal(t, "type-atomic", audit.entries[0].TargetID)
 }
 
 func TestProductionDocumentTypeOwnerCanActivate(t *testing.T) {

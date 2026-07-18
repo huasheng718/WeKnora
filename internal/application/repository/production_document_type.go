@@ -33,8 +33,9 @@ func (r *productionDocumentTypeRepository) Activate(
 	tenantID uint64,
 	code string,
 	schemaVersion int,
-) error {
-	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+) (*types.ProductionDocumentType, error) {
+	var activated types.ProductionDocumentType
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(&types.ProductionDocumentType{}).
 			Where("tenant_id = ? AND code = ? AND status = ?", tenantID, code, types.ProductionDocumentTypeActive).
 			Update("status", types.ProductionDocumentTypeRetired).Error; err != nil {
@@ -53,8 +54,15 @@ func (r *productionDocumentTypeRepository) Activate(
 		if result.RowsAffected == 0 {
 			return gorm.ErrRecordNotFound
 		}
-		return nil
+		return tx.Where(
+			"tenant_id = ? AND code = ? AND schema_version = ? AND status = ?",
+			tenantID, code, schemaVersion, types.ProductionDocumentTypeActive,
+		).First(&activated).Error
 	})
+	if err != nil {
+		return nil, err
+	}
+	return &activated, nil
 }
 
 func (r *productionDocumentTypeRepository) GetByID(

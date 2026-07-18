@@ -24,7 +24,7 @@ type CreateProductionDocumentTypeInput struct {
 // ProductionDocumentTypeRepository persists versioned document-type definitions.
 type ProductionDocumentTypeRepository interface {
 	Create(ctx context.Context, documentType *types.ProductionDocumentType) error
-	Activate(ctx context.Context, tenantID uint64, code string, schemaVersion int) error
+	Activate(ctx context.Context, tenantID uint64, code string, schemaVersion int) (*types.ProductionDocumentType, error)
 	GetByID(ctx context.Context, tenantID uint64, documentTypeID string) (*types.ProductionDocumentType, error)
 	GetActiveByCode(ctx context.Context, tenantID uint64, code string) (*types.ProductionDocumentType, error)
 	List(ctx context.Context, tenantID uint64) ([]*types.ProductionDocumentType, error)

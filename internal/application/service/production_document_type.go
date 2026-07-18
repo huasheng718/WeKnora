@@ -73,10 +73,7 @@ func (s *productionDocumentTypeService) ActivateDocumentType(
 	if err != nil {
 		return nil, err
 	}
-	if err := s.repo.Activate(ctx, tenantID, code, schemaVersion); err != nil {
-		return nil, err
-	}
-	documentType, err := s.repo.GetActiveByCode(ctx, tenantID, code)
+	documentType, err := s.repo.Activate(ctx, tenantID, code, schemaVersion)
 	if err != nil {
 		return nil, err
 	}
