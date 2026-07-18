@@ -51,6 +51,14 @@ func TestProductionDocumentTypeRepositoryCreatesAndScopesLookups(t *testing.T) {
 	require.Nil(t, got)
 }
 
+func TestProductionDocumentTypeRepositoryCreateRejectsNilInput(t *testing.T) {
+	repo, _ := newProductionDocumentTypeRepoTestDB(t)
+
+	err := repo.Create(context.Background(), nil)
+
+	require.ErrorContains(t, err, "production document type")
+}
+
 func TestProductionDocumentTypeRepositoryListsOnlyTenantRows(t *testing.T) {
 	repo, db := newProductionDocumentTypeRepoTestDB(t)
 	require.NoError(t, db.Create(productionDocumentType("type-1", 7, "baseline", 1)).Error)

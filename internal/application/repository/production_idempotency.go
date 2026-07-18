@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/types"
@@ -23,6 +24,9 @@ func (r *productionIdempotencyRepository) Reserve(
 	ctx context.Context,
 	record *types.ProductionIdempotencyKey,
 ) (*types.ProductionIdempotencyKey, bool, error) {
+	if record == nil {
+		return nil, false, errors.New("production idempotency record is required")
+	}
 	result := r.db.WithContext(ctx).
 		Clauses(clause.OnConflict{
 			Columns: []clause.Column{
@@ -63,7 +67,7 @@ func (r *productionIdempotencyRepository) Complete(
 	now := time.Now()
 	result := r.db.WithContext(ctx).
 		Model(&types.ProductionIdempotencyKey{}).
-		Where("id = ?", id).
+		Where("id = ? AND completed_at IS NULL", id).
 		Updates(map[string]any{
 			"status_code":   statusCode,
 			"response_body": responseBody,
@@ -73,7 +77,16 @@ func (r *productionIdempotencyRepository) Complete(
 		return result.Error
 	}
 	if result.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
+		var count int64
+		if err := r.db.WithContext(ctx).
+			Model(&types.ProductionIdempotencyKey{}).
+			Where("id = ?", id).
+			Count(&count).Error; err != nil {
+			return err
+		}
+		if count == 0 {
+			return gorm.ErrRecordNotFound
+		}
 	}
 	return nil
 }

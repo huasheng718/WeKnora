@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"errors"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -22,11 +23,23 @@ func (r *productionProjectRepository) Create(
 	project *types.ProductionProject,
 	owner *types.ProductionProjectMember,
 ) error {
+	if project == nil {
+		return errors.New("production project is required")
+	}
+	if owner == nil {
+		return errors.New("production project owner is required")
+	}
+	persistedOwner := &types.ProductionProjectMember{
+		ProjectID:  project.ID,
+		UserID:     project.OwnerUserID,
+		Role:       types.ProductionRoleProjectOwner,
+		AssignedBy: owner.AssignedBy,
+	}
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(project).Error; err != nil {
 			return err
 		}
-		return tx.Create(owner).Error
+		return tx.Create(persistedOwner).Error
 	})
 }
 
@@ -70,6 +83,9 @@ func (r *productionProjectRepository) AssignRole(
 	tenantID uint64,
 	member *types.ProductionProjectMember,
 ) error {
+	if member == nil {
+		return errors.New("production project member is required")
+	}
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var project types.ProductionProject
 		if err := tx.Select("id").

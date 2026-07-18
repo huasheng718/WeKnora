@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"errors"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -21,6 +22,9 @@ func (r *productionDocumentTypeRepository) Create(
 	ctx context.Context,
 	documentType *types.ProductionDocumentType,
 ) error {
+	if documentType == nil {
+		return errors.New("production document type is required")
+	}
 	return r.db.WithContext(ctx).Create(documentType).Error
 }
 

@@ -20,9 +20,13 @@ func newProductionRepoTestDB(t *testing.T) (interfaces.ProductionProjectReposito
 	t.Helper()
 
 	dsn := "file:" + strings.NewReplacer("/", "_", " ", "_").Replace(t.Name()) +
-		"?mode=memory&cache=shared&_foreign_keys=1"
+		"?mode=memory&cache=shared&_foreign_keys=1&_busy_timeout=5000"
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
 	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = sqlDB.Close() })
 
 	_, filename, _, ok := runtime.Caller(0)
 	require.True(t, ok)
@@ -71,21 +75,59 @@ func TestProductionProjectRepositoryCreatePersistsProjectAndOwner(t *testing.T) 
 	require.Equal(t, int64(1), ownerCount)
 }
 
-func TestProductionProjectRepositoryCreateRollsBackProjectWhenOwnerFails(t *testing.T) {
+func TestProductionProjectRepositoryCreateDerivesOwnerMembershipFromProject(t *testing.T) {
 	repo, db := newProductionRepoTestDB(t)
+	seedProductionProject(t, db, "project-b", 8)
 	project := &types.ProductionProject{
-		ID:          "project-1",
+		ID:          "project-a",
 		TenantID:    7,
 		Name:        "Foundation",
-		OwnerUserID: "author-1",
+		OwnerUserID: "owner-a",
 		Status:      types.ProductionProjectActive,
 	}
 	owner := &types.ProductionProjectMember{
-		ProjectID:  "missing-project",
-		UserID:     "author-1",
-		Role:       types.ProductionRoleProjectOwner,
-		AssignedBy: "author-1",
+		ProjectID:  "project-b",
+		UserID:     "attacker",
+		Role:       types.ProductionRolePublisher,
+		AssignedBy: "creator-a",
 	}
+
+	require.NoError(t, repo.Create(context.Background(), project, owner))
+
+	var members []types.ProductionProjectMember
+	require.NoError(t, db.Order("project_id ASC").Find(&members).Error)
+	require.Len(t, members, 1)
+	require.Equal(t, "project-a", members[0].ProjectID)
+	require.Equal(t, "owner-a", members[0].UserID)
+	require.Equal(t, types.ProductionRoleProjectOwner, members[0].Role)
+	require.Equal(t, "creator-a", members[0].AssignedBy)
+}
+
+func TestProductionProjectRepositoryCreateRejectsNilInputs(t *testing.T) {
+	repo, _ := newProductionRepoTestDB(t)
+	project := &types.ProductionProject{
+		ID: "project-1", TenantID: 7, Name: "Foundation", OwnerUserID: "owner-1",
+		Status: types.ProductionProjectActive,
+	}
+	owner := &types.ProductionProjectMember{AssignedBy: "owner-1"}
+
+	require.ErrorContains(t, repo.Create(context.Background(), nil, owner), "production project")
+	require.ErrorContains(t, repo.Create(context.Background(), project, nil), "project owner")
+}
+
+func TestProductionProjectRepositoryCreateRollsBackProjectWhenOwnerInsertFails(t *testing.T) {
+	repo, db := newProductionRepoTestDB(t)
+	require.NoError(t, db.Exec(`
+CREATE TRIGGER fail_production_owner_insert
+BEFORE INSERT ON production_project_members
+BEGIN
+    SELECT RAISE(ABORT, 'forced owner insert failure');
+END`).Error)
+	project := &types.ProductionProject{
+		ID: "project-1", TenantID: 7, Name: "Foundation", OwnerUserID: "owner-1",
+		Status: types.ProductionProjectActive,
+	}
+	owner := &types.ProductionProjectMember{AssignedBy: "owner-1"}
 
 	require.Error(t, repo.Create(context.Background(), project, owner))
 
@@ -151,4 +193,14 @@ func TestProductionProjectRepositoryScopesRoleOperationsByProjectTenant(t *testi
 	roles, err = repo.ListRoles(context.Background(), 7, "project-1", "user-1")
 	require.NoError(t, err)
 	require.Empty(t, roles)
+}
+
+func TestProductionProjectRepositoryAssignRoleRejectsNilMember(t *testing.T) {
+	repo, _ := newProductionRepoTestDB(t)
+	var err error
+
+	require.NotPanics(t, func() {
+		err = repo.AssignRole(context.Background(), 7, nil)
+	})
+	require.ErrorContains(t, err, "project member")
 }
