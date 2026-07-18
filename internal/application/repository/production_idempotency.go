@@ -64,10 +64,14 @@ func (r *productionIdempotencyRepository) Complete(
 	statusCode int,
 	responseBody types.JSON,
 ) error {
+	tenantID, ok := types.TenantIDFromContext(ctx)
+	if !ok || tenantID == 0 {
+		return errors.New("production idempotency completion requires tenant context")
+	}
 	now := time.Now()
 	result := r.db.WithContext(ctx).
 		Model(&types.ProductionIdempotencyKey{}).
-		Where("id = ? AND completed_at IS NULL", id).
+		Where("tenant_id = ? AND id = ? AND completed_at IS NULL", tenantID, id).
 		Updates(map[string]any{
 			"status_code":   statusCode,
 			"response_body": responseBody,
@@ -80,7 +84,7 @@ func (r *productionIdempotencyRepository) Complete(
 		var count int64
 		if err := r.db.WithContext(ctx).
 			Model(&types.ProductionIdempotencyKey{}).
-			Where("id = ?", id).
+			Where("tenant_id = ? AND id = ?", tenantID, id).
 			Count(&count).Error; err != nil {
 			return err
 		}

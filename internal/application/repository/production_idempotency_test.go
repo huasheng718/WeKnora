@@ -33,6 +33,10 @@ func idempotencyRecord(
 	}
 }
 
+func productionTenantContext(tenantID uint64) context.Context {
+	return context.WithValue(context.Background(), types.TenantIDContextKey, tenantID)
+}
+
 func TestProductionIdempotencyReserveReturnsExistingRecord(t *testing.T) {
 	repo, db := newProductionIdempotencyRepoTestDB(t)
 	ctx := context.Background()
@@ -133,7 +137,7 @@ func TestProductionIdempotencyReserveScopesUniquenessByTenantActorAndRoute(t *te
 
 func TestProductionIdempotencyCompletePersistsResponseForRetry(t *testing.T) {
 	repo, _ := newProductionIdempotencyRepoTestDB(t)
-	ctx := context.Background()
+	ctx := productionTenantContext(7)
 	record := idempotencyRecord(7, "author-1", "/production/projects", "request-1", "digest-a")
 	_, created, err := repo.Reserve(ctx, record)
 	require.NoError(t, err)
@@ -153,7 +157,7 @@ func TestProductionIdempotencyCompletePersistsResponseForRetry(t *testing.T) {
 
 func TestProductionIdempotencyCompletePreservesFirstResponse(t *testing.T) {
 	repo, _ := newProductionIdempotencyRepoTestDB(t)
-	ctx := context.Background()
+	ctx := productionTenantContext(7)
 	record := idempotencyRecord(7, "author-1", "/production/projects", "request-1", "digest-a")
 	_, created, err := repo.Reserve(ctx, record)
 	require.NoError(t, err)
@@ -178,10 +182,58 @@ func TestProductionIdempotencyCompletePreservesFirstResponse(t *testing.T) {
 	require.Equal(t, firstCompletedAt, *persisted.CompletedAt)
 }
 
+func TestProductionIdempotencyCompleteRejectsCrossTenantReservation(t *testing.T) {
+	repo, db := newProductionIdempotencyRepoTestDB(t)
+	record := idempotencyRecord(7, "author-1", "/production/projects", "request-1", "digest-a")
+	_, created, err := repo.Reserve(context.Background(), record)
+	require.NoError(t, err)
+	require.True(t, created)
+
+	err = repo.Complete(productionTenantContext(8), record.ID, 403, types.JSON(`{"error":"forbidden"}`))
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+
+	var unchanged types.ProductionIdempotencyKey
+	require.NoError(t, db.First(&unchanged, "id = ?", record.ID).Error)
+	require.Nil(t, unchanged.StatusCode)
+	require.Nil(t, unchanged.ResponseBody)
+	require.Nil(t, unchanged.CompletedAt)
+
+	require.NoError(t, repo.Complete(
+		productionTenantContext(7), record.ID, 201, types.JSON(`{"id":"project-1"}`),
+	))
+	require.NoError(t, db.First(&unchanged, "id = ?", record.ID).Error)
+	require.NotNil(t, unchanged.StatusCode)
+	require.Equal(t, 201, *unchanged.StatusCode)
+	require.NotNil(t, unchanged.CompletedAt)
+}
+
+func TestProductionIdempotencyCompleteRequiresNonzeroTenantContext(t *testing.T) {
+	repo, db := newProductionIdempotencyRepoTestDB(t)
+	record := idempotencyRecord(7, "author-1", "/production/projects", "request-1", "digest-a")
+	_, created, err := repo.Reserve(context.Background(), record)
+	require.NoError(t, err)
+	require.True(t, created)
+
+	contexts := []context.Context{
+		context.Background(),
+		productionTenantContext(0),
+	}
+	for _, ctx := range contexts {
+		err = repo.Complete(ctx, record.ID, 201, types.JSON(`{"id":"project-1"}`))
+		require.ErrorContains(t, err, "tenant")
+	}
+
+	var unchanged types.ProductionIdempotencyKey
+	require.NoError(t, db.First(&unchanged, "id = ?", record.ID).Error)
+	require.Nil(t, unchanged.StatusCode)
+	require.Nil(t, unchanged.ResponseBody)
+	require.Nil(t, unchanged.CompletedAt)
+}
+
 func TestProductionIdempotencyCompleteRejectsMissingReservation(t *testing.T) {
 	repo, _ := newProductionIdempotencyRepoTestDB(t)
 
-	err := repo.Complete(context.Background(), "missing", 200, types.JSON(`{}`))
+	err := repo.Complete(productionTenantContext(7), "missing", 200, types.JSON(`{}`))
 
 	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
 }
