@@ -89,8 +89,8 @@ func (h *ProductionDocumentTypeHandler) Activate(c *gin.Context) {
 		return
 	}
 	documentTypeID := strings.TrimSpace(c.Param("id"))
-	if documentTypeID == "" {
-		c.Error(apperrors.NewValidationError("document type id is required"))
+	if !isProductionUUID(documentTypeID) {
+		c.Error(apperrors.NewValidationError("document type id must be a valid UUID"))
 		return
 	}
 	documentType, err := h.service.GetDocumentType(c.Request.Context(), tenantID, documentTypeID)

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -236,4 +237,109 @@ func TestProductionIdempotencyCompleteRejectsMissingReservation(t *testing.T) {
 	err := repo.Complete(productionTenantContext(7), "missing", 200, types.JSON(`{}`))
 
 	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+}
+
+func TestProductionIdempotencyReleaseAllowsImmediateRetry(t *testing.T) {
+	repo, db := newProductionIdempotencyRepoTestDB(t)
+	ctx := productionTenantContext(7)
+	first := idempotencyRecord(7, "author-1", "/production/projects", "request-1", "digest-a")
+	_, created, err := repo.Reserve(ctx, first)
+	require.NoError(t, err)
+	require.True(t, created)
+
+	require.NoError(t, repo.Release(ctx, first.ID))
+
+	second := idempotencyRecord(7, "author-1", "/production/projects", "request-1", "digest-b")
+	reserved, created, err := repo.Reserve(ctx, second)
+	require.NoError(t, err)
+	require.True(t, created)
+	require.Equal(t, second.ID, reserved.ID)
+	require.Equal(t, "digest-b", reserved.RequestDigest)
+	var count int64
+	require.NoError(t, db.Model(&types.ProductionIdempotencyKey{}).Count(&count).Error)
+	require.Equal(t, int64(1), count)
+}
+
+func TestProductionIdempotencyReleaseDoesNotDeleteCompletedResponse(t *testing.T) {
+	repo, _ := newProductionIdempotencyRepoTestDB(t)
+	ctx := productionTenantContext(7)
+	record := idempotencyRecord(7, "author-1", "/production/projects", "request-1", "digest-a")
+	_, created, err := repo.Reserve(ctx, record)
+	require.NoError(t, err)
+	require.True(t, created)
+	require.NoError(t, repo.Complete(ctx, record.ID, 201, types.JSON(`{"id":"project-1"}`)))
+
+	require.NoError(t, repo.Release(ctx, record.ID))
+
+	existing, created, err := repo.Reserve(ctx, record)
+	require.NoError(t, err)
+	require.False(t, created)
+	require.NotNil(t, existing.StatusCode)
+	require.Equal(t, 201, *existing.StatusCode)
+}
+
+func TestProductionIdempotencyReserveReclaimsStaleIncompleteReservation(t *testing.T) {
+	repo, db := newProductionIdempotencyRepoTestDB(t)
+	ctx := productionTenantContext(7)
+	first := idempotencyRecord(7, "author-1", "/production/projects", "request-1", "digest-a")
+	_, created, err := repo.Reserve(ctx, first)
+	require.NoError(t, err)
+	require.True(t, created)
+	require.NoError(t, db.Model(&types.ProductionIdempotencyKey{}).
+		Where("id = ?", first.ID).
+		Update("created_at", time.Now().Add(-productionIdempotencyLease-time.Minute)).Error)
+
+	retry := idempotencyRecord(7, "author-1", "/production/projects", "request-1", "digest-b")
+	retry.ID = "reservation-retry"
+	reclaimed, created, err := repo.Reserve(ctx, retry)
+
+	require.NoError(t, err)
+	require.True(t, created)
+	require.Equal(t, first.ID, reclaimed.ID, "reclaim keeps the unique row and atomically renews its lease")
+	require.Equal(t, "digest-b", reclaimed.RequestDigest)
+	require.WithinDuration(t, time.Now(), reclaimed.CreatedAt, time.Second)
+	var count int64
+	require.NoError(t, db.Model(&types.ProductionIdempotencyKey{}).Count(&count).Error)
+	require.Equal(t, int64(1), count)
+}
+
+func TestProductionIdempotencyStaleReclaimHasSingleWinner(t *testing.T) {
+	repo, db := newProductionIdempotencyRepoTestDB(t)
+	ctx := productionTenantContext(7)
+	first := idempotencyRecord(7, "author-1", "/production/projects", "request-1", "digest-stale")
+	_, created, err := repo.Reserve(ctx, first)
+	require.NoError(t, err)
+	require.True(t, created)
+	require.NoError(t, db.Model(&types.ProductionIdempotencyKey{}).
+		Where("id = ?", first.ID).
+		Update("created_at", time.Now().Add(-productionIdempotencyLease-time.Minute)).Error)
+
+	start := make(chan struct{})
+	type result struct {
+		digest  string
+		created bool
+		err     error
+	}
+	results := make(chan result, 2)
+	for _, digest := range []string{"digest-a", "digest-b"} {
+		go func(digest string) {
+			<-start
+			record := idempotencyRecord(7, "author-1", "/production/projects", "request-1", digest)
+			reserved, created, err := repo.Reserve(ctx, record)
+			results <- result{digest: reservedDigest(reserved), created: created, err: err}
+		}(digest)
+	}
+	close(start)
+	firstResult, secondResult := <-results, <-results
+	require.NoError(t, firstResult.err)
+	require.NoError(t, secondResult.err)
+	require.NotEqual(t, firstResult.created, secondResult.created, "exactly one caller renews the stale lease")
+	require.Equal(t, firstResult.digest, secondResult.digest, "both callers observe the winning digest")
+}
+
+func reservedDigest(record *types.ProductionIdempotencyKey) string {
+	if record == nil {
+		return ""
+	}
+	return record.RequestDigest
 }

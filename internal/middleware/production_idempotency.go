@@ -2,9 +2,11 @@ package middleware
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -18,10 +20,19 @@ import (
 
 const (
 	productionIdempotencyKeyRequired = "PRODUCTION_IDEMPOTENCY_KEY_REQUIRED"
+	productionIdempotencyKeyInvalid  = "PRODUCTION_IDEMPOTENCY_KEY_INVALID"
 	productionIdempotencyKeyConflict = "PRODUCTION_IDEMPOTENCY_KEY_CONFLICT"
 	productionIdempotencyInProgress  = "PRODUCTION_IDEMPOTENCY_IN_PROGRESS"
 	productionIdempotencyUnavailable = "PRODUCTION_IDEMPOTENCY_UNAVAILABLE"
+	productionRequestBodyTooLarge    = "PRODUCTION_REQUEST_BODY_TOO_LARGE"
+
+	productionIdempotencyMaxKeyBytes = 255
+	// productionFoundationMaxBodyBytes is intentionally smaller than upload
+	// limits: foundation commands are JSON metadata/schema definitions.
+	productionFoundationMaxBodyBytes = 1 << 20 // 1 MiB
 )
+
+var errProductionRequestBodyTooLarge = errors.New("production request body exceeds limit")
 
 // ProductionIdempotencyMiddleware provides durable replay semantics for all
 // production write routes.
@@ -46,6 +57,11 @@ func (m *ProductionIdempotencyMiddleware) Require() gin.HandlerFunc {
 				"Idempotency-Key header is required", false)
 			return
 		}
+		if len(key) > productionIdempotencyMaxKeyBytes {
+			abortProductionIdempotency(c, http.StatusBadRequest, productionIdempotencyKeyInvalid,
+				"Idempotency-Key must be between 1 and 255 bytes", false)
+			return
+		}
 
 		ctx := c.Request.Context()
 		tenantID, tenantOK := types.TenantIDFromContext(ctx)
@@ -58,6 +74,11 @@ func (m *ProductionIdempotencyMiddleware) Require() gin.HandlerFunc {
 
 		body, err := readAndRestoreProductionBody(c)
 		if err != nil {
+			if errors.Is(err, errProductionRequestBodyTooLarge) {
+				abortProductionIdempotency(c, http.StatusRequestEntityTooLarge, productionRequestBodyTooLarge,
+					"production request body exceeds 1 MiB limit", false)
+				return
+			}
 			abortProductionIdempotency(c, http.StatusBadRequest, productionIdempotencyKeyRequired,
 				"request body could not be read", false)
 			return
@@ -72,7 +93,7 @@ func (m *ProductionIdempotencyMiddleware) Require() gin.HandlerFunc {
 			IdempotencyKey: key,
 			RequestDigest:  digest,
 		}
-		existing, created, err := m.repo.Reserve(ctx, reservation)
+		reserved, created, err := m.repo.Reserve(ctx, reservation)
 		if err != nil {
 			logger.Errorf(ctx, "production idempotency reservation failed: %v", err)
 			abortProductionIdempotency(c, http.StatusInternalServerError, productionIdempotencyUnavailable,
@@ -80,18 +101,31 @@ func (m *ProductionIdempotencyMiddleware) Require() gin.HandlerFunc {
 			return
 		}
 		if !created {
-			m.replayOrReject(c, existing, digest)
+			m.replayOrReject(c, reserved, digest)
 			return
 		}
+		if reserved == nil {
+			abortProductionIdempotency(c, http.StatusInternalServerError, productionIdempotencyUnavailable,
+				"idempotency reservation is unavailable", true)
+			return
+		}
+		reservationID := reserved.ID
 
 		original := c.Writer
 		capture := newProductionResponseCapture(original)
 		func() {
 			c.Writer = capture
-			defer func() { c.Writer = original }()
+			defer func() {
+				c.Writer = original
+				if recovered := recover(); recovered != nil {
+					m.releaseReservation(ctx, reservationID)
+					panic(recovered)
+				}
+			}()
 			c.Next()
 		}()
 		if !capture.hasResponse() {
+			m.releaseReservation(ctx, reservationID)
 			return
 		}
 
@@ -103,14 +137,24 @@ func (m *ProductionIdempotencyMiddleware) Require() gin.HandlerFunc {
 				capture.size = len(canonical)
 				responseBody = canonical
 			}
-			if err := m.repo.Complete(ctx, reservation.ID, capture.Status(), types.JSON(responseBody)); err != nil {
+			if err := m.repo.Complete(ctx, reservationID, capture.Status(), types.JSON(responseBody)); err != nil {
 				logger.Errorf(ctx, "production idempotency completion failed: %v", err)
+				m.releaseReservation(ctx, reservationID)
 				writeProductionIdempotencyResponse(original, http.StatusInternalServerError,
 					productionIdempotencyUnavailable, "idempotency completion failed", true)
 				return
 			}
+			capture.flushTo(original)
+			return
 		}
+		m.releaseReservation(ctx, reservationID)
 		capture.flushTo(original)
+	}
+}
+
+func (m *ProductionIdempotencyMiddleware) releaseReservation(ctx context.Context, id string) {
+	if err := m.repo.Release(ctx, id); err != nil {
+		logger.Errorf(ctx, "production idempotency release failed: %v", err)
 	}
 }
 
@@ -146,9 +190,15 @@ func readAndRestoreProductionBody(c *gin.Context) ([]byte, error) {
 	if c.Request.Body == nil {
 		return nil, nil
 	}
-	body, err := io.ReadAll(c.Request.Body)
+	if c.Request.ContentLength > productionFoundationMaxBodyBytes {
+		return nil, errProductionRequestBodyTooLarge
+	}
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, productionFoundationMaxBodyBytes+1))
 	if err != nil {
 		return nil, err
+	}
+	if len(body) > productionFoundationMaxBodyBytes {
+		return nil, errProductionRequestBodyTooLarge
 	}
 	c.Request.Body = io.NopCloser(bytes.NewReader(body))
 	return body, nil

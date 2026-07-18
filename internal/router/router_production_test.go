@@ -54,6 +54,15 @@ func (r *productionRouterIdempotencyRepo) Complete(
 	return nil
 }
 
+func (r *productionRouterIdempotencyRepo) Release(_ context.Context, id string) error {
+	for key, record := range r.records {
+		if record.ID == id && record.StatusCode == nil {
+			delete(r.records, key)
+		}
+	}
+	return nil
+}
+
 type productionRouterProjectService struct {
 	createCalls int
 }

@@ -9,6 +9,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
 
@@ -67,8 +68,8 @@ func (h *ProductionProjectHandler) Create(c *gin.Context) {
 
 func (h *ProductionProjectHandler) AssignRole(c *gin.Context) {
 	projectID := strings.TrimSpace(c.Param("id"))
-	if projectID == "" {
-		c.Error(apperrors.NewValidationError("project id is required"))
+	if !isProductionUUID(projectID) {
+		c.Error(apperrors.NewValidationError("project id must be a valid UUID"))
 		return
 	}
 	var request assignProductionProjectRoleRequest
@@ -77,8 +78,12 @@ func (h *ProductionProjectHandler) AssignRole(c *gin.Context) {
 		return
 	}
 	request.UserID = strings.TrimSpace(request.UserID)
-	if request.UserID == "" || !request.Role.IsValid() {
-		c.Error(apperrors.NewValidationError("valid user_id and role are required"))
+	if !isProductionUUID(request.UserID) {
+		c.Error(apperrors.NewValidationError("user_id must be a valid UUID"))
+		return
+	}
+	if !request.Role.IsValid() {
+		c.Error(apperrors.NewValidationError("valid role is required"))
 		return
 	}
 	if err := h.service.AssignRole(c.Request.Context(), projectID, request.UserID, request.Role); err != nil {
@@ -92,8 +97,16 @@ func (h *ProductionProjectHandler) RemoveRole(c *gin.Context) {
 	projectID := strings.TrimSpace(c.Param("id"))
 	userID := strings.TrimSpace(c.Param("user_id"))
 	role := types.ProductionRole(strings.TrimSpace(c.Param("role")))
-	if projectID == "" || userID == "" || !role.IsValid() {
-		c.Error(apperrors.NewValidationError("valid project id, user id and role are required"))
+	if !isProductionUUID(projectID) {
+		c.Error(apperrors.NewValidationError("project id must be a valid UUID"))
+		return
+	}
+	if !isProductionUUID(userID) {
+		c.Error(apperrors.NewValidationError("user id must be a valid UUID"))
+		return
+	}
+	if !role.IsValid() {
+		c.Error(apperrors.NewValidationError("valid role is required"))
 		return
 	}
 	if err := h.service.RemoveRole(c.Request.Context(), projectID, userID, role); err != nil {
@@ -101,6 +114,11 @@ func (h *ProductionProjectHandler) RemoveRole(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+func isProductionUUID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed != uuid.Nil
 }
 
 func productionRequestIdentity(c *gin.Context) (uint64, string, bool) {

@@ -20,6 +20,7 @@ type productionIdempotencyRepoStub struct {
 	mu                  sync.Mutex
 	records             map[string]*types.ProductionIdempotencyKey
 	normalizeOnComplete bool
+	releaseCalls        int
 }
 
 func newProductionIdempotencyRepoStub() *productionIdempotencyRepoStub {
@@ -76,6 +77,19 @@ func (r *productionIdempotencyRepoStub) Complete(
 	return nil
 }
 
+func (r *productionIdempotencyRepoStub) Release(ctx context.Context, id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.releaseCalls++
+	tenantID, _ := types.TenantIDFromContext(ctx)
+	for key, record := range r.records {
+		if record.ID == id && record.TenantID == tenantID && record.StatusCode == nil {
+			delete(r.records, key)
+		}
+	}
+	return nil
+}
+
 func newProductionIdempotencyTestEngine(
 	repo *productionIdempotencyRepoStub,
 	handler gin.HandlerFunc,
@@ -117,6 +131,34 @@ func TestProductionIdempotencyRequiresKey(t *testing.T) {
 
 	require.Equal(t, http.StatusBadRequest, response.Code)
 	require.JSONEq(t, `{"success":false,"error":{"code":"PRODUCTION_IDEMPOTENCY_KEY_REQUIRED","message":"Idempotency-Key header is required"}}`, response.Body.String())
+}
+
+func TestProductionIdempotencyRejectsOversizedKeyBeforeReservation(t *testing.T) {
+	repo := newProductionIdempotencyRepoStub()
+	engine := newProductionIdempotencyTestEngine(repo, func(c *gin.Context) {
+		c.JSON(http.StatusCreated, gin.H{"success": true})
+	})
+
+	response := performProductionIdempotencyRequest(engine, strings.Repeat("k", 256), `{"name":"Baseline"}`)
+
+	require.Equal(t, http.StatusBadRequest, response.Code)
+	require.Contains(t, response.Body.String(), "PRODUCTION_IDEMPOTENCY_KEY_INVALID")
+	require.Empty(t, repo.records)
+}
+
+func TestProductionIdempotencyRejectsOversizedBodyBeforeReservation(t *testing.T) {
+	repo := newProductionIdempotencyRepoStub()
+	engine := newProductionIdempotencyTestEngine(repo, func(c *gin.Context) {
+		c.JSON(http.StatusCreated, gin.H{"success": true})
+	})
+
+	response := performProductionIdempotencyRequest(
+		engine, "request-1", strings.Repeat("x", productionFoundationMaxBodyBytes+1),
+	)
+
+	require.Equal(t, http.StatusRequestEntityTooLarge, response.Code)
+	require.Contains(t, response.Body.String(), "PRODUCTION_REQUEST_BODY_TOO_LARGE")
+	require.Empty(t, repo.records)
 }
 
 func TestProductionIdempotencyReplaysCanonicalJSONWithStatusAndBody(t *testing.T) {
@@ -168,15 +210,45 @@ func TestProductionIdempotencyRejectsKeyReusedWithDifferentBody(t *testing.T) {
 
 func TestProductionIdempotencyRejectsInProgressDuplicateAsRetryable(t *testing.T) {
 	repo := newProductionIdempotencyRepoStub()
+	body := `{"name":"Baseline"}`
+	_, created, err := repo.Reserve(context.Background(), &types.ProductionIdempotencyKey{
+		ID:             "live-reservation",
+		TenantID:       7,
+		ActorUserID:    "author-1",
+		Route:          "POST /production/projects",
+		IdempotencyKey: "request-1",
+		RequestDigest:  productionRequestDigest([]byte(body)),
+	})
+	require.NoError(t, err)
+	require.True(t, created)
+	calls := 0
 	engine := newProductionIdempotencyTestEngine(repo, func(c *gin.Context) {
+		calls++
 		c.Status(http.StatusInternalServerError)
 	})
-	performProductionIdempotencyRequest(engine, "request-1", `{"name":"Baseline"}`)
 
-	response := performProductionIdempotencyRequest(engine, "request-1", `{"name":"Baseline"}`)
+	response := performProductionIdempotencyRequest(engine, "request-1", body)
 
 	require.Equal(t, http.StatusConflict, response.Code)
 	require.JSONEq(t, `{"success":false,"error":{"code":"PRODUCTION_IDEMPOTENCY_IN_PROGRESS","message":"request with this idempotency key is still in progress","retryable":true}}`, response.Body.String())
+	require.Zero(t, calls)
+}
+
+func TestProductionIdempotencyReleasesTerminalResponseForImmediateRetry(t *testing.T) {
+	repo := newProductionIdempotencyRepoStub()
+	calls := 0
+	engine := newProductionIdempotencyTestEngine(repo, func(c *gin.Context) {
+		calls++
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"success": false})
+	})
+
+	first := performProductionIdempotencyRequest(engine, "request-1", `{"name":"Baseline"}`)
+	second := performProductionIdempotencyRequest(engine, "request-1", `{"name":"Baseline"}`)
+
+	require.Equal(t, http.StatusUnprocessableEntity, first.Code)
+	require.Equal(t, http.StatusUnprocessableEntity, second.Code)
+	require.Equal(t, 2, calls)
+	require.Equal(t, 2, repo.releaseCalls)
 }
 
 func TestProductionIdempotencyLeavesUnwrittenErrorsForOuterErrorHandler(t *testing.T) {
@@ -191,14 +263,21 @@ func TestProductionIdempotencyLeavesUnwrittenErrorsForOuterErrorHandler(t *testi
 }
 
 func TestProductionIdempotencyRestoresWriterBeforeOuterRecovery(t *testing.T) {
-	engine := newProductionIdempotencyTestEngine(newProductionIdempotencyRepoStub(), func(*gin.Context) {
+	repo := newProductionIdempotencyRepoStub()
+	calls := 0
+	engine := newProductionIdempotencyTestEngine(repo, func(*gin.Context) {
+		calls++
 		panic("write failed")
 	}, Recovery())
 
-	response := performProductionIdempotencyRequest(engine, "request-1", `{"name":"Baseline"}`)
+	first := performProductionIdempotencyRequest(engine, "request-1", `{"name":"Baseline"}`)
+	second := performProductionIdempotencyRequest(engine, "request-1", `{"name":"Baseline"}`)
 
-	require.Equal(t, http.StatusInternalServerError, response.Code)
-	require.Contains(t, response.Body.String(), "Internal Server Error")
+	require.Equal(t, http.StatusInternalServerError, first.Code)
+	require.Equal(t, http.StatusInternalServerError, second.Code)
+	require.Contains(t, first.Body.String(), "Internal Server Error")
+	require.Equal(t, 2, calls)
+	require.Equal(t, 2, repo.releaseCalls)
 }
 
 func TestProductionIdempotencyScopesReservationToConcreteResourcePath(t *testing.T) {

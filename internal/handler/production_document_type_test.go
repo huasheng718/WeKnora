@@ -25,14 +25,14 @@ func (s *productionDocumentTypeServiceStub) CreateDocumentType(_ context.Context
 	if s.err != nil {
 		return nil, s.err
 	}
-	return &types.ProductionDocumentType{ID: "type-1", TenantID: tenantID, Code: input.Code, Name: input.Name, SchemaVersion: input.SchemaVersion, Status: types.ProductionDocumentTypeDraft, CreatedBy: "admin-1"}, nil
+	return &types.ProductionDocumentType{ID: productionDocumentTypeID, TenantID: tenantID, Code: input.Code, Name: input.Name, SchemaVersion: input.SchemaVersion, Status: types.ProductionDocumentTypeDraft, CreatedBy: "admin-1"}, nil
 }
 func (s *productionDocumentTypeServiceStub) ActivateDocumentType(_ context.Context, tenantID uint64, code string, schemaVersion int) (*types.ProductionDocumentType, error) {
 	s.activatedCode, s.activatedVer = code, schemaVersion
 	if s.err != nil {
 		return nil, s.err
 	}
-	return &types.ProductionDocumentType{ID: "type-1", TenantID: tenantID, Code: code, SchemaVersion: schemaVersion, Status: types.ProductionDocumentTypeActive}, nil
+	return &types.ProductionDocumentType{ID: productionDocumentTypeID, TenantID: tenantID, Code: code, SchemaVersion: schemaVersion, Status: types.ProductionDocumentTypeActive}, nil
 }
 func (s *productionDocumentTypeServiceStub) GetDocumentType(_ context.Context, tenantID uint64, documentTypeID string) (*types.ProductionDocumentType, error) {
 	s.getID = documentTypeID
@@ -52,29 +52,46 @@ func TestProductionDocumentTypeHandlerCreatesAndListsDefinitions(t *testing.T) {
 	h.Create(create)
 
 	list, listRecorder := newProductionHandlerContext(http.MethodGet, "/production/document-types", "")
-	service.documentTypes = []*types.ProductionDocumentType{{ID: "type-1", TenantID: 7, Code: "baseline", SchemaVersion: 1}}
+	service.documentTypes = []*types.ProductionDocumentType{{ID: productionDocumentTypeID, TenantID: 7, Code: "baseline", SchemaVersion: 1}}
 	h.List(list)
 
 	require.Equal(t, http.StatusCreated, createRecorder.Code)
 	require.Equal(t, "baseline", service.created.Code)
 	require.JSONEq(t, `{"type":"object"}`, string(service.created.BlockSchema))
 	require.Equal(t, http.StatusOK, listRecorder.Code)
-	require.Contains(t, listRecorder.Body.String(), `"type-1"`)
+	require.Contains(t, listRecorder.Body.String(), productionDocumentTypeID)
 }
 
 func TestProductionDocumentTypeHandlerActivatesVersionAddressedByID(t *testing.T) {
 	service := &productionDocumentTypeServiceStub{}
 	h := NewProductionDocumentTypeHandler(service)
-	c, recorder := newProductionHandlerContext(http.MethodPut, "/production/document-types/type-1/activate", "")
-	c.Params = append(c.Params, gin.Param{Key: "id", Value: "type-1"})
+	c, recorder := newProductionHandlerContext(http.MethodPut, "/production/document-types/"+productionDocumentTypeID+"/activate", "")
+	c.Params = append(c.Params, gin.Param{Key: "id", Value: productionDocumentTypeID})
 
 	h.Activate(c)
 
 	require.Equal(t, http.StatusOK, recorder.Code)
-	require.Equal(t, "type-1", service.getID)
+	require.Equal(t, productionDocumentTypeID, service.getID)
 	require.Equal(t, "baseline", service.activatedCode)
 	require.Equal(t, 3, service.activatedVer)
 	require.Contains(t, recorder.Body.String(), `"status":"active"`)
+}
+
+func TestProductionDocumentTypeHandlerRejectsMalformedIDBeforeServiceAccess(t *testing.T) {
+	service := &productionDocumentTypeServiceStub{}
+	h := NewProductionDocumentTypeHandler(service)
+
+	response := performProductionHandlerRequest(
+		http.MethodPut,
+		"/production/document-types/:id/activate",
+		"/production/document-types/not-a-uuid/activate",
+		"",
+		h.Activate,
+	)
+
+	require.Equal(t, http.StatusBadRequest, response.Code)
+	require.Contains(t, response.Body.String(), "valid UUID")
+	require.Empty(t, service.getID)
 }
 
 var _ interfaces.ProductionDocumentTypeService = (*productionDocumentTypeServiceStub)(nil)

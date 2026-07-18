@@ -15,6 +15,10 @@ type productionIdempotencyRepository struct {
 	db *gorm.DB
 }
 
+// productionIdempotencyLease bounds how long a crashed request can block a
+// retry. Reserve atomically renews an incomplete row older than this interval.
+const productionIdempotencyLease = 5 * time.Minute
+
 // NewProductionIdempotencyRepository creates a durable idempotency repository.
 func NewProductionIdempotencyRepository(db *gorm.DB) interfaces.ProductionIdempotencyRepository {
 	return &productionIdempotencyRepository{db: db}
@@ -45,6 +49,28 @@ func (r *productionIdempotencyRepository) Reserve(
 		return record, true, nil
 	}
 
+	// A process can die after reserving but before completing or releasing.
+	// Renew the stale row with one conditional UPDATE: concurrent reclaimers
+	// race on created_at, and only the first one can move the lease forward.
+	now := time.Now()
+	reclaimed := r.db.WithContext(ctx).
+		Model(&types.ProductionIdempotencyKey{}).
+		Where(
+			"tenant_id = ? AND actor_user_id = ? AND route = ? AND idempotency_key = ?",
+			record.TenantID, record.ActorUserID, record.Route, record.IdempotencyKey,
+		).
+		Where("completed_at IS NULL AND created_at < ?", now.Add(-productionIdempotencyLease)).
+		Updates(map[string]any{
+			"request_digest": record.RequestDigest,
+			"status_code":    nil,
+			"response_body":  nil,
+			"completed_at":   nil,
+			"created_at":     now,
+		})
+	if reclaimed.Error != nil {
+		return nil, false, reclaimed.Error
+	}
+
 	var existing types.ProductionIdempotencyKey
 	err := r.db.WithContext(ctx).
 		Where(
@@ -55,7 +81,7 @@ func (r *productionIdempotencyRepository) Reserve(
 	if err != nil {
 		return nil, false, err
 	}
-	return &existing, false, nil
+	return &existing, reclaimed.RowsAffected == 1, nil
 }
 
 func (r *productionIdempotencyRepository) Complete(
@@ -91,6 +117,34 @@ func (r *productionIdempotencyRepository) Complete(
 		if count == 0 {
 			return gorm.ErrRecordNotFound
 		}
+	}
+	return nil
+}
+
+func (r *productionIdempotencyRepository) Release(ctx context.Context, id string) error {
+	tenantID, ok := types.TenantIDFromContext(ctx)
+	if !ok || tenantID == 0 {
+		return errors.New("production idempotency release requires tenant context")
+	}
+	result := r.db.WithContext(ctx).
+		Where("tenant_id = ? AND id = ? AND completed_at IS NULL", tenantID, id).
+		Delete(&types.ProductionIdempotencyKey{})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected > 0 {
+		return nil
+	}
+
+	var count int64
+	if err := r.db.WithContext(ctx).
+		Model(&types.ProductionIdempotencyKey{}).
+		Where("tenant_id = ? AND id = ?", tenantID, id).
+		Count(&count).Error; err != nil {
+		return err
+	}
+	if count == 0 {
+		return gorm.ErrRecordNotFound
 	}
 	return nil
 }

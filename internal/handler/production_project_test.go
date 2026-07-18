@@ -14,6 +14,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const (
+	productionProjectID      = "11111111-1111-4111-8111-111111111111"
+	productionReviewerID     = "22222222-2222-4222-8222-222222222222"
+	productionDocumentTypeID = "33333333-3333-4333-8333-333333333333"
+)
+
 type productionProjectServiceStub struct {
 	projects []*types.ProductionProject
 	created  interfaces.CreateProductionProjectInput
@@ -35,7 +41,7 @@ func (s *productionProjectServiceStub) CreateProject(_ context.Context, input in
 	if s.err != nil {
 		return nil, s.err
 	}
-	return &types.ProductionProject{ID: "project-1", TenantID: 7, Name: input.Name, Description: input.Description, OwnerUserID: "author-1", Status: types.ProductionProjectActive}, nil
+	return &types.ProductionProject{ID: productionProjectID, TenantID: 7, Name: input.Name, Description: input.Description, OwnerUserID: "author-1", Status: types.ProductionProjectActive}, nil
 }
 func (s *productionProjectServiceStub) GetProject(context.Context, uint64, string) (*types.ProductionProject, error) {
 	return nil, s.err
@@ -77,11 +83,11 @@ func TestProductionProjectHandlerCreatesProject(t *testing.T) {
 
 	require.Equal(t, http.StatusCreated, recorder.Code)
 	require.Equal(t, "Baseline", service.created.Name)
-	require.JSONEq(t, `{"success":true,"data":{"id":"project-1","tenant_id":7,"name":"Baseline","description":"Core docs","owner_user_id":"author-1","status":"active","created_at":"0001-01-01T00:00:00Z","updated_at":"0001-01-01T00:00:00Z","deleted_at":null}}`, recorder.Body.String())
+	require.JSONEq(t, `{"success":true,"data":{"id":"11111111-1111-4111-8111-111111111111","tenant_id":7,"name":"Baseline","description":"Core docs","owner_user_id":"author-1","status":"active","created_at":"0001-01-01T00:00:00Z","updated_at":"0001-01-01T00:00:00Z","deleted_at":null}}`, recorder.Body.String())
 }
 
 func TestProductionProjectHandlerListsOnlyContextTenantAndUser(t *testing.T) {
-	service := &productionProjectServiceStub{projects: []*types.ProductionProject{{ID: "project-1", TenantID: 7, Name: "Baseline"}}}
+	service := &productionProjectServiceStub{projects: []*types.ProductionProject{{ID: productionProjectID, TenantID: 7, Name: "Baseline"}}}
 	h := NewProductionProjectHandler(service)
 	c, recorder := newProductionHandlerContext(http.MethodGet, "/production/projects", "")
 
@@ -90,7 +96,7 @@ func TestProductionProjectHandlerListsOnlyContextTenantAndUser(t *testing.T) {
 	require.Equal(t, http.StatusOK, recorder.Code)
 	require.Equal(t, uint64(7), service.listTenant)
 	require.Equal(t, "author-1", service.listUser)
-	require.Contains(t, recorder.Body.String(), `"project-1"`)
+	require.Contains(t, recorder.Body.String(), productionProjectID)
 }
 
 func TestProductionProjectHandlerPreservesServiceAuthorization(t *testing.T) {
@@ -116,20 +122,76 @@ func TestProductionProjectHandlerPreservesServiceAuthorization(t *testing.T) {
 func TestProductionProjectHandlerAssignsAndRemovesRoles(t *testing.T) {
 	service := &productionProjectServiceStub{}
 	h := NewProductionProjectHandler(service)
-	assign, assignRecorder := newProductionHandlerContext(http.MethodPost, "/production/projects/project-1/members", `{"user_id":"reviewer-1","role":"business_reviewer"}`)
-	assign.Params = gin.Params{{Key: "id", Value: "project-1"}}
+	assign, assignRecorder := newProductionHandlerContext(http.MethodPost, "/production/projects/"+productionProjectID+"/members", `{"user_id":"`+productionReviewerID+`","role":"business_reviewer"}`)
+	assign.Params = gin.Params{{Key: "id", Value: productionProjectID}}
 	h.AssignRole(assign)
 
-	remove, removeRecorder := newProductionHandlerContext(http.MethodDelete, "/production/projects/project-1/members/reviewer-1/business_reviewer", "")
-	remove.Params = gin.Params{{Key: "id", Value: "project-1"}, {Key: "user_id", Value: "reviewer-1"}, {Key: "role", Value: "business_reviewer"}}
+	remove, removeRecorder := newProductionHandlerContext(http.MethodDelete, "/production/projects/"+productionProjectID+"/members/"+productionReviewerID+"/business_reviewer", "")
+	remove.Params = gin.Params{{Key: "id", Value: productionProjectID}, {Key: "user_id", Value: productionReviewerID}, {Key: "role", Value: "business_reviewer"}}
 	h.RemoveRole(remove)
 
 	require.Equal(t, http.StatusOK, assignRecorder.Code)
-	require.Equal(t, "project-1", service.assigned.projectID)
-	require.Equal(t, "reviewer-1", service.assigned.userID)
+	require.Equal(t, productionProjectID, service.assigned.projectID)
+	require.Equal(t, productionReviewerID, service.assigned.userID)
 	require.Equal(t, types.ProductionRoleBusinessReviewer, service.assigned.role)
 	require.Equal(t, http.StatusOK, removeRecorder.Code)
 	require.Equal(t, types.ProductionRoleBusinessReviewer, service.removed.role)
+}
+
+func performProductionHandlerRequest(
+	method, pattern, path, body string,
+	handler gin.HandlerFunc,
+) *httptest.ResponseRecorder {
+	engine := gin.New()
+	engine.Use(middleware.ErrorHandler())
+	engine.Handle(method, pattern, func(c *gin.Context) {
+		ctx := context.WithValue(c.Request.Context(), types.TenantIDContextKey, uint64(7))
+		ctx = context.WithValue(ctx, types.UserIDContextKey, "author-1")
+		c.Request = c.Request.WithContext(ctx)
+		handler(c)
+	})
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(method, path, strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(recorder, request)
+	return recorder
+}
+
+func TestProductionProjectHandlerRejectsMalformedResourceAndUserIDs(t *testing.T) {
+	service := &productionProjectServiceStub{}
+	h := NewProductionProjectHandler(service)
+	tests := []struct {
+		name, method, pattern, path, body string
+		handler                           gin.HandlerFunc
+	}{
+		{
+			name: "assign malformed project", method: http.MethodPost,
+			pattern: "/production/projects/:id/members", path: "/production/projects/not-a-uuid/members",
+			body: `{"user_id":"` + productionReviewerID + `","role":"author"}`, handler: h.AssignRole,
+		},
+		{
+			name: "assign malformed user", method: http.MethodPost,
+			pattern: "/production/projects/:id/members", path: "/production/projects/" + productionProjectID + "/members",
+			body: `{"user_id":"not-a-uuid","role":"author"}`, handler: h.AssignRole,
+		},
+		{
+			name: "remove malformed user", method: http.MethodDelete,
+			pattern: "/production/projects/:id/members/:user_id/:role",
+			path:    "/production/projects/" + productionProjectID + "/members/not-a-uuid/author",
+			handler: h.RemoveRole,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := performProductionHandlerRequest(
+				test.method, test.pattern, test.path, test.body, test.handler,
+			)
+			require.Equal(t, http.StatusBadRequest, response.Code)
+			require.Contains(t, response.Body.String(), "valid UUID")
+		})
+	}
+	require.Empty(t, service.assigned.projectID)
+	require.Empty(t, service.removed.projectID)
 }
 
 var _ interfaces.ProductionProjectService = (*productionProjectServiceStub)(nil)
