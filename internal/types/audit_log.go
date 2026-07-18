@@ -129,6 +129,12 @@ const (
 	AuditActionSystemQueueTaskDeleted   AuditAction = "system.queue_task_deleted"
 	AuditActionSystemQueueTaskRunNow    AuditAction = "system.queue_task_run_now"
 	AuditActionSystemQueueTaskCancelled AuditAction = "system.queue_task_cancelled"
+
+	// Knowledge-production foundation lifecycle actions.
+	AuditActionProductionProjectCreated        AuditAction = "production.project_created"
+	AuditActionProductionProjectRoleSet        AuditAction = "production.project_role_set"
+	AuditActionProductionDocumentTypeCreated   AuditAction = "production.document_type_created"
+	AuditActionProductionDocumentTypeActivated AuditAction = "production.document_type_activated"
 )
 
 // AuditOutcome distinguishes successful mutations from middleware-level

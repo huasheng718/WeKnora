@@ -1,10 +1,15 @@
 package types
 
 import (
+	"errors"
 	"time"
 
 	"gorm.io/gorm"
 )
+
+// ErrProductionForbidden is returned when the caller lacks tenant or
+// project-scoped authority for a production operation.
+var ErrProductionForbidden = errors.New("production operation forbidden")
 
 // ProductionRole is a project-scoped production responsibility. It is
 // intentionally separate from TenantRole, which controls tenant-wide access.

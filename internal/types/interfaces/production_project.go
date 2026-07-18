@@ -30,4 +30,5 @@ type ProductionProjectService interface {
 	ListProjects(ctx context.Context, tenantID uint64, userID string) ([]*types.ProductionProject, error)
 	AssignRole(ctx context.Context, projectID, userID string, role types.ProductionRole) error
 	RemoveRole(ctx context.Context, projectID, userID string, role types.ProductionRole) error
+	RequireProjectRole(ctx context.Context, projectID string, roles ...types.ProductionRole) error
 }
