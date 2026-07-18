@@ -52,20 +52,23 @@ func (r *productionIdempotencyRepository) Reserve(
 	// A process can die after reserving but before completing or releasing.
 	// Renew the stale row with one conditional UPDATE: concurrent reclaimers
 	// race on created_at, and only the first one can move the lease forward.
+	// The digest must match so expiry never weakens key/body conflict semantics.
+	// Rotating the primary-key ID fences the expired owner out of Complete and
+	// Release, both of which require the current reservation ID.
 	now := time.Now()
 	reclaimed := r.db.WithContext(ctx).
 		Model(&types.ProductionIdempotencyKey{}).
 		Where(
-			"tenant_id = ? AND actor_user_id = ? AND route = ? AND idempotency_key = ?",
-			record.TenantID, record.ActorUserID, record.Route, record.IdempotencyKey,
+			"tenant_id = ? AND actor_user_id = ? AND route = ? AND idempotency_key = ? AND request_digest = ?",
+			record.TenantID, record.ActorUserID, record.Route, record.IdempotencyKey, record.RequestDigest,
 		).
 		Where("completed_at IS NULL AND created_at < ?", now.Add(-productionIdempotencyLease)).
 		Updates(map[string]any{
-			"request_digest": record.RequestDigest,
-			"status_code":    nil,
-			"response_body":  nil,
-			"completed_at":   nil,
-			"created_at":     now,
+			"id":            record.ID,
+			"status_code":   nil,
+			"response_body": nil,
+			"completed_at":  nil,
+			"created_at":    now,
 		})
 	if reclaimed.Error != nil {
 		return nil, false, reclaimed.Error

@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sync"
 	"testing"
 	"time"
@@ -278,7 +279,7 @@ func TestProductionIdempotencyReleaseDoesNotDeleteCompletedResponse(t *testing.T
 	require.Equal(t, 201, *existing.StatusCode)
 }
 
-func TestProductionIdempotencyReserveReclaimsStaleIncompleteReservation(t *testing.T) {
+func TestProductionIdempotencyStaleDifferentDigestIsNotReclaimed(t *testing.T) {
 	repo, db := newProductionIdempotencyRepoTestDB(t)
 	ctx := productionTenantContext(7)
 	first := idempotencyRecord(7, "author-1", "/production/projects", "request-1", "digest-a")
@@ -291,16 +292,84 @@ func TestProductionIdempotencyReserveReclaimsStaleIncompleteReservation(t *testi
 
 	retry := idempotencyRecord(7, "author-1", "/production/projects", "request-1", "digest-b")
 	retry.ID = "reservation-retry"
-	reclaimed, created, err := repo.Reserve(ctx, retry)
+	existing, created, err := repo.Reserve(ctx, retry)
 
 	require.NoError(t, err)
-	require.True(t, created)
-	require.Equal(t, first.ID, reclaimed.ID, "reclaim keeps the unique row and atomically renews its lease")
-	require.Equal(t, "digest-b", reclaimed.RequestDigest)
-	require.WithinDuration(t, time.Now(), reclaimed.CreatedAt, time.Second)
+	require.False(t, created)
+	require.Equal(t, first.ID, existing.ID)
+	require.Equal(t, "digest-a", existing.RequestDigest)
+	require.Less(t, existing.CreatedAt, time.Now().Add(-productionIdempotencyLease))
 	var count int64
 	require.NoError(t, db.Model(&types.ProductionIdempotencyKey{}).Count(&count).Error)
 	require.Equal(t, int64(1), count)
+}
+
+func reclaimStaleSameDigest(
+	t *testing.T,
+	repo interfaces.ProductionIdempotencyRepository,
+	db *gorm.DB,
+) (*types.ProductionIdempotencyKey, *types.ProductionIdempotencyKey) {
+	t.Helper()
+	ctx := productionTenantContext(7)
+	old := idempotencyRecord(7, "author-1", "/production/projects", "request-1", "digest-a")
+	old.ID = "reservation-old"
+	_, created, err := repo.Reserve(ctx, old)
+	require.NoError(t, err)
+	require.True(t, created)
+	require.NoError(t, db.Model(&types.ProductionIdempotencyKey{}).
+		Where("id = ?", old.ID).
+		Update("created_at", time.Now().Add(-productionIdempotencyLease-time.Minute)).Error)
+
+	retry := idempotencyRecord(7, "author-1", "/production/projects", "request-1", "digest-a")
+	retry.ID = "reservation-new"
+	reclaimed, created, err := repo.Reserve(ctx, retry)
+	require.NoError(t, err)
+	require.True(t, created)
+	require.Equal(t, retry.ID, reclaimed.ID, "reclaim must rotate the fencing token")
+	require.Equal(t, old.RequestDigest, reclaimed.RequestDigest)
+	require.WithinDuration(t, time.Now(), reclaimed.CreatedAt, time.Second)
+	return old, reclaimed
+}
+
+func TestProductionIdempotencyOldLeaseHolderCannotCompleteAfterReclaim(t *testing.T) {
+	repo, db := newProductionIdempotencyRepoTestDB(t)
+	old, _ := reclaimStaleSameDigest(t, repo, db)
+
+	err := repo.Complete(
+		productionTenantContext(7), old.ID, http.StatusCreated, types.JSON(`{"stale":true}`),
+	)
+
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+}
+
+func TestProductionIdempotencyOldLeaseHolderCannotReleaseAfterReclaim(t *testing.T) {
+	repo, db := newProductionIdempotencyRepoTestDB(t)
+	old, current := reclaimStaleSameDigest(t, repo, db)
+
+	err := repo.Release(productionTenantContext(7), old.ID)
+
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	var persisted types.ProductionIdempotencyKey
+	require.NoError(t, db.First(&persisted, "id = ?", current.ID).Error)
+}
+
+func TestProductionIdempotencyNewLeaseHolderCanCompleteAndReplay(t *testing.T) {
+	repo, db := newProductionIdempotencyRepoTestDB(t)
+	_, current := reclaimStaleSameDigest(t, repo, db)
+	ctx := productionTenantContext(7)
+	responseBody := types.JSON(`{"id":"project-1"}`)
+
+	require.NoError(t, repo.Complete(ctx, current.ID, http.StatusCreated, responseBody))
+	retry := idempotencyRecord(7, "author-1", "/production/projects", "request-1", "digest-a")
+	retry.ID = "reservation-later"
+	replayed, created, err := repo.Reserve(ctx, retry)
+
+	require.NoError(t, err)
+	require.False(t, created)
+	require.Equal(t, current.ID, replayed.ID)
+	require.NotNil(t, replayed.StatusCode)
+	require.Equal(t, http.StatusCreated, *replayed.StatusCode)
+	require.JSONEq(t, string(responseBody), string(replayed.ResponseBody))
 }
 
 func TestProductionIdempotencyStaleReclaimHasSingleWinner(t *testing.T) {
@@ -316,30 +385,32 @@ func TestProductionIdempotencyStaleReclaimHasSingleWinner(t *testing.T) {
 
 	start := make(chan struct{})
 	type result struct {
-		digest  string
+		id      string
 		created bool
 		err     error
 	}
 	results := make(chan result, 2)
-	for _, digest := range []string{"digest-a", "digest-b"} {
-		go func(digest string) {
+	for _, id := range []string{"reservation-a", "reservation-b"} {
+		go func(id string) {
 			<-start
-			record := idempotencyRecord(7, "author-1", "/production/projects", "request-1", digest)
+			record := idempotencyRecord(7, "author-1", "/production/projects", "request-1", "digest-stale")
+			record.ID = id
 			reserved, created, err := repo.Reserve(ctx, record)
-			results <- result{digest: reservedDigest(reserved), created: created, err: err}
-		}(digest)
+			results <- result{id: reservedID(reserved), created: created, err: err}
+		}(id)
 	}
 	close(start)
 	firstResult, secondResult := <-results, <-results
 	require.NoError(t, firstResult.err)
 	require.NoError(t, secondResult.err)
 	require.NotEqual(t, firstResult.created, secondResult.created, "exactly one caller renews the stale lease")
-	require.Equal(t, firstResult.digest, secondResult.digest, "both callers observe the winning digest")
+	require.Equal(t, firstResult.id, secondResult.id, "both callers observe the winning fencing token")
+	require.NotEqual(t, first.ID, firstResult.id, "winner must rotate the expired fencing token")
 }
 
-func reservedDigest(record *types.ProductionIdempotencyKey) string {
+func reservedID(record *types.ProductionIdempotencyKey) string {
 	if record == nil {
 		return ""
 	}
-	return record.RequestDigest
+	return record.ID
 }
