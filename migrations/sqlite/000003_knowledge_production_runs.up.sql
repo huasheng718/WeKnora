@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS production_runs (
     CONSTRAINT chk_production_runs_document_type_snapshot CHECK (json_valid(document_type_snapshot)),
     CONSTRAINT chk_production_runs_raw_response CHECK (
         (raw_model_response IS NULL AND raw_model_response_digest IS NULL) OR
-        (raw_model_response IS NOT NULL AND json_valid(raw_model_response) AND length(raw_model_response_digest) = 64 AND raw_model_response_digest NOT GLOB '*[^0-9a-f]*')
+        (raw_model_response IS NOT NULL AND raw_model_response_digest IS NOT NULL AND json_valid(raw_model_response) AND length(raw_model_response_digest) = 64 AND raw_model_response_digest NOT GLOB '*[^0-9a-f]*')
     ),
     CONSTRAINT chk_production_runs_terminal_timestamp CHECK (
         (status IN ('completed', 'failed', 'cancelled')) = (completed_at IS NOT NULL)
@@ -94,7 +94,7 @@ CREATE TABLE IF NOT EXISTS production_tool_calls (
     CONSTRAINT chk_production_tool_calls_request_digest CHECK (length(request_digest) = 64 AND request_digest NOT GLOB '*[^0-9a-f]*'),
     CONSTRAINT chk_production_tool_calls_response CHECK (
         (response_snapshot IS NULL AND response_digest IS NULL) OR
-        (response_snapshot IS NOT NULL AND json_valid(response_snapshot) AND length(response_digest) = 64 AND response_digest NOT GLOB '*[^0-9a-f]*')
+        (response_snapshot IS NOT NULL AND response_digest IS NOT NULL AND json_valid(response_snapshot) AND length(response_digest) = 64 AND response_digest NOT GLOB '*[^0-9a-f]*')
     ),
     CONSTRAINT chk_production_tool_calls_evidence_pair CHECK (
         (response_evidence_id IS NULL) = (response_evidence_source_item_id IS NULL)
@@ -130,6 +130,92 @@ CREATE INDEX IF NOT EXISTS idx_production_tool_calls_run_status
 CREATE INDEX IF NOT EXISTS idx_production_tool_calls_approval
     ON production_tool_calls (tenant_id, status, approval_status);
 
+CREATE TRIGGER IF NOT EXISTS trg_production_tool_calls_guard_invocation_identity
+    BEFORE UPDATE ON production_tool_calls
+    FOR EACH ROW
+    WHEN OLD.status <> 'planned' AND (
+        NEW.run_id IS NOT OLD.run_id OR
+        NEW.tenant_id IS NOT OLD.tenant_id OR
+        NEW.project_id IS NOT OLD.project_id OR
+        NEW.document_id IS NOT OLD.document_id OR
+        NEW.source_set_id IS NOT OLD.source_set_id OR
+        NEW.provider_type IS NOT OLD.provider_type OR
+        NEW.provider_id IS NOT OLD.provider_id OR
+        NEW.tool_name IS NOT OLD.tool_name OR
+        NEW.request_snapshot IS NOT OLD.request_snapshot OR
+        NEW.request_digest IS NOT OLD.request_digest OR
+        NEW.attempt IS NOT OLD.attempt OR
+        NEW.current_step IS NOT OLD.current_step OR
+        NEW.idempotency_key IS NOT OLD.idempotency_key
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'production tool call invocation identity is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_production_tool_calls_guard_approval_decision
+    BEFORE UPDATE ON production_tool_calls
+    FOR EACH ROW
+    WHEN OLD.approval_status IN ('approved', 'rejected') AND (
+        NEW.approval_status IS NOT OLD.approval_status OR
+        NEW.approval_requested_at IS NOT OLD.approval_requested_at OR
+        NEW.approved_by IS NOT OLD.approved_by OR
+        NEW.approved_at IS NOT OLD.approved_at OR
+        NEW.rejected_by IS NOT OLD.rejected_by OR
+        NEW.rejected_at IS NOT OLD.rejected_at
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'production tool call approval decision is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_production_tool_calls_guard_invocation_replace
+    BEFORE INSERT ON production_tool_calls
+    FOR EACH ROW
+    WHEN EXISTS (
+        SELECT 1 FROM production_tool_calls
+        WHERE status IN ('pending_approval', 'approved', 'executing')
+          AND (id = NEW.id OR (run_id = NEW.run_id AND idempotency_key = NEW.idempotency_key) OR
+               (run_id = NEW.run_id AND attempt = NEW.attempt AND current_step = NEW.current_step))
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'production tool call invocation identity is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_production_tool_calls_fence_parent_insert
+    BEFORE INSERT ON production_tool_calls
+    FOR EACH ROW
+    WHEN EXISTS (
+        SELECT 1 FROM production_runs
+        WHERE id = NEW.run_id AND status IN ('completed', 'failed', 'cancelled')
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'terminal production runs reject tool calls');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_production_tool_calls_fence_parent_update
+    BEFORE UPDATE ON production_tool_calls
+    FOR EACH ROW
+    WHEN EXISTS (
+        SELECT 1 FROM production_runs
+        WHERE id IN (OLD.run_id, NEW.run_id) AND status IN ('completed', 'failed', 'cancelled')
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'terminal production runs reject tool calls');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_production_runs_fence_terminal_children
+    BEFORE UPDATE OF status ON production_runs
+    FOR EACH ROW
+    WHEN OLD.status NOT IN ('completed', 'failed', 'cancelled')
+      AND NEW.status IN ('completed', 'failed', 'cancelled')
+      AND EXISTS (
+          SELECT 1 FROM production_tool_calls call
+          WHERE call.run_id = OLD.id
+            AND call.status IN ('planned', 'pending_approval', 'approved', 'executing')
+      )
+BEGIN
+    SELECT RAISE(ABORT, 'active production tool calls prevent terminal run');
+END;
+
 CREATE TRIGGER IF NOT EXISTS trg_production_runs_guard_terminal
     BEFORE UPDATE ON production_runs
     FOR EACH ROW
@@ -161,7 +247,10 @@ END;
 CREATE TRIGGER IF NOT EXISTS trg_production_tool_calls_guard_terminal
     BEFORE UPDATE ON production_tool_calls
     FOR EACH ROW
-    WHEN OLD.status IN ('completed', 'failed', 'rejected')
+    WHEN OLD.status IN ('completed', 'failed', 'rejected') AND NOT EXISTS (
+        SELECT 1 FROM production_runs
+        WHERE id = OLD.run_id AND status IN ('completed', 'failed', 'cancelled')
+    )
 BEGIN
     SELECT RAISE(ABORT, 'terminal production tool calls are immutable');
 END;

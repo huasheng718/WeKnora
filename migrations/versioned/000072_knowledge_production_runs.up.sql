@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS production_runs (
     CONSTRAINT chk_production_runs_resume CHECK (attempt >= 0 AND current_step >= 0),
     CONSTRAINT chk_production_runs_raw_response CHECK (
         (raw_model_response IS NULL AND raw_model_response_digest IS NULL) OR
-        (raw_model_response IS NOT NULL AND raw_model_response_digest ~ '^[0-9a-f]{64}$')
+        (raw_model_response IS NOT NULL AND raw_model_response_digest IS NOT NULL AND raw_model_response_digest ~ '^[0-9a-f]{64}$')
     ),
     CONSTRAINT chk_production_runs_terminal_timestamp CHECK (
         (status IN ('completed', 'failed', 'cancelled')) = (completed_at IS NOT NULL)
@@ -91,7 +91,7 @@ CREATE TABLE IF NOT EXISTS production_tool_calls (
     CONSTRAINT chk_production_tool_calls_request_digest CHECK (request_digest ~ '^[0-9a-f]{64}$'),
     CONSTRAINT chk_production_tool_calls_response CHECK (
         (response_snapshot IS NULL AND response_digest IS NULL) OR
-        (response_snapshot IS NOT NULL AND response_digest ~ '^[0-9a-f]{64}$')
+        (response_snapshot IS NOT NULL AND response_digest IS NOT NULL AND response_digest ~ '^[0-9a-f]{64}$')
     ),
     CONSTRAINT chk_production_tool_calls_evidence_pair CHECK (
         (response_evidence_id IS NULL) = (response_evidence_source_item_id IS NULL)
@@ -126,6 +126,103 @@ CREATE INDEX IF NOT EXISTS idx_production_tool_calls_run_status
     ON production_tool_calls (run_id, status, attempt, current_step);
 CREATE INDEX IF NOT EXISTS idx_production_tool_calls_approval
     ON production_tool_calls (tenant_id, status, approval_status);
+
+CREATE OR REPLACE FUNCTION guard_production_tool_call_invocation_identity()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF OLD.status <> 'planned' AND (
+        NEW.run_id IS DISTINCT FROM OLD.run_id OR
+        NEW.tenant_id IS DISTINCT FROM OLD.tenant_id OR
+        NEW.project_id IS DISTINCT FROM OLD.project_id OR
+        NEW.document_id IS DISTINCT FROM OLD.document_id OR
+        NEW.source_set_id IS DISTINCT FROM OLD.source_set_id OR
+        NEW.provider_type IS DISTINCT FROM OLD.provider_type OR
+        NEW.provider_id IS DISTINCT FROM OLD.provider_id OR
+        NEW.tool_name IS DISTINCT FROM OLD.tool_name OR
+        NEW.request_snapshot IS DISTINCT FROM OLD.request_snapshot OR
+        NEW.request_digest IS DISTINCT FROM OLD.request_digest OR
+        NEW.attempt IS DISTINCT FROM OLD.attempt OR
+        NEW.current_step IS DISTINCT FROM OLD.current_step OR
+        NEW.idempotency_key IS DISTINCT FROM OLD.idempotency_key
+    ) THEN
+        RAISE EXCEPTION 'production tool call invocation identity is immutable';
+    END IF;
+    IF OLD.approval_status IN ('approved', 'rejected') AND (
+        NEW.approval_status IS DISTINCT FROM OLD.approval_status OR
+        NEW.approval_requested_at IS DISTINCT FROM OLD.approval_requested_at OR
+        NEW.approved_by IS DISTINCT FROM OLD.approved_by OR
+        NEW.approved_at IS DISTINCT FROM OLD.approved_at OR
+        NEW.rejected_by IS DISTINCT FROM OLD.rejected_by OR
+        NEW.rejected_at IS DISTINCT FROM OLD.rejected_at
+    ) THEN
+        RAISE EXCEPTION 'production tool call approval decision is immutable';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_production_tool_calls_guard_invocation_identity
+    BEFORE UPDATE ON production_tool_calls
+    FOR EACH ROW
+    EXECUTE FUNCTION guard_production_tool_call_invocation_identity();
+
+CREATE OR REPLACE FUNCTION fence_production_tool_call_parent()
+RETURNS TRIGGER AS $$
+DECLARE
+    parent_status VARCHAR(24);
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        SELECT status INTO parent_status
+        FROM production_runs
+        WHERE id = NEW.run_id
+        FOR UPDATE;
+        IF parent_status IN ('completed', 'failed', 'cancelled') THEN
+            RAISE EXCEPTION 'terminal production runs reject tool calls';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    FOR parent_status IN
+        SELECT status
+        FROM production_runs
+        WHERE id IN (OLD.run_id, NEW.run_id)
+        ORDER BY id
+        FOR UPDATE
+    LOOP
+        IF parent_status IN ('completed', 'failed', 'cancelled') THEN
+            RAISE EXCEPTION 'terminal production runs reject tool calls';
+        END IF;
+    END LOOP;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_production_tool_calls_fence_parent
+    BEFORE INSERT OR UPDATE ON production_tool_calls
+    FOR EACH ROW
+    EXECUTE FUNCTION fence_production_tool_call_parent();
+
+CREATE OR REPLACE FUNCTION fence_terminal_production_run_children()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF OLD.status NOT IN ('completed', 'failed', 'cancelled')
+       AND NEW.status IN ('completed', 'failed', 'cancelled')
+       AND EXISTS (
+           SELECT 1
+           FROM production_tool_calls call
+           WHERE call.run_id = OLD.id
+             AND call.status IN ('planned', 'pending_approval', 'approved', 'executing')
+       ) THEN
+        RAISE EXCEPTION 'active production tool calls prevent terminal run';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_production_runs_fence_terminal_children
+    BEFORE UPDATE OF status ON production_runs
+    FOR EACH ROW
+    EXECUTE FUNCTION fence_terminal_production_run_children();
 
 CREATE OR REPLACE FUNCTION guard_terminal_production_run()
 RETURNS TRIGGER AS $$

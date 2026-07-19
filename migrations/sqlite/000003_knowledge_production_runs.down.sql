@@ -1,3 +1,9 @@
+DROP TRIGGER IF EXISTS trg_production_runs_fence_terminal_children;
+DROP TRIGGER IF EXISTS trg_production_tool_calls_fence_parent_update;
+DROP TRIGGER IF EXISTS trg_production_tool_calls_fence_parent_insert;
+DROP TRIGGER IF EXISTS trg_production_tool_calls_guard_invocation_replace;
+DROP TRIGGER IF EXISTS trg_production_tool_calls_guard_approval_decision;
+DROP TRIGGER IF EXISTS trg_production_tool_calls_guard_invocation_identity;
 DROP TRIGGER IF EXISTS trg_production_tool_calls_guard_terminal_delete;
 DROP TRIGGER IF EXISTS trg_production_tool_calls_guard_terminal_replace;
 DROP TRIGGER IF EXISTS trg_production_tool_calls_guard_terminal;

@@ -88,6 +88,30 @@ func TestProductionRunsPostgreSQLMigrationDeclaresEquivalentStructure(t *testing
 		"CREATE TRIGGER trg_production_tool_calls_guard_terminal",
 		"BEFORE UPDATE OR DELETE ON production_runs",
 		"BEFORE UPDATE OR DELETE ON production_tool_calls",
+		"CREATE OR REPLACE FUNCTION guard_production_tool_call_invocation_identity()",
+		"CREATE TRIGGER trg_production_tool_calls_guard_invocation_identity",
+		"OLD.status <> 'planned'",
+		"CREATE OR REPLACE FUNCTION fence_production_tool_call_parent()",
+		"CREATE TRIGGER trg_production_tool_calls_fence_parent",
+		"FOR UPDATE",
+		"CREATE OR REPLACE FUNCTION fence_terminal_production_run_children()",
+		"CREATE TRIGGER trg_production_runs_fence_terminal_children",
+		"call.status IN ('planned', 'pending_approval', 'approved', 'executing')",
+		"raw_model_response IS NOT NULL AND raw_model_response_digest IS NOT NULL",
+		"response_snapshot IS NOT NULL AND response_digest IS NOT NULL",
+		"NEW.run_id IS DISTINCT FROM OLD.run_id",
+		"NEW.tenant_id IS DISTINCT FROM OLD.tenant_id",
+		"NEW.project_id IS DISTINCT FROM OLD.project_id",
+		"NEW.document_id IS DISTINCT FROM OLD.document_id",
+		"NEW.source_set_id IS DISTINCT FROM OLD.source_set_id",
+		"NEW.provider_type IS DISTINCT FROM OLD.provider_type",
+		"NEW.provider_id IS DISTINCT FROM OLD.provider_id",
+		"NEW.tool_name IS DISTINCT FROM OLD.tool_name",
+		"NEW.request_snapshot IS DISTINCT FROM OLD.request_snapshot",
+		"NEW.request_digest IS DISTINCT FROM OLD.request_digest",
+		"NEW.attempt IS DISTINCT FROM OLD.attempt",
+		"NEW.current_step IS DISTINCT FROM OLD.current_step",
+		"NEW.idempotency_key IS DISTINCT FROM OLD.idempotency_key",
 	} {
 		require.Contains(t, up, declaration)
 	}
@@ -98,8 +122,136 @@ func TestProductionRunsPostgreSQLMigrationDeclaresEquivalentStructure(t *testing
 	down := mustReadMigration(t, "../../migrations/versioned/000072_knowledge_production_runs.down.sql")
 	_, err = pg_query.Parse(down)
 	require.NoError(t, err)
+	for _, declaration := range []string{
+		"DROP TRIGGER IF EXISTS trg_production_runs_fence_terminal_children ON production_runs",
+		"DROP FUNCTION IF EXISTS fence_terminal_production_run_children()",
+		"DROP TRIGGER IF EXISTS trg_production_tool_calls_fence_parent ON production_tool_calls",
+		"DROP FUNCTION IF EXISTS fence_production_tool_call_parent()",
+		"DROP TRIGGER IF EXISTS trg_production_tool_calls_guard_invocation_identity ON production_tool_calls",
+		"DROP FUNCTION IF EXISTS guard_production_tool_call_invocation_identity()",
+	} {
+		require.Contains(t, down, declaration)
+	}
 	require.Less(t, strings.Index(down, "DROP TABLE IF EXISTS production_tool_calls"), strings.Index(down, "DROP TABLE IF EXISTS production_runs"))
 	require.Less(t, strings.Index(down, "DROP TABLE IF EXISTS production_runs"), strings.Index(down, "DROP INDEX IF EXISTS uq_production_document_versions_run_context"))
+}
+
+func TestProductionRunsSQLiteMigrationFreezesInvocationIdentityAfterApprovalRequested(t *testing.T) {
+	for _, mutation := range productionToolCallIdentityMutations() {
+		t.Run(mutation.name, func(t *testing.T) {
+			db := openProductionRunsSQLite(t)
+			seedProductionRunScopes(t, db)
+			insertProductionRun(t, db, "run-1", 1, "project-1", "document-1", "source-set-1", "version-1", "run-key-1")
+			insertProductionRun(t, db, "run-other", 1, "project-1", "document-1", "source-set-1", "version-1", "run-key-other")
+			insertProductionToolCall(t, db, "call-1", "run-1", "call-key-1", 0, 0)
+			_, err := db.Exec(`UPDATE production_tool_calls SET status = 'pending_approval', approval_status = 'pending', approval_requested_at = CURRENT_TIMESTAMP WHERE id = 'call-1'`)
+			require.NoError(t, err)
+
+			_, err = db.Exec(`UPDATE production_tool_calls SET ` + mutation.assignment + ` WHERE id = 'call-1'`)
+			require.ErrorContains(t, err, "production tool call invocation identity is immutable")
+		})
+	}
+}
+
+func TestProductionRunsSQLiteMigrationFreezesInvocationIdentityThroughApprovedCompletion(t *testing.T) {
+	for _, mutation := range productionToolCallIdentityMutations() {
+		t.Run(mutation.name, func(t *testing.T) {
+			db := openProductionRunsSQLite(t)
+			seedProductionRunScopes(t, db)
+			insertProductionRun(t, db, "run-1", 1, "project-1", "document-1", "source-set-1", "version-1", "run-key-1")
+			insertProductionRun(t, db, "run-other", 1, "project-1", "document-1", "source-set-1", "version-1", "run-key-other")
+			insertProductionToolCall(t, db, "call-1", "run-1", "call-key-1", 0, 0)
+			_, err := db.Exec(`UPDATE production_tool_calls SET status = 'pending_approval', approval_status = 'pending', approval_requested_at = CURRENT_TIMESTAMP WHERE id = 'call-1'`)
+			require.NoError(t, err)
+			_, err = db.Exec(`UPDATE production_tool_calls SET status = 'approved', approval_status = 'approved', approved_by = 'reviewer-1', approved_at = CURRENT_TIMESTAMP WHERE id = 'call-1'`)
+			require.NoError(t, err)
+
+			_, err = db.Exec(`UPDATE production_tool_calls SET status = 'completed', response_snapshot = '{"ok":true}', response_digest = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', response_evidence_id = 'evidence-1', response_evidence_source_item_id = 'source-item-1', completed_at = CURRENT_TIMESTAMP, ` + mutation.assignment + ` WHERE id = 'call-1'`)
+			require.ErrorContains(t, err, "production tool call invocation identity is immutable")
+		})
+	}
+}
+
+func TestProductionRunsSQLiteMigrationRejectsFrozenInvocationReplace(t *testing.T) {
+	db := openProductionRunsSQLite(t)
+	seedProductionRunScopes(t, db)
+	insertProductionRun(t, db, "run-1", 1, "project-1", "document-1", "source-set-1", "version-1", "run-key-1")
+	insertProductionToolCall(t, db, "call-1", "run-1", "call-key-1", 0, 0)
+	_, err := db.Exec(`UPDATE production_tool_calls SET status = 'pending_approval', approval_status = 'pending', approval_requested_at = CURRENT_TIMESTAMP WHERE id = 'call-1'`)
+	require.NoError(t, err)
+
+	_, err = db.Exec(`INSERT OR REPLACE INTO production_tool_calls (id, run_id, tenant_id, project_id, document_id, source_set_id, attempt, current_step, idempotency_key, provider_type, provider_id, tool_name, request_snapshot, request_digest) VALUES ('call-replaced', 'run-1', 1, 'project-1', 'document-1', 'source-set-1', 0, 1, 'call-key-1', 'mcp', 'changed', 'changed', '{"changed":true}', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')`)
+	require.ErrorContains(t, err, "production tool call invocation identity is immutable")
+}
+
+func TestProductionRunsSQLiteMigrationRequiresExactPayloadDigestPairs(t *testing.T) {
+	db := openProductionRunsSQLite(t)
+	seedProductionRunScopes(t, db)
+
+	_, err := db.Exec(`INSERT INTO production_runs (id, tenant_id, project_id, document_id, source_set_id, run_type, model_id, document_type_snapshot, idempotency_key, raw_model_response) VALUES ('run-payload-only', 1, 'project-1', 'document-1', 'source-set-1', 'write', 'model-1', '{}', 'run-payload-only', '{"text":"value"}')`)
+	require.Error(t, err)
+	_, err = db.Exec(`INSERT INTO production_runs (id, tenant_id, project_id, document_id, source_set_id, run_type, model_id, document_type_snapshot, idempotency_key, raw_model_response_digest) VALUES ('run-digest-only', 1, 'project-1', 'document-1', 'source-set-1', 'write', 'model-1', '{}', 'run-digest-only', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')`)
+	require.Error(t, err)
+	_, err = db.Exec(`INSERT INTO production_runs (id, tenant_id, project_id, document_id, source_set_id, run_type, model_id, document_type_snapshot, idempotency_key, raw_model_response, raw_model_response_digest) VALUES ('run-valid-pair', 1, 'project-1', 'document-1', 'source-set-1', 'write', 'model-1', '{}', 'run-valid-pair', '{"text":"value"}', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')`)
+	require.NoError(t, err)
+
+	insertProductionRun(t, db, "run-1", 1, "project-1", "document-1", "source-set-1", "version-1", "run-key-1")
+	insertProductionToolCall(t, db, "call-payload-only", "run-1", "call-payload-only", 0, 0)
+	_, err = db.Exec(`UPDATE production_tool_calls SET response_snapshot = '{"ok":true}' WHERE id = 'call-payload-only'`)
+	require.Error(t, err)
+	insertProductionToolCall(t, db, "call-digest-only", "run-1", "call-digest-only", 0, 1)
+	_, err = db.Exec(`UPDATE production_tool_calls SET response_digest = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' WHERE id = 'call-digest-only'`)
+	require.Error(t, err)
+	insertProductionToolCall(t, db, "call-valid-pair", "run-1", "call-valid-pair", 0, 2)
+	_, err = db.Exec(`UPDATE production_tool_calls SET response_snapshot = '{"ok":true}', response_digest = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' WHERE id = 'call-valid-pair'`)
+	require.NoError(t, err)
+}
+
+func TestProductionRunsSQLiteMigrationFencesTerminalParentAndActiveChildren(t *testing.T) {
+	t.Run("terminal parent rejects insert", func(t *testing.T) {
+		db := openProductionRunsSQLite(t)
+		seedProductionRunScopes(t, db)
+		insertProductionRun(t, db, "run-1", 1, "project-1", "document-1", "source-set-1", "version-1", "run-key-1")
+		_, err := db.Exec(`UPDATE production_runs SET status = 'failed', completed_at = CURRENT_TIMESTAMP WHERE id = 'run-1'`)
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO production_tool_calls (id, run_id, tenant_id, project_id, document_id, source_set_id, attempt, current_step, idempotency_key, provider_type, provider_id, tool_name, request_snapshot, request_digest) VALUES ('call-late', 'run-1', 1, 'project-1', 'document-1', 'source-set-1', 0, 0, 'call-late', 'skill', 'writer', 'collect', '{}', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')`)
+		require.ErrorContains(t, err, "terminal production runs reject tool calls")
+	})
+
+	t.Run("call cannot advance after parent terminal", func(t *testing.T) {
+		db := openProductionRunsSQLite(t)
+		seedProductionRunScopes(t, db)
+		insertProductionRun(t, db, "run-1", 1, "project-1", "document-1", "source-set-1", "version-1", "run-key-1")
+		insertProductionToolCall(t, db, "call-1", "run-1", "call-key-1", 0, 0)
+		_, err := db.Exec(`UPDATE production_tool_calls SET status = 'completed', response_snapshot = '{"ok":true}', response_digest = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', response_evidence_id = 'evidence-1', response_evidence_source_item_id = 'source-item-1', completed_at = CURRENT_TIMESTAMP WHERE id = 'call-1'`)
+		require.NoError(t, err)
+		_, err = db.Exec(`UPDATE production_runs SET status = 'completed', output_version_id = 'version-1', completed_at = CURRENT_TIMESTAMP WHERE id = 'run-1'`)
+		require.NoError(t, err)
+		_, err = db.Exec(`UPDATE production_tool_calls SET updated_at = CURRENT_TIMESTAMP WHERE id = 'call-1'`)
+		require.ErrorContains(t, err, "terminal production runs reject tool calls")
+	})
+
+	for _, childStatus := range []string{"planned", "pending_approval", "approved", "executing"} {
+		t.Run("active child "+childStatus, func(t *testing.T) {
+			db := openProductionRunsSQLite(t)
+			seedProductionRunScopes(t, db)
+			insertProductionRun(t, db, "run-1", 1, "project-1", "document-1", "source-set-1", "version-1", "run-key-1")
+			insertProductionToolCall(t, db, "call-1", "run-1", "call-key-1", 0, 0)
+			setProductionToolCallStatus(t, db, "call-1", childStatus)
+			_, err := db.Exec(`UPDATE production_runs SET status = 'failed', completed_at = CURRENT_TIMESTAMP WHERE id = 'run-1'`)
+			require.ErrorContains(t, err, "active production tool calls prevent terminal run")
+		})
+	}
+
+	t.Run("all terminal children allow terminal run", func(t *testing.T) {
+		db := openProductionRunsSQLite(t)
+		seedProductionRunScopes(t, db)
+		insertProductionRun(t, db, "run-1", 1, "project-1", "document-1", "source-set-1", "version-1", "run-key-1")
+		insertProductionToolCall(t, db, "call-1", "run-1", "call-key-1", 0, 0)
+		setProductionToolCallStatus(t, db, "call-1", "completed")
+		_, err := db.Exec(`UPDATE production_runs SET status = 'failed', completed_at = CURRENT_TIMESTAMP WHERE id = 'run-1'`)
+		require.NoError(t, err)
+	})
 }
 
 func TestProductionRunsSQLiteMigrationEnforcesScopeAndIdempotency(t *testing.T) {
@@ -818,6 +970,56 @@ func seedProductionRunScopes(t *testing.T, db *sql.DB) {
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO production_evidence_snapshots (id, source_item_id, snapshot_type, inline_content, content_digest, redaction_metadata) VALUES ('evidence-1', 'source-item-1', 'tool_result', '{"ok":true}', 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', '{}'), ('evidence-2', 'source-item-2', 'tool_result', '{"ok":true}', 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd', '{}')`)
 	require.NoError(t, err)
+}
+
+type productionToolCallIdentityMutation struct {
+	name       string
+	assignment string
+}
+
+func productionToolCallIdentityMutations() []productionToolCallIdentityMutation {
+	return []productionToolCallIdentityMutation{
+		{name: "run id", assignment: "run_id = 'run-other'"},
+		{name: "tenant id", assignment: "tenant_id = 2"},
+		{name: "project id", assignment: "project_id = 'project-2'"},
+		{name: "document id", assignment: "document_id = 'document-2'"},
+		{name: "source set id", assignment: "source_set_id = 'source-set-2'"},
+		{name: "provider type", assignment: "provider_type = 'mcp'"},
+		{name: "provider id", assignment: "provider_id = 'changed-provider'"},
+		{name: "tool name", assignment: "tool_name = 'changed-tool'"},
+		{name: "request snapshot", assignment: `request_snapshot = '{"changed":true}'`},
+		{name: "request digest", assignment: "request_digest = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'"},
+		{name: "attempt", assignment: "attempt = 1"},
+		{name: "current step", assignment: "current_step = 1"},
+		{name: "idempotency key", assignment: "idempotency_key = 'changed-key'"},
+	}
+}
+
+func setProductionToolCallStatus(t *testing.T, db *sql.DB, callID, status string) {
+	t.Helper()
+
+	var statements []string
+	switch status {
+	case "planned":
+		return
+	case "pending_approval":
+		statements = []string{`UPDATE production_tool_calls SET status = 'pending_approval', approval_status = 'pending', approval_requested_at = CURRENT_TIMESTAMP WHERE id = ?`}
+	case "approved":
+		statements = []string{
+			`UPDATE production_tool_calls SET status = 'pending_approval', approval_status = 'pending', approval_requested_at = CURRENT_TIMESTAMP WHERE id = ?`,
+			`UPDATE production_tool_calls SET status = 'approved', approval_status = 'approved', approved_by = 'reviewer-1', approved_at = CURRENT_TIMESTAMP WHERE id = ?`,
+		}
+	case "executing":
+		statements = []string{`UPDATE production_tool_calls SET status = 'executing', started_at = CURRENT_TIMESTAMP WHERE id = ?`}
+	case "completed":
+		statements = []string{`UPDATE production_tool_calls SET status = 'completed', response_snapshot = '{"ok":true}', response_digest = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', response_evidence_id = 'evidence-1', response_evidence_source_item_id = 'source-item-1', completed_at = CURRENT_TIMESTAMP WHERE id = ?`}
+	default:
+		t.Fatalf("unsupported production tool call status %s", status)
+	}
+	for _, statement := range statements {
+		_, err := db.Exec(statement, callID)
+		require.NoError(t, err)
+	}
 }
 
 func insertProductionRun(t *testing.T, db *sql.DB, id string, tenantID int, projectID, documentID, sourceSetID, inputVersionID, idempotencyKey string) {
