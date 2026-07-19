@@ -130,6 +130,9 @@ CREATE INDEX IF NOT EXISTS idx_production_tool_calls_approval
 CREATE OR REPLACE FUNCTION guard_production_tool_call_invocation_identity()
 RETURNS TRIGGER AS $$
 BEGIN
+    IF NEW.id IS DISTINCT FROM OLD.id THEN
+        RAISE EXCEPTION 'production tool call invocation identity is immutable';
+    END IF;
     IF OLD.status <> 'planned' AND (
         NEW.run_id IS DISTINCT FROM OLD.run_id OR
         NEW.tenant_id IS DISTINCT FROM OLD.tenant_id OR

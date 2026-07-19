@@ -99,6 +99,7 @@ func TestProductionRunsPostgreSQLMigrationDeclaresEquivalentStructure(t *testing
 		"call.status IN ('planned', 'pending_approval', 'approved', 'executing')",
 		"raw_model_response IS NOT NULL AND raw_model_response_digest IS NOT NULL",
 		"response_snapshot IS NOT NULL AND response_digest IS NOT NULL",
+		"NEW.id IS DISTINCT FROM OLD.id",
 		"NEW.run_id IS DISTINCT FROM OLD.run_id",
 		"NEW.tenant_id IS DISTINCT FROM OLD.tenant_id",
 		"NEW.project_id IS DISTINCT FROM OLD.project_id",
@@ -134,6 +135,16 @@ func TestProductionRunsPostgreSQLMigrationDeclaresEquivalentStructure(t *testing
 	}
 	require.Less(t, strings.Index(down, "DROP TABLE IF EXISTS production_tool_calls"), strings.Index(down, "DROP TABLE IF EXISTS production_runs"))
 	require.Less(t, strings.Index(down, "DROP TABLE IF EXISTS production_runs"), strings.Index(down, "DROP INDEX IF EXISTS uq_production_document_versions_run_context"))
+}
+
+func TestProductionRunsSQLiteMigrationFreezesToolCallPrimaryKeyWhilePlanned(t *testing.T) {
+	db := openProductionRunsSQLite(t)
+	seedProductionRunScopes(t, db)
+	insertProductionRun(t, db, "run-1", 1, "project-1", "document-1", "source-set-1", "version-1", "run-key-1")
+	insertProductionToolCall(t, db, "call-1", "run-1", "call-key-1", 0, 0)
+
+	_, err := db.Exec(`UPDATE production_tool_calls SET id = 'call-changed' WHERE id = 'call-1'`)
+	require.ErrorContains(t, err, "production tool call invocation identity is immutable")
 }
 
 func TestProductionRunsSQLiteMigrationFreezesInvocationIdentityAfterApprovalRequested(t *testing.T) {
@@ -979,6 +990,7 @@ type productionToolCallIdentityMutation struct {
 
 func productionToolCallIdentityMutations() []productionToolCallIdentityMutation {
 	return []productionToolCallIdentityMutation{
+		{name: "id", assignment: "id = 'call-changed'"},
 		{name: "run id", assignment: "run_id = 'run-other'"},
 		{name: "tenant id", assignment: "tenant_id = 2"},
 		{name: "project id", assignment: "project_id = 'project-2'"},

@@ -133,20 +133,22 @@ CREATE INDEX IF NOT EXISTS idx_production_tool_calls_approval
 CREATE TRIGGER IF NOT EXISTS trg_production_tool_calls_guard_invocation_identity
     BEFORE UPDATE ON production_tool_calls
     FOR EACH ROW
-    WHEN OLD.status <> 'planned' AND (
-        NEW.run_id IS NOT OLD.run_id OR
-        NEW.tenant_id IS NOT OLD.tenant_id OR
-        NEW.project_id IS NOT OLD.project_id OR
-        NEW.document_id IS NOT OLD.document_id OR
-        NEW.source_set_id IS NOT OLD.source_set_id OR
-        NEW.provider_type IS NOT OLD.provider_type OR
-        NEW.provider_id IS NOT OLD.provider_id OR
-        NEW.tool_name IS NOT OLD.tool_name OR
-        NEW.request_snapshot IS NOT OLD.request_snapshot OR
-        NEW.request_digest IS NOT OLD.request_digest OR
-        NEW.attempt IS NOT OLD.attempt OR
-        NEW.current_step IS NOT OLD.current_step OR
-        NEW.idempotency_key IS NOT OLD.idempotency_key
+    WHEN NEW.id IS NOT OLD.id OR (
+        OLD.status <> 'planned' AND (
+            NEW.run_id IS NOT OLD.run_id OR
+            NEW.tenant_id IS NOT OLD.tenant_id OR
+            NEW.project_id IS NOT OLD.project_id OR
+            NEW.document_id IS NOT OLD.document_id OR
+            NEW.source_set_id IS NOT OLD.source_set_id OR
+            NEW.provider_type IS NOT OLD.provider_type OR
+            NEW.provider_id IS NOT OLD.provider_id OR
+            NEW.tool_name IS NOT OLD.tool_name OR
+            NEW.request_snapshot IS NOT OLD.request_snapshot OR
+            NEW.request_digest IS NOT OLD.request_digest OR
+            NEW.attempt IS NOT OLD.attempt OR
+            NEW.current_step IS NOT OLD.current_step OR
+            NEW.idempotency_key IS NOT OLD.idempotency_key
+        )
     )
 BEGIN
     SELECT RAISE(ABORT, 'production tool call invocation identity is immutable');
