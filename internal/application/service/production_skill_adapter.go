@@ -21,14 +21,15 @@ import (
 const productionSkillToolName = "load_instructions"
 
 var (
-	errProductionToolCallInvalid       = errors.New("production tool call is invalid")
-	errProductionToolScope             = errors.New("production tool call is outside its run scope")
-	errProductionSkillNotPreloaded     = errors.New("production skill is not preloaded")
-	errProductionSkillUnbound          = errors.New("production skill is not bound to the document type snapshot")
-	errProductionSkillDigestMismatch   = errors.New("production skill digest does not match the document type snapshot")
-	errProductionProviderExecution     = errors.New("production provider execution failed")
-	errProductionProviderOutputUnsafe  = errors.New("production provider output is unsafe")
-	errProductionProviderConfiguration = errors.New("production provider configuration is invalid")
+	errProductionToolCallInvalid        = errors.New("production tool call is invalid")
+	errProductionToolScope              = errors.New("production tool call is outside its run scope")
+	errProductionSkillNotPreloaded      = errors.New("production skill is not preloaded")
+	errProductionSkillUnbound           = errors.New("production skill is not bound to the document type snapshot")
+	errProductionSkillDigestMismatch    = errors.New("production skill digest does not match the document type snapshot")
+	errProductionProviderExecution      = errors.New("production provider execution failed")
+	errProductionProviderOutputUnsafe   = errors.New("production provider output is unsafe")
+	errProductionProviderConfiguration  = errors.New("production provider configuration is invalid")
+	errProductionProviderDigestMismatch = errors.New("production provider digest does not match the pinned request")
 )
 
 // ProductionToolAdapter is the deterministic boundary between durable tool

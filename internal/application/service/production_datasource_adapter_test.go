@@ -37,6 +37,38 @@ type fakeProductionConnector struct {
 	seenToken  string
 }
 
+type spyProductionConnectorRegistry struct {
+	connector datasource.Connector
+	calls     int
+}
+
+func (s *spyProductionConnectorRegistry) Get(string) (datasource.Connector, error) {
+	s.calls++
+	if s.connector == nil {
+		return nil, datasource.ErrConnectorNotFound
+	}
+	return s.connector, nil
+}
+
+func dataSourceRequestSnapshot(t *testing.T, sourceItemID string, resourceIDs []string, parentID, providerDigest string) types.JSON {
+	t.Helper()
+	request := map[string]any{"source_item_id": sourceItemID}
+	if len(resourceIDs) > 0 {
+		request["resource_ids"] = resourceIDs
+	}
+	if parentID != "" {
+		request["parent_id"] = parentID
+	}
+	if providerDigest != "" {
+		request["provider_digest"] = providerDigest
+	}
+	raw, err := json.Marshal(request)
+	require.NoError(t, err)
+	canonical, err := types.CanonicalProductionJSON(raw)
+	require.NoError(t, err)
+	return canonical
+}
+
 func (f *fakeProductionConnector) Type() string { return types.ConnectorTypeNotion }
 func (f *fakeProductionConnector) Validate(context.Context, *types.DataSourceConfig) error {
 	return nil
@@ -79,9 +111,11 @@ func dataSourceAdapterFixture(t *testing.T, connector *fakeProductionConnector) 
 		set:      &types.ProductionSourceSet{ID: adapterSourceSetID, TenantID: 7, ProjectID: adapterProjectID},
 		evidence: make(map[string]*types.ProductionEvidenceSnapshot),
 	}
-	request := types.JSON(`{"source_item_id":"` + adapterSourceItemID + `","resource_ids":["resource-b","resource-a"]}`)
-	request, err = types.CanonicalProductionJSON(request)
+	configDigest := adapterDigest(config)
+	descriptor, err := types.CanonicalProductionJSON(types.JSON(`{"config_digest":"` + configDigest + `","connector_type":"notion","datasource_id":"` + adapterDataSourceID + `"}`))
 	require.NoError(t, err)
+	providerDigest := adapterDigest(descriptor)
+	request := dataSourceRequestSnapshot(t, adapterSourceItemID, []string{"resource-b", "resource-a"}, "", providerDigest)
 	call := &types.ProductionToolCall{
 		ID: adapterCallID, RunID: adapterRunID, TenantID: 7, ProjectID: adapterProjectID,
 		DocumentID: adapterDocumentID, SourceSetID: adapterSourceSetID, Attempt: 2, CurrentStep: 3,
@@ -89,8 +123,7 @@ func dataSourceAdapterFixture(t *testing.T, connector *fakeProductionConnector) 
 		ToolName: productionDataSourceFetchToolName, RequestSnapshot: request, RequestDigest: adapterDigest(request),
 		Status: types.ProductionToolCallExecuting,
 	}
-	registry := datasource.NewConnectorRegistry()
-	require.NoError(t, registry.Register(connector))
+	registry := &spyProductionConnectorRegistry{connector: connector}
 	adapter := NewProductionDataSourceAdapter(
 		&fakeProductionDataSourceService{dataSource: &types.DataSource{
 			ID: adapterDataSourceID, TenantID: 7, Type: types.ConnectorTypeNotion, Config: config,
@@ -113,10 +146,60 @@ func TestProductionDataSourceAdapterPlanIsSideEffectFreeAndCredentialFree(t *tes
 	require.NoError(t, err)
 	require.Zero(t, connector.fetchCalls)
 	require.Zero(t, connector.listCalls)
-	require.Zero(t, dataSources.calls)
+	require.Equal(t, 1, dataSources.calls)
+	require.Zero(t, adapter.registry.(*spyProductionConnectorRegistry).calls)
 	require.NotContains(t, string(plan.Canonical), "credential-value")
 	require.NotContains(t, string(plan.Canonical), "access_token")
 	require.Equal(t, adapterDigest(plan.Canonical), plan.Digest)
+}
+
+func TestProductionDataSourceAdapterPlanDigestPinsExecuteAndEvidence(t *testing.T) {
+	connector := &fakeProductionConnector{fetch: []types.FetchedItem{{ExternalID: "doc", Title: "stable"}}}
+	adapter, call, _ := dataSourceAdapterFixture(t, connector)
+	planningRequest := dataSourceRequestSnapshot(t, adapterSourceItemID, []string{"resource-b", "resource-a"}, "", "")
+	call.Status, call.RequestSnapshot, call.RequestDigest = types.ProductionToolCallPlanned, planningRequest, adapterDigest(planningRequest)
+
+	plan, err := adapter.Plan(context.Background(), call)
+	require.NoError(t, err)
+	require.NotEmpty(t, plan.ProviderDigest)
+
+	executeRequest := dataSourceRequestSnapshot(t, adapterSourceItemID, []string{"resource-b", "resource-a"}, "", plan.ProviderDigest)
+	call.Status, call.RequestSnapshot, call.RequestDigest = types.ProductionToolCallExecuting, executeRequest, adapterDigest(executeRequest)
+	result, err := adapter.Execute(context.Background(), call)
+	require.NoError(t, err)
+	require.Equal(t, plan.ProviderDigest, result.ProviderDigest)
+	var metadata map[string]any
+	require.NoError(t, json.Unmarshal(result.Evidence.RedactionMetadata, &metadata))
+	require.Equal(t, plan.ProviderDigest, metadata["provider_digest"])
+}
+
+func TestProductionDataSourceAdapterRejectsPinnedProviderMutationBeforeRegistryProviderOrEvidence(t *testing.T) {
+	mutations := map[string]func(*types.DataSource){
+		"encrypted config": func(ds *types.DataSource) { ds.Config = types.JSON(`{"credentials":{"token":"enc:v1:changed"}}`) },
+		"configured roots": func(ds *types.DataSource) { ds.Config = types.JSON(`{"type":"notion","resource_ids":["other-root"]}`) },
+		"provider type":    func(ds *types.DataSource) { ds.Type = types.ConnectorTypeFeishu },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			connector := &fakeProductionConnector{}
+			adapter, call, _ := dataSourceAdapterFixture(t, connector)
+			planningRequest := dataSourceRequestSnapshot(t, adapterSourceItemID, []string{"resource-b", "resource-a"}, "", "")
+			call.Status, call.RequestSnapshot, call.RequestDigest = types.ProductionToolCallPlanned, planningRequest, adapterDigest(planningRequest)
+			plan, err := adapter.Plan(context.Background(), call)
+			require.NoError(t, err)
+
+			executeRequest := dataSourceRequestSnapshot(t, adapterSourceItemID, []string{"resource-b", "resource-a"}, "", plan.ProviderDigest)
+			call.Status, call.RequestSnapshot, call.RequestDigest = types.ProductionToolCallExecuting, executeRequest, adapterDigest(executeRequest)
+			dataSources := adapter.dataSources.(*fakeProductionDataSourceService)
+			mutate(dataSources.dataSource)
+			_, err = adapter.Execute(context.Background(), call)
+			require.ErrorIs(t, err, errProductionProviderDigestMismatch)
+			require.Zero(t, adapter.registry.(*spyProductionConnectorRegistry).calls)
+			require.Zero(t, connector.fetchCalls)
+			require.Zero(t, connector.listCalls)
+			require.Zero(t, adapter.evidence.(*fakeProductionEvidenceService).attachCalls)
+		})
+	}
 }
 
 func TestProductionDataSourceAdapterRecursivelyRedactsSecretKeys(t *testing.T) {
@@ -130,9 +213,8 @@ func TestProductionDataSourceAdapterRecursivelyRedactsSecretKeys(t *testing.T) {
 	}}}
 	adapter, call, _ := dataSourceAdapterFixture(t, connector)
 	call.ToolName = productionDataSourceListToolName
-	request := types.JSON(`{"parent_id":"resource-a","source_item_id":"` + adapterSourceItemID + `"}`)
-	request, err := types.CanonicalProductionJSON(request)
-	require.NoError(t, err)
+	pinned := callProviderDigest(t, call)
+	request := dataSourceRequestSnapshot(t, adapterSourceItemID, nil, "resource-a", pinned)
 	call.RequestSnapshot, call.RequestDigest = request, adapterDigest(request)
 
 	result, err := adapter.Execute(context.Background(), call)
@@ -185,17 +267,14 @@ func TestProductionDataSourceAdapterListRestrictsParentToConfiguredRoots(t *test
 	connector := &fakeProductionConnector{}
 	adapter, call, _ := dataSourceAdapterFixture(t, connector)
 	call.ToolName = productionDataSourceListToolName
-	request := types.JSON(`{"parent_id":"other-root","source_item_id":"` + adapterSourceItemID + `"}`)
-	request, err := types.CanonicalProductionJSON(request)
-	require.NoError(t, err)
+	pinned := callProviderDigest(t, call)
+	request := dataSourceRequestSnapshot(t, adapterSourceItemID, nil, "other-root", pinned)
 	call.RequestSnapshot, call.RequestDigest = request, adapterDigest(request)
-	_, err = adapter.Execute(context.Background(), call)
+	_, err := adapter.Execute(context.Background(), call)
 	require.ErrorIs(t, err, errProductionToolScope)
 	require.Zero(t, connector.listCalls)
 
-	request = types.JSON(`{"parent_id":"resource-a","source_item_id":"` + adapterSourceItemID + `"}`)
-	request, err = types.CanonicalProductionJSON(request)
-	require.NoError(t, err)
+	request = dataSourceRequestSnapshot(t, adapterSourceItemID, nil, "resource-a", pinned)
 	call.RequestSnapshot, call.RequestDigest = request, adapterDigest(request)
 	_, err = adapter.Execute(context.Background(), call)
 	require.NoError(t, err)
@@ -212,15 +291,37 @@ func TestProductionDataSourceAdapterNormalizesOutputAndRetryIdentityDeterministi
 
 	first, err := adapter.Execute(context.Background(), call)
 	require.NoError(t, err)
+	dataSourceCalls := adapter.dataSources.(*fakeProductionDataSourceService).calls
+	adapter.dataSources.(*fakeProductionDataSourceService).dataSource.Config = types.JSON(`{"changed":true}`)
 	connector.fetch = []types.FetchedItem{{ExternalID: "changed", Title: "Provider changed"}}
 	second, err := adapter.Execute(context.Background(), call)
 	require.NoError(t, err)
 	require.Equal(t, first, second)
 	require.Equal(t, 1, connector.fetchCalls)
+	require.Equal(t, dataSourceCalls, adapter.dataSources.(*fakeProductionDataSourceService).calls)
 	require.Equal(t, adapterDigest(first.Evidence.InlineContent), first.Evidence.ContentDigest)
 	require.Equal(t, first.ResponseDigest, adapterDigest(first.ResponseSnapshot))
 	require.NotEmpty(t, first.ProviderDigest)
 	require.Equal(t, adapterCallID, first.ToolCallID)
+}
+
+func callProviderDigest(t *testing.T, call *types.ProductionToolCall) string {
+	t.Helper()
+	var request productionDataSourceRequest
+	require.NoError(t, json.Unmarshal(call.RequestSnapshot, &request))
+	return request.ProviderDigest
+}
+
+func pinProductionDataSourceCall(t *testing.T, adapter *ProductionDataSourceAdapter, call *types.ProductionToolCall) {
+	t.Helper()
+	var request productionDataSourceRequest
+	require.NoError(t, json.Unmarshal(call.RequestSnapshot, &request))
+	planning := dataSourceRequestSnapshot(t, request.SourceItemID, request.ResourceIDs, request.ParentID, "")
+	call.Status, call.RequestSnapshot, call.RequestDigest = types.ProductionToolCallPlanned, planning, adapterDigest(planning)
+	plan, err := adapter.Plan(context.Background(), call)
+	require.NoError(t, err)
+	executing := dataSourceRequestSnapshot(t, request.SourceItemID, request.ResourceIDs, request.ParentID, plan.ProviderDigest)
+	call.Status, call.RequestSnapshot, call.RequestDigest = types.ProductionToolCallExecuting, executing, adapterDigest(executing)
 }
 
 func TestProductionDataSourceAdapterSecretValuePolicyAvoidsShortSubstringFalsePositive(t *testing.T) {
@@ -235,6 +336,7 @@ func TestProductionDataSourceAdapterSecretValuePolicyAvoidsShortSubstringFalsePo
 	adapter.dataSources = &fakeProductionDataSourceService{dataSource: &types.DataSource{
 		ID: adapterDataSourceID, TenantID: 7, Type: types.ConnectorTypeNotion, Config: raw,
 	}}
+	pinProductionDataSourceCall(t, adapter, call)
 	_, err = adapter.Execute(context.Background(), call)
 	require.NoError(t, err)
 
@@ -247,6 +349,7 @@ func TestProductionDataSourceAdapterSecretValuePolicyAvoidsShortSubstringFalsePo
 	}}
 	connector.fetch = []types.FetchedItem{{ExternalID: "doc", URL: "https://example.test/?key=" + longToken}}
 	call.ID = "10000000-0000-4000-8000-000000000008"
+	pinProductionDataSourceCall(t, adapter, call)
 	_, err = adapter.Execute(context.Background(), call)
 	require.ErrorIs(t, err, errProductionProviderOutputUnsafe)
 }

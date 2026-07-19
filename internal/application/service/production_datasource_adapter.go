@@ -23,18 +23,22 @@ type productionDataSourceResolver interface {
 	GetDataSource(ctx context.Context, id string) (*types.DataSource, error)
 }
 
+type productionConnectorRegistry interface {
+	Get(connectorType string) (datasource.Connector, error)
+}
+
 // ProductionDataSourceAdapter resolves stored credentials only for the live
 // connector call. Plans, results and evidence contain no DataSource.Config.
 type ProductionDataSourceAdapter struct {
 	dataSources productionDataSourceResolver
-	registry    *datasource.ConnectorRegistry
+	registry    productionConnectorRegistry
 	scope       productionToolScope
 	evidence    productionToolEvidenceService
 }
 
 func NewProductionDataSourceAdapter(
 	dataSources productionDataSourceResolver,
-	registry *datasource.ConnectorRegistry,
+	registry productionConnectorRegistry,
 	runs productionToolRunResolver,
 	sources productionToolSourceResolver,
 	evidence productionToolEvidenceService,
@@ -47,9 +51,10 @@ func NewProductionDataSourceAdapter(
 }
 
 type productionDataSourceRequest struct {
-	SourceItemID string   `json:"source_item_id"`
-	ResourceIDs  []string `json:"resource_ids,omitempty"`
-	ParentID     string   `json:"parent_id,omitempty"`
+	SourceItemID   string   `json:"source_item_id"`
+	ResourceIDs    []string `json:"resource_ids,omitempty"`
+	ParentID       string   `json:"parent_id,omitempty"`
+	ProviderDigest string   `json:"provider_digest,omitempty"`
 }
 
 type productionDataSourcePrepared struct {
@@ -64,7 +69,7 @@ type productionDataSourcePrepared struct {
 }
 
 func (a *ProductionDataSourceAdapter) Plan(ctx context.Context, call *types.ProductionToolCall) (*ProductionToolPlan, error) {
-	plan, _, _, err := a.plan(ctx, call, types.ProductionToolCallPlanned)
+	plan, _, _, err := a.plan(ctx, call, types.ProductionToolCallPlanned, true)
 	if err != nil {
 		return nil, err
 	}
@@ -72,7 +77,7 @@ func (a *ProductionDataSourceAdapter) Plan(ctx context.Context, call *types.Prod
 }
 
 func (a *ProductionDataSourceAdapter) Execute(ctx context.Context, call *types.ProductionToolCall) (*ProductionToolResult, error) {
-	plan, request, item, err := a.plan(ctx, call, types.ProductionToolCallExecuting)
+	plan, request, item, err := a.plan(ctx, call, types.ProductionToolCallExecuting, false)
 	if err != nil {
 		return nil, err
 	}
@@ -134,6 +139,7 @@ func (a *ProductionDataSourceAdapter) plan(
 	ctx context.Context,
 	call *types.ProductionToolCall,
 	status types.ProductionToolCallStatus,
+	resolveProvider bool,
 ) (*ProductionToolPlan, productionDataSourceRequest, *types.ProductionSourceItem, error) {
 	var request productionDataSourceRequest
 	if a == nil || a.scope.runs == nil || a.scope.sources == nil {
@@ -156,13 +162,23 @@ func (a *ProductionDataSourceAdapter) plan(
 	if err != nil || item.ExternalID != call.ProviderID {
 		return nil, request, nil, errProductionToolScope
 	}
-	descriptor, err := canonicalProductionValue(map[string]any{
-		"datasource_id": call.ProviderID, "provider_type": call.ProviderType,
-	})
-	if err != nil {
+	providerDigest := request.ProviderDigest
+	if resolveProvider {
+		dataSource, err := a.resolveDataSource(ctx, call, item)
+		if err != nil {
+			return nil, request, nil, err
+		}
+		providerDigest, err = productionDataSourceProviderDigest(dataSource)
+		if err != nil {
+			return nil, request, nil, errProductionProviderConfiguration
+		}
+		if request.ProviderDigest != "" && request.ProviderDigest != providerDigest {
+			return nil, request, nil, errProductionProviderDigestMismatch
+		}
+	} else if !canonicalProductionSHA256(providerDigest) {
 		return nil, request, nil, errProductionToolCallInvalid
 	}
-	plan, err := newProductionToolPlan(call, productionToolDigest(descriptor))
+	plan, err := newProductionToolPlan(call, providerDigest)
 	return plan, request, item, err
 }
 
@@ -183,7 +199,7 @@ func (a *ProductionDataSourceAdapter) persistedResult(
 		evidenceSet.ID != call.SourceSetID || evidenceSet.TenantID != call.TenantID || evidenceSet.ProjectID != call.ProjectID {
 		return nil, false, types.ErrProductionEvidenceConflict
 	}
-	result, err := productionToolResultFromEvidence(call, plan, evidence, "")
+	result, err := productionToolResultFromEvidence(call, plan, evidence, plan.ProviderDigest)
 	return result, err == nil, err
 }
 
@@ -191,16 +207,22 @@ func (a *ProductionDataSourceAdapter) prepare(ctx context.Context, call *types.P
 	if a == nil || a.dataSources == nil || a.registry == nil || a.evidence == nil {
 		return nil, errProductionProviderConfiguration
 	}
-	plan, request, item, err := a.plan(ctx, call, types.ProductionToolCallExecuting)
+	plan, request, item, err := a.plan(ctx, call, types.ProductionToolCallExecuting, false)
 	if err != nil {
 		return nil, err
 	}
-	dataSource, err := a.dataSources.GetDataSource(ctx, call.ProviderID)
+	dataSource, err := a.resolveDataSource(ctx, call, item)
+	if err != nil {
+		return nil, err
+	}
+	providerDigest, err := productionDataSourceProviderDigest(dataSource)
 	if err != nil {
 		return nil, errProductionProviderConfiguration
 	}
-	if dataSource == nil || dataSource.ID != call.ProviderID || dataSource.TenantID != call.TenantID ||
-		strings.TrimSpace(dataSource.Type) == "" || item.SourceSystem != dataSource.Type {
+	if providerDigest != request.ProviderDigest {
+		return nil, errProductionProviderDigestMismatch
+	}
+	if item.SourceSystem != dataSource.Type {
 		return nil, errProductionToolScope
 	}
 	config, err := dataSource.ParseConfig()
@@ -215,24 +237,48 @@ func (a *ProductionDataSourceAdapter) prepare(ctx context.Context, call *types.P
 		return nil, err
 	}
 	credentialValues := productionCredentialValues(config.Credentials)
-	providerDescriptor, redactedCount, err := redactProductionSecrets(map[string]any{
-		"connector_type": config.Type,
-		"datasource_id":  dataSource.ID,
-		"resource_ids":   sortedProductionStrings(config.ResourceIDs),
-		"settings":       config.Settings,
-	})
-	if err != nil || containsProductionCredentialValue(providerDescriptor, credentialValues) {
-		return nil, errProductionProviderConfiguration
-	}
-	providerCanonical, err := canonicalProductionValue(providerDescriptor)
+	_, redactedCount, err := redactProductionSecrets(config.Settings)
 	if err != nil {
 		return nil, errProductionProviderConfiguration
 	}
 	return &productionDataSourcePrepared{
 		plan: plan, request: request, connector: connector, config: config,
 		credentialValues: credentialValues, providerRedactedCount: redactedCount,
-		providerDigest: productionToolDigest(providerCanonical), item: item,
+		providerDigest: request.ProviderDigest, item: item,
 	}, nil
+}
+
+func (a *ProductionDataSourceAdapter) resolveDataSource(
+	ctx context.Context,
+	call *types.ProductionToolCall,
+	item *types.ProductionSourceItem,
+) (*types.DataSource, error) {
+	if a.dataSources == nil {
+		return nil, errProductionProviderConfiguration
+	}
+	dataSource, err := a.dataSources.GetDataSource(ctx, call.ProviderID)
+	if err != nil {
+		return nil, errProductionProviderConfiguration
+	}
+	if dataSource == nil || dataSource.ID != call.ProviderID || dataSource.TenantID != call.TenantID || strings.TrimSpace(dataSource.Type) == "" {
+		return nil, errProductionToolScope
+	}
+	return dataSource, nil
+}
+
+func productionDataSourceProviderDigest(dataSource *types.DataSource) (string, error) {
+	if dataSource == nil || !canonicalProductionUUID(dataSource.ID) || strings.TrimSpace(dataSource.Type) == "" {
+		return "", errProductionProviderConfiguration
+	}
+	descriptor, err := canonicalProductionValue(map[string]any{
+		"config_digest":  productionToolDigest(dataSource.Config),
+		"connector_type": dataSource.Type,
+		"datasource_id":  dataSource.ID,
+	})
+	if err != nil {
+		return "", err
+	}
+	return productionToolDigest(descriptor), nil
 }
 
 func validateProductionDataSourceRequestShape(toolName string, request productionDataSourceRequest) error {
