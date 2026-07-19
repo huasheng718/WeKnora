@@ -232,6 +232,57 @@ func TestProductionSourceServiceCanonicalizesInlineEvidenceAndComputesSHA256(t *
 	require.Equal(t, snapshot.ContentDigest, persisted.ContentDigest)
 }
 
+func TestProductionSourceServiceDeterministicEvidenceIsIdempotentAndConflictsOnMismatch(t *testing.T) {
+	svc, repo, db, _, _ := newProductionSourceServiceFixture(t)
+	createServiceSourceSet(t, repo, types.ProductionSourceSetCollecting)
+	createServiceSourceItem(t, repo, types.ProductionSourceItemAccepted)
+	evidenceID := "55555555-5555-4555-8555-555555555555"
+	input := interfaces.CreateEvidenceSnapshotInput{
+		EvidenceID: evidenceID, SnapshotType: types.ProductionEvidenceSnapshotToolResult,
+		InlineContent:     types.JSON(`{"result":"stable"}`),
+		RedactionMetadata: types.JSON(`{"provider_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`),
+		CapturedByRunID:   "66666666-6666-4666-8666-666666666666",
+	}
+
+	first, err := svc.AttachEvidence(sourceServiceContext(7), serviceItemID, input)
+	require.NoError(t, err)
+	second, err := svc.AttachEvidence(sourceServiceContext(7), serviceItemID, input)
+	require.NoError(t, err)
+	require.Equal(t, first, second)
+	require.Equal(t, evidenceID, first.ID)
+
+	var count int64
+	require.NoError(t, db.Model(&types.ProductionEvidenceSnapshot{}).Where("id = ?", evidenceID).Count(&count).Error)
+	require.Equal(t, int64(1), count)
+
+	input.InlineContent = types.JSON(`{"result":"changed"}`)
+	_, err = svc.AttachEvidence(sourceServiceContext(7), serviceItemID, input)
+	require.ErrorIs(t, err, types.ErrProductionEvidenceConflict)
+	var persisted types.ProductionEvidenceSnapshot
+	require.NoError(t, db.First(&persisted, "id = ?", evidenceID).Error)
+	require.Equal(t, first.InlineContent, persisted.InlineContent)
+}
+
+func TestProductionSourceServiceGetEvidenceReturnsTenantScopedContext(t *testing.T) {
+	svc, repo, _, _, _ := newProductionSourceServiceFixture(t)
+	createServiceSourceSet(t, repo, types.ProductionSourceSetCollecting)
+	createServiceSourceItem(t, repo, types.ProductionSourceItemAccepted)
+	evidenceID := "55555555-5555-4555-8555-555555555555"
+	_, err := svc.AttachEvidence(sourceServiceContext(7), serviceItemID, interfaces.CreateEvidenceSnapshotInput{
+		EvidenceID: evidenceID, SnapshotType: types.ProductionEvidenceSnapshotJSON, InlineContent: types.JSON(`{"ok":true}`),
+	})
+	require.NoError(t, err)
+
+	evidence, item, set, err := svc.GetEvidence(sourceServiceContext(7), evidenceID)
+	require.NoError(t, err)
+	require.Equal(t, evidenceID, evidence.ID)
+	require.Equal(t, serviceItemID, item.ID)
+	require.Equal(t, serviceSetID, set.ID)
+
+	_, _, _, err = svc.GetEvidence(sourceServiceContext(8), evidenceID)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+}
+
 func TestProductionSourceServiceCanonicalizesInlineEvidenceNumbersExactly(t *testing.T) {
 	svc, repo, _, _, _ := newProductionSourceServiceFixture(t)
 	createServiceSourceSet(t, repo, types.ProductionSourceSetCollecting)

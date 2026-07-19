@@ -10,11 +10,12 @@ import (
 	"io"
 	"strconv"
 	"strings"
-	"unicode"
 
 	"github.com/Tencent/WeKnora/internal/agent/skills"
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 const productionSkillToolName = "load_instructions"
@@ -68,6 +69,11 @@ type productionToolRunResolver interface {
 
 type productionToolSourceResolver interface {
 	GetItem(ctx context.Context, tenantID uint64, itemID string) (*types.ProductionSourceItem, *types.ProductionSourceSet, error)
+	GetEvidence(ctx context.Context, tenantID uint64, evidenceID string) (*types.ProductionEvidenceSnapshot, *types.ProductionSourceItem, *types.ProductionSourceSet, error)
+}
+
+type productionToolEvidenceService interface {
+	AttachEvidence(ctx context.Context, itemID string, evidence interfaces.CreateEvidenceSnapshotInput) (*types.ProductionEvidenceSnapshot, error)
 }
 
 type productionSkillRuntime interface {
@@ -87,9 +93,10 @@ type productionToolScope struct {
 // ProductionSkillAdapter exposes only preloaded, snapshot-bound Skill
 // instructions. It never executes Skill scripts.
 type ProductionSkillAdapter struct {
-	runtime productionSkillRuntime
-	catalog productionSkillCatalog
-	scope   productionToolScope
+	runtime  productionSkillRuntime
+	catalog  productionSkillCatalog
+	scope    productionToolScope
+	evidence productionToolEvidenceService
 }
 
 func NewProductionSkillAdapter(
@@ -97,11 +104,13 @@ func NewProductionSkillAdapter(
 	catalog productionSkillCatalog,
 	runs productionToolRunResolver,
 	sources productionToolSourceResolver,
+	evidence productionToolEvidenceService,
 ) *ProductionSkillAdapter {
 	return &ProductionSkillAdapter{
-		runtime: runtime,
-		catalog: catalog,
-		scope:   productionToolScope{runs: runs, sources: sources},
+		runtime:  runtime,
+		catalog:  catalog,
+		scope:    productionToolScope{runs: runs, sources: sources},
+		evidence: evidence,
 	}
 }
 
@@ -117,14 +126,21 @@ type productionSkillPrepared struct {
 }
 
 func (a *ProductionSkillAdapter) Plan(ctx context.Context, call *types.ProductionToolCall) (*ProductionToolPlan, error) {
-	prepared, err := a.prepare(ctx, call)
+	plan, _, _, err := a.plan(ctx, call, types.ProductionToolCallPlanned)
 	if err != nil {
 		return nil, err
 	}
-	return prepared.plan, nil
+	return plan, nil
 }
 
 func (a *ProductionSkillAdapter) Execute(ctx context.Context, call *types.ProductionToolCall) (*ProductionToolResult, error) {
+	plan, item, pinnedDigest, err := a.plan(ctx, call, types.ProductionToolCallExecuting)
+	if err != nil {
+		return nil, err
+	}
+	if result, found, err := a.persistedResult(ctx, call, plan, item, pinnedDigest); err != nil || found {
+		return result, err
+	}
 	prepared, err := a.prepare(ctx, call)
 	if err != nil {
 		return nil, err
@@ -138,32 +154,74 @@ func (a *ProductionSkillAdapter) Execute(ctx context.Context, call *types.Produc
 	if err != nil {
 		return nil, errProductionProviderOutputUnsafe
 	}
-	evidence := newProductionToolEvidence(call, prepared.item.ID, prepared.content, metadata)
-	response, err := canonicalProductionResponse(prepared.content, prepared.digest, metadata, evidence)
+	evidenceID := productionToolEvidenceID(call)
+	persisted, err := a.evidence.AttachEvidence(ctx, prepared.item.ID, interfaces.CreateEvidenceSnapshotInput{
+		EvidenceID: evidenceID, SnapshotType: types.ProductionEvidenceSnapshotToolResult,
+		InlineContent: prepared.content, ContentDigest: productionToolDigest(prepared.content),
+		RedactionMetadata: metadata, CapturedByRunID: call.RunID,
+	})
 	if err != nil {
-		return nil, errProductionProviderOutputUnsafe
+		return nil, err
 	}
-	return &ProductionToolResult{
-		ToolCallID: call.ID, PlanDigest: prepared.plan.Digest,
-		ResponseSnapshot: response, ResponseDigest: productionToolDigest(response),
-		ProviderDigest: prepared.digest, RedactionMetadata: metadata, Evidence: evidence,
-	}, nil
+	return productionToolResultFromEvidence(call, plan, persisted, prepared.digest)
 }
 
-func (a *ProductionSkillAdapter) prepare(ctx context.Context, call *types.ProductionToolCall) (*productionSkillPrepared, error) {
-	if a == nil || a.runtime == nil || a.catalog == nil {
-		return nil, errProductionProviderConfiguration
+func (a *ProductionSkillAdapter) plan(
+	ctx context.Context,
+	call *types.ProductionToolCall,
+	status types.ProductionToolCallStatus,
+) (*ProductionToolPlan, *types.ProductionSourceItem, string, error) {
+	if a == nil || a.scope.runs == nil || a.scope.sources == nil {
+		return nil, nil, "", errProductionProviderConfiguration
 	}
-	if err := validateProductionToolCall(call, types.ProductionToolProviderSkill, productionSkillToolName); err != nil {
-		return nil, err
+	if err := validateProductionToolCall(call, types.ProductionToolProviderSkill, status, productionSkillToolName); err != nil {
+		return nil, nil, "", err
 	}
 	var request productionSkillRequest
 	if err := decodeProductionToolRequest(call, &request); err != nil || !canonicalProductionUUID(request.SourceItemID) {
-		return nil, errProductionToolCallInvalid
+		return nil, nil, "", errProductionToolCallInvalid
 	}
 	run, item, _, err := a.scope.resolve(ctx, call, request.SourceItemID, types.ProductionSourceKindSkill)
 	if err != nil || item.ExternalID != call.ProviderID {
-		return nil, errProductionToolScope
+		return nil, nil, "", errProductionToolScope
+	}
+	pinnedDigest, err := pinnedProductionSkillDigest(run.DocumentTypeSnapshot, call.ProviderID)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	plan, err := newProductionToolPlan(call, pinnedDigest)
+	return plan, item, pinnedDigest, err
+}
+
+func (a *ProductionSkillAdapter) persistedResult(
+	ctx context.Context,
+	call *types.ProductionToolCall,
+	plan *ProductionToolPlan,
+	item *types.ProductionSourceItem,
+	providerDigest string,
+) (*ProductionToolResult, bool, error) {
+	evidence, evidenceItem, evidenceSet, err := a.scope.sources.GetEvidence(ctx, call.TenantID, productionToolEvidenceID(call))
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if evidenceItem == nil || evidenceSet == nil || evidenceItem.ID != item.ID || evidenceItem.SourceSetID != call.SourceSetID ||
+		evidenceSet.ID != call.SourceSetID || evidenceSet.TenantID != call.TenantID || evidenceSet.ProjectID != call.ProjectID {
+		return nil, false, types.ErrProductionEvidenceConflict
+	}
+	result, err := productionToolResultFromEvidence(call, plan, evidence, providerDigest)
+	return result, err == nil, err
+}
+
+func (a *ProductionSkillAdapter) prepare(ctx context.Context, call *types.ProductionToolCall) (*productionSkillPrepared, error) {
+	if a == nil || a.runtime == nil || a.catalog == nil || a.evidence == nil {
+		return nil, errProductionProviderConfiguration
+	}
+	plan, item, pinnedDigest, err := a.plan(ctx, call, types.ProductionToolCallExecuting)
+	if err != nil {
+		return nil, err
 	}
 	preloaded, err := a.catalog.ListPreloadedSkills(ctx)
 	if err != nil {
@@ -178,10 +236,6 @@ func (a *ProductionSkillAdapter) prepare(ctx context.Context, call *types.Produc
 	}
 	if !found {
 		return nil, errProductionSkillNotPreloaded
-	}
-	pinnedDigest, err := pinnedProductionSkillDigest(run.DocumentTypeSnapshot, call.ProviderID)
-	if err != nil {
-		return nil, err
 	}
 	catalogSkill, err := a.catalog.GetSkillByName(ctx, call.ProviderID)
 	if err != nil || catalogSkill == nil || catalogSkill.Name != call.ProviderID {
@@ -198,10 +252,6 @@ func (a *ProductionSkillAdapter) prepare(ctx context.Context, call *types.Produc
 	liveContent, liveDigest, err := canonicalProductionSkill(liveSkill)
 	if err != nil || liveDigest != pinnedDigest || !bytes.Equal(liveContent, catalogContent) {
 		return nil, errProductionSkillDigestMismatch
-	}
-	plan, err := newProductionToolPlan(call, liveDigest)
-	if err != nil {
-		return nil, errProductionToolCallInvalid
 	}
 	return &productionSkillPrepared{plan: plan, content: liveContent, digest: liveDigest, item: item}, nil
 }
@@ -222,58 +272,35 @@ func canonicalProductionSkill(skill *skills.Skill) (types.JSON, string, error) {
 }
 
 func pinnedProductionSkillDigest(snapshot types.JSON, name string) (string, error) {
-	var root map[string]any
-	if err := decodeProductionJSON(snapshot, &root, false); err != nil {
+	var root struct {
+		SkillBindings json.RawMessage `json:"skill_bindings"`
+	}
+	if err := decodeProductionJSON(snapshot, &root, false); err != nil || len(root.SkillBindings) == 0 {
 		return "", errProductionSkillUnbound
 	}
-	bindings, ok := root["skill_bindings"]
-	if !ok {
+	var bindings struct {
+		Version int `json:"version"`
+		Skills  []struct {
+			Name   string `json:"name"`
+			Digest string `json:"digest"`
+		} `json:"skills"`
+	}
+	if err := decodeProductionJSON(types.JSON(root.SkillBindings), &bindings, true); err != nil || bindings.Version != 1 {
 		return "", errProductionSkillUnbound
 	}
 	found := ""
-	add := func(bindingName, digest string) error {
-		if bindingName != name {
-			return nil
+	seen := make(map[string]struct{}, len(bindings.Skills))
+	for _, binding := range bindings.Skills {
+		if binding.Name == "" || strings.TrimSpace(binding.Name) != binding.Name || !canonicalProductionSHA256(binding.Digest) {
+			return "", errProductionSkillDigestMismatch
 		}
-		if !canonicalProductionSHA256(digest) || found != "" {
-			return errProductionSkillDigestMismatch
+		if _, duplicate := seen[binding.Name]; duplicate {
+			return "", errProductionSkillDigestMismatch
 		}
-		found = digest
-		return nil
-	}
-	switch typed := bindings.(type) {
-	case []any:
-		for _, candidate := range typed {
-			binding, ok := candidate.(map[string]any)
-			if !ok {
-				return "", errProductionSkillUnbound
-			}
-			bindingName, _ := binding["name"].(string)
-			digest, _ := binding["instruction_digest"].(string)
-			if err := add(bindingName, digest); err != nil {
-				return "", err
-			}
+		seen[binding.Name] = struct{}{}
+		if binding.Name == name {
+			found = binding.Digest
 		}
-	case map[string]any:
-		candidate, ok := typed[name]
-		if !ok {
-			break
-		}
-		switch binding := candidate.(type) {
-		case string:
-			if err := add(name, binding); err != nil {
-				return "", err
-			}
-		case map[string]any:
-			digest, _ := binding["instruction_digest"].(string)
-			if err := add(name, digest); err != nil {
-				return "", err
-			}
-		default:
-			return "", errProductionSkillUnbound
-		}
-	default:
-		return "", errProductionSkillUnbound
 	}
 	if found == "" {
 		return "", errProductionSkillUnbound
@@ -304,11 +331,16 @@ func (s productionToolScope) resolve(
 	return run, item, set, nil
 }
 
-func validateProductionToolCall(call *types.ProductionToolCall, provider types.ProductionToolProviderType, tools ...string) error {
+func validateProductionToolCall(
+	call *types.ProductionToolCall,
+	provider types.ProductionToolProviderType,
+	status types.ProductionToolCallStatus,
+	tools ...string,
+) error {
 	if call == nil || call.TenantID == 0 || call.Attempt < 1 || call.CurrentStep < 0 ||
 		!canonicalProductionUUID(call.ID) || !canonicalProductionUUID(call.RunID) ||
 		!canonicalProductionUUID(call.ProjectID) || !canonicalProductionUUID(call.DocumentID) ||
-		!canonicalProductionUUID(call.SourceSetID) || call.ProviderType != provider || strings.TrimSpace(call.ProviderID) == "" {
+		!canonicalProductionUUID(call.SourceSetID) || call.ProviderType != provider || call.Status != status || strings.TrimSpace(call.ProviderID) == "" {
 		return errProductionToolCallInvalid
 	}
 	validTool := false
@@ -381,13 +413,58 @@ func newProductionToolPlan(call *types.ProductionToolCall, providerDigest string
 }
 
 func newProductionToolEvidence(call *types.ProductionToolCall, sourceItemID string, content, metadata types.JSON) *types.ProductionEvidenceSnapshot {
-	name := call.ID + ":" + string(call.ProviderType) + ":" + call.ProviderID + ":" + call.ToolName + ":" + strconv.Itoa(call.Attempt)
-	evidenceID := uuid.NewSHA1(uuid.MustParse("a148243e-c5b7-45a1-92f1-c410f317e7f4"), []byte(name)).String()
+	evidenceID := productionToolEvidenceID(call)
 	return &types.ProductionEvidenceSnapshot{
 		ID: evidenceID, SourceItemID: sourceItemID, SnapshotType: types.ProductionEvidenceSnapshotToolResult,
 		InlineContent: content, ContentDigest: productionToolDigest(content),
 		RedactionMetadata: metadata, CapturedByRunID: call.RunID,
 	}
+}
+
+func productionToolEvidenceID(call *types.ProductionToolCall) string {
+	name := call.ID + ":" + string(call.ProviderType) + ":" + call.ProviderID + ":" + call.ToolName + ":" + strconv.Itoa(call.Attempt)
+	return uuid.NewSHA1(uuid.MustParse("a148243e-c5b7-45a1-92f1-c410f317e7f4"), []byte(name)).String()
+}
+
+func productionToolResultFromEvidence(
+	call *types.ProductionToolCall,
+	plan *ProductionToolPlan,
+	evidence *types.ProductionEvidenceSnapshot,
+	providerDigest string,
+) (*ProductionToolResult, error) {
+	if evidence == nil || evidence.ID != productionToolEvidenceID(call) || evidence.SnapshotType != types.ProductionEvidenceSnapshotToolResult ||
+		evidence.CapturedByRunID != call.RunID || !canonicalProductionSHA256(evidence.ContentDigest) ||
+		productionToolDigest(evidence.InlineContent) != evidence.ContentDigest {
+		return nil, types.ErrProductionEvidenceConflict
+	}
+	canonicalContent, err := types.CanonicalProductionJSON(evidence.InlineContent)
+	if err != nil || !bytes.Equal(canonicalContent, evidence.InlineContent) {
+		return nil, types.ErrProductionEvidenceConflict
+	}
+	canonicalMetadata, err := types.CanonicalProductionJSON(evidence.RedactionMetadata)
+	if err != nil || !bytes.Equal(canonicalMetadata, evidence.RedactionMetadata) {
+		return nil, types.ErrProductionEvidenceConflict
+	}
+	var metadata struct {
+		ProviderDigest string `json:"provider_digest"`
+	}
+	if err := decodeProductionJSON(canonicalMetadata, &metadata, false); err != nil || !canonicalProductionSHA256(metadata.ProviderDigest) {
+		return nil, types.ErrProductionEvidenceConflict
+	}
+	if providerDigest == "" {
+		providerDigest = metadata.ProviderDigest
+	} else if metadata.ProviderDigest != providerDigest {
+		return nil, types.ErrProductionEvidenceConflict
+	}
+	response, err := canonicalProductionResponse(canonicalContent, providerDigest, canonicalMetadata, evidence)
+	if err != nil {
+		return nil, types.ErrProductionEvidenceConflict
+	}
+	return &ProductionToolResult{
+		ToolCallID: call.ID, PlanDigest: plan.Digest, ResponseSnapshot: response,
+		ResponseDigest: productionToolDigest(response), ProviderDigest: providerDigest,
+		RedactionMetadata: canonicalMetadata, Evidence: evidence,
+	}, nil
 }
 
 func canonicalProductionResponse(content types.JSON, providerDigest string, metadata types.JSON, evidence *types.ProductionEvidenceSnapshot) (types.JSON, error) {
@@ -431,58 +508,12 @@ func canonicalProductionSHA256(value string) bool {
 	return err == nil && len(decoded) == sha256.Size && hex.EncodeToString(decoded) == value
 }
 
-func normalizedProductionSecretKey(key string) string {
-	var normalized strings.Builder
-	for _, r := range strings.ToLower(key) {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			normalized.WriteRune(r)
-		}
-	}
-	return normalized.String()
-}
-
 func productionSecretKey(key string) bool {
-	switch normalizedProductionSecretKey(key) {
-	case "token", "accesstoken", "refreshtoken", "clientsecret", "apikey", "authorization",
-		"password", "secret", "privatekey", "credential", "credentials":
-		return true
-	default:
-		return false
-	}
+	return types.IsProductionCredentialKey(key)
 }
 
 func rejectProductionSecretFields(raw types.JSON) error {
-	var value any
-	if err := decodeProductionJSON(raw, &value, false); err != nil {
-		return err
-	}
-	return walkProductionValue(value, func(key string, _ any) error {
-		if productionSecretKey(key) {
-			return errProductionProviderOutputUnsafe
-		}
-		return nil
-	})
-}
-
-func walkProductionValue(value any, visit func(string, any) error) error {
-	switch typed := value.(type) {
-	case map[string]any:
-		for key, nested := range typed {
-			if err := visit(key, nested); err != nil {
-				return err
-			}
-			if err := walkProductionValue(nested, visit); err != nil {
-				return err
-			}
-		}
-	case []any:
-		for _, nested := range typed {
-			if err := walkProductionValue(nested, visit); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return types.RejectProductionCredentialFields(raw)
 }
 
 var _ ProductionToolAdapter = (*ProductionSkillAdapter)(nil)

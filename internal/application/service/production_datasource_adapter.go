@@ -3,12 +3,15 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/datasource"
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"gorm.io/gorm"
 )
 
 const (
@@ -26,6 +29,7 @@ type ProductionDataSourceAdapter struct {
 	dataSources productionDataSourceResolver
 	registry    *datasource.ConnectorRegistry
 	scope       productionToolScope
+	evidence    productionToolEvidenceService
 }
 
 func NewProductionDataSourceAdapter(
@@ -33,10 +37,12 @@ func NewProductionDataSourceAdapter(
 	registry *datasource.ConnectorRegistry,
 	runs productionToolRunResolver,
 	sources productionToolSourceResolver,
+	evidence productionToolEvidenceService,
 ) *ProductionDataSourceAdapter {
 	return &ProductionDataSourceAdapter{
 		dataSources: dataSources, registry: registry,
-		scope: productionToolScope{runs: runs, sources: sources},
+		scope:    productionToolScope{runs: runs, sources: sources},
+		evidence: evidence,
 	}
 }
 
@@ -51,20 +57,28 @@ type productionDataSourcePrepared struct {
 	request               productionDataSourceRequest
 	connector             datasource.Connector
 	config                *types.DataSourceConfig
-	credentialValues      []string
+	credentialValues      []productionCredentialValue
 	providerRedactedCount int
+	providerDigest        string
 	item                  *types.ProductionSourceItem
 }
 
 func (a *ProductionDataSourceAdapter) Plan(ctx context.Context, call *types.ProductionToolCall) (*ProductionToolPlan, error) {
-	prepared, err := a.prepare(ctx, call)
+	plan, _, _, err := a.plan(ctx, call, types.ProductionToolCallPlanned)
 	if err != nil {
 		return nil, err
 	}
-	return prepared.plan, nil
+	return plan, nil
 }
 
 func (a *ProductionDataSourceAdapter) Execute(ctx context.Context, call *types.ProductionToolCall) (*ProductionToolResult, error) {
+	plan, request, item, err := a.plan(ctx, call, types.ProductionToolCallExecuting)
+	if err != nil {
+		return nil, err
+	}
+	if result, found, err := a.persistedResult(ctx, call, plan, item); err != nil || found {
+		return result, err
+	}
 	prepared, err := a.prepare(ctx, call)
 	if err != nil {
 		return nil, err
@@ -96,7 +110,7 @@ func (a *ProductionDataSourceAdapter) Execute(ctx context.Context, call *types.P
 	}
 	metadata, err := canonicalProductionValue(map[string]any{
 		"adapter":                  "datasource",
-		"provider_digest":          prepared.plan.ProviderDigest,
+		"provider_digest":          prepared.providerDigest,
 		"provider_redacted_fields": prepared.providerRedactedCount,
 		"redacted":                 redactedCount > 0,
 		"redacted_fields":          redactedCount,
@@ -104,38 +118,82 @@ func (a *ProductionDataSourceAdapter) Execute(ctx context.Context, call *types.P
 	if err != nil {
 		return nil, errProductionProviderOutputUnsafe
 	}
-	evidence := newProductionToolEvidence(call, prepared.item.ID, content, metadata)
-	response, err := canonicalProductionResponse(content, prepared.plan.ProviderDigest, metadata, evidence)
+	persisted, err := a.evidence.AttachEvidence(ctx, prepared.item.ID, interfaces.CreateEvidenceSnapshotInput{
+		EvidenceID: productionToolEvidenceID(call), SnapshotType: types.ProductionEvidenceSnapshotToolResult,
+		InlineContent: content, ContentDigest: productionToolDigest(content),
+		RedactionMetadata: metadata, CapturedByRunID: call.RunID,
+	})
 	if err != nil {
-		return nil, errProductionProviderOutputUnsafe
-	}
-	return &ProductionToolResult{
-		ToolCallID: call.ID, PlanDigest: prepared.plan.Digest,
-		ResponseSnapshot: response, ResponseDigest: productionToolDigest(response),
-		ProviderDigest: prepared.plan.ProviderDigest, RedactionMetadata: metadata, Evidence: evidence,
-	}, nil
-}
-
-func (a *ProductionDataSourceAdapter) prepare(ctx context.Context, call *types.ProductionToolCall) (*productionDataSourcePrepared, error) {
-	if a == nil || a.dataSources == nil || a.registry == nil {
-		return nil, errProductionProviderConfiguration
-	}
-	if err := validateProductionToolCall(
-		call, types.ProductionToolProviderDatasource,
-		productionDataSourceFetchToolName, productionDataSourceListToolName,
-	); err != nil {
 		return nil, err
 	}
-	if !canonicalProductionUUID(call.ProviderID) {
-		return nil, errProductionToolCallInvalid
-	}
+	_ = request
+	return productionToolResultFromEvidence(call, plan, persisted, prepared.providerDigest)
+}
+
+func (a *ProductionDataSourceAdapter) plan(
+	ctx context.Context,
+	call *types.ProductionToolCall,
+	status types.ProductionToolCallStatus,
+) (*ProductionToolPlan, productionDataSourceRequest, *types.ProductionSourceItem, error) {
 	var request productionDataSourceRequest
+	if a == nil || a.scope.runs == nil || a.scope.sources == nil {
+		return nil, request, nil, errProductionProviderConfiguration
+	}
+	if err := validateProductionToolCall(call, types.ProductionToolProviderDatasource, status,
+		productionDataSourceFetchToolName, productionDataSourceListToolName); err != nil {
+		return nil, request, nil, err
+	}
+	if !canonicalProductionUUID(call.ProviderID) {
+		return nil, request, nil, errProductionToolCallInvalid
+	}
 	if err := decodeProductionToolRequest(call, &request); err != nil || !canonicalProductionUUID(request.SourceItemID) {
-		return nil, errProductionToolCallInvalid
+		return nil, request, nil, errProductionToolCallInvalid
+	}
+	if err := validateProductionDataSourceRequestShape(call.ToolName, request); err != nil {
+		return nil, request, nil, err
 	}
 	_, item, _, err := a.scope.resolve(ctx, call, request.SourceItemID, types.ProductionSourceKindDatasource)
 	if err != nil || item.ExternalID != call.ProviderID {
-		return nil, errProductionToolScope
+		return nil, request, nil, errProductionToolScope
+	}
+	descriptor, err := canonicalProductionValue(map[string]any{
+		"datasource_id": call.ProviderID, "provider_type": call.ProviderType,
+	})
+	if err != nil {
+		return nil, request, nil, errProductionToolCallInvalid
+	}
+	plan, err := newProductionToolPlan(call, productionToolDigest(descriptor))
+	return plan, request, item, err
+}
+
+func (a *ProductionDataSourceAdapter) persistedResult(
+	ctx context.Context,
+	call *types.ProductionToolCall,
+	plan *ProductionToolPlan,
+	item *types.ProductionSourceItem,
+) (*ProductionToolResult, bool, error) {
+	evidence, evidenceItem, evidenceSet, err := a.scope.sources.GetEvidence(ctx, call.TenantID, productionToolEvidenceID(call))
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if evidenceItem == nil || evidenceSet == nil || evidenceItem.ID != item.ID || evidenceItem.SourceSetID != call.SourceSetID ||
+		evidenceSet.ID != call.SourceSetID || evidenceSet.TenantID != call.TenantID || evidenceSet.ProjectID != call.ProjectID {
+		return nil, false, types.ErrProductionEvidenceConflict
+	}
+	result, err := productionToolResultFromEvidence(call, plan, evidence, "")
+	return result, err == nil, err
+}
+
+func (a *ProductionDataSourceAdapter) prepare(ctx context.Context, call *types.ProductionToolCall) (*productionDataSourcePrepared, error) {
+	if a == nil || a.dataSources == nil || a.registry == nil || a.evidence == nil {
+		return nil, errProductionProviderConfiguration
+	}
+	plan, request, item, err := a.plan(ctx, call, types.ProductionToolCallExecuting)
+	if err != nil {
+		return nil, err
 	}
 	dataSource, err := a.dataSources.GetDataSource(ctx, call.ProviderID)
 	if err != nil {
@@ -170,14 +228,37 @@ func (a *ProductionDataSourceAdapter) prepare(ctx context.Context, call *types.P
 	if err != nil {
 		return nil, errProductionProviderConfiguration
 	}
-	plan, err := newProductionToolPlan(call, productionToolDigest(providerCanonical))
-	if err != nil {
-		return nil, errProductionToolCallInvalid
-	}
 	return &productionDataSourcePrepared{
 		plan: plan, request: request, connector: connector, config: config,
-		credentialValues: credentialValues, providerRedactedCount: redactedCount, item: item,
+		credentialValues: credentialValues, providerRedactedCount: redactedCount,
+		providerDigest: productionToolDigest(providerCanonical), item: item,
 	}, nil
+}
+
+func validateProductionDataSourceRequestShape(toolName string, request productionDataSourceRequest) error {
+	switch toolName {
+	case productionDataSourceFetchToolName:
+		if request.ParentID != "" || len(request.ResourceIDs) == 0 {
+			return errProductionToolCallInvalid
+		}
+		seen := make(map[string]struct{}, len(request.ResourceIDs))
+		for _, id := range request.ResourceIDs {
+			if strings.TrimSpace(id) == "" {
+				return errProductionToolCallInvalid
+			}
+			if _, duplicate := seen[id]; duplicate {
+				return errProductionToolCallInvalid
+			}
+			seen[id] = struct{}{}
+		}
+	case productionDataSourceListToolName:
+		if len(request.ResourceIDs) != 0 {
+			return errProductionToolCallInvalid
+		}
+	default:
+		return errProductionToolCallInvalid
+	}
+	return nil
 }
 
 func validateProductionDataSourceRequest(toolName string, request productionDataSourceRequest, configured []string) error {
@@ -204,8 +285,24 @@ func validateProductionDataSourceRequest(toolName string, request productionData
 			seen[id] = struct{}{}
 		}
 	case productionDataSourceListToolName:
-		if len(request.ResourceIDs) != 0 {
-			return errProductionToolCallInvalid
+		if len(configured) == 0 {
+			if request.ParentID != "" {
+				return errProductionToolScope
+			}
+			return nil
+		}
+		if request.ParentID == "" {
+			return errProductionToolScope
+		}
+		allowed := false
+		for _, root := range configured {
+			if request.ParentID == root {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return errProductionToolScope
 		}
 	default:
 		return errProductionToolCallInvalid
@@ -339,15 +436,21 @@ func redactProductionDecodedValue(value any) (any, int, error) {
 	}
 }
 
-func productionCredentialValues(credentials map[string]any) []string {
-	values := make([]string, 0)
+type productionCredentialValue struct {
+	canonical string
+	text      string
+}
+
+// Embedded matching is limited to long, varied values. Short ordinary values
+// are still rejected on exact scalar equality but cannot redact prose merely
+// because they appear as a substring.
+const productionEmbeddedCredentialMinLength = 16
+
+func productionCredentialValues(credentials map[string]any) []productionCredentialValue {
+	values := make([]productionCredentialValue, 0)
 	var collect func(any)
 	collect = func(value any) {
 		switch typed := value.(type) {
-		case string:
-			if typed != "" {
-				values = append(values, typed)
-			}
 		case map[string]any:
 			for _, nested := range typed {
 				collect(nested)
@@ -356,18 +459,36 @@ func productionCredentialValues(credentials map[string]any) []string {
 			for _, nested := range typed {
 				collect(nested)
 			}
+		case string, bool, float64, json.Number:
+			canonical, err := canonicalProductionValue(typed)
+			if err != nil || string(canonical) == `""` {
+				return
+			}
+			entry := productionCredentialValue{canonical: string(canonical)}
+			if text, ok := typed.(string); ok {
+				entry.text = text
+			}
+			values = append(values, entry)
 		}
 	}
 	collect(credentials)
-	sort.Strings(values)
+	sort.Slice(values, func(i, j int) bool { return values[i].canonical < values[j].canonical })
 	return values
 }
 
-func containsProductionCredentialValue(value any, credentials []string) bool {
+func containsProductionCredentialValue(value any, credentials []productionCredentialValue) bool {
+	canonical, err := canonicalProductionValue(value)
+	if err == nil {
+		for _, credential := range credentials {
+			if string(canonical) == credential.canonical {
+				return true
+			}
+		}
+	}
 	switch typed := value.(type) {
 	case string:
 		for _, credential := range credentials {
-			if credential != "" && strings.Contains(typed, credential) {
+			if productionEmbeddedCredential(credential.text) && strings.Contains(typed, credential.text) {
 				return true
 			}
 		}
@@ -385,6 +506,17 @@ func containsProductionCredentialValue(value any, credentials []string) bool {
 		}
 	}
 	return false
+}
+
+func productionEmbeddedCredential(value string) bool {
+	if len(value) < productionEmbeddedCredentialMinLength {
+		return false
+	}
+	unique := make(map[rune]struct{})
+	for _, r := range value {
+		unique[r] = struct{}{}
+	}
+	return len(unique) >= 8
 }
 
 var _ ProductionToolAdapter = (*ProductionDataSourceAdapter)(nil)

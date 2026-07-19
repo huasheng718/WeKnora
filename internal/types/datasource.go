@@ -476,10 +476,7 @@ func (d *DataSource) ParseConfig() (*DataSourceConfig, error) {
 		// then see an empty credential string; HasCredentials() returns
 		// false; the UI surfaces "credential not configured" and the
 		// user can re-enter without losing the rest of the data source.
-		log.Printf(
-			"[crypto] datasource credential %q: decrypt failed (SYSTEM_AES_KEY missing/rotated?), treating as unconfigured",
-			k,
-		)
+		log.Printf("[crypto] datasource credential decrypt failed (SYSTEM_AES_KEY missing/rotated?), treating as unconfigured")
 		config.Credentials[k] = ""
 	}
 	return &config, nil

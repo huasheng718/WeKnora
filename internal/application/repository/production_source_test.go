@@ -107,6 +107,28 @@ func TestProductionSourceRepositoryScopesEveryLookupByTenant(t *testing.T) {
 	require.ErrorIs(t, repo.DecideItem(context.Background(), 8, sourceItemID, types.ProductionSourceItemAccepted), gorm.ErrRecordNotFound)
 }
 
+func TestProductionSourceRepositoryGetsEvidenceWithAuthoritativeTenantContext(t *testing.T) {
+	repo, _ := newProductionSourceRepoTestDB(t)
+	createProductionSourceSet(t, repo, types.ProductionSourceSetCollecting)
+	createProductionSourceItem(t, repo, types.ProductionSourceItemAccepted)
+	require.NoError(t, repo.CreateEvidence(context.Background(), 7, sourceItemID, &types.ProductionEvidenceSnapshot{
+		ID: evidenceID, SnapshotType: types.ProductionEvidenceSnapshotText,
+		InlineContent: types.JSON(`"snapshot"`), ContentDigest: testDigest, RedactionMetadata: types.JSON(`{}`),
+	}))
+
+	evidence, item, set, err := repo.GetEvidence(context.Background(), 7, evidenceID)
+	require.NoError(t, err)
+	require.Equal(t, evidenceID, evidence.ID)
+	require.Equal(t, sourceItemID, item.ID)
+	require.Equal(t, sourceSetID, set.ID)
+
+	evidence, item, set, err = repo.GetEvidence(context.Background(), 8, evidenceID)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	require.Nil(t, evidence)
+	require.Nil(t, item)
+	require.Nil(t, set)
+}
+
 func TestProductionSourceRepositoryRejectsNewItemsAndEvidenceForFrozenSet(t *testing.T) {
 	repo, db := newProductionSourceRepoTestDB(t)
 	createProductionSourceSet(t, repo, types.ProductionSourceSetCollecting)

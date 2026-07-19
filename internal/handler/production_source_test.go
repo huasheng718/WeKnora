@@ -53,6 +53,10 @@ func (*productionSourceServiceStub) AttachEvidence(context.Context, string, inte
 	panic("unexpected AttachEvidence")
 }
 
+func (*productionSourceServiceStub) GetEvidence(context.Context, string) (*types.ProductionEvidenceSnapshot, *types.ProductionSourceItem, *types.ProductionSourceSet, error) {
+	panic("unexpected GetEvidence")
+}
+
 func (s *productionSourceServiceStub) Freeze(_ context.Context, sourceSetID string) error {
 	s.frozenID = sourceSetID
 	return s.err

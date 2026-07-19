@@ -175,6 +175,33 @@ func (r *productionSourceRepository) GetItem(
 	return &item, &sourceSet, nil
 }
 
+func (r *productionSourceRepository) GetEvidence(
+	ctx context.Context,
+	tenantID uint64,
+	evidenceID string,
+) (*types.ProductionEvidenceSnapshot, *types.ProductionSourceItem, *types.ProductionSourceSet, error) {
+	db := database.DBFromContext(ctx, r.db).WithContext(ctx)
+	var evidence types.ProductionEvidenceSnapshot
+	err := db.Table("production_evidence_snapshots AS evidence").
+		Select("evidence.*").
+		Joins("JOIN production_source_items AS item ON item.id = evidence.source_item_id").
+		Joins("JOIN production_source_sets AS source_set ON source_set.id = item.source_set_id").
+		Where("source_set.tenant_id = ? AND evidence.id = ?", tenantID, evidenceID).
+		First(&evidence).Error
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	var item types.ProductionSourceItem
+	if err := db.Where("id = ?", evidence.SourceItemID).First(&item).Error; err != nil {
+		return nil, nil, nil, err
+	}
+	var sourceSet types.ProductionSourceSet
+	if err := db.Where("tenant_id = ? AND id = ?", tenantID, item.SourceSetID).First(&sourceSet).Error; err != nil {
+		return nil, nil, nil, err
+	}
+	return &evidence, &item, &sourceSet, nil
+}
+
 func (r *productionSourceRepository) ListAcceptedEvidence(
 	ctx context.Context,
 	tenantID uint64,

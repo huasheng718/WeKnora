@@ -11,6 +11,7 @@ var (
 	ErrProductionEvidenceImmutable       = errors.New("production evidence snapshots are immutable")
 	ErrProductionEvidenceDigestMismatch  = errors.New("production evidence digest does not match content")
 	ErrProductionEvidenceResourceInvalid = errors.New("production evidence resource is invalid")
+	ErrProductionEvidenceConflict        = errors.New("production evidence identity conflicts with immutable content")
 )
 
 type ProductionSourceSetStatus string

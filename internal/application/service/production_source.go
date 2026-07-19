@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 type productionSourceService struct {
@@ -208,8 +210,14 @@ func (s *productionSourceService) AttachEvidence(
 	if err != nil {
 		return nil, fmt.Errorf("invalid production evidence redaction metadata: %w", err)
 	}
+	evidenceID := input.EvidenceID
+	if evidenceID == "" {
+		evidenceID = uuid.NewString()
+	} else if err := requireProductionSourceID(evidenceID, "evidence id"); err != nil {
+		return nil, err
+	}
 	snapshot := &types.ProductionEvidenceSnapshot{
-		ID: uuid.NewString(), SourceItemID: itemID, SnapshotType: input.SnapshotType,
+		ID: evidenceID, SourceItemID: itemID, SnapshotType: input.SnapshotType,
 		RedactionMetadata: redaction, CapturedByRunID: runID,
 	}
 	if input.ResourceReference != "" {
@@ -258,10 +266,66 @@ func (s *productionSourceService) AttachEvidence(
 		snapshot.InlineContent = canonical
 		snapshot.ContentDigest = digest
 	}
+	if existing, existingItem, existingSet, getErr := s.repo.GetEvidence(ctx, tenantID, evidenceID); getErr == nil {
+		if !sameProductionEvidence(existing, existingItem, existingSet, snapshot, sourceSet) {
+			return nil, types.ErrProductionEvidenceConflict
+		}
+		return existing, nil
+	} else if !errors.Is(getErr, gorm.ErrRecordNotFound) {
+		return nil, getErr
+	}
 	if err := s.repo.CreateEvidence(ctx, tenantID, itemID, snapshot); err != nil {
+		if !errors.Is(err, types.ErrProductionConflict) {
+			return nil, err
+		}
+		existing, existingItem, existingSet, getErr := s.repo.GetEvidence(ctx, tenantID, evidenceID)
+		if getErr != nil || !sameProductionEvidence(existing, existingItem, existingSet, snapshot, sourceSet) {
+			return nil, types.ErrProductionEvidenceConflict
+		}
+		return existing, nil
+	}
+	persisted, _, _, err := s.repo.GetEvidence(ctx, tenantID, evidenceID)
+	if err != nil {
 		return nil, err
 	}
-	return snapshot, nil
+	return persisted, nil
+}
+
+func (s *productionSourceService) GetEvidence(
+	ctx context.Context,
+	evidenceID string,
+) (*types.ProductionEvidenceSnapshot, *types.ProductionSourceItem, *types.ProductionSourceSet, error) {
+	tenantID, _, err := productionCaller(ctx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if err := requireProductionSourceID(evidenceID, "evidence id"); err != nil {
+		return nil, nil, nil, err
+	}
+	evidence, item, sourceSet, err := s.repo.GetEvidence(ctx, tenantID, evidenceID)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if err := requireProductionSourceAuthor(ctx, s.projects, sourceSet.ProjectID); err != nil {
+		return nil, nil, nil, err
+	}
+	return evidence, item, sourceSet, nil
+}
+
+func sameProductionEvidence(
+	existing *types.ProductionEvidenceSnapshot,
+	existingItem *types.ProductionSourceItem,
+	existingSet *types.ProductionSourceSet,
+	candidate *types.ProductionEvidenceSnapshot,
+	candidateSet *types.ProductionSourceSet,
+) bool {
+	return existing != nil && existingItem != nil && existingSet != nil && candidate != nil && candidateSet != nil &&
+		existing.ID == candidate.ID && existing.SourceItemID == candidate.SourceItemID &&
+		existingItem.ID == candidate.SourceItemID && existingItem.SourceSetID == candidateSet.ID &&
+		existingSet.ID == candidateSet.ID && existingSet.TenantID == candidateSet.TenantID && existingSet.ProjectID == candidateSet.ProjectID &&
+		existing.SnapshotType == candidate.SnapshotType && existing.StoragePath == candidate.StoragePath &&
+		bytes.Equal(existing.InlineContent, candidate.InlineContent) && existing.ContentDigest == candidate.ContentDigest &&
+		bytes.Equal(existing.RedactionMetadata, candidate.RedactionMetadata) && existing.CapturedByRunID == candidate.CapturedByRunID
 }
 
 func (s *productionSourceService) Freeze(ctx context.Context, sourceSetID string) error {

@@ -92,6 +92,9 @@ func (s *productionRouterSourceService) DecideItem(context.Context, string, type
 func (s *productionRouterSourceService) AttachEvidence(context.Context, string, interfaces.CreateEvidenceSnapshotInput) (*types.ProductionEvidenceSnapshot, error) {
 	return nil, s.err
 }
+func (s *productionRouterSourceService) GetEvidence(context.Context, string) (*types.ProductionEvidenceSnapshot, *types.ProductionSourceItem, *types.ProductionSourceSet, error) {
+	return nil, nil, nil, s.err
+}
 func (s *productionRouterSourceService) Freeze(context.Context, string) error {
 	s.freezeCalls++
 	return s.err

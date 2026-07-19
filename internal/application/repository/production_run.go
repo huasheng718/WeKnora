@@ -1,11 +1,9 @@
 package repository
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -557,38 +555,7 @@ func productionSnapshotDigest(raw types.JSON) string {
 }
 
 func rejectProductionCredentials(raw types.JSON) error {
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	var value any
-	if err := decoder.Decode(&value); err != nil {
-		return err
-	}
-	var inspect func(any) error
-	inspect = func(candidate any) error {
-		switch typed := candidate.(type) {
-		case map[string]any:
-			for key, nested := range typed {
-				normalized := strings.NewReplacer("-", "", "_", "", " ", "").Replace(strings.ToLower(key))
-				switch normalized {
-				case "apikey", "accesskey", "accesstoken", "authorization", "clientsecret",
-					"credential", "credentials", "password", "passwd", "privatekey",
-					"refreshtoken", "secret", "token":
-					return fmt.Errorf("credential field %q is not allowed in production snapshots", key)
-				}
-				if err := inspect(nested); err != nil {
-					return err
-				}
-			}
-		case []any:
-			for _, nested := range typed {
-				if err := inspect(nested); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	}
-	return inspect(value)
+	return types.RejectProductionCredentialFields(raw)
 }
 
 func requireCanonicalProductionUUID(name, value string) error {

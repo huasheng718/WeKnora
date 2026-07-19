@@ -27,6 +27,7 @@ type CreateProductionSourceItemInput struct {
 }
 
 type CreateEvidenceSnapshotInput struct {
+	EvidenceID        string
 	SnapshotType      types.ProductionEvidenceSnapshotType
 	ResourceReference string
 	InlineContent     types.JSON
@@ -44,6 +45,7 @@ type ProductionSourceRepository interface {
 	GetSet(ctx context.Context, tenantID uint64, sourceSetID string) (*types.ProductionSourceSet, error)
 	CreateItem(ctx context.Context, tenantID uint64, sourceSetID string, item *types.ProductionSourceItem) error
 	GetItem(ctx context.Context, tenantID uint64, itemID string) (*types.ProductionSourceItem, *types.ProductionSourceSet, error)
+	GetEvidence(ctx context.Context, tenantID uint64, evidenceID string) (*types.ProductionEvidenceSnapshot, *types.ProductionSourceItem, *types.ProductionSourceSet, error)
 	ListAcceptedEvidence(ctx context.Context, tenantID uint64, projectID, sourceSetID string) ([]*types.ProductionEvidenceSnapshot, error)
 	DecideItem(ctx context.Context, tenantID uint64, itemID string, decision types.ProductionSourceItemStatus) error
 	CreateEvidence(ctx context.Context, tenantID uint64, itemID string, evidence *types.ProductionEvidenceSnapshot) error
@@ -55,5 +57,6 @@ type ProductionSourceService interface {
 	AddItem(ctx context.Context, sourceSetID string, input CreateProductionSourceItemInput) (*types.ProductionSourceItem, error)
 	DecideItem(ctx context.Context, itemID string, decision types.ProductionSourceItemStatus) error
 	AttachEvidence(ctx context.Context, itemID string, evidence CreateEvidenceSnapshotInput) (*types.ProductionEvidenceSnapshot, error)
+	GetEvidence(ctx context.Context, evidenceID string) (*types.ProductionEvidenceSnapshot, *types.ProductionSourceItem, *types.ProductionSourceSet, error)
 	Freeze(ctx context.Context, sourceSetID string) error
 }
