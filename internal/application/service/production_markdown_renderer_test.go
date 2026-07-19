@@ -1,6 +1,7 @@
 package service
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -107,6 +108,35 @@ func TestProductionMarkdownRendererEscapesEntitiesAndApostrophesFaithfully(t *te
 	require.NoError(t, err)
 	require.Contains(t, markdown, "Tom &amp; Jerry&#39;s &lt;tag&gt; &amp;lt;literal&amp;gt;")
 	require.NotContains(t, markdown, `&\#39;`)
+}
+
+func TestProductionMarkdownRendererEscapesUserFenceAndQuoteDelimitersWithoutChangingGeneratedStructure(t *testing.T) {
+	paragraph := strconv.Quote("paragraph\n```\n~~~\n> quote")
+	heading := strconv.Quote("heading\n```\n~~~\n> quote")
+	item := strconv.Quote("item\n```\n~~~\n> quote")
+	cell := strconv.Quote("cell\n```\n~~~\n> quote")
+	note := strconv.Quote("note\n```\n~~~\n> quote")
+	version := &types.ProductionDocumentVersion{Blocks: []*types.ProductionDocumentBlock{
+		productionValidationBlock("p", "paragraph", 0, paragraph, `{}`, `[]`),
+		productionValidationBlock("h", "heading", 1, heading, `{"level":3}`, `[]`),
+		productionValidationBlock("l", "list", 2, `[`+item+`]`, `{}`, `[]`),
+		productionValidationBlock("t", "table", 3, `{"headers":["text"],"rows":[[`+cell+`]]}`, `{}`, `[]`),
+		productionValidationBlock("n", "callout", 4, note, `{"kind":"note"}`, `[]`),
+		productionValidationBlock("c", "code", 5, `"raw code"`, `{"language":"go"}`, `[]`),
+		productionValidationBlock("next", "heading", 6, `"Following"`, `{"level":2}`, `[]`),
+	}}
+
+	markdown, err := RenderProductionMarkdown(version)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, strings.Count(markdown, "\\`\\`\\`"), 5)
+	require.GreaterOrEqual(t, strings.Count(markdown, `\~\~\~`), 5)
+	require.GreaterOrEqual(t, strings.Count(markdown, "&gt; quote"), 5)
+	require.NotContains(t, markdown, "<br>```")
+	require.NotContains(t, markdown, "<br>~~~")
+	require.NotContains(t, markdown, "<br>> quote")
+	require.Contains(t, markdown, "> **NOTE**<br>")
+	require.Contains(t, markdown, "```go\nraw code\n```")
+	require.Contains(t, markdown, "\n\n## Following\n")
 }
 
 func TestProductionMarkdownRendererEncodesImageMarkdownDelimiters(t *testing.T) {

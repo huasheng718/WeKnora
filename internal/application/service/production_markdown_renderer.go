@@ -17,7 +17,7 @@ func productionEscapeMarkdown(value string) string {
 	replacer := strings.NewReplacer(
 		`\`, `\\`, `*`, `\*`, `_`, `\_`, `{`, `\{`, `}`, `\}`,
 		`[`, `\[`, `]`, `\]`, `(`, `\(`, `)`, `\)`, `#`, `\#`,
-		`+`, `\+`, `-`, `\-`, `!`, `\!`, `|`, `\|`,
+		`+`, `\+`, `-`, `\-`, `!`, `\!`, `|`, `\|`, "`", "\\`", `~`, `\~`,
 	)
 	value = html.EscapeString(replacer.Replace(value))
 	value = strings.ReplaceAll(value, "\r\n", "<br>")
