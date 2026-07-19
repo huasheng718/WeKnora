@@ -21,6 +21,7 @@ var (
 	ErrProductionBlockLineageInvalid      = errors.New("production block lineage is invalid")
 	ErrProductionDocumentVersionImmutable = errors.New("production document versions are immutable")
 	ErrProductionDocumentBlockImmutable   = errors.New("production document blocks are immutable")
+	ErrProductionDocumentValidation       = errors.New("production document version failed governed validation")
 )
 
 type ProductionDocumentStatus string

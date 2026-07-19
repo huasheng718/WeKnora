@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS production_evidence_snapshots (
     captured_by_run_id VARCHAR(36) NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT chk_production_evidence_snapshots_type CHECK (snapshot_type IN ('text', 'json', 'file', 'tool_result')),
-    CONSTRAINT chk_production_evidence_snapshots_content CHECK (storage_path IS NOT NULL OR inline_content IS NOT NULL)
+    CONSTRAINT chk_production_evidence_snapshots_content CHECK ((storage_path IS NOT NULL)::integer + (inline_content IS NOT NULL)::integer = 1)
 );
 
 CREATE INDEX IF NOT EXISTS idx_production_evidence_snapshots_source_item
@@ -176,7 +176,10 @@ CREATE TABLE IF NOT EXISTS production_block_lineage (
     from_logical_block_id VARCHAR(36) NOT NULL,
     to_version_id VARCHAR(36) NOT NULL REFERENCES production_document_versions(id) ON DELETE CASCADE,
     to_logical_block_id VARCHAR(36) NOT NULL,
-    relation VARCHAR(24) NOT NULL,
+	relation VARCHAR(24) NOT NULL,
+	CONSTRAINT chk_production_block_lineage_relation CHECK (relation IN ('same', 'split', 'merged')),
+	CONSTRAINT fk_production_block_lineage_from_block FOREIGN KEY (from_version_id, from_logical_block_id) REFERENCES production_document_blocks(version_id, logical_block_id) ON DELETE RESTRICT,
+	CONSTRAINT fk_production_block_lineage_to_block FOREIGN KEY (to_version_id, to_logical_block_id) REFERENCES production_document_blocks(version_id, logical_block_id) ON DELETE RESTRICT,
     UNIQUE(from_version_id, from_logical_block_id, to_version_id, to_logical_block_id, relation)
 );
 
@@ -185,13 +188,57 @@ CREATE INDEX IF NOT EXISTS idx_production_block_lineage_from_version
 CREATE INDEX IF NOT EXISTS idx_production_block_lineage_to_version
     ON production_block_lineage (to_version_id);
 
-CREATE OR REPLACE FUNCTION prevent_frozen_production_source_item_mutation()
+CREATE OR REPLACE FUNCTION prevent_production_block_lineage_mutation()
 RETURNS TRIGGER AS $$
 BEGIN
-    IF OLD.status = 'accepted' AND EXISTS (
-        SELECT 1 FROM production_source_sets WHERE id = OLD.source_set_id AND status = 'frozen'
-    ) THEN
-        RAISE EXCEPTION 'accepted source items are immutable when their source set is frozen';
+	RAISE EXCEPTION 'block lineage is append-only';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_production_block_lineage_prevent_mutation
+	BEFORE UPDATE OR DELETE ON production_block_lineage
+	FOR EACH ROW
+	EXECUTE FUNCTION prevent_production_block_lineage_mutation();
+
+CREATE OR REPLACE FUNCTION prevent_production_block_lineage_replace()
+RETURNS TRIGGER AS $$
+BEGIN
+	IF EXISTS (
+		SELECT 1 FROM production_block_lineage
+		WHERE id = NEW.id OR (
+			from_version_id = NEW.from_version_id
+			AND from_logical_block_id = NEW.from_logical_block_id
+			AND to_version_id = NEW.to_version_id
+			AND to_logical_block_id = NEW.to_logical_block_id
+			AND relation = NEW.relation
+		)
+	) THEN
+		RAISE EXCEPTION 'block lineage is append-only';
+	END IF;
+	RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_production_block_lineage_prevent_replace
+	BEFORE INSERT ON production_block_lineage
+	FOR EACH ROW
+	EXECUTE FUNCTION prevent_production_block_lineage_replace();
+
+CREATE OR REPLACE FUNCTION prevent_frozen_production_source_item_write()
+RETURNS TRIGGER AS $$
+BEGIN
+	IF TG_OP = 'INSERT' AND EXISTS (
+		SELECT 1 FROM production_source_sets WHERE id = NEW.source_set_id AND status = 'frozen'
+	) THEN
+		RAISE EXCEPTION 'source items cannot be inserted into frozen source sets';
+	END IF;
+	IF TG_OP <> 'INSERT' AND (
+		EXISTS (SELECT 1 FROM production_source_sets WHERE id = OLD.source_set_id AND status = 'frozen')
+		OR (TG_OP = 'UPDATE' AND EXISTS (
+			SELECT 1 FROM production_source_sets WHERE id = NEW.source_set_id AND status = 'frozen'
+		))
+	) THEN
+		RAISE EXCEPTION 'source items in frozen source sets are immutable';
     END IF;
     IF TG_OP = 'DELETE' THEN
         RETURN OLD;
@@ -200,30 +247,30 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER trg_production_source_items_prevent_frozen_accepted_mutation
-    BEFORE UPDATE OR DELETE ON production_source_items
+CREATE TRIGGER trg_production_source_items_prevent_frozen_write
+    BEFORE INSERT OR UPDATE OR DELETE ON production_source_items
     FOR EACH ROW
-    EXECUTE FUNCTION prevent_frozen_production_source_item_mutation();
+	EXECUTE FUNCTION prevent_frozen_production_source_item_write();
 
-CREATE OR REPLACE FUNCTION prevent_frozen_production_source_item_replace()
+CREATE OR REPLACE FUNCTION prevent_frozen_production_evidence_insert()
 RETURNS TRIGGER AS $$
 BEGIN
-    IF EXISTS (
-        SELECT 1
-        FROM production_source_items i
-        JOIN production_source_sets s ON s.id = i.source_set_id
-        WHERE i.id = NEW.id AND i.status = 'accepted' AND s.status = 'frozen'
-    ) THEN
-        RAISE EXCEPTION 'accepted source items are immutable when their source set is frozen';
-    END IF;
-    RETURN NEW;
+	IF EXISTS (
+		SELECT 1
+		FROM production_source_items item
+		JOIN production_source_sets source_set ON source_set.id = item.source_set_id
+		WHERE item.id = NEW.source_item_id AND source_set.status = 'frozen'
+	) THEN
+		RAISE EXCEPTION 'evidence cannot be inserted into frozen source sets';
+	END IF;
+	RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER trg_production_source_items_prevent_frozen_accepted_replace
-    BEFORE INSERT ON production_source_items
-    FOR EACH ROW
-    EXECUTE FUNCTION prevent_frozen_production_source_item_replace();
+CREATE TRIGGER trg_production_evidence_snapshots_prevent_frozen_insert
+	BEFORE INSERT ON production_evidence_snapshots
+	FOR EACH ROW
+	EXECUTE FUNCTION prevent_frozen_production_evidence_insert();
 
 CREATE OR REPLACE FUNCTION prevent_production_evidence_snapshot_mutation()
 RETURNS TRIGGER AS $$

@@ -44,6 +44,7 @@ type ProductionSourceRepository interface {
 	GetSet(ctx context.Context, tenantID uint64, sourceSetID string) (*types.ProductionSourceSet, error)
 	CreateItem(ctx context.Context, tenantID uint64, sourceSetID string, item *types.ProductionSourceItem) error
 	GetItem(ctx context.Context, tenantID uint64, itemID string) (*types.ProductionSourceItem, *types.ProductionSourceSet, error)
+	ListAcceptedEvidence(ctx context.Context, tenantID uint64, projectID, sourceSetID string) ([]*types.ProductionEvidenceSnapshot, error)
 	DecideItem(ctx context.Context, tenantID uint64, itemID string, decision types.ProductionSourceItemStatus) error
 	CreateEvidence(ctx context.Context, tenantID uint64, itemID string, evidence *types.ProductionEvidenceSnapshot) error
 	Freeze(ctx context.Context, tenantID uint64, sourceSetID string) error

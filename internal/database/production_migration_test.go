@@ -213,6 +213,35 @@ func TestProductionDocumentsPostgreSQLMigrationDeclaresEquivalentStructure(t *te
 	}
 }
 
+func TestProductionDocumentsPostgreSQLMigrationDeclaresFinalIntegrityGuards(t *testing.T) {
+	up := mustReadMigration(t, "../../migrations/versioned/000071_knowledge_production_documents.up.sql")
+	down := mustReadMigration(t, "../../migrations/versioned/000071_knowledge_production_documents.down.sql")
+
+	for _, fragment := range []string{
+		"CHECK ((storage_path IS NOT NULL)::integer + (inline_content IS NOT NULL)::integer = 1)",
+		"FOREIGN KEY (from_version_id, from_logical_block_id) REFERENCES production_document_blocks(version_id, logical_block_id)",
+		"FOREIGN KEY (to_version_id, to_logical_block_id) REFERENCES production_document_blocks(version_id, logical_block_id)",
+		"CHECK (relation IN ('same', 'split', 'merged'))",
+		"CREATE TRIGGER trg_production_block_lineage_prevent_mutation",
+		"CREATE TRIGGER trg_production_block_lineage_prevent_replace",
+		"NEW.source_set_id",
+		"production_evidence_snapshots",
+		"source items cannot be inserted into frozen source sets",
+		"source items in frozen source sets are immutable",
+		"evidence cannot be inserted into frozen source sets",
+	} {
+		require.Contains(t, up, fragment)
+	}
+	for _, fragment := range []string{
+		"DROP TRIGGER IF EXISTS trg_production_block_lineage_prevent_replace ON production_block_lineage",
+		"DROP TRIGGER IF EXISTS trg_production_block_lineage_prevent_mutation ON production_block_lineage",
+		"DROP FUNCTION IF EXISTS prevent_production_block_lineage_replace()",
+		"DROP FUNCTION IF EXISTS prevent_production_block_lineage_mutation()",
+	} {
+		require.Contains(t, down, fragment)
+	}
+}
+
 func TestProductionFoundationMigrationsApplySQLiteConstraintsAndRollback(t *testing.T) {
 	db := openProductionFoundationSQLite(t)
 	_, err := db.Exec(`INSERT INTO production_projects (id, tenant_id, name, owner_user_id) VALUES ('project-1', 1, 'Project', 'owner-1')`)
@@ -288,9 +317,9 @@ func TestProductionDocumentsSQLiteMigrationEnforcesIntegrityAndRollback(t *testi
 	_, err = db.Exec(`INSERT INTO production_source_items (id, source_set_id, source_kind, title, mime_type, content_digest, captured_at, metadata) VALUES ('missing-set', 'missing', 'manual', 'Missing', 'text/plain', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', CURRENT_TIMESTAMP, '{}')`)
 	require.Error(t, err)
 	_, err = db.Exec(`UPDATE production_source_items SET title = 'Changed' WHERE id = 'source-item-1'`)
-	require.ErrorContains(t, err, "accepted source items are immutable")
+	require.ErrorContains(t, err, "source items in frozen source sets are immutable")
 	_, err = db.Exec(`DELETE FROM production_source_items WHERE id = 'source-item-1'`)
-	require.ErrorContains(t, err, "accepted source items are immutable")
+	require.ErrorContains(t, err, "source items in frozen source sets are immutable")
 	_, err = db.Exec(`UPDATE production_evidence_snapshots SET content_digest = 'changed' WHERE id = 'evidence-1'`)
 	require.ErrorContains(t, err, "evidence snapshots are immutable")
 
@@ -432,7 +461,7 @@ func TestProductionDocumentsSQLiteMigrationGuardsRelationshipsAndReplacements(t 
 	require.Error(t, err)
 
 	_, err = db.Exec(`INSERT OR REPLACE INTO production_source_items (id, source_set_id, source_kind, title, mime_type, content_digest, captured_at, metadata, status) VALUES ('source-item-1', 'source-set-1', 'manual', 'Replaced', 'text/plain', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', CURRENT_TIMESTAMP, '{}', 'accepted')`)
-	require.ErrorContains(t, err, "accepted source items are immutable")
+	require.ErrorContains(t, err, "source items cannot be inserted into frozen source sets")
 	_, err = db.Exec(`INSERT OR REPLACE INTO production_evidence_snapshots (id, source_item_id, snapshot_type, inline_content, content_digest, redaction_metadata) VALUES ('evidence-1', 'source-item-1', 'text', '{"text":"replacement"}', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', '{}')`)
 	require.ErrorContains(t, err, "evidence snapshots are immutable")
 	_, err = db.Exec(`INSERT OR REPLACE INTO production_document_versions (id, document_id, tenant_id, project_id, version_number, source_set_id, origin, content_digest, created_by) VALUES ('version-1', 'document-1', 1, 'project-1', 1, 'source-set-1', 'human', 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', 'owner-1')`)
@@ -448,6 +477,89 @@ func TestProductionDocumentsSQLiteMigrationGuardsRelationshipsAndReplacements(t 
 	require.NoError(t, err)
 	_, err = db.Exec(`DELETE FROM production_source_sets WHERE id = 'source-set-cleanup'`)
 	require.NoError(t, err)
+}
+
+func TestProductionDocumentsSQLiteEvidenceContentIsExclusive(t *testing.T) {
+	db := openProductionDocumentsSQLite(t)
+	insertProductionDocumentType(t, db, "type-1", "baseline", 1, "active")
+	_, err := db.Exec(`INSERT INTO production_projects (id, tenant_id, name, owner_user_id) VALUES ('project-1', 1, 'Project', 'owner-1')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_source_sets (id, tenant_id, project_id, document_type_id, created_by) VALUES ('source-set-1', 1, 'project-1', 'type-1', 'owner-1')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_source_items (id, source_set_id, source_kind, title, mime_type, content_digest, captured_at, metadata) VALUES ('source-item-1', 'source-set-1', 'manual', 'Source', 'text/plain', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', CURRENT_TIMESTAMP, '{}')`)
+	require.NoError(t, err)
+
+	_, err = db.Exec(`INSERT INTO production_evidence_snapshots (id, source_item_id, snapshot_type, content_digest, redaction_metadata) VALUES ('evidence-neither', 'source-item-1', 'text', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', '{}')`)
+	require.Error(t, err)
+	_, err = db.Exec(`INSERT INTO production_evidence_snapshots (id, source_item_id, snapshot_type, storage_path, inline_content, content_digest, redaction_metadata) VALUES ('evidence-both', 'source-item-1', 'text', 'resource://aaaaaaaaaaaaaaaaaaaaaa', '"inline"', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', '{}')`)
+	require.Error(t, err)
+}
+
+func TestProductionDocumentsSQLiteFrozenSetsRejectAllItemAndEvidenceMutations(t *testing.T) {
+	db := openProductionDocumentsSQLite(t)
+	insertProductionDocumentType(t, db, "type-1", "baseline", 1, "active")
+	_, err := db.Exec(`INSERT INTO production_projects (id, tenant_id, name, owner_user_id) VALUES ('project-1', 1, 'Project', 'owner-1')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_source_sets (id, tenant_id, project_id, document_type_id, created_by) VALUES ('frozen-set', 1, 'project-1', 'type-1', 'owner-1'), ('collecting-set', 1, 'project-1', 'type-1', 'owner-1')`)
+	require.NoError(t, err)
+	for _, row := range []struct{ id, setID, status string }{
+		{"frozen-candidate", "frozen-set", "candidate"},
+		{"frozen-rejected", "frozen-set", "rejected"},
+		{"frozen-accepted", "frozen-set", "accepted"},
+		{"collecting-candidate", "collecting-set", "candidate"},
+	} {
+		_, err = db.Exec(`INSERT INTO production_source_items (id, source_set_id, source_kind, title, mime_type, content_digest, captured_at, metadata, status) VALUES (?, ?, 'manual', 'Source', 'text/plain', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', CURRENT_TIMESTAMP, '{}', ?)`, row.id, row.setID, row.status)
+		require.NoError(t, err)
+	}
+	_, err = db.Exec(`UPDATE production_source_sets SET status = 'frozen', frozen_at = CURRENT_TIMESTAMP WHERE id = 'frozen-set'`)
+	require.NoError(t, err)
+
+	for _, status := range []string{"candidate", "rejected", "accepted"} {
+		_, err = db.Exec(`INSERT INTO production_source_items (id, source_set_id, source_kind, title, mime_type, content_digest, captured_at, metadata, status) VALUES (?, 'frozen-set', 'manual', 'Late', 'text/plain', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', CURRENT_TIMESTAMP, '{}', ?)`, "late-"+status, status)
+		require.ErrorContains(t, err, "source items cannot be inserted into frozen source sets")
+	}
+	for _, itemID := range []string{"frozen-candidate", "frozen-rejected", "frozen-accepted"} {
+		_, err = db.Exec(`UPDATE production_source_items SET title = 'Changed' WHERE id = ?`, itemID)
+		require.ErrorContains(t, err, "source items in frozen source sets are immutable")
+		_, err = db.Exec(`DELETE FROM production_source_items WHERE id = ?`, itemID)
+		require.ErrorContains(t, err, "source items in frozen source sets are immutable")
+	}
+	_, err = db.Exec(`UPDATE production_source_items SET source_set_id = 'collecting-set' WHERE id = 'frozen-candidate'`)
+	require.ErrorContains(t, err, "source items in frozen source sets are immutable")
+	_, err = db.Exec(`UPDATE production_source_items SET source_set_id = 'frozen-set' WHERE id = 'collecting-candidate'`)
+	require.ErrorContains(t, err, "source items in frozen source sets are immutable")
+	_, err = db.Exec(`INSERT INTO production_evidence_snapshots (id, source_item_id, snapshot_type, inline_content, content_digest, redaction_metadata) VALUES ('late-evidence', 'frozen-candidate', 'text', '"late"', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', '{}')`)
+	require.ErrorContains(t, err, "evidence cannot be inserted into frozen source sets")
+}
+
+func TestProductionDocumentsSQLiteLineageRequiresRealImmutableEndpoints(t *testing.T) {
+	db := openProductionDocumentsSQLite(t)
+	insertProductionDocumentType(t, db, "type-1", "baseline", 1, "active")
+	_, err := db.Exec(`INSERT INTO production_projects (id, tenant_id, name, owner_user_id) VALUES ('project-1', 1, 'Project', 'owner-1')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_source_sets (id, tenant_id, project_id, document_type_id, created_by) VALUES ('source-set-1', 1, 'project-1', 'type-1', 'owner-1')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_documents (id, tenant_id, project_id, document_type_id, document_type_schema_version, title, created_by) VALUES ('document-1', 1, 'project-1', 'type-1', 1, 'Document', 'owner-1')`)
+	require.NoError(t, err)
+	insertProductionVersion(t, db, "version-1", "document-1", 1, "project-1", 1, "source-set-1", "")
+	insertProductionVersion(t, db, "version-2", "document-1", 1, "project-1", 2, "source-set-1", "version-1")
+	insertProductionBlock(t, db, "block-1", "version-1", "block-a")
+	insertProductionBlock(t, db, "block-2", "version-2", "block-b")
+
+	_, err = db.Exec(`INSERT INTO production_block_lineage (id, from_version_id, from_logical_block_id, to_version_id, to_logical_block_id, relation) VALUES ('missing-from', 'version-1', 'missing', 'version-2', 'block-b', 'same')`)
+	require.Error(t, err)
+	_, err = db.Exec(`INSERT INTO production_block_lineage (id, from_version_id, from_logical_block_id, to_version_id, to_logical_block_id, relation) VALUES ('missing-to', 'version-1', 'block-a', 'version-2', 'missing', 'same')`)
+	require.Error(t, err)
+	_, err = db.Exec(`INSERT INTO production_block_lineage (id, from_version_id, from_logical_block_id, to_version_id, to_logical_block_id, relation) VALUES ('bad-relation', 'version-1', 'block-a', 'version-2', 'block-b', 'copied')`)
+	require.Error(t, err)
+	_, err = db.Exec(`INSERT INTO production_block_lineage (id, from_version_id, from_logical_block_id, to_version_id, to_logical_block_id, relation) VALUES ('lineage-1', 'version-1', 'block-a', 'version-2', 'block-b', 'same')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_block_lineage SET relation = 'split' WHERE id = 'lineage-1'`)
+	require.ErrorContains(t, err, "block lineage is append-only")
+	_, err = db.Exec(`DELETE FROM production_block_lineage WHERE id = 'lineage-1'`)
+	require.ErrorContains(t, err, "block lineage is append-only")
+	_, err = db.Exec(`INSERT OR REPLACE INTO production_block_lineage (id, from_version_id, from_logical_block_id, to_version_id, to_logical_block_id, relation) VALUES ('lineage-1', 'version-1', 'block-a', 'version-2', 'block-b', 'same')`)
+	require.ErrorContains(t, err, "block lineage is append-only")
 }
 
 func TestProductionDocumentsSQLiteMigrationRollsBackPopulatedSchema(t *testing.T) {

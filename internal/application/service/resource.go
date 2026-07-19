@@ -120,6 +120,28 @@ func (s *resourceCatalog) Resolve(ctx context.Context, reference string) (*types
 	return resource, nil
 }
 
+func (s *resourceCatalog) ResolveBound(
+	ctx context.Context,
+	reference string,
+	requirement interfaces.ResourceBindingRequirement,
+) (*types.StoredResource, error) {
+	handle, ok := types.ParseResourcePath(reference)
+	if !ok {
+		return nil, fmt.Errorf("invalid resource reference")
+	}
+	if requirement.TenantID == 0 || strings.TrimSpace(requirement.OwnerType) == "" || strings.TrimSpace(requirement.OwnerID) == "" {
+		return nil, fmt.Errorf("resource binding requirement is incomplete")
+	}
+	resource, err := s.repo.GetBoundByHandle(ctx, handle, requirement)
+	if err != nil {
+		return nil, err
+	}
+	if resource == nil {
+		return nil, types.ErrResourceBindingNotFound
+	}
+	return resource, nil
+}
+
 func (s *resourceCatalog) ResolvePath(ctx context.Context, value string) (string, *types.StoredResource, error) {
 	if _, ok := types.ParseResourcePath(value); !ok {
 		return value, nil, nil

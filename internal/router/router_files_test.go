@@ -40,6 +40,10 @@ func (s *stubResourceCatalog) Resolve(context.Context, string) (*types.StoredRes
 	return s.resource, nil
 }
 
+func (s *stubResourceCatalog) ResolveBound(context.Context, string, interfaces.ResourceBindingRequirement) (*types.StoredResource, error) {
+	return s.resource, nil
+}
+
 func (s *stubResourceCatalog) ResolvePath(_ context.Context, value string) (string, *types.StoredResource, error) {
 	if _, ok := types.ParseResourcePath(value); ok && s.resource != nil {
 		return s.resource.PhysicalPath, s.resource, nil

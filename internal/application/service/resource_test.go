@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -64,6 +65,39 @@ func TestResourceCatalogBindingAndAccessGrant(t *testing.T) {
 	resource, err := catalog.ResolveAccessGrant(ctx, token)
 	require.NoError(t, err)
 	require.Equal(t, uint64(9), resource.TenantID)
+}
+
+func TestResourceCatalogResolveBoundRequiresExactTenantAndOwner(t *testing.T) {
+	catalog, _ := newResourceCatalogForTest(t)
+	ctx := context.Background()
+	ref, err := catalog.Register(
+		ctx,
+		9,
+		"local://9/exports/governed.pdf",
+		interfaces.ResourceRegistration{OriginalName: "governed.pdf", ContentHash: strings.Repeat("a", 64)},
+	)
+	require.NoError(t, err)
+	require.NoError(t, catalog.Bind(
+		ctx, ref, types.ResourceOwnerTypeProductionProject, "project-1", "evidence",
+	))
+
+	resource, err := catalog.ResolveBound(ctx, ref, interfaces.ResourceBindingRequirement{
+		TenantID: 9, OwnerType: types.ResourceOwnerTypeProductionProject,
+		OwnerID: "project-1",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resource)
+	require.Equal(t, uint64(9), resource.TenantID)
+
+	for _, requirement := range []interfaces.ResourceBindingRequirement{
+		{TenantID: 8, OwnerType: types.ResourceOwnerTypeProductionProject, OwnerID: "project-1"},
+		{TenantID: 9, OwnerType: types.ResourceOwnerTypeProductionProject, OwnerID: "project-2"},
+		{TenantID: 9, OwnerType: "knowledge", OwnerID: "project-1"},
+	} {
+		resource, err = catalog.ResolveBound(ctx, ref, requirement)
+		require.Nil(t, resource)
+		require.ErrorContains(t, err, "resource binding")
+	}
 }
 
 func TestResourceCatalogRejectsUnsupportedPhysicalPath(t *testing.T) {

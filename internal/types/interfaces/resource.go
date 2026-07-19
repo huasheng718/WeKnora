@@ -24,9 +24,18 @@ type ResourceRepository interface {
 	GetByTenantLocation(ctx context.Context, tenantID uint64, locationHash string) (*types.StoredResource, error)
 	MarkDeleted(ctx context.Context, id string) error
 	CreateBinding(ctx context.Context, binding *types.ResourceBinding) error
+	GetBoundByHandle(ctx context.Context, handle string, requirement ResourceBindingRequirement) (*types.StoredResource, error)
 	CreateGrant(ctx context.Context, grant *types.ResourceAccessGrant) error
 	GetValidGrant(ctx context.Context, tokenHash string, now time.Time) (*types.ResourceAccessGrant, error)
 	DeleteExpiredGrants(ctx context.Context, before time.Time) error
+}
+
+// ResourceBindingRequirement is an authoritative owner scope used for a
+// resource resolution. Callers derive these fields from their domain object.
+type ResourceBindingRequirement struct {
+	TenantID  uint64
+	OwnerType string
+	OwnerID   string
 }
 
 // ResourceRegistration describes one physical object at registration time.
@@ -44,6 +53,7 @@ type ResourceRegistration struct {
 type ResourceCatalog interface {
 	Register(ctx context.Context, tenantID uint64, physicalPath string, meta ResourceRegistration) (string, error)
 	Resolve(ctx context.Context, reference string) (*types.StoredResource, error)
+	ResolveBound(ctx context.Context, reference string, requirement ResourceBindingRequirement) (*types.StoredResource, error)
 	ResolvePath(ctx context.Context, value string) (string, *types.StoredResource, error)
 	Bind(ctx context.Context, reference, ownerType, ownerID, relation string) error
 	MarkDeleted(ctx context.Context, reference string) error

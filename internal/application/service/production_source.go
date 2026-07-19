@@ -19,6 +19,7 @@ type productionSourceService struct {
 	projects  interfaces.ProductionProjectAuthorizer
 	resources interfaces.ResourceCatalog
 	audit     interfaces.AuditLogService
+	uow       interfaces.ProductionUnitOfWork
 }
 
 func NewProductionSourceService(
@@ -26,8 +27,9 @@ func NewProductionSourceService(
 	projects interfaces.ProductionProjectAuthorizer,
 	resources interfaces.ResourceCatalog,
 	audit interfaces.AuditLogService,
+	uow interfaces.ProductionUnitOfWork,
 ) *productionSourceService {
-	return &productionSourceService{repo: repo, projects: projects, resources: resources, audit: audit}
+	return &productionSourceService{repo: repo, projects: projects, resources: resources, audit: audit, uow: uow}
 }
 
 func canonicalProductionSourceID(value, name string, rejectNonCanonical bool) (string, error) {
@@ -216,8 +218,13 @@ func (s *productionSourceService) AttachEvidence(
 			return nil, types.ErrProductionEvidenceResourceInvalid
 		}
 		canonicalReference := types.BuildResourcePath(handle)
-		resource, resolveErr := s.resources.Resolve(ctx, canonicalReference)
+		resource, resolveErr := s.resources.ResolveBound(ctx, canonicalReference, interfaces.ResourceBindingRequirement{
+			TenantID: tenantID, OwnerType: types.ResourceOwnerTypeProductionProject, OwnerID: sourceSet.ProjectID,
+		})
 		if resolveErr != nil {
+			if errors.Is(resolveErr, types.ErrResourceBindingNotFound) {
+				return nil, errors.Join(types.ErrProductionForbidden, resolveErr)
+			}
 			return nil, resolveErr
 		}
 		if resource == nil {
@@ -272,17 +279,19 @@ func (s *productionSourceService) Freeze(ctx context.Context, sourceSetID string
 	if err := requireProductionSourceAuthor(ctx, s.projects, sourceSet.ProjectID); err != nil {
 		return err
 	}
-	if err := s.repo.Freeze(ctx, tenantID, sourceSetID); err != nil {
-		return err
+	if s.uow == nil {
+		return errors.New("production unit of work is required")
 	}
-	if err := emitRequiredProductionAudit(ctx, s.audit, &types.AuditLog{
-		TenantID: tenantID, ActorUserID: userID, ActorRole: string(types.TenantRoleFromContext(ctx)),
-		Action: types.AuditActionProductionSourceFrozen, TargetType: "production_source_set",
-		TargetID: sourceSetID, Outcome: types.AuditOutcomeSuccess,
-	}); err != nil {
-		return err
-	}
-	return nil
+	return s.uow.WithinTransaction(ctx, func(txCtx context.Context) error {
+		if err := s.repo.Freeze(txCtx, tenantID, sourceSetID); err != nil {
+			return err
+		}
+		return emitRequiredProductionAudit(txCtx, s.audit, &types.AuditLog{
+			TenantID: tenantID, ActorUserID: userID, ActorRole: string(types.TenantRoleFromContext(ctx)),
+			Action: types.AuditActionProductionSourceFrozen, TargetType: "production_source_set",
+			TargetID: sourceSetID, Outcome: types.AuditOutcomeSuccess,
+		})
+	})
 }
 
 var _ interfaces.ProductionSourceService = (*productionSourceService)(nil)

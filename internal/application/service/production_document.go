@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -17,7 +18,9 @@ type productionDocumentService struct {
 	sources       interfaces.ProductionSourceRepository
 	documentTypes interfaces.ProductionDocumentTypeRepository
 	projects      interfaces.ProductionProjectAuthorizer
+	resources     interfaces.ResourceCatalog
 	audit         interfaces.AuditLogService
+	uow           interfaces.ProductionUnitOfWork
 }
 
 func NewProductionDocumentService(
@@ -25,11 +28,42 @@ func NewProductionDocumentService(
 	sources interfaces.ProductionSourceRepository,
 	documentTypes interfaces.ProductionDocumentTypeRepository,
 	projects interfaces.ProductionProjectAuthorizer,
+	resources interfaces.ResourceCatalog,
 	audit interfaces.AuditLogService,
+	uow interfaces.ProductionUnitOfWork,
 ) *productionDocumentService {
 	return &productionDocumentService{
-		documents: documents, sources: sources, documentTypes: documentTypes, projects: projects, audit: audit,
+		documents: documents, sources: sources, documentTypes: documentTypes, projects: projects,
+		resources: resources, audit: audit, uow: uow,
 	}
+}
+
+type ProductionDocumentValidationError struct {
+	Issues []ProductionValidationIssue
+	Cause  error
+}
+
+func (e *ProductionDocumentValidationError) Error() string {
+	parts := make([]string, 0, len(e.Issues)+1)
+	for _, issue := range e.Issues {
+		parts = append(parts, issue.Code)
+	}
+	if e.Cause != nil {
+		parts = append(parts, e.Cause.Error())
+	}
+	if len(parts) == 0 {
+		return types.ErrProductionDocumentValidation.Error()
+	}
+	sort.Strings(parts)
+	return types.ErrProductionDocumentValidation.Error() + ": " + strings.Join(parts, ", ")
+}
+
+func (e *ProductionDocumentValidationError) Unwrap() []error {
+	errors := []error{types.ErrProductionDocumentValidation}
+	if e.Cause != nil {
+		errors = append(errors, e.Cause)
+	}
+	return errors
 }
 
 func requireProductionDocumentAuthor(
@@ -131,13 +165,18 @@ func (s *productionDocumentService) CreateDocument(
 		Origin: types.ProductionDocumentOriginHuman, CreatedBy: userID,
 	}
 	bootstrapVersion.ContentDigest = types.ComputeProductionVersionDigest(bootstrapVersion)
-	if err := s.documents.CreateDocument(ctx, document, bootstrapVersion); err != nil {
-		return nil, err
+	if s.uow == nil {
+		return nil, errors.New("production unit of work is required")
 	}
-	if err := emitRequiredProductionAudit(ctx, s.audit, &types.AuditLog{
-		TenantID: tenantID, ActorUserID: userID, ActorRole: string(types.TenantRoleFromContext(ctx)),
-		Action: types.AuditActionProductionVersionCreated, TargetType: "production_document_version",
-		TargetID: bootstrapVersion.ID, Outcome: types.AuditOutcomeSuccess,
+	if err := s.uow.WithinTransaction(ctx, func(txCtx context.Context) error {
+		if err := s.documents.CreateDocument(txCtx, document, bootstrapVersion); err != nil {
+			return err
+		}
+		return emitRequiredProductionAudit(txCtx, s.audit, &types.AuditLog{
+			TenantID: tenantID, ActorUserID: userID, ActorRole: string(types.TenantRoleFromContext(ctx)),
+			Action: types.AuditActionProductionVersionCreated, TargetType: "production_document_version",
+			TargetID: bootstrapVersion.ID, Outcome: types.AuditOutcomeSuccess,
+		})
 	}); err != nil {
 		return nil, err
 	}
@@ -228,6 +267,43 @@ func buildProductionBlockLineage(
 	return lineage, nil
 }
 
+func (s *productionDocumentService) loadAcceptedProductionEvidence(
+	ctx context.Context,
+	tenantID uint64,
+	projectID, sourceSetID string,
+) (map[string]struct{}, map[string]*types.ProductionEvidenceSnapshot, error) {
+	snapshots, err := s.sources.ListAcceptedEvidence(ctx, tenantID, projectID, sourceSetID)
+	if err != nil {
+		return nil, nil, err
+	}
+	accepted := make(map[string]struct{}, len(snapshots))
+	evidenceByID := make(map[string]*types.ProductionEvidenceSnapshot, len(snapshots))
+	for _, snapshot := range snapshots {
+		if snapshot == nil || snapshot.ID == "" {
+			return nil, nil, &ProductionDocumentValidationError{Cause: errors.New("accepted evidence snapshot is invalid")}
+		}
+		if snapshot.StoragePath != "" {
+			if s.resources == nil {
+				return nil, nil, &ProductionDocumentValidationError{Cause: errors.New("resource catalog is required for registry-backed evidence")}
+			}
+			resource, resolveErr := s.resources.ResolveBound(ctx, snapshot.StoragePath, interfaces.ResourceBindingRequirement{
+				TenantID: tenantID, OwnerType: types.ResourceOwnerTypeProductionProject, OwnerID: projectID,
+			})
+			if resolveErr != nil {
+				return nil, nil, &ProductionDocumentValidationError{Cause: fmt.Errorf("resolve evidence %s: %w", snapshot.ID, resolveErr)}
+			}
+			if resource == nil || resource.TenantID != tenantID || resource.State != types.ResourceStateActive ||
+				resource.Lifecycle != types.ResourceLifecyclePersistent {
+				return nil, nil, &ProductionDocumentValidationError{Cause: fmt.Errorf("evidence %s resource is invalid", snapshot.ID)}
+			}
+			snapshot.ResolvedContentDigest = resource.ContentHash
+		}
+		accepted[snapshot.ID] = struct{}{}
+		evidenceByID[snapshot.ID] = snapshot
+	}
+	return accepted, evidenceByID, nil
+}
+
 func (s *productionDocumentService) AppendVersion(
 	ctx context.Context,
 	documentID string,
@@ -290,6 +366,7 @@ func (s *productionDocumentService) AppendVersion(
 		ID: uuid.NewString(), DocumentID: document.ID, SourceSetID: input.SourceSetID,
 		Origin: origin, ChangeSummary: input.ChangeSummary, CreatedBy: userID, Blocks: blocks,
 	}
+	version.DocumentTypeCode = documentType.Code
 	if input.ParentVersionID != "" {
 		version.ParentVersionID = &input.ParentVersionID
 	}
@@ -298,13 +375,31 @@ func (s *productionDocumentService) AppendVersion(
 	if err != nil {
 		return nil, err
 	}
-	if err := s.documents.AppendVersion(ctx, version, blocks, lineage); err != nil {
+	acceptedEvidence, evidenceByID, err := s.loadAcceptedProductionEvidence(
+		ctx, tenantID, document.ProjectID, input.SourceSetID,
+	)
+	if err != nil {
 		return nil, err
 	}
-	if err := emitRequiredProductionAudit(ctx, s.audit, &types.AuditLog{
-		TenantID: tenantID, ActorUserID: userID, ActorRole: string(types.TenantRoleFromContext(ctx)),
-		Action: types.AuditActionProductionVersionCreated, TargetType: "production_document_version",
-		TargetID: version.ID, Outcome: types.AuditOutcomeSuccess,
+	validation := ValidateProductionVersion(version, acceptedEvidence)
+	if len(validation.Errors) != 0 {
+		return nil, &ProductionDocumentValidationError{Issues: validation.Errors}
+	}
+	if err := VerifyProductionVersionDigests(version, evidenceByID); err != nil {
+		return nil, &ProductionDocumentValidationError{Cause: err}
+	}
+	if s.uow == nil {
+		return nil, errors.New("production unit of work is required")
+	}
+	if err := s.uow.WithinTransaction(ctx, func(txCtx context.Context) error {
+		if err := s.documents.AppendVersion(txCtx, version, blocks, lineage); err != nil {
+			return err
+		}
+		return emitRequiredProductionAudit(txCtx, s.audit, &types.AuditLog{
+			TenantID: tenantID, ActorUserID: userID, ActorRole: string(types.TenantRoleFromContext(ctx)),
+			Action: types.AuditActionProductionVersionCreated, TargetType: "production_document_version",
+			TargetID: version.ID, Outcome: types.AuditOutcomeSuccess,
+		})
 	}); err != nil {
 		return nil, err
 	}

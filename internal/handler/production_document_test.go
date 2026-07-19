@@ -2,8 +2,11 @@ package handler
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -296,7 +299,7 @@ func newProductionDocumentsHTTPFixture(t *testing.T) *productionDocumentsHTTPFix
 		ID: fixture.projectID, TenantID: 7, Name: "Project", OwnerUserID: "author-1", Status: types.ProductionProjectActive,
 	}).Error)
 	require.NoError(t, db.Create(&types.ProductionDocumentType{
-		ID: fixture.typeID, TenantID: 7, Code: "baseline", Name: "Baseline", SchemaVersion: 1,
+		ID: fixture.typeID, TenantID: 7, Code: "software-development-baseline", Name: "Baseline", SchemaVersion: 1,
 		BlockSchema: types.JSON(`{}`), SourceRequirements: types.JSON(`{}`), SkillBindings: types.JSON(`{}`),
 		QualityRules: types.JSON(`{}`), ReviewPolicy: types.JSON(`{}`), PublicationPolicy: types.JSON(`{}`),
 		Status: types.ProductionDocumentTypeActive, CreatedBy: "author-1",
@@ -317,9 +320,10 @@ func newProductionDocumentsHTTPFixture(t *testing.T) *productionDocumentsHTTPFix
 		AuditLogService: appservice.NewAuditLogService(apprepository.NewAuditLogRepository(db)),
 	}
 	authorizer := &productionHTTPAuthorizer{}
-	sourceService := appservice.NewProductionSourceService(fixture.sources, authorizer, nil, fixture.audit)
+	uow := apprepository.NewProductionUnitOfWork(db)
+	sourceService := appservice.NewProductionSourceService(fixture.sources, authorizer, nil, fixture.audit, uow)
 	documentService := appservice.NewProductionDocumentService(
-		fixture.documents, fixture.sources, apprepository.NewProductionDocumentTypeRepository(db), authorizer, fixture.audit,
+		fixture.documents, fixture.sources, apprepository.NewProductionDocumentTypeRepository(db), authorizer, nil, fixture.audit, uow,
 	)
 	idempotency := apprepository.NewProductionIdempotencyRepository(db)
 	fixture.completion = &productionCompletionFailingRepo{ProductionIdempotencyRepository: idempotency}
@@ -367,12 +371,48 @@ func countProductionRows(t *testing.T, db *gorm.DB, model any) int64 {
 }
 
 func attachProductionFixtureEvidence(t *testing.T, fixture *productionDocumentsHTTPFixture) {
+	attachProductionFixtureEvidenceWithDigest(t, fixture, "")
+}
+
+func attachProductionFixtureEvidenceWithDigest(t *testing.T, fixture *productionDocumentsHTTPFixture, digest string) {
 	t.Helper()
+	inline := types.JSON(`"evidence"`)
+	if digest == "" {
+		sum := sha256.Sum256(inline)
+		digest = hex.EncodeToString(sum[:])
+	}
 	require.NoError(t, fixture.sources.CreateEvidence(context.Background(), 7, productionSourceItemID, &types.ProductionEvidenceSnapshot{
 		ID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", SourceItemID: productionSourceItemID,
-		SnapshotType: types.ProductionEvidenceSnapshotText, InlineContent: types.JSON(`"evidence"`),
-		ContentDigest: strings.Repeat("b", 64), RedactionMetadata: types.JSON(`{}`),
+		SnapshotType: types.ProductionEvidenceSnapshotText, InlineContent: inline,
+		ContentDigest: digest, RedactionMetadata: types.JSON(`{}`),
 	}))
+}
+
+func governedProductionVersionBody(extra ...map[string]any) string {
+	blocks := make([]map[string]any, 0, len(appservice.BuiltinSoftwareDevelopmentBaseline().RequiredSections)+len(extra))
+	for index, section := range appservice.BuiltinSoftwareDevelopmentBaseline().RequiredSections {
+		blocks = append(blocks, map[string]any{
+			"logical_block_id": fmt.Sprintf("section-%02d", index), "block_type": "heading", "content": section,
+			"attributes": map[string]any{}, "evidence_refs": []string{}, "ai_provenance": map[string]any{},
+		})
+	}
+	blocks = append(blocks, extra...)
+	payload, err := json.Marshal(map[string]any{
+		"source_set_id": productionSourceSetID, "origin": "human", "change_summary": "Governed draft",
+		"blocks": blocks, "lineage": []any{},
+	})
+	if err != nil {
+		panic(err)
+	}
+	return string(payload)
+}
+
+func validGovernedProductionVersionBody() string {
+	return governedProductionVersionBody(map[string]any{
+		"logical_block_id": "claim", "block_type": "paragraph", "content": "governed claim",
+		"attributes": map[string]any{}, "evidence_refs": []string{"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
+		"ai_provenance": map[string]any{},
+	})
 }
 
 func createProductionDocumentRequestBody(fixture *productionDocumentsHTTPFixture) string {
@@ -430,17 +470,17 @@ func TestProductionSourceAndDocumentHTTPTransactions(t *testing.T) {
 	appendPath := "/production/documents/" + fixture.documentID + "/versions"
 	beforeVersions := countProductionRows(t, fixture.db, &types.ProductionDocumentVersion{})
 	beforeBlocks := countProductionRows(t, fixture.db, &types.ProductionDocumentBlock{})
-	stale := performProductionDocumentsHTTPRequest(fixture, appendPath, "append-stale", validProductionVersionBody(), productionStaleID)
+	stale := performProductionDocumentsHTTPRequest(fixture, appendPath, "append-stale", validGovernedProductionVersionBody(), productionStaleID)
 	require.Equal(t, http.StatusConflict, stale.Code)
 	require.Equal(t, beforeVersions, countProductionRows(t, fixture.db, &types.ProductionDocumentVersion{}))
 	require.Equal(t, beforeBlocks, countProductionRows(t, fixture.db, &types.ProductionDocumentBlock{}))
 
-	created := performProductionDocumentsHTTPRequest(fixture, appendPath, "append-success", validProductionVersionBody(), headID)
-	replay := performProductionDocumentsHTTPRequest(fixture, appendPath, "append-success", validProductionVersionBody(), headID)
+	created := performProductionDocumentsHTTPRequest(fixture, appendPath, "append-success", validGovernedProductionVersionBody(), headID)
+	replay := performProductionDocumentsHTTPRequest(fixture, appendPath, "append-success", validGovernedProductionVersionBody(), headID)
 	require.Equal(t, http.StatusCreated, created.Code)
 	require.Equal(t, created.Body.String(), replay.Body.String())
 	conflictingReplay := performProductionDocumentsHTTPRequest(
-		fixture, appendPath, "append-success", validProductionVersionBody(), productionStaleID,
+		fixture, appendPath, "append-success", validGovernedProductionVersionBody(), productionStaleID,
 	)
 	require.Equal(t, http.StatusConflict, conflictingReplay.Code)
 	require.Contains(t, conflictingReplay.Body.String(), "PRODUCTION_IDEMPOTENCY_KEY_CONFLICT")
@@ -456,11 +496,81 @@ func TestProductionSourceAndDocumentHTTPTransactions(t *testing.T) {
 	require.NoError(t, fixture.db.First(&current, "id = ?", fixture.documentID).Error)
 	require.NotNil(t, current.CurrentVersionID)
 	fixture.completion.failNext = true
-	failed := performProductionDocumentsHTTPRequest(fixture, appendPath, "append-completion-fails", validProductionVersionBody(), *current.CurrentVersionID)
+	failed := performProductionDocumentsHTTPRequest(fixture, appendPath, "append-completion-fails", validGovernedProductionVersionBody(), *current.CurrentVersionID)
 	require.Equal(t, http.StatusInternalServerError, failed.Code)
 	require.Equal(t, beforeVersions+1, countProductionRows(t, fixture.db, &types.ProductionDocumentVersion{}))
 	require.Equal(t, int64(3), countProductionRows(t, fixture.db, &types.AuditLog{}))
 	require.Equal(t, int64(3), countProductionRows(t, fixture.db, &types.ProductionIdempotencyKey{}))
+}
+
+func TestProductionDocumentHTTPRejectsUngovernedAppendsWithoutRowsHeadOrAudit(t *testing.T) {
+	tests := []struct {
+		name           string
+		body           string
+		evidenceDigest string
+	}{
+		{
+			name: "unknown evidence",
+			body: governedProductionVersionBody(map[string]any{
+				"logical_block_id": "claim", "block_type": "paragraph", "content": "claim",
+				"attributes": map[string]any{}, "evidence_refs": []string{"unknown-evidence"}, "ai_provenance": map[string]any{},
+			}),
+		},
+		{
+			name: "missing evidence",
+			body: governedProductionVersionBody(map[string]any{
+				"logical_block_id": "claim", "block_type": "paragraph", "content": "claim",
+				"attributes": map[string]any{}, "evidence_refs": []string{}, "ai_provenance": map[string]any{},
+			}),
+		},
+		{
+			name: "unsupported block",
+			body: governedProductionVersionBody(map[string]any{
+				"logical_block_id": "quote", "block_type": "quote", "content": "claim",
+				"attributes": map[string]any{"needs_confirmation": true}, "evidence_refs": []string{}, "ai_provenance": map[string]any{},
+			}),
+		},
+		{
+			name: "missing required sections",
+			body: `{"source_set_id":"` + productionSourceSetID + `","origin":"human","blocks":[{"logical_block_id":"only","block_type":"heading","content":"基线范围与目标","attributes":{},"evidence_refs":[],"ai_provenance":{}}]}`,
+		},
+		{
+			name: "mismatched evidence digest", body: validGovernedProductionVersionBody(),
+			evidenceDigest: strings.Repeat("f", 64),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newProductionDocumentsHTTPFixture(t)
+			attachProductionFixtureEvidenceWithDigest(t, fixture, test.evidenceDigest)
+			freeze := performProductionDocumentsHTTPRequest(
+				fixture, "/production/source-sets/"+fixture.sourceSetID+"/freeze", "freeze", "", "",
+			)
+			require.Equal(t, http.StatusOK, freeze.Code)
+			created := performProductionDocumentsHTTPRequest(
+				fixture, "/production/projects/"+fixture.projectID+"/documents", "create",
+				createProductionDocumentRequestBody(fixture), "",
+			)
+			require.Equal(t, http.StatusCreated, created.Code)
+			document := decodeProductionDocumentResponse(t, created)
+			bootstrapID := *document.CurrentVersionID
+			beforeAudits := countProductionRows(t, fixture.db, &types.AuditLog{})
+
+			response := performProductionDocumentsHTTPRequest(
+				fixture, "/production/documents/"+document.ID+"/versions", "invalid-append", test.body, bootstrapID,
+			)
+
+			require.Equal(t, http.StatusBadRequest, response.Code)
+			require.Equal(t, int64(1), countProductionRows(t, fixture.db, &types.ProductionDocumentVersion{}))
+			require.Zero(t, countProductionRows(t, fixture.db, &types.ProductionDocumentBlock{}))
+			require.Zero(t, countProductionRows(t, fixture.db, &types.ProductionBlockLineage{}))
+			require.Equal(t, beforeAudits, countProductionRows(t, fixture.db, &types.AuditLog{}))
+			var persisted types.ProductionDocument
+			require.NoError(t, fixture.db.First(&persisted, "id = ?", document.ID).Error)
+			require.Equal(t, bootstrapID, *persisted.CurrentVersionID)
+		})
+	}
 }
 
 func TestProductionGovernedAuditFailuresRollBackHTTPMutations(t *testing.T) {
@@ -520,7 +630,7 @@ func TestProductionGovernedAuditFailuresRollBackHTTPMutations(t *testing.T) {
 
 		response := performProductionDocumentsHTTPRequest(
 			fixture, "/production/documents/"+document.ID+"/versions", "append-audit-fails",
-			validProductionVersionBody(), bootstrapID,
+			validGovernedProductionVersionBody(), bootstrapID,
 		)
 
 		require.Equal(t, http.StatusInternalServerError, response.Code)

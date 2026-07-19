@@ -46,6 +46,8 @@ type productionSourceResourceCatalogStub struct {
 	resource *types.StoredResource
 	err      error
 	resolved string
+	bound    interfaces.ResourceBindingRequirement
+	boundErr error
 }
 
 func (r *productionSourceResourceCatalogStub) Register(context.Context, uint64, string, interfaces.ResourceRegistration) (string, error) {
@@ -54,6 +56,11 @@ func (r *productionSourceResourceCatalogStub) Register(context.Context, uint64, 
 func (r *productionSourceResourceCatalogStub) Resolve(_ context.Context, reference string) (*types.StoredResource, error) {
 	r.resolved = reference
 	return r.resource, r.err
+}
+func (r *productionSourceResourceCatalogStub) ResolveBound(_ context.Context, reference string, requirement interfaces.ResourceBindingRequirement) (*types.StoredResource, error) {
+	r.resolved = reference
+	r.bound = requirement
+	return r.resource, r.boundErr
 }
 func (r *productionSourceResourceCatalogStub) ResolvePath(context.Context, string) (string, *types.StoredResource, error) {
 	return "", nil, errors.New("unexpected resolve path")
@@ -86,6 +93,7 @@ func newProductionSourceServiceFixture(t *testing.T) (*productionSourceService, 
 		require.NoError(t, readErr)
 		require.NoError(t, db.Exec(string(migration)).Error)
 	}
+	require.NoError(t, db.AutoMigrate(&types.AuditLog{}))
 	require.NoError(t, db.Create(&types.ProductionProject{
 		ID: serviceProjectID, TenantID: 7, Name: "Project", OwnerUserID: "owner", Status: types.ProductionProjectActive,
 	}).Error)
@@ -98,7 +106,9 @@ func newProductionSourceServiceFixture(t *testing.T) (*productionSourceService, 
 	repo := apprepository.NewProductionSourceRepository(db)
 	authorizer := &productionSourceAuthorizerStub{}
 	resources := &productionSourceResourceCatalogStub{}
-	return NewProductionSourceService(repo, authorizer, resources, &productionAuditServiceStub{}), repo, db, authorizer, resources
+	return NewProductionSourceService(
+		repo, authorizer, resources, &productionAuditServiceStub{}, apprepository.NewProductionUnitOfWork(db),
+	), repo, db, authorizer, resources
 }
 
 func sourceServiceContext(tenantID uint64) context.Context {
@@ -309,6 +319,33 @@ func TestProductionSourceServiceResolvesTenantScopedResourceReferenceAndUsesRegi
 	require.Equal(t, reference, snapshot.StoragePath)
 	require.Equal(t, strings.Repeat("c", 64), snapshot.ContentDigest)
 	require.Equal(t, reference, resources.resolved)
+	require.Equal(t, interfaces.ResourceBindingRequirement{
+		TenantID: 7, OwnerType: types.ResourceOwnerTypeProductionProject,
+		OwnerID: serviceProjectID,
+	}, resources.bound)
+}
+
+func TestProductionSourceServiceRejectsSameTenantResourceBoundToAnotherProject(t *testing.T) {
+	svc, repo, db, _, resources := newProductionSourceServiceFixture(t)
+	createServiceSourceSet(t, repo, types.ProductionSourceSetCollecting)
+	createServiceSourceItem(t, repo, types.ProductionSourceItemAccepted)
+	resources.resource = &types.StoredResource{
+		ID: "resource-id", Handle: strings.Repeat("a", types.ResourceHandleLength), TenantID: 7,
+		ContentHash: strings.Repeat("c", 64), State: types.ResourceStateActive,
+		Lifecycle: types.ResourceLifecyclePersistent,
+	}
+	resources.boundErr = types.ErrResourceBindingNotFound
+
+	snapshot, err := svc.AttachEvidence(sourceServiceContext(7), serviceItemID, interfaces.CreateEvidenceSnapshotInput{
+		SnapshotType:      types.ProductionEvidenceSnapshotFile,
+		ResourceReference: types.BuildResourcePath(resources.resource.Handle),
+	})
+
+	require.Nil(t, snapshot)
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
+	var count int64
+	require.NoError(t, db.Model(&types.ProductionEvidenceSnapshot{}).Count(&count).Error)
+	require.Zero(t, count)
 }
 
 func TestProductionSourceServiceCanonicalizesResourceReferenceBeforeResolveAndPersistence(t *testing.T) {
@@ -387,4 +424,29 @@ func TestProductionSourceServiceReturnsRequiredFreezeAuditFailure(t *testing.T) 
 	err := svc.Freeze(sourceServiceContext(7), serviceSetID)
 
 	require.ErrorContains(t, err, "governed audit unavailable")
+}
+
+func TestProductionSourceDirectServiceAuditFailureRollsBackFreeze(t *testing.T) {
+	svc, repo, db, _, _ := newProductionSourceServiceFixture(t)
+	svc.audit = NewAuditLogService(apprepository.NewAuditLogRepository(db))
+	createServiceSourceSet(t, repo, types.ProductionSourceSetCollecting)
+	require.NoError(t, installServiceAuditFailureTrigger(db))
+
+	err := svc.Freeze(sourceServiceContext(7), serviceSetID)
+
+	require.ErrorContains(t, err, "forced governed audit failure")
+	set, getErr := repo.GetSet(context.Background(), 7, serviceSetID)
+	require.NoError(t, getErr)
+	require.Equal(t, types.ProductionSourceSetCollecting, set.Status)
+	var auditCount int64
+	require.NoError(t, db.Model(&types.AuditLog{}).Count(&auditCount).Error)
+	require.Zero(t, auditCount)
+
+	require.NoError(t, db.Exec(`DROP TRIGGER fail_governed_audit_insert`).Error)
+	require.NoError(t, svc.Freeze(sourceServiceContext(7), serviceSetID))
+	set, getErr = repo.GetSet(context.Background(), 7, serviceSetID)
+	require.NoError(t, getErr)
+	require.Equal(t, types.ProductionSourceSetFrozen, set.Status)
+	require.NoError(t, db.Model(&types.AuditLog{}).Count(&auditCount).Error)
+	require.Equal(t, int64(1), auditCount)
 }

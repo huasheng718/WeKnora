@@ -1,6 +1,7 @@
 package types
 
 import (
+	"errors"
 	"strings"
 	"time"
 
@@ -8,14 +9,17 @@ import (
 	"gorm.io/gorm"
 )
 
+var ErrResourceBindingNotFound = errors.New("resource binding not found")
+
 // Stable resource reference and lifecycle constants.
 const (
-	ResourceScheme              = "resource://"
-	ResourceHandleLength        = 22
-	ResourceStateActive         = "active"
-	ResourceStateDeleted        = "deleted"
-	ResourceLifecyclePersistent = "persistent"
-	ResourceLifecycleTemporary  = "temporary"
+	ResourceScheme                     = "resource://"
+	ResourceHandleLength               = 22
+	ResourceStateActive                = "active"
+	ResourceStateDeleted               = "deleted"
+	ResourceLifecyclePersistent        = "persistent"
+	ResourceLifecycleTemporary         = "temporary"
+	ResourceOwnerTypeProductionProject = "production_project"
 )
 
 // StoredResource is the stable application identity of one stored object. PhysicalPath

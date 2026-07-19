@@ -153,7 +153,8 @@ func handleProductionServiceError(c *gin.Context, err error, message string) {
 		c.Error(apperrors.NewConflictError("production resource state conflict"))
 	case errors.Is(err, types.ErrProductionEvidenceDigestMismatch),
 		errors.Is(err, types.ErrProductionEvidenceResourceInvalid),
-		errors.Is(err, types.ErrProductionBlockLineageInvalid):
+		errors.Is(err, types.ErrProductionBlockLineageInvalid),
+		errors.Is(err, types.ErrProductionDocumentValidation):
 		c.Error(apperrors.NewValidationError("invalid production resource"))
 	case errors.Is(err, gorm.ErrRecordNotFound):
 		c.Error(apperrors.NewNotFoundError("production resource not found"))

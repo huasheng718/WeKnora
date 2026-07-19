@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/database"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"gorm.io/gorm"
@@ -69,6 +70,26 @@ func (r *resourceRepository) MarkDeleted(ctx context.Context, id string) error {
 
 func (r *resourceRepository) CreateBinding(ctx context.Context, binding *types.ResourceBinding) error {
 	return r.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(binding).Error
+}
+
+func (r *resourceRepository) GetBoundByHandle(
+	ctx context.Context,
+	handle string,
+	requirement interfaces.ResourceBindingRequirement,
+) (*types.StoredResource, error) {
+	var resource types.StoredResource
+	err := database.DBFromContext(ctx, r.db).WithContext(ctx).
+		Table("resources AS resource").
+		Select("resource.*").
+		Joins("JOIN resource_bindings AS binding ON binding.resource_id = resource.id AND binding.tenant_id = resource.tenant_id").
+		Where("resource.handle = ? AND resource.tenant_id = ?", handle, requirement.TenantID).
+		Where("resource.state = ? AND resource.deleted_at IS NULL", types.ResourceStateActive).
+		Where("binding.owner_type = ? AND binding.owner_id = ?", requirement.OwnerType, requirement.OwnerID).
+		First(&resource).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	return &resource, err
 }
 
 func (r *resourceRepository) CreateGrant(ctx context.Context, grant *types.ResourceAccessGrant) error {

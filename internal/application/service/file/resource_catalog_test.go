@@ -39,6 +39,14 @@ func (c *catalogStub) Resolve(_ context.Context, _ string) (*types.StoredResourc
 	return c.resource, nil
 }
 
+func (c *catalogStub) ResolveBound(
+	context.Context,
+	string,
+	interfaces.ResourceBindingRequirement,
+) (*types.StoredResource, error) {
+	return c.resource, nil
+}
+
 func (c *catalogStub) ResolvePath(_ context.Context, value string) (string, *types.StoredResource, error) {
 	if value == c.ref {
 		return c.resource.PhysicalPath, c.resource, nil

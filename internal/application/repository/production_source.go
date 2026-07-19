@@ -175,6 +175,27 @@ func (r *productionSourceRepository) GetItem(
 	return &item, &sourceSet, nil
 }
 
+func (r *productionSourceRepository) ListAcceptedEvidence(
+	ctx context.Context,
+	tenantID uint64,
+	projectID, sourceSetID string,
+) ([]*types.ProductionEvidenceSnapshot, error) {
+	var evidence []*types.ProductionEvidenceSnapshot
+	err := database.DBFromContext(ctx, r.db).WithContext(ctx).
+		Table("production_evidence_snapshots AS evidence").
+		Select("evidence.*").
+		Joins("JOIN production_source_items AS item ON item.id = evidence.source_item_id").
+		Joins("JOIN production_source_sets AS source_set ON source_set.id = item.source_set_id").
+		Where(
+			"source_set.id = ? AND source_set.tenant_id = ? AND source_set.project_id = ? AND source_set.status = ?",
+			sourceSetID, tenantID, projectID, types.ProductionSourceSetFrozen,
+		).
+		Where("item.status = ?", types.ProductionSourceItemAccepted).
+		Order("evidence.id ASC").
+		Find(&evidence).Error
+	return evidence, err
+}
+
 func (r *productionSourceRepository) DecideItem(
 	ctx context.Context,
 	tenantID uint64,

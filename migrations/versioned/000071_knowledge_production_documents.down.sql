@@ -1,3 +1,7 @@
+DROP TRIGGER IF EXISTS trg_production_block_lineage_prevent_replace ON production_block_lineage;
+DROP FUNCTION IF EXISTS prevent_production_block_lineage_replace();
+DROP TRIGGER IF EXISTS trg_production_block_lineage_prevent_mutation ON production_block_lineage;
+DROP FUNCTION IF EXISTS prevent_production_block_lineage_mutation();
 DROP TRIGGER IF EXISTS trg_production_document_blocks_prevent_replace ON production_document_blocks;
 DROP FUNCTION IF EXISTS prevent_production_document_block_replace();
 DROP TRIGGER IF EXISTS trg_production_document_blocks_prevent_mutation ON production_document_blocks;
@@ -10,10 +14,10 @@ DROP TRIGGER IF EXISTS trg_production_evidence_snapshots_prevent_replace ON prod
 DROP FUNCTION IF EXISTS prevent_production_evidence_snapshot_replace();
 DROP TRIGGER IF EXISTS trg_production_evidence_snapshots_prevent_mutation ON production_evidence_snapshots;
 DROP FUNCTION IF EXISTS prevent_production_evidence_snapshot_mutation();
-DROP TRIGGER IF EXISTS trg_production_source_items_prevent_frozen_accepted_replace ON production_source_items;
-DROP FUNCTION IF EXISTS prevent_frozen_production_source_item_replace();
-DROP TRIGGER IF EXISTS trg_production_source_items_prevent_frozen_accepted_mutation ON production_source_items;
-DROP FUNCTION IF EXISTS prevent_frozen_production_source_item_mutation();
+DROP TRIGGER IF EXISTS trg_production_evidence_snapshots_prevent_frozen_insert ON production_evidence_snapshots;
+DROP FUNCTION IF EXISTS prevent_frozen_production_evidence_insert();
+DROP TRIGGER IF EXISTS trg_production_source_items_prevent_frozen_write ON production_source_items;
+DROP FUNCTION IF EXISTS prevent_frozen_production_source_item_write();
 DROP TRIGGER IF EXISTS trg_production_source_sets_prevent_frozen_delete ON production_source_sets;
 DROP FUNCTION IF EXISTS prevent_frozen_production_source_set_delete();
 DROP TRIGGER IF EXISTS trg_production_source_sets_prevent_reopen ON production_source_sets;
