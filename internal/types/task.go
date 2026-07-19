@@ -9,6 +9,7 @@ const (
 	WorkerPoolEnrichment  = "enrichment"
 	WorkerPoolMaintenance = "maintenance"
 	WorkerPoolShared      = "shared"
+	WorkerPoolProduction  = "production"
 	WorkerPoolWiki        = "wiki"
 
 	// Upstream defaults are explicit guarantees plus an elastic pool. The
@@ -19,6 +20,7 @@ const (
 	DefaultEnrichmentWorkerConcurrency  = 12
 	DefaultMaintenanceWorkerConcurrency = 4
 	DefaultSharedWorkerConcurrency      = 6
+	DefaultProductionWorkerConcurrency  = 4
 	DefaultWikiWorkerConcurrency        = 8
 	DefaultUpstreamWorkerConcurrency    = DefaultCoreWorkerConcurrency +
 		DefaultPostProcessWorkerConcurrency + DefaultEnrichmentWorkerConcurrency +
@@ -37,6 +39,7 @@ const (
 	QueueQuestion    = "question"
 	QueueSync        = "sync"
 	QueueMaintenance = "low"
+	QueueProduction  = "production"
 	QueueWiki        = "wiki"
 )
 
@@ -69,6 +72,9 @@ var queueDefinitions = []QueueDefinition{
 	{Name: QueueMaintenance, Pool: WorkerPoolMaintenance, Weight: 1, TaskTypes: []string{
 		TypeFAQImport, TypeKBClone, TypeIndexDelete, TypeKBDelete,
 		TypeKnowledgeListDelete, TypeKnowledgeListReparse, TypeKnowledgeMove,
+	}},
+	{Name: QueueProduction, Pool: WorkerPoolProduction, Weight: 1, TaskTypes: []string{
+		TypeProductionCollect, TypeProductionWrite, TypeProductionValidate,
 	}},
 	{Name: QueueWiki, Pool: WorkerPoolWiki, Weight: 1, TaskTypes: []string{TypeWikiIngest, TypeWikiFinalize}},
 }
@@ -131,6 +137,7 @@ type WorkerPoolConcurrency struct {
 	Enrichment  int
 	Maintenance int
 	Shared      int
+	Production  int
 	Wiki        int
 }
 
@@ -141,6 +148,7 @@ func DefaultWorkerPoolConcurrency() WorkerPoolConcurrency {
 		Enrichment:  DefaultEnrichmentWorkerConcurrency,
 		Maintenance: DefaultMaintenanceWorkerConcurrency,
 		Shared:      DefaultSharedWorkerConcurrency,
+		Production:  DefaultProductionWorkerConcurrency,
 		Wiki:        DefaultWikiWorkerConcurrency,
 	}
 }
@@ -166,6 +174,7 @@ func ResolveWorkerPoolConcurrency(read func(key, env string, fallback int) int) 
 	allocation.Enrichment = positive("asynq.enrichment_concurrency", "WEKNORA_ASYNQ_ENRICHMENT_CONCURRENCY", allocation.Enrichment)
 	allocation.Maintenance = positive("asynq.maintenance_concurrency", "WEKNORA_ASYNQ_MAINTENANCE_CONCURRENCY", allocation.Maintenance)
 	allocation.Shared = positive("asynq.shared_concurrency", "WEKNORA_ASYNQ_SHARED_CONCURRENCY", allocation.Shared)
+	allocation.Production = positive("asynq.production_concurrency", "WEKNORA_ASYNQ_PRODUCTION_CONCURRENCY", allocation.Production)
 	allocation.Wiki = positive("asynq.wiki_concurrency", "WEKNORA_WIKI_ASYNQ_CONCURRENCY", allocation.Wiki)
 	return allocation
 }
@@ -234,8 +243,11 @@ const (
 	TypeKnowledgePostProcess = "knowledge:post_process" // 知识后处理任务（统一调度）
 	TypeManualProcess        = "manual:process"         // 手工知识更新任务（cleanup + 重新索引）
 	TypeDataSourceSync       = "datasource:sync"        // 数据源同步任务
-	TypeWikiIngest           = "wiki:ingest"            // Wiki 页面同步任务
-	TypeWikiFinalize         = "wiki:finalize"          // Wiki KB 级收尾任务（防抖：索引重建/死链清理/交叉链接）
+	TypeProductionCollect    = "production:collect"
+	TypeProductionWrite      = "production:write"
+	TypeProductionValidate   = "production:validate"
+	TypeWikiIngest           = "wiki:ingest"   // Wiki 页面同步任务
+	TypeWikiFinalize         = "wiki:finalize" // Wiki KB 级收尾任务（防抖：索引重建/死链清理/交叉链接）
 )
 
 // ExtractChunkPayload represents the extract chunk task payload

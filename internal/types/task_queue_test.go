@@ -13,6 +13,7 @@ func TestQueueDefinitionsAreUniqueAndConsumable(t *testing.T) {
 		WorkerPoolPostProcess: true,
 		WorkerPoolEnrichment:  true,
 		WorkerPoolMaintenance: true,
+		WorkerPoolProduction:  true,
 		WorkerPoolWiki:        true,
 	}
 	seen := make(map[string]bool, len(definitions))
@@ -70,7 +71,8 @@ func TestEveryAsynqTaskTypeHasADeclaredQueue(t *testing.T) {
 		TypeIndexDelete, TypeKBDelete, TypeKnowledgeListDelete,
 		TypeKnowledgeListReparse, TypeKnowledgeMove, TypeDataTableSummary,
 		TypeImageMultimodal, TypeKnowledgePostProcess, TypeManualProcess,
-		TypeDataSourceSync, TypeWikiIngest, TypeWikiFinalize,
+		TypeDataSourceSync, TypeProductionCollect, TypeProductionWrite,
+		TypeProductionValidate, TypeWikiIngest, TypeWikiFinalize,
 	}
 	for _, taskType := range taskTypes {
 		if _, ok := QueueForTaskType(taskType); !ok {
@@ -85,8 +87,48 @@ func TestDefaultWorkerPoolConcurrencyIsExplicitBudget(t *testing.T) {
 		t.Fatalf("upstream total = %d, want %d", allocation.UpstreamTotal(), DefaultUpstreamWorkerConcurrency)
 	}
 	if allocation.Core < 1 || allocation.PostProcess < 1 || allocation.Enrichment < 1 ||
-		allocation.Maintenance < 1 || allocation.Shared < 1 || allocation.Wiki < 1 {
+		allocation.Maintenance < 1 || allocation.Shared < 1 || allocation.Production < 1 || allocation.Wiki < 1 {
 		t.Fatalf("every pool must have positive explicit capacity: %+v", allocation)
+	}
+}
+
+func TestProductionTaskTypesUseProductionQueue(t *testing.T) {
+	for _, taskType := range []string{TypeProductionCollect, TypeProductionWrite, TypeProductionValidate} {
+		queue, ok := QueueForTaskType(taskType)
+		if !ok {
+			t.Fatalf("task type %q has no queue", taskType)
+		}
+		if queue != QueueProduction {
+			t.Fatalf("task type %q queue = %q, want %q", taskType, queue, QueueProduction)
+		}
+	}
+
+	if weights := QueueWeightsForPool(WorkerPoolProduction); len(weights) != 1 || weights[QueueProduction] < 1 {
+		t.Fatalf("production pool must consume only the production queue: %+v", weights)
+	}
+	if shared := QueueWeightsForSharedPool(); shared[QueueProduction] != 0 {
+		t.Fatalf("shared pool must not consume production tasks: %+v", shared)
+	}
+}
+
+func TestResolveWorkerPoolConcurrencyKeepsProductionIndependent(t *testing.T) {
+	allocation := ResolveWorkerPoolConcurrency(func(key, _ string, fallback int) int {
+		if key == "asynq.production_concurrency" {
+			return 3
+		}
+		if key == "asynq.shared_concurrency" {
+			return 17
+		}
+		return fallback
+	})
+	if allocation.Production != 3 {
+		t.Fatalf("production = %d, want override 3", allocation.Production)
+	}
+	if allocation.Shared != 17 {
+		t.Fatalf("shared = %d, want override 17", allocation.Shared)
+	}
+	if allocation.UpstreamTotal() != DefaultUpstreamWorkerConcurrency+11 {
+		t.Fatalf("production capacity must not be counted in upstream pool total: %d", allocation.UpstreamTotal())
 	}
 }
 
