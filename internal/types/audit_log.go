@@ -135,6 +135,8 @@ const (
 	AuditActionProductionProjectRoleSet        AuditAction = "production.project_role_set"
 	AuditActionProductionDocumentTypeCreated   AuditAction = "production.document_type_created"
 	AuditActionProductionDocumentTypeActivated AuditAction = "production.document_type_activated"
+	AuditActionProductionSourceFrozen          AuditAction = "production.source_frozen"
+	AuditActionProductionVersionCreated        AuditAction = "production.version_created"
 )
 
 // AuditOutcome distinguishes successful mutations from middleware-level

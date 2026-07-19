@@ -93,6 +93,8 @@ type RouterParams struct {
 	WikiPageHandler              *handler.WikiPageHandler
 	ProductionProjectHandler     *handler.ProductionProjectHandler
 	ProductionDocTypeHandler     *handler.ProductionDocumentTypeHandler
+	ProductionSourceHandler      *handler.ProductionSourceHandler
+	ProductionDocumentHandler    *handler.ProductionDocumentHandler
 	ProductionIdempotency        *middleware.ProductionIdempotencyMiddleware
 }
 
@@ -275,6 +277,8 @@ func NewRouter(params RouterParams) *gin.Engine {
 			v1,
 			params.ProductionProjectHandler,
 			params.ProductionDocTypeHandler,
+			params.ProductionSourceHandler,
+			params.ProductionDocumentHandler,
 			rbacGuards,
 			params.ProductionIdempotency,
 		)
@@ -296,6 +300,8 @@ func RegisterProductionRoutes(
 	r *gin.RouterGroup,
 	projectHandler *handler.ProductionProjectHandler,
 	documentTypeHandler *handler.ProductionDocumentTypeHandler,
+	sourceHandler *handler.ProductionSourceHandler,
+	documentHandler *handler.ProductionDocumentHandler,
 	g *rbacGuards,
 	idempotency *middleware.ProductionIdempotencyMiddleware,
 ) {
@@ -307,6 +313,12 @@ func RegisterProductionRoutes(
 	production.GET("/document-types", g.Viewer(), documentTypeHandler.List)
 	production.POST("/document-types", g.Admin(), idempotency.Require(), documentTypeHandler.Create)
 	production.PUT("/document-types/:id/activate", g.Admin(), idempotency.Require(), documentTypeHandler.Activate)
+	production.POST("/projects/:id/source-sets", g.Contributor(), idempotency.Require(), sourceHandler.CreateSet)
+	production.PUT("/source-items/:id/decision", g.Contributor(), idempotency.Require(), sourceHandler.DecideItem)
+	production.POST("/source-sets/:id/freeze", g.Contributor(), idempotency.Require(), sourceHandler.Freeze)
+	production.POST("/projects/:id/documents", g.Contributor(), idempotency.Require(), documentHandler.Create)
+	production.GET("/documents/:id/versions", g.Viewer(), documentHandler.ListVersions)
+	production.POST("/documents/:id/versions", g.Contributor(), idempotency.Require(), documentHandler.AppendVersion)
 }
 
 // RegisterChunkerDebugRoutes wires the read-only chunker preview endpoint

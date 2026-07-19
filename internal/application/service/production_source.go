@@ -18,14 +18,16 @@ type productionSourceService struct {
 	repo      interfaces.ProductionSourceRepository
 	projects  interfaces.ProductionProjectAuthorizer
 	resources interfaces.ResourceCatalog
+	audit     interfaces.AuditLogService
 }
 
 func NewProductionSourceService(
 	repo interfaces.ProductionSourceRepository,
 	projects interfaces.ProductionProjectAuthorizer,
 	resources interfaces.ResourceCatalog,
+	audit interfaces.AuditLogService,
 ) *productionSourceService {
-	return &productionSourceService{repo: repo, projects: projects, resources: resources}
+	return &productionSourceService{repo: repo, projects: projects, resources: resources, audit: audit}
 }
 
 func canonicalProductionSourceID(value, name string, rejectNonCanonical bool) (string, error) {
@@ -256,7 +258,7 @@ func (s *productionSourceService) AttachEvidence(
 }
 
 func (s *productionSourceService) Freeze(ctx context.Context, sourceSetID string) error {
-	tenantID, _, err := productionCaller(ctx)
+	tenantID, userID, err := productionCaller(ctx)
 	if err != nil {
 		return err
 	}
@@ -270,7 +272,15 @@ func (s *productionSourceService) Freeze(ctx context.Context, sourceSetID string
 	if err := requireProductionSourceAuthor(ctx, s.projects, sourceSet.ProjectID); err != nil {
 		return err
 	}
-	return s.repo.Freeze(ctx, tenantID, sourceSetID)
+	if err := s.repo.Freeze(ctx, tenantID, sourceSetID); err != nil {
+		return err
+	}
+	emitProductionAudit(ctx, s.audit, &types.AuditLog{
+		TenantID: tenantID, ActorUserID: userID, ActorRole: string(types.TenantRoleFromContext(ctx)),
+		Action: types.AuditActionProductionSourceFrozen, TargetType: "production_source_set",
+		TargetID: sourceSetID, Outcome: types.AuditOutcomeSuccess,
+	})
+	return nil
 }
 
 var _ interfaces.ProductionSourceService = (*productionSourceService)(nil)

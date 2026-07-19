@@ -123,7 +123,7 @@ func (h *ProductionProjectHandler) RemoveRole(c *gin.Context) {
 
 func isProductionUUID(value string) bool {
 	parsed, err := uuid.Parse(value)
-	return err == nil && parsed != uuid.Nil
+	return err == nil && parsed != uuid.Nil && parsed.String() == value
 }
 
 func productionRequestIdentity(c *gin.Context) (uint64, string, bool) {
@@ -140,11 +140,24 @@ func handleProductionServiceError(c *gin.Context, err error, message string) {
 	switch {
 	case errors.Is(err, types.ErrProductionForbidden):
 		c.Error(apperrors.NewForbiddenError("production operation forbidden"))
-	case errors.Is(err, types.ErrProductionConflict):
-		c.Error(apperrors.NewConflictError("production resource already exists"))
+	case errors.Is(err, types.ErrProductionConflict),
+		errors.Is(err, types.ErrProductionSourceSetFrozen),
+		errors.Is(err, types.ErrProductionEvidenceMissing),
+		errors.Is(err, types.ErrProductionEvidenceImmutable),
+		errors.Is(err, types.ErrProductionDocumentStaleParent),
+		errors.Is(err, types.ErrProductionDocumentSourceSetInvalid),
+		errors.Is(err, types.ErrProductionDocumentTypeInactive),
+		errors.Is(err, types.ErrProductionDocumentTypeImmutable),
+		errors.Is(err, types.ErrProductionDocumentVersionImmutable),
+		errors.Is(err, types.ErrProductionDocumentBlockImmutable):
+		c.Error(apperrors.NewConflictError("production resource state conflict"))
+	case errors.Is(err, types.ErrProductionEvidenceDigestMismatch),
+		errors.Is(err, types.ErrProductionEvidenceResourceInvalid),
+		errors.Is(err, types.ErrProductionBlockLineageInvalid):
+		c.Error(apperrors.NewValidationError("invalid production resource"))
 	case errors.Is(err, gorm.ErrRecordNotFound):
 		c.Error(apperrors.NewNotFoundError("production resource not found"))
 	default:
-		c.Error(apperrors.NewInternalServerError(message).WithDetails(err.Error()))
+		c.Error(apperrors.NewInternalServerError(message))
 	}
 }

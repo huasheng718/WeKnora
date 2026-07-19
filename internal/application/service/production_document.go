@@ -17,6 +17,7 @@ type productionDocumentService struct {
 	sources       interfaces.ProductionSourceRepository
 	documentTypes interfaces.ProductionDocumentTypeRepository
 	projects      interfaces.ProductionProjectAuthorizer
+	audit         interfaces.AuditLogService
 }
 
 func NewProductionDocumentService(
@@ -24,9 +25,10 @@ func NewProductionDocumentService(
 	sources interfaces.ProductionSourceRepository,
 	documentTypes interfaces.ProductionDocumentTypeRepository,
 	projects interfaces.ProductionProjectAuthorizer,
+	audit interfaces.AuditLogService,
 ) *productionDocumentService {
 	return &productionDocumentService{
-		documents: documents, sources: sources, documentTypes: documentTypes, projects: projects,
+		documents: documents, sources: sources, documentTypes: documentTypes, projects: projects, audit: audit,
 	}
 }
 
@@ -287,6 +289,11 @@ func (s *productionDocumentService) AppendVersion(
 	if err := s.documents.AppendVersion(ctx, version, blocks, lineage); err != nil {
 		return nil, err
 	}
+	emitProductionAudit(ctx, s.audit, &types.AuditLog{
+		TenantID: tenantID, ActorUserID: userID, ActorRole: string(types.TenantRoleFromContext(ctx)),
+		Action: types.AuditActionProductionVersionCreated, TargetType: "production_document_version",
+		TargetID: version.ID, Outcome: types.AuditOutcomeSuccess,
+	})
 	return version, nil
 }
 

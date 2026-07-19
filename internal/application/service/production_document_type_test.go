@@ -275,4 +275,6 @@ func TestProductionProjectAndDocumentTypeAuditActionWireValues(t *testing.T) {
 	require.Equal(t, types.AuditAction("production.project_role_set"), types.AuditActionProductionProjectRoleSet)
 	require.Equal(t, types.AuditAction("production.document_type_created"), types.AuditActionProductionDocumentTypeCreated)
 	require.Equal(t, types.AuditAction("production.document_type_activated"), types.AuditActionProductionDocumentTypeActivated)
+	require.Equal(t, types.AuditAction("production.source_frozen"), types.AuditActionProductionSourceFrozen)
+	require.Equal(t, types.AuditAction("production.version_created"), types.AuditActionProductionVersionCreated)
 }

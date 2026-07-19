@@ -73,6 +73,7 @@ func newProductionDocumentServiceFixture(t *testing.T) (*productionDocumentServi
 		apprepository.NewProductionSourceRepository(db),
 		apprepository.NewProductionDocumentTypeRepository(db),
 		authorizer,
+		nil,
 	)
 	return service, documents, db, authorizer
 }

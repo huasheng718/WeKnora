@@ -178,6 +178,8 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(repository.NewTaskDeadLetterRepository))
 	must(container.Provide(repository.NewProductionProjectRepository))
 	must(container.Provide(repository.NewProductionDocumentTypeRepository))
+	must(container.Provide(repository.NewProductionSourceRepository))
+	must(container.Provide(repository.NewProductionDocumentRepository))
 	must(container.Provide(repository.NewProductionIdempotencyRepository))
 
 	// MCP manager for managing MCP client connections
@@ -229,6 +231,11 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(service.NewEmbedChannelService))
 	must(container.Provide(service.NewProductionProjectService, dig.As(new(interfaces.ProductionProjectService))))
 	must(container.Provide(service.NewProductionDocumentTypeService, dig.As(new(interfaces.ProductionDocumentTypeService))))
+	must(container.Provide(func(projects interfaces.ProductionProjectService) interfaces.ProductionProjectAuthorizer {
+		return projects
+	}))
+	must(container.Provide(service.NewProductionSourceService, dig.As(new(interfaces.ProductionSourceService))))
+	must(container.Provide(service.NewProductionDocumentService, dig.As(new(interfaces.ProductionDocumentService))))
 	must(container.Provide(middleware.NewProductionIdempotencyMiddleware))
 
 	// Web search service (needed by AgentService)
@@ -392,6 +399,8 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(handler.NewWeKnoraCloudHandler))
 	must(container.Provide(handler.NewProductionProjectHandler))
 	must(container.Provide(handler.NewProductionDocumentTypeHandler))
+	must(container.Provide(handler.NewProductionSourceHandler))
+	must(container.Provide(handler.NewProductionDocumentHandler))
 	logger.Debugf(ctx, "[Container] HTTP handlers registered")
 
 	// Wire the chat package's local image resolver so multimodal chat can read

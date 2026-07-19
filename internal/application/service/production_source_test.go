@@ -98,7 +98,7 @@ func newProductionSourceServiceFixture(t *testing.T) (*productionSourceService, 
 	repo := apprepository.NewProductionSourceRepository(db)
 	authorizer := &productionSourceAuthorizerStub{}
 	resources := &productionSourceResourceCatalogStub{}
-	return NewProductionSourceService(repo, authorizer, resources), repo, db, authorizer, resources
+	return NewProductionSourceService(repo, authorizer, resources, nil), repo, db, authorizer, resources
 }
 
 func sourceServiceContext(tenantID uint64) context.Context {
