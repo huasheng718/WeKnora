@@ -52,6 +52,170 @@ func TestProductionDocumentsMigrationsDeclareRequiredTables(t *testing.T) {
 	}
 }
 
+func TestProductionRunsMigrationsDeclareRequiredTables(t *testing.T) {
+	postgres := mustReadMigration(t, "../../migrations/versioned/000072_knowledge_production_runs.up.sql")
+	sqlite := mustReadMigration(t, "../../migrations/sqlite/000003_knowledge_production_runs.up.sql")
+
+	for _, table := range []string{"production_runs", "production_tool_calls"} {
+		require.Contains(t, postgres, "CREATE TABLE IF NOT EXISTS "+table)
+		require.Contains(t, sqlite, "CREATE TABLE IF NOT EXISTS "+table)
+	}
+}
+
+func TestProductionRunsPostgreSQLMigrationDeclaresEquivalentStructure(t *testing.T) {
+	up := mustReadMigration(t, "../../migrations/versioned/000072_knowledge_production_runs.up.sql")
+	_, err := pg_query.Parse(up)
+	require.NoError(t, err)
+
+	for _, declaration := range []string{
+		"state_payload JSONB NOT NULL DEFAULT '{}'::jsonb",
+		"document_type_snapshot JSONB NOT NULL",
+		"raw_model_response JSONB NULL",
+		"request_snapshot JSONB NOT NULL",
+		"response_snapshot JSONB NULL",
+		"CHECK (run_type IN ('collect', 'write', 'rewrite', 'validate'))",
+		"CHECK (status IN ('queued', 'running', 'waiting_approval', 'completed', 'failed', 'cancelled'))",
+		"CHECK (provider_type IN ('skill', 'mcp', 'datasource'))",
+		"CHECK (status IN ('planned', 'pending_approval', 'approved', 'rejected', 'executing', 'completed', 'failed'))",
+		"FOREIGN KEY (document_id, tenant_id, project_id) REFERENCES production_documents(id, tenant_id, project_id)",
+		"FOREIGN KEY (source_set_id, tenant_id, project_id) REFERENCES production_source_sets(id, tenant_id, project_id)",
+		"FOREIGN KEY (input_version_id, document_id, tenant_id, project_id, source_set_id)",
+		"FOREIGN KEY (output_version_id, document_id, tenant_id, project_id, source_set_id)",
+		"FOREIGN KEY (run_id, tenant_id, project_id, document_id, source_set_id)",
+		"FOREIGN KEY (response_evidence_id, response_evidence_source_item_id)",
+		"FOREIGN KEY (response_evidence_source_item_id, source_set_id)",
+		"CREATE TRIGGER trg_production_runs_guard_terminal",
+		"CREATE TRIGGER trg_production_tool_calls_guard_terminal",
+		"BEFORE UPDATE OR DELETE ON production_runs",
+		"BEFORE UPDATE OR DELETE ON production_tool_calls",
+	} {
+		require.Contains(t, up, declaration)
+	}
+	for _, secret := range []string{"api_key", "access_token", "refresh_token", "credential", "secret"} {
+		require.NotContains(t, strings.ToLower(up), secret)
+	}
+
+	down := mustReadMigration(t, "../../migrations/versioned/000072_knowledge_production_runs.down.sql")
+	_, err = pg_query.Parse(down)
+	require.NoError(t, err)
+	require.Less(t, strings.Index(down, "DROP TABLE IF EXISTS production_tool_calls"), strings.Index(down, "DROP TABLE IF EXISTS production_runs"))
+	require.Less(t, strings.Index(down, "DROP TABLE IF EXISTS production_runs"), strings.Index(down, "DROP INDEX IF EXISTS uq_production_document_versions_run_context"))
+}
+
+func TestProductionRunsSQLiteMigrationEnforcesScopeAndIdempotency(t *testing.T) {
+	db := openProductionRunsSQLite(t)
+	seedProductionRunScopes(t, db)
+
+	insertProductionRun(t, db, "run-1", 1, "project-1", "document-1", "source-set-1", "version-1", "run-key-1")
+	_, err := db.Exec(`INSERT INTO production_runs (id, tenant_id, project_id, document_id, source_set_id, run_type, model_id, document_type_snapshot, input_version_id, idempotency_key) VALUES ('run-duplicate-key', 1, 'project-1', 'document-1', 'source-set-1', 'write', 'model-1', '{}', 'version-1', 'run-key-1')`)
+	require.Error(t, err)
+	_, err = db.Exec(`INSERT INTO production_runs (id, tenant_id, project_id, document_id, source_set_id, run_type, model_id, document_type_snapshot, input_version_id, idempotency_key) VALUES ('run-cross-project', 1, 'project-1', 'document-1', 'source-set-2', 'write', 'model-1', '{}', 'version-2', 'run-key-2')`)
+	require.Error(t, err)
+	_, err = db.Exec(`INSERT INTO production_runs (id, tenant_id, project_id, document_id, source_set_id, run_type, model_id, document_type_snapshot, input_version_id, idempotency_key) VALUES ('run-cross-version', 1, 'project-1', 'document-1', 'source-set-1', 'write', 'model-1', '{}', 'version-2', 'run-key-3')`)
+	require.Error(t, err)
+	_, err = db.Exec(`INSERT INTO production_runs (id, tenant_id, project_id, document_id, source_set_id, run_type, model_id, document_type_snapshot, input_version_id, idempotency_key) VALUES ('run-cross-tenant', 2, 'project-1', 'document-1', 'source-set-1', 'write', 'model-1', '{}', 'version-1', 'run-key-4')`)
+	require.Error(t, err)
+	insertProductionRun(t, db, "run-output", 1, "project-1", "document-1", "source-set-1", "version-1", "run-key-output")
+	_, err = db.Exec(`UPDATE production_runs SET output_version_id = 'version-2' WHERE id = 'run-output'`)
+	require.Error(t, err)
+
+	insertProductionToolCall(t, db, "call-1", "run-1", "call-key-1", 0, 0)
+	_, err = db.Exec(`INSERT INTO production_tool_calls (id, run_id, tenant_id, project_id, document_id, source_set_id, attempt, current_step, idempotency_key, provider_type, provider_id, tool_name, request_snapshot, request_digest) VALUES ('call-duplicate-key', 'run-1', 1, 'project-1', 'document-1', 'source-set-1', 0, 1, 'call-key-1', 'skill', 'writer', 'collect', '{}', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')`)
+	require.Error(t, err)
+	_, err = db.Exec(`INSERT INTO production_tool_calls (id, run_id, tenant_id, project_id, document_id, source_set_id, attempt, current_step, idempotency_key, provider_type, provider_id, tool_name, request_snapshot, request_digest) VALUES ('call-duplicate-step', 'run-1', 1, 'project-1', 'document-1', 'source-set-1', 0, 0, 'call-key-2', 'skill', 'writer', 'collect', '{}', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')`)
+	require.Error(t, err)
+	_, err = db.Exec(`INSERT INTO production_tool_calls (id, run_id, tenant_id, project_id, document_id, source_set_id, attempt, current_step, idempotency_key, provider_type, provider_id, tool_name, request_snapshot, request_digest) VALUES ('call-cross-run-scope', 'run-1', 1, 'project-2', 'document-2', 'source-set-2', 0, 1, 'call-key-3', 'skill', 'writer', 'collect', '{}', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')`)
+	require.Error(t, err)
+}
+
+func TestProductionRunsSQLiteMigrationLinksEvidenceWithinSourceSet(t *testing.T) {
+	db := openProductionRunsSQLite(t)
+	seedProductionRunScopes(t, db)
+	insertProductionRun(t, db, "run-1", 1, "project-1", "document-1", "source-set-1", "version-1", "run-key-1")
+	insertProductionToolCall(t, db, "call-1", "run-1", "call-key-1", 0, 0)
+
+	_, err := db.Exec(`UPDATE production_tool_calls SET status = 'completed', response_snapshot = '{"ok":true}', response_digest = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', response_evidence_id = 'evidence-1', response_evidence_source_item_id = 'source-item-1', completed_at = CURRENT_TIMESTAMP WHERE id = 'call-1'`)
+	require.NoError(t, err)
+
+	insertProductionToolCall(t, db, "call-2", "run-1", "call-key-2", 0, 1)
+	_, err = db.Exec(`UPDATE production_tool_calls SET status = 'completed', response_snapshot = '{"ok":true}', response_digest = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', response_evidence_id = 'evidence-2', response_evidence_source_item_id = 'source-item-2', completed_at = CURRENT_TIMESTAMP WHERE id = 'call-2'`)
+	require.Error(t, err)
+}
+
+func TestProductionRunsSQLiteMigrationGuardsTerminalRowsAndReplacements(t *testing.T) {
+	db := openProductionRunsSQLite(t)
+	seedProductionRunScopes(t, db)
+	insertProductionRun(t, db, "run-1", 1, "project-1", "document-1", "source-set-1", "version-1", "run-key-1")
+	_, err := db.Exec(`UPDATE production_runs SET status = 'completed', output_version_id = 'version-1', raw_model_response = '{"text":"done"}', raw_model_response_digest = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', completed_at = CURRENT_TIMESTAMP WHERE id = 'run-1'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_runs SET status = 'running' WHERE id = 'run-1'`)
+	require.ErrorContains(t, err, "terminal production runs are immutable")
+	_, err = db.Exec(`UPDATE production_runs SET raw_model_response = '{"text":"changed"}' WHERE id = 'run-1'`)
+	require.ErrorContains(t, err, "terminal production runs are immutable")
+	_, err = db.Exec(`DELETE FROM production_runs WHERE id = 'run-1'`)
+	require.ErrorContains(t, err, "terminal production runs are immutable")
+	_, err = db.Exec(`INSERT OR REPLACE INTO production_runs (id, tenant_id, project_id, document_id, source_set_id, run_type, model_id, document_type_snapshot, input_version_id, idempotency_key) VALUES ('run-replaced', 1, 'project-1', 'document-1', 'source-set-1', 'write', 'model-1', '{}', 'version-1', 'run-key-1')`)
+	require.ErrorContains(t, err, "terminal production runs cannot be replaced")
+
+	insertProductionRun(t, db, "run-2", 1, "project-1", "document-1", "source-set-1", "version-1", "run-key-2")
+	insertProductionToolCall(t, db, "call-1", "run-2", "call-key-1", 0, 0)
+	_, err = db.Exec(`UPDATE production_tool_calls SET status = 'completed', response_snapshot = '{"ok":true}', response_digest = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', response_evidence_id = 'evidence-1', response_evidence_source_item_id = 'source-item-1', completed_at = CURRENT_TIMESTAMP WHERE id = 'call-1'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_tool_calls SET status = 'executing' WHERE id = 'call-1'`)
+	require.ErrorContains(t, err, "terminal production tool calls are immutable")
+	_, err = db.Exec(`UPDATE production_tool_calls SET response_snapshot = '{"ok":false}' WHERE id = 'call-1'`)
+	require.ErrorContains(t, err, "terminal production tool calls are immutable")
+	_, err = db.Exec(`DELETE FROM production_tool_calls WHERE id = 'call-1'`)
+	require.ErrorContains(t, err, "terminal production tool calls are immutable")
+	_, err = db.Exec(`INSERT OR REPLACE INTO production_tool_calls (id, run_id, tenant_id, project_id, document_id, source_set_id, attempt, current_step, idempotency_key, provider_type, provider_id, tool_name, request_snapshot, request_digest) VALUES ('call-replaced', 'run-2', 1, 'project-1', 'document-1', 'source-set-1', 0, 1, 'call-key-1', 'skill', 'writer', 'collect', '{}', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')`)
+	require.ErrorContains(t, err, "terminal production tool calls cannot be replaced")
+}
+
+func TestProductionRunsSQLiteMigrationRejectsInvalidContracts(t *testing.T) {
+	db := openProductionRunsSQLite(t)
+	seedProductionRunScopes(t, db)
+
+	_, err := db.Exec(`INSERT INTO production_runs (id, tenant_id, project_id, document_id, source_set_id, run_type, status, model_id, document_type_snapshot, idempotency_key) VALUES ('bad-run-status', 1, 'project-1', 'document-1', 'source-set-1', 'write', 'paused', 'model-1', '{}', 'run-key-1')`)
+	require.Error(t, err)
+	_, err = db.Exec(`INSERT INTO production_runs (id, tenant_id, project_id, document_id, source_set_id, run_type, model_id, document_type_snapshot, idempotency_key, raw_model_response_digest) VALUES ('bad-run-digest', 1, 'project-1', 'document-1', 'source-set-1', 'write', 'model-1', '{}', 'run-key-2', 'short')`)
+	require.Error(t, err)
+	insertProductionRun(t, db, "run-1", 1, "project-1", "document-1", "source-set-1", "version-1", "run-key-3")
+	_, err = db.Exec(`INSERT INTO production_tool_calls (id, run_id, tenant_id, project_id, document_id, source_set_id, attempt, current_step, idempotency_key, provider_type, provider_id, tool_name, request_snapshot, request_digest) VALUES ('bad-provider', 'run-1', 1, 'project-1', 'document-1', 'source-set-1', 0, 0, 'call-key-1', 'http', 'writer', 'collect', '{}', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')`)
+	require.Error(t, err)
+	_, err = db.Exec(`INSERT INTO production_tool_calls (id, run_id, tenant_id, project_id, document_id, source_set_id, attempt, current_step, idempotency_key, provider_type, provider_id, tool_name, request_snapshot, request_digest) VALUES ('bad-digest', 'run-1', 1, 'project-1', 'document-1', 'source-set-1', 0, 0, 'call-key-2', 'skill', 'writer', 'collect', '{}', 'not-a-sha256')`)
+	require.Error(t, err)
+	_, err = db.Exec(`INSERT INTO production_tool_calls (id, run_id, tenant_id, project_id, document_id, source_set_id, attempt, current_step, idempotency_key, provider_type, provider_id, tool_name, request_snapshot, request_digest, status, approval_status) VALUES ('bad-approval', 'run-1', 1, 'project-1', 'document-1', 'source-set-1', 0, 0, 'call-key-3', 'skill', 'writer', 'collect', '{}', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'pending_approval', 'pending')`)
+	require.Error(t, err)
+	_, err = db.Exec(`INSERT INTO production_tool_calls (id, run_id, tenant_id, project_id, document_id, source_set_id, attempt, current_step, idempotency_key, provider_type, provider_id, tool_name, request_snapshot, request_digest, status, approval_status, approval_requested_at) VALUES ('approval-call', 'run-1', 1, 'project-1', 'document-1', 'source-set-1', 0, 0, 'call-key-4', 'skill', 'writer', 'collect', '{}', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'pending_approval', 'pending', CURRENT_TIMESTAMP)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_tool_calls SET status = 'approved', approval_status = 'approved', approved_by = 'reviewer-1', approved_at = CURRENT_TIMESTAMP WHERE id = 'approval-call'`)
+	require.NoError(t, err)
+}
+
+func TestProductionRunsSQLiteMigrationRollsBackPopulatedSchema(t *testing.T) {
+	db := openProductionRunsSQLite(t)
+	seedProductionRunScopes(t, db)
+	insertProductionRun(t, db, "run-1", 1, "project-1", "document-1", "source-set-1", "version-1", "run-key-1")
+	insertProductionToolCall(t, db, "call-1", "run-1", "call-key-1", 0, 0)
+	_, err := db.Exec(`UPDATE production_tool_calls SET status = 'completed', response_snapshot = '{"ok":true}', response_digest = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', response_evidence_id = 'evidence-1', response_evidence_source_item_id = 'source-item-1', completed_at = CURRENT_TIMESTAMP WHERE id = 'call-1'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_runs SET status = 'failed', error_code = 'MODEL_ERROR', error_message = 'failed', completed_at = CURRENT_TIMESTAMP WHERE id = 'run-1'`)
+	require.NoError(t, err)
+
+	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000003_knowledge_production_runs.down.sql"))
+	require.NoError(t, err)
+	for _, table := range []string{"production_tool_calls", "production_runs"} {
+		require.Empty(t, sqliteMasterSQL(t, db, "table", table))
+	}
+	for _, index := range []string{
+		"uq_production_document_versions_run_context",
+		"uq_production_source_items_set_context",
+		"uq_production_evidence_snapshots_item_context",
+	} {
+		require.Empty(t, sqliteMasterSQL(t, db, "index", index))
+	}
+}
+
 func TestProductionFoundationSQLiteMigrationPreventsActiveDefinitionUpdates(t *testing.T) {
 	db := openProductionFoundationSQLite(t)
 	insertProductionDocumentType(t, db, "type-1", "baseline", 1, "draft")
@@ -627,6 +791,53 @@ func openProductionDocumentsSQLite(t *testing.T) *sql.DB {
 	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000002_knowledge_production_documents.up.sql"))
 	require.NoError(t, err)
 	return db
+}
+
+func openProductionRunsSQLite(t *testing.T) *sql.DB {
+	t.Helper()
+
+	db := openProductionDocumentsSQLite(t)
+	_, err := db.Exec(mustReadMigration(t, "../../migrations/sqlite/000003_knowledge_production_runs.up.sql"))
+	require.NoError(t, err)
+	return db
+}
+
+func seedProductionRunScopes(t *testing.T, db *sql.DB) {
+	t.Helper()
+
+	insertProductionDocumentType(t, db, "type-1", "baseline", 1, "active")
+	_, err := db.Exec(`INSERT INTO production_projects (id, tenant_id, name, owner_user_id) VALUES ('project-1', 1, 'Project 1', 'owner-1'), ('project-2', 1, 'Project 2', 'owner-1')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_source_sets (id, tenant_id, project_id, document_type_id, created_by) VALUES ('source-set-1', 1, 'project-1', 'type-1', 'owner-1'), ('source-set-2', 1, 'project-2', 'type-1', 'owner-1')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_documents (id, tenant_id, project_id, document_type_id, document_type_schema_version, title, created_by) VALUES ('document-1', 1, 'project-1', 'type-1', 1, 'Document 1', 'owner-1'), ('document-2', 1, 'project-2', 'type-1', 1, 'Document 2', 'owner-1')`)
+	require.NoError(t, err)
+	insertProductionVersion(t, db, "version-1", "document-1", 1, "project-1", 1, "source-set-1", "")
+	insertProductionVersion(t, db, "version-2", "document-2", 1, "project-2", 1, "source-set-2", "")
+	_, err = db.Exec(`INSERT INTO production_source_items (id, source_set_id, source_kind, title, mime_type, content_digest, captured_at, metadata, status) VALUES ('source-item-1', 'source-set-1', 'manual', 'Source 1', 'application/json', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', CURRENT_TIMESTAMP, '{}', 'accepted'), ('source-item-2', 'source-set-2', 'manual', 'Source 2', 'application/json', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', CURRENT_TIMESTAMP, '{}', 'accepted')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_evidence_snapshots (id, source_item_id, snapshot_type, inline_content, content_digest, redaction_metadata) VALUES ('evidence-1', 'source-item-1', 'tool_result', '{"ok":true}', 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', '{}'), ('evidence-2', 'source-item-2', 'tool_result', '{"ok":true}', 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd', '{}')`)
+	require.NoError(t, err)
+}
+
+func insertProductionRun(t *testing.T, db *sql.DB, id string, tenantID int, projectID, documentID, sourceSetID, inputVersionID, idempotencyKey string) {
+	t.Helper()
+
+	_, err := db.Exec(
+		`INSERT INTO production_runs (id, tenant_id, project_id, document_id, source_set_id, run_type, model_id, document_type_snapshot, input_version_id, idempotency_key) VALUES (?, ?, ?, ?, ?, 'write', 'model-1', '{}', NULLIF(?, ''), ?)`,
+		id, tenantID, projectID, documentID, sourceSetID, inputVersionID, idempotencyKey,
+	)
+	require.NoError(t, err)
+}
+
+func insertProductionToolCall(t *testing.T, db *sql.DB, id, runID, idempotencyKey string, attempt, currentStep int) {
+	t.Helper()
+
+	_, err := db.Exec(
+		`INSERT INTO production_tool_calls (id, run_id, tenant_id, project_id, document_id, source_set_id, attempt, current_step, idempotency_key, provider_type, provider_id, tool_name, request_snapshot, request_digest) VALUES (?, ?, 1, 'project-1', 'document-1', 'source-set-1', ?, ?, ?, 'skill', 'writer', 'collect', '{}', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')`,
+		id, runID, attempt, currentStep, idempotencyKey,
+	)
+	require.NoError(t, err)
 }
 
 func insertProductionDocumentType(t *testing.T, db *sql.DB, id, code string, schemaVersion int, status string) {
