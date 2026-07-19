@@ -15,6 +15,8 @@ CREATE TABLE IF NOT EXISTS production_runs (
     status VARCHAR(24) NOT NULL DEFAULT 'queued',
     attempt INTEGER NOT NULL DEFAULT 0,
     current_step INTEGER NOT NULL DEFAULT 0,
+    wakeup_version INTEGER NOT NULL DEFAULT 0,
+    wakeup_enqueued_version INTEGER NOT NULL DEFAULT 0,
     state_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
     model_id VARCHAR(64) NOT NULL,
     document_type_snapshot JSONB NOT NULL,
@@ -32,6 +34,10 @@ CREATE TABLE IF NOT EXISTS production_runs (
     CONSTRAINT chk_production_runs_type CHECK (run_type IN ('collect', 'write', 'rewrite', 'validate')),
     CONSTRAINT chk_production_runs_status CHECK (status IN ('queued', 'running', 'waiting_approval', 'completed', 'failed', 'cancelled')),
     CONSTRAINT chk_production_runs_resume CHECK (attempt >= 0 AND current_step >= 0),
+    CONSTRAINT chk_production_runs_wakeup CHECK (
+        wakeup_version >= 0 AND wakeup_enqueued_version >= 0 AND
+        wakeup_enqueued_version <= wakeup_version
+    ),
     CONSTRAINT chk_production_runs_raw_response CHECK (
         (raw_model_response IS NULL AND raw_model_response_digest IS NULL) OR
         (raw_model_response IS NOT NULL AND raw_model_response_digest IS NOT NULL AND raw_model_response_digest ~ '^[0-9a-f]{64}$')

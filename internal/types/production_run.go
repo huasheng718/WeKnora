@@ -1,11 +1,27 @@
 package types
 
 import (
+	"errors"
+	"fmt"
 	"time"
 
 	apperrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/google/uuid"
 )
+
+var ErrProductionRunLeaseActive = errors.New("production run lease is active")
+
+// ProductionRunLeaseActiveError tells the task runner to retry an early
+// redelivery instead of acknowledging a run still owned by another worker.
+type ProductionRunLeaseActiveError struct {
+	RetryAfter time.Duration
+}
+
+func (e *ProductionRunLeaseActiveError) Error() string {
+	return fmt.Sprintf("%v; retry after %s", ErrProductionRunLeaseActive, e.RetryAfter)
+}
+
+func (e *ProductionRunLeaseActiveError) Unwrap() error { return ErrProductionRunLeaseActive }
 
 // ProductionRunType identifies the durable orchestration workflow.
 type ProductionRunType string
@@ -120,6 +136,8 @@ type ProductionRun struct {
 	Status                 ProductionRunStatus `json:"status" gorm:"type:varchar(24);not null;default:'queued'"`
 	Attempt                int                 `json:"attempt" gorm:"not null;default:0"`
 	CurrentStep            int                 `json:"current_step" gorm:"not null;default:0"`
+	WakeupVersion          int                 `json:"wakeup_version" gorm:"not null;default:0"`
+	WakeupEnqueuedVersion  int                 `json:"wakeup_enqueued_version" gorm:"not null;default:0"`
 	StatePayload           JSON                `json:"state_payload" gorm:"type:jsonb;not null"`
 	ModelID                string              `json:"model_id" gorm:"type:varchar(64);not null"`
 	DocumentTypeSnapshot   JSON                `json:"document_type_snapshot" gorm:"type:jsonb;not null"`

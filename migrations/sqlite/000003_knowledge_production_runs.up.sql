@@ -15,6 +15,8 @@ CREATE TABLE IF NOT EXISTS production_runs (
     status VARCHAR(24) NOT NULL DEFAULT 'queued',
     attempt INTEGER NOT NULL DEFAULT 0,
     current_step INTEGER NOT NULL DEFAULT 0,
+    wakeup_version INTEGER NOT NULL DEFAULT 0,
+    wakeup_enqueued_version INTEGER NOT NULL DEFAULT 0,
     state_payload TEXT NOT NULL DEFAULT '{}',
     model_id VARCHAR(64) NOT NULL,
     document_type_snapshot TEXT NOT NULL,
@@ -32,6 +34,10 @@ CREATE TABLE IF NOT EXISTS production_runs (
     CONSTRAINT chk_production_runs_type CHECK (run_type IN ('collect', 'write', 'rewrite', 'validate')),
     CONSTRAINT chk_production_runs_status CHECK (status IN ('queued', 'running', 'waiting_approval', 'completed', 'failed', 'cancelled')),
     CONSTRAINT chk_production_runs_resume CHECK (attempt >= 0 AND current_step >= 0),
+    CONSTRAINT chk_production_runs_wakeup CHECK (
+        wakeup_version >= 0 AND wakeup_enqueued_version >= 0 AND
+        wakeup_enqueued_version <= wakeup_version
+    ),
     CONSTRAINT chk_production_runs_state_payload CHECK (json_valid(state_payload)),
     CONSTRAINT chk_production_runs_document_type_snapshot CHECK (json_valid(document_type_snapshot)),
     CONSTRAINT chk_production_runs_raw_response CHECK (

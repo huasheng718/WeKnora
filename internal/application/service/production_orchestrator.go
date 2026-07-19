@@ -12,7 +12,10 @@ import (
 	"github.com/hibiken/asynq"
 )
 
-const defaultProductionRunLeaseTTL = 5 * time.Minute
+const (
+	defaultProductionRunLeaseTTL = 5 * time.Minute
+	productionSystemActorID      = "00000000-0000-4000-8000-000000000001"
+)
 
 // ProductionStepResult is the complete durable output of one executor call.
 // Concrete Skill, MCP, writer and validator executors are registered by later
@@ -22,7 +25,20 @@ type ProductionStepResult struct {
 	RawModelResponse types.JSON
 	OutputVersionID  *string
 	ToolCall         *types.ProductionToolCall
+	ToolCallResult   *ProductionToolCallResult
 	Complete         bool
+}
+
+// ProductionToolCallResult binds executor output to one explicit persisted
+// invocation; the orchestrator never infers identity from call order.
+type ProductionToolCallResult struct {
+	ToolCallID                   string
+	Status                       types.ProductionToolCallStatus
+	ResponseSnapshot             types.JSON
+	ResponseEvidenceID           string
+	ResponseEvidenceSourceItemID string
+	ErrorCode                    string
+	ErrorMessage                 string
 }
 
 // ProductionStepExecutor executes exactly one resumable step. Approved calls
@@ -75,6 +91,12 @@ func (o *ProductionOrchestrator) CreateRun(ctx context.Context, run *types.Produ
 	if run.Attempt != 1 || run.CurrentStep != 0 {
 		return errors.New("new production run must start at attempt 1 step 0")
 	}
+	if run.WakeupVersion == 0 {
+		run.WakeupVersion = 1
+	}
+	if run.WakeupVersion != 1 || run.WakeupEnqueuedVersion != 0 {
+		return errors.New("new production run must start with pending wakeup version 1")
+	}
 	if err := (types.ProductionRunPayload{
 		TenantID: run.TenantID, RunID: run.ID, Attempt: run.Attempt,
 	}).Validate(); err != nil {
@@ -83,7 +105,8 @@ func (o *ProductionOrchestrator) CreateRun(ctx context.Context, run *types.Produ
 	if err := o.repo.Create(ctx, run); err != nil {
 		return err
 	}
-	return o.enqueue(run)
+	_, err := o.enqueuePending(ctx, run)
+	return err
 }
 
 // HandleRun claims and executes at most one resumable step, persists its
@@ -109,8 +132,8 @@ func (o *ProductionOrchestrator) HandleRun(ctx context.Context, payload types.Pr
 		ctx,
 		payload.TenantID,
 		payload.RunID,
-		interfaces.ProductionRunCAS{Status: run.Status, Attempt: run.Attempt, CurrentStep: run.CurrentStep},
-		o.now().UTC().Add(-o.leaseTTL),
+		productionRunCAS(run),
+		o.leaseTTL,
 	)
 	if err != nil {
 		return err
@@ -126,17 +149,27 @@ func (o *ProductionOrchestrator) HandleRun(ctx context.Context, payload types.Pr
 	approved := approvedCallsForStep(calls, claimed.Attempt, claimed.CurrentStep)
 	result, executeErr := o.executor.ExecuteStep(ctx, claimed, approved)
 	if executeErr != nil {
-		return o.persistExecutionFailure(ctx, claimed, executeErr)
+		return o.persistExecutionFailure(ctx, claimed, calls, executeErr)
 	}
 	if result.ToolCall != nil {
+		if len(approved) > 0 || result.ToolCallResult != nil {
+			return o.persistExecutionFailure(ctx, claimed, calls, errors.New("approved tool execution cannot request another tool call"))
+		}
 		return o.persistApprovalWait(ctx, claimed, result.ToolCall)
 	}
-	return o.persistStepResult(ctx, claimed, result)
+	if len(approved) > 0 && result.ToolCallResult == nil {
+		return o.persistExecutionFailure(ctx, claimed, calls, errors.New("approved tool execution result is required"))
+	}
+	if len(approved) == 0 && result.ToolCallResult != nil {
+		return o.persistExecutionFailure(ctx, claimed, calls, errors.New("tool result does not match a persisted approved call"))
+	}
+	return o.persistStepResult(ctx, claimed, calls, result)
 }
 
 func (o *ProductionOrchestrator) persistStepResult(
 	ctx context.Context,
 	run *types.ProductionRun,
+	calls []*types.ProductionToolCall,
 	result ProductionStepResult,
 ) error {
 	nextStep := run.CurrentStep + 1
@@ -145,46 +178,111 @@ func (o *ProductionOrchestrator) persistStepResult(
 		RawModelResponse: result.RawModelResponse, OutputVersionID: result.OutputVersionID,
 	}
 	to := types.ProductionRunQueued
+	patch.IncrementWakeup = true
 	if result.Complete {
 		to = types.ProductionRunCompleted
+		patch.IncrementWakeup = false
 		completedAt := o.now().UTC()
 		patch.CompletedAt = &completedAt
 	}
-	changed, err := o.repo.Transition(ctx, run.TenantID, run.ID, productionRunCAS(run), to, patch)
+	var transitioned *types.ProductionRun
+	err := o.uow.WithinTransaction(ctx, func(txCtx context.Context) error {
+		if result.ToolCallResult != nil {
+			call, matchErr := matchingToolResultCall(run, calls, result.ToolCallResult.ToolCallID)
+			if matchErr != nil {
+				return matchErr
+			}
+			completedAt := o.now().UTC()
+			callPatch := interfaces.ProductionToolCallPatch{CompletedAt: &completedAt}
+			if result.ToolCallResult.Status == types.ProductionToolCallCompleted {
+				callPatch.ResponseSnapshot = result.ToolCallResult.ResponseSnapshot
+				callPatch.ResponseEvidenceID = stringPtr(result.ToolCallResult.ResponseEvidenceID)
+				callPatch.ResponseEvidenceSourceItemID = stringPtr(result.ToolCallResult.ResponseEvidenceSourceItemID)
+			} else if result.ToolCallResult.Status == types.ProductionToolCallFailed {
+				callPatch.ErrorCode = stringPtr(result.ToolCallResult.ErrorCode)
+				callPatch.ErrorMessage = stringPtr(result.ToolCallResult.ErrorMessage)
+				to = types.ProductionRunFailed
+				patch.IncrementWakeup = false
+				patch.CompletedAt = &completedAt
+				patch.ErrorCode = callPatch.ErrorCode
+				patch.ErrorMessage = callPatch.ErrorMessage
+			} else {
+				return errors.New("tool call result status must be completed or failed")
+			}
+			changed, callErr := o.repo.TransitionToolCall(
+				txCtx, run.TenantID, run.ID, call.ID,
+				interfaces.ProductionToolCallCAS{Status: call.Status, Attempt: call.Attempt, CurrentStep: call.CurrentStep},
+				result.ToolCallResult.Status, callPatch,
+			)
+			if callErr != nil {
+				return callErr
+			}
+			if !changed {
+				return errors.New("production tool call became stale before output was persisted")
+			}
+		}
+		if to == types.ProductionRunCompleted {
+			remaining := calls
+			if result.ToolCallResult != nil {
+				remaining = toolCallsExcept(calls, result.ToolCallResult.ToolCallID)
+			}
+			if err := o.failActiveToolCalls(
+				txCtx, run, remaining, "PARENT_COMPLETED", "parent run completed",
+				productionSystemActorID, o.now().UTC(),
+			); err != nil {
+				return err
+			}
+		}
+		var changed bool
+		var transitionErr error
+		transitioned, changed, transitionErr = o.repo.Transition(
+			txCtx, run.TenantID, run.ID, productionRunCAS(run), to, patch,
+		)
+		if transitionErr != nil {
+			return transitionErr
+		}
+		if !changed {
+			return errors.New("production run became stale before step output was persisted")
+		}
+		return nil
+	})
 	if err != nil {
 		return err
 	}
-	if !changed {
-		return errors.New("production run became stale before step output was persisted")
-	}
-	if result.Complete {
+	if transitioned.Status != types.ProductionRunQueued {
 		return nil
 	}
-	run.Status = types.ProductionRunQueued
-	run.CurrentStep = nextStep
-	run.StatePayload = result.StatePayload
-	return o.enqueue(run)
+	_, err = o.enqueuePending(ctx, transitioned)
+	return err
 }
 
 func (o *ProductionOrchestrator) persistExecutionFailure(
 	ctx context.Context,
 	run *types.ProductionRun,
+	active []*types.ProductionToolCall,
 	executeErr error,
 ) error {
 	code := "STEP_EXECUTION_FAILED"
 	message := executeErr.Error()
 	completedAt := o.now().UTC()
-	changed, err := o.repo.Transition(
-		ctx, run.TenantID, run.ID, productionRunCAS(run), types.ProductionRunFailed,
-		interfaces.ProductionRunPatch{ErrorCode: &code, ErrorMessage: &message, CompletedAt: &completedAt},
-	)
-	if err != nil {
-		return err
-	}
-	if !changed {
-		return errors.New("production run became stale before failure was persisted")
-	}
-	return nil
+	return o.uow.WithinTransaction(ctx, func(txCtx context.Context) error {
+		if err := o.failActiveToolCalls(
+			txCtx, run, active, code, message, productionSystemActorID, completedAt,
+		); err != nil {
+			return err
+		}
+		_, changed, err := o.repo.Transition(
+			txCtx, run.TenantID, run.ID, productionRunCAS(run), types.ProductionRunFailed,
+			interfaces.ProductionRunPatch{ErrorCode: &code, ErrorMessage: &message, CompletedAt: &completedAt},
+		)
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return errors.New("production run became stale before failure was persisted")
+		}
+		return nil
+	})
 }
 
 func (o *ProductionOrchestrator) persistApprovalWait(
@@ -211,7 +309,7 @@ func (o *ProductionOrchestrator) persistApprovalWait(
 		if err := o.repo.CreateToolCall(txCtx, call); err != nil {
 			return err
 		}
-		changed, err := o.repo.Transition(
+		_, changed, err := o.repo.Transition(
 			txCtx, run.TenantID, run.ID, productionRunCAS(run),
 			types.ProductionRunWaitingApproval, interfaces.ProductionRunPatch{},
 		)
@@ -241,12 +339,16 @@ func (o *ProductionOrchestrator) ResolveDecision(
 	if err != nil {
 		return false, err
 	}
-	if call.Status != types.ProductionToolCallPendingApproval {
-		return false, nil
-	}
 	run, err := o.repo.Get(ctx, tenantID, call.RunID)
 	if err != nil {
 		return false, err
+	}
+	if call.Status != types.ProductionToolCallPendingApproval {
+		if call.Status == types.ProductionToolCallApproved && run.Status == types.ProductionRunQueued &&
+			run.Attempt == call.Attempt && run.CurrentStep == call.CurrentStep {
+			return o.enqueuePending(ctx, run)
+		}
+		return false, nil
 	}
 	if run.Status != types.ProductionRunWaitingApproval || run.Attempt != call.Attempt || run.CurrentStep != call.CurrentStep {
 		latest, latestErr := o.repo.GetToolCall(ctx, tenantID, callID)
@@ -254,12 +356,16 @@ func (o *ProductionOrchestrator) ResolveDecision(
 			return false, latestErr
 		}
 		if latest.Status != types.ProductionToolCallPendingApproval {
+			if latest.Status == types.ProductionToolCallApproved && run.Status == types.ProductionRunQueued {
+				return o.enqueuePending(ctx, run)
+			}
 			return false, nil
 		}
 		return false, errors.New("production approval does not match the persisted waiting step")
 	}
 
-	won := false
+	decisionWon := false
+	var transitioned *types.ProductionRun
 	err = o.uow.WithinTransaction(ctx, func(txCtx context.Context) error {
 		resolved, resolveErr := o.repo.ResolveToolCall(
 			txCtx, tenantID, call.ID,
@@ -273,9 +379,10 @@ func (o *ProductionOrchestrator) ResolveDecision(
 			return nil
 		}
 		to := types.ProductionRunQueued
-		patch := interfaces.ProductionRunPatch{}
+		patch := interfaces.ProductionRunPatch{IncrementWakeup: true}
 		if decision == types.ProductionToolCallRejected {
 			to = types.ProductionRunFailed
+			patch.IncrementWakeup = false
 			code := "TOOL_CALL_REJECTED"
 			message := "production tool call was rejected"
 			completedAt := o.now().UTC()
@@ -283,7 +390,9 @@ func (o *ProductionOrchestrator) ResolveDecision(
 			patch.ErrorMessage = &message
 			patch.CompletedAt = &completedAt
 		}
-		changed, transitionErr := o.repo.Transition(
+		var changed bool
+		var transitionErr error
+		transitioned, changed, transitionErr = o.repo.Transition(
 			txCtx, tenantID, run.ID, productionRunCAS(run), to, patch,
 		)
 		if transitionErr != nil {
@@ -292,20 +401,16 @@ func (o *ProductionOrchestrator) ResolveDecision(
 		if !changed {
 			return errors.New("production run became stale while resolving approval")
 		}
-		won = true
+		decisionWon = true
 		return nil
 	})
-	if err != nil || !won {
+	if err != nil || !decisionWon {
 		return false, err
 	}
 	if decision == types.ProductionToolCallRejected {
 		return true, nil
 	}
-	run.Status = types.ProductionRunQueued
-	if err := o.enqueue(run); err != nil {
-		return true, err
-	}
-	return true, nil
+	return o.enqueuePending(ctx, transitioned)
 }
 
 // Resume reissues a deterministic wake-up for a queued run or resumes a
@@ -330,7 +435,7 @@ func (o *ProductionOrchestrator) Resume(
 		return false, nil
 	}
 	if run.Status == types.ProductionRunQueued {
-		return true, o.enqueue(run)
+		return o.enqueuePending(ctx, run)
 	}
 	if run.Status != types.ProductionRunWaitingApproval {
 		return false, nil
@@ -342,14 +447,14 @@ func (o *ProductionOrchestrator) Resume(
 	if len(approvedCallsForStep(calls, run.Attempt, run.CurrentStep)) == 0 {
 		return false, errors.New("production run has no approved tool call for the persisted step")
 	}
-	changed, err := o.repo.Transition(
-		ctx, tenantID, runID, productionRunCAS(run), types.ProductionRunQueued, interfaces.ProductionRunPatch{},
+	transitioned, changed, err := o.repo.Transition(
+		ctx, tenantID, runID, productionRunCAS(run), types.ProductionRunQueued,
+		interfaces.ProductionRunPatch{IncrementWakeup: true},
 	)
 	if err != nil || !changed {
 		return false, err
 	}
-	run.Status = types.ProductionRunQueued
-	return true, o.enqueue(run)
+	return o.enqueuePending(ctx, transitioned)
 }
 
 // Cancel terminalizes a queued/running run, or rejects its pending approval
@@ -371,38 +476,16 @@ func (o *ProductionOrchestrator) Cancel(
 		return false, errors.New("terminal production runs are immutable")
 	}
 	completedAt := o.now().UTC()
-	if run.Status != types.ProductionRunWaitingApproval {
-		return o.repo.Transition(
-			ctx, tenantID, runID, productionRunCAS(run), types.ProductionRunCancelled,
-			interfaces.ProductionRunPatch{CompletedAt: &completedAt},
-		)
-	}
 	calls, err := o.repo.ListToolCalls(ctx, tenantID, runID)
 	if err != nil {
 		return false, err
 	}
-	var pending *types.ProductionToolCall
-	for _, call := range calls {
-		if call.Attempt == run.Attempt && call.CurrentStep == run.CurrentStep &&
-			call.Status == types.ProductionToolCallPendingApproval {
-			pending = call
-			break
-		}
-	}
-	if pending == nil {
-		return false, errors.New("waiting production run has no pending tool call")
-	}
 	won := false
 	err = o.uow.WithinTransaction(ctx, func(txCtx context.Context) error {
-		resolved, resolveErr := o.repo.ResolveToolCall(
-			txCtx, tenantID, pending.ID,
-			interfaces.ProductionToolCallCAS{Status: pending.Status, Attempt: pending.Attempt, CurrentStep: pending.CurrentStep},
-			types.ProductionToolCallRejected, actor,
-		)
-		if resolveErr != nil || !resolved {
-			return resolveErr
+		if err := o.terminalizeCallsForCancellation(txCtx, run, calls, actor, completedAt); err != nil {
+			return err
 		}
-		changed, transitionErr := o.repo.Transition(
+		_, changed, transitionErr := o.repo.Transition(
 			txCtx, tenantID, runID, productionRunCAS(run), types.ProductionRunCancelled,
 			interfaces.ProductionRunPatch{CompletedAt: &completedAt},
 		)
@@ -418,26 +501,43 @@ func (o *ProductionOrchestrator) Cancel(
 	return won, err
 }
 
-func (o *ProductionOrchestrator) enqueue(run *types.ProductionRun) error {
+func (o *ProductionOrchestrator) enqueuePending(ctx context.Context, run *types.ProductionRun) (bool, error) {
+	if run == nil || run.Status != types.ProductionRunQueued || run.WakeupVersion <= run.WakeupEnqueuedVersion {
+		return false, nil
+	}
 	payload := types.ProductionRunPayload{TenantID: run.TenantID, RunID: run.ID, Attempt: run.Attempt}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
-		return err
+		return false, err
 	}
 	taskType, err := productionTaskType(run.RunType)
 	if err != nil {
-		return err
+		return false, err
 	}
-	taskID := fmt.Sprintf("production:%d:%s:%d:%d", run.TenantID, run.ID, run.Attempt, run.CurrentStep)
+	taskID := fmt.Sprintf("production:%d:%s:%d:wakeup:%d", run.TenantID, run.ID, run.Attempt, run.WakeupVersion)
 	_, err = o.enqueuer.Enqueue(
 		asynq.NewTask(taskType, encoded),
 		asynq.Queue(types.QueueProduction),
 		asynq.TaskID(taskID),
 	)
-	if errors.Is(err, asynq.ErrTaskIDConflict) {
-		return nil
+	owned := err == nil
+	if err != nil && !errors.Is(err, asynq.ErrTaskIDConflict) {
+		return false, err
 	}
-	return err
+	marked, markErr := o.repo.MarkWakeupEnqueued(ctx, run.TenantID, run.ID, run.WakeupVersion)
+	if markErr != nil {
+		return owned, markErr
+	}
+	if !marked {
+		latest, getErr := o.repo.Get(ctx, run.TenantID, run.ID)
+		if getErr != nil {
+			return owned, getErr
+		}
+		if latest.WakeupEnqueuedVersion < run.WakeupVersion {
+			return owned, errors.New("production wakeup became stale before enqueue mark")
+		}
+	}
+	return owned, nil
 }
 
 func (o *ProductionOrchestrator) validateDependencies() error {
@@ -453,6 +553,7 @@ func (o *ProductionOrchestrator) validateDependencies() error {
 func productionRunCAS(run *types.ProductionRun) interfaces.ProductionRunCAS {
 	return interfaces.ProductionRunCAS{
 		Status: run.Status, Attempt: run.Attempt, CurrentStep: run.CurrentStep,
+		WakeupVersion: run.WakeupVersion,
 	}
 }
 
@@ -463,13 +564,107 @@ func approvedCallsForStep(
 	approved := make([]*types.ProductionToolCall, 0, len(calls))
 	for _, call := range calls {
 		if call.Attempt == attempt && call.CurrentStep == currentStep &&
-			call.Status == types.ProductionToolCallApproved &&
+			(call.Status == types.ProductionToolCallApproved || call.Status == types.ProductionToolCallExecuting) &&
 			call.ApprovalStatus == types.ProductionToolApprovalApproved {
 			approved = append(approved, call)
 		}
 	}
 	return approved
 }
+
+func matchingToolResultCall(
+	run *types.ProductionRun,
+	calls []*types.ProductionToolCall,
+	callID string,
+) (*types.ProductionToolCall, error) {
+	for _, call := range calls {
+		if call.ID != callID {
+			continue
+		}
+		if call.TenantID != run.TenantID || call.RunID != run.ID ||
+			call.Attempt != run.Attempt || call.CurrentStep != run.CurrentStep {
+			return nil, errors.New("tool call result does not own the claimed run step")
+		}
+		if call.Status != types.ProductionToolCallApproved && call.Status != types.ProductionToolCallExecuting {
+			return nil, errors.New("tool call result is not approved or executing")
+		}
+		return call, nil
+	}
+	return nil, errors.New("tool call result id does not match the approved run step")
+}
+
+func toolCallsExcept(calls []*types.ProductionToolCall, excludedID string) []*types.ProductionToolCall {
+	filtered := make([]*types.ProductionToolCall, 0, len(calls))
+	for _, call := range calls {
+		if call.ID != excludedID {
+			filtered = append(filtered, call)
+		}
+	}
+	return filtered
+}
+
+func (o *ProductionOrchestrator) failActiveToolCalls(
+	ctx context.Context,
+	run *types.ProductionRun,
+	calls []*types.ProductionToolCall,
+	code, message string,
+	actor string,
+	completedAt time.Time,
+) error {
+	for _, call := range calls {
+		if call.TenantID != run.TenantID || call.RunID != run.ID {
+			return errors.New("production tool call ownership mismatch")
+		}
+		if call.Status == types.ProductionToolCallPendingApproval {
+			changed, err := o.repo.ResolveToolCall(
+				ctx, run.TenantID, call.ID,
+				interfaces.ProductionToolCallCAS{Status: call.Status, Attempt: call.Attempt, CurrentStep: call.CurrentStep},
+				types.ProductionToolCallRejected, actor,
+			)
+			if err != nil {
+				return err
+			}
+			if !changed {
+				return errors.New("pending production tool call became stale while terminalizing parent")
+			}
+			continue
+		}
+		if call.Status != types.ProductionToolCallPlanned &&
+			call.Status != types.ProductionToolCallApproved &&
+			call.Status != types.ProductionToolCallExecuting {
+			continue
+		}
+		changed, err := o.repo.TransitionToolCall(
+			ctx, run.TenantID, run.ID, call.ID,
+			interfaces.ProductionToolCallCAS{Status: call.Status, Attempt: call.Attempt, CurrentStep: call.CurrentStep},
+			types.ProductionToolCallFailed,
+			interfaces.ProductionToolCallPatch{
+				ErrorCode: &code, ErrorMessage: &message, CompletedAt: &completedAt,
+			},
+		)
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return errors.New("production tool call became stale while failing parent run")
+		}
+	}
+	return nil
+}
+
+func (o *ProductionOrchestrator) terminalizeCallsForCancellation(
+	ctx context.Context,
+	run *types.ProductionRun,
+	calls []*types.ProductionToolCall,
+	actor string,
+	completedAt time.Time,
+) error {
+	return o.failActiveToolCalls(
+		ctx, run, calls, "RUN_CANCELLED", "production run was cancelled", actor, completedAt,
+	)
+}
+
+func stringPtr(value string) *string { return &value }
 
 func productionTaskType(runType types.ProductionRunType) (string, error) {
 	switch runType {

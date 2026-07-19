@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -18,6 +19,15 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
+)
+
+const (
+	repoProjectID    = "00000000-0000-4000-8000-000000000001"
+	repoTypeID       = "00000000-0000-4000-8000-000000000002"
+	repoSourceSetID  = "00000000-0000-4000-8000-000000000003"
+	repoDocumentID   = "00000000-0000-4000-8000-000000000004"
+	repoSourceItemID = "00000000-0000-4000-8000-000000000005"
+	repoEvidenceID   = "00000000-0000-4000-8000-000000000006"
 )
 
 func newProductionRunRepoTestDB(t *testing.T) (interfaces.ProductionRunRepository, *gorm.DB) {
@@ -43,7 +53,7 @@ func newProductionRunRepoTestDB(t *testing.T) (interfaces.ProductionRunRepositor
 		require.NoError(t, readErr)
 		require.NoError(t, db.Exec(string(migration)).Error)
 	}
-	seedProductionRunContext(t, db, 7, "project-1", "type-1", "source-1", "document-1")
+	seedProductionRunContext(t, db, 7, repoProjectID, repoTypeID, repoSourceSetID, repoDocumentID)
 	return NewProductionRunRepository(db), db
 }
 
@@ -64,7 +74,20 @@ VALUES (?, ?, ?, ?, 1, 'active', 'owner-1')`, documentTypeID, tenantID, document
 	require.NoError(t, db.Exec(`
 INSERT INTO production_source_sets
     (id, tenant_id, project_id, document_type_id, status, created_by)
-VALUES (?, ?, ?, ?, 'frozen', 'owner-1')`, sourceSetID, tenantID, projectID, documentTypeID).Error)
+	VALUES (?, ?, ?, ?, 'collecting', 'owner-1')`, sourceSetID, tenantID, projectID, documentTypeID).Error)
+	require.NoError(t, db.Exec(`
+INSERT INTO production_source_items
+    (id, source_set_id, source_kind, title, mime_type, content_digest, captured_at, metadata, status)
+VALUES (?, ?, 'manual', 'Evidence', 'application/json', ?, CURRENT_TIMESTAMP, '{}', 'accepted')`,
+		repoSourceItemID, sourceSetID, strings.Repeat("a", 64)).Error)
+	require.NoError(t, db.Exec(`
+INSERT INTO production_evidence_snapshots
+    (id, source_item_id, snapshot_type, inline_content, content_digest, redaction_metadata)
+VALUES (?, ?, 'tool_result', '{"ok":true}', ?, '{}')`,
+		repoEvidenceID, repoSourceItemID, strings.Repeat("b", 64)).Error)
+	require.NoError(t, db.Exec(`
+UPDATE production_source_sets SET status = 'frozen', frozen_at = CURRENT_TIMESTAMP WHERE id = ?`,
+		sourceSetID).Error)
 	require.NoError(t, db.Exec(`
 INSERT INTO production_documents
     (id, tenant_id, project_id, document_type_id, document_type_schema_version, title, status, created_by)
@@ -75,13 +98,14 @@ func newTestProductionRun(tenantID uint64) *types.ProductionRun {
 	return &types.ProductionRun{
 		ID:                   uuid.NewString(),
 		TenantID:             tenantID,
-		ProjectID:            "project-1",
-		DocumentID:           "document-1",
-		SourceSetID:          "source-1",
+		ProjectID:            repoProjectID,
+		DocumentID:           repoDocumentID,
+		SourceSetID:          repoSourceSetID,
 		RunType:              types.ProductionRunWrite,
 		Status:               types.ProductionRunQueued,
 		Attempt:              1,
 		CurrentStep:          0,
+		WakeupVersion:        1,
 		StatePayload:         types.JSON(`{"z":2,"a":1}`),
 		ModelID:              "model-1",
 		DocumentTypeSnapshot: types.JSON(`{"version":1,"name":"report"}`),
@@ -92,6 +116,7 @@ func newTestProductionRun(tenantID uint64) *types.ProductionRun {
 func runCAS(run *types.ProductionRun) interfaces.ProductionRunCAS {
 	return interfaces.ProductionRunCAS{
 		Status: run.Status, Attempt: run.Attempt, CurrentStep: run.CurrentStep,
+		WakeupVersion: run.WakeupVersion,
 	}
 }
 
@@ -115,13 +140,49 @@ func TestProductionRunRepositoryCreateCanonicalizesSnapshotsAndScopesReads(t *te
 }
 
 func TestProductionRunRepositoryRejectsCredentialSnapshots(t *testing.T) {
-	repo, _ := newProductionRunRepoTestDB(t)
+	for _, key := range []string{
+		"access_token", "Access-Token", "refreshToken", "client_secret", "API-KEY", "apikey",
+		"Authorization", "password", "token", "secret", "credentials", "private-key",
+	} {
+		t.Run(key, func(t *testing.T) {
+			repo, db := newProductionRunRepoTestDB(t)
+			run := newTestProductionRun(7)
+			run.StatePayload = types.JSON(fmt.Sprintf(`{"nested":[{"%s":"must-not-persist"}]}`, key))
+
+			err := repo.Create(context.Background(), run)
+
+			require.ErrorContains(t, err, "credential")
+			var count int64
+			require.NoError(t, db.Model(&types.ProductionRun{}).Where("id = ?", run.ID).Count(&count).Error)
+			require.Zero(t, count)
+		})
+	}
+}
+
+func TestProductionRunRepositoryRejectsNonCanonicalUUIDsBeforeWrite(t *testing.T) {
+	for _, invalid := range []string{
+		"not-a-uuid", strings.ReplaceAll(uuid.NewString(), "-", ""),
+		"{" + uuid.NewString() + "}", "urn:uuid:" + uuid.NewString(), strings.ToUpper(uuid.NewString()),
+	} {
+		t.Run(invalid, func(t *testing.T) {
+			repo, db := newProductionRunRepoTestDB(t)
+			run := newTestProductionRun(7)
+			run.ID = invalid
+			err := repo.Create(context.Background(), run)
+			require.ErrorContains(t, err, "canonical UUID")
+			var count int64
+			require.NoError(t, db.Model(&types.ProductionRun{}).Count(&count).Error)
+			require.Zero(t, count)
+		})
+	}
+
+	repo, db := newProductionRunRepoTestDB(t)
 	run := newTestProductionRun(7)
-	run.StatePayload = types.JSON(`{"api_key":"must-not-persist"}`)
-
-	err := repo.Create(context.Background(), run)
-
-	require.ErrorContains(t, err, "credential")
+	run.ProjectID = "project-1"
+	require.ErrorContains(t, repo.Create(context.Background(), run), "project_id")
+	var count int64
+	require.NoError(t, db.Model(&types.ProductionRun{}).Count(&count).Error)
+	require.Zero(t, count)
 }
 
 func TestProductionRunRepositoryTransitionUsesFullCASAndRejectsInvalidTransition(t *testing.T) {
@@ -129,13 +190,13 @@ func TestProductionRunRepositoryTransitionUsesFullCASAndRejectsInvalidTransition
 	run := newTestProductionRun(7)
 	require.NoError(t, repo.Create(context.Background(), run))
 
-	changed, err := repo.Transition(context.Background(), 7, run.ID,
-		interfaces.ProductionRunCAS{Status: types.ProductionRunQueued, Attempt: 2, CurrentStep: 0},
+	_, changed, err := repo.Transition(context.Background(), 7, run.ID,
+		interfaces.ProductionRunCAS{Status: types.ProductionRunQueued, Attempt: 2, CurrentStep: 0, WakeupVersion: 1},
 		types.ProductionRunRunning, interfaces.ProductionRunPatch{})
 	require.NoError(t, err)
 	require.False(t, changed)
 
-	changed, err = repo.Transition(context.Background(), 7, run.ID, runCAS(run),
+	_, changed, err = repo.Transition(context.Background(), 7, run.ID, runCAS(run),
 		types.ProductionRunCompleted, interfaces.ProductionRunPatch{})
 	require.ErrorContains(t, err, "invalid production run transition")
 	require.False(t, changed)
@@ -155,7 +216,7 @@ func TestProductionRunRepositoryTwoWorkerClaimHasSingleWinner(t *testing.T) {
 		go func() {
 			ready.Done()
 			<-start
-			_, claimed, err := repo.Claim(context.Background(), 7, run.ID, runCAS(run), time.Time{})
+			_, claimed, err := repo.Claim(context.Background(), 7, run.ID, runCAS(run), time.Minute)
 			results <- claimed
 			errs <- err
 		}()
@@ -165,7 +226,10 @@ func TestProductionRunRepositoryTwoWorkerClaimHasSingleWinner(t *testing.T) {
 
 	winners := 0
 	for i := 0; i < 2; i++ {
-		require.NoError(t, <-errs)
+		err := <-errs
+		if err != nil {
+			require.ErrorIs(t, err, types.ErrProductionRunLeaseActive)
+		}
 		if <-results {
 			winners++
 		}
@@ -177,22 +241,37 @@ func TestProductionRunRepositoryExpiredClaimIncrementsAttemptAndFencesStaleWorke
 	repo, db := newProductionRunRepoTestDB(t)
 	run := newTestProductionRun(7)
 	run.Status = types.ProductionRunRunning
-	run.UpdatedAt = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	require.NoError(t, repo.Create(context.Background(), run))
-	require.NoError(t, db.Model(&types.ProductionRun{}).
-		Where("tenant_id = ? AND id = ?", 7, run.ID).
-		UpdateColumn("updated_at", run.UpdatedAt).Error)
+	require.NoError(t, db.Exec(`UPDATE production_runs
+        SET updated_at = datetime(CURRENT_TIMESTAMP, '-10 minutes')
+        WHERE tenant_id = ? AND id = ?`, 7, run.ID).Error)
 
-	claimed, ok, err := repo.Claim(context.Background(), 7, run.ID, runCAS(run), run.UpdatedAt.Add(time.Minute))
+	claimed, ok, err := repo.Claim(context.Background(), 7, run.ID, runCAS(run), time.Minute)
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.Equal(t, 2, claimed.Attempt)
 
 	nextStep := 1
-	changed, err := repo.Transition(context.Background(), 7, run.ID, runCAS(run),
-		types.ProductionRunQueued, interfaces.ProductionRunPatch{CurrentStep: &nextStep})
+	_, changed, err := repo.Transition(context.Background(), 7, run.ID, runCAS(run),
+		types.ProductionRunQueued, interfaces.ProductionRunPatch{CurrentStep: &nextStep, IncrementWakeup: true})
 	require.NoError(t, err)
 	require.False(t, changed, "attempt 1 worker must not advance attempt 2")
+}
+
+func TestProductionRunRepositoryActiveLeaseReturnsTypedRetryableError(t *testing.T) {
+	repo, db := newProductionRunRepoTestDB(t)
+	run := newTestProductionRun(7)
+	run.Status = types.ProductionRunRunning
+	require.NoError(t, repo.Create(context.Background(), run))
+	require.NoError(t, db.Exec(`UPDATE production_runs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?`, run.ID).Error)
+
+	claimed, ok, err := repo.Claim(context.Background(), 7, run.ID, runCAS(run), 5*time.Minute)
+
+	require.False(t, ok)
+	require.Nil(t, claimed)
+	var leaseErr *types.ProductionRunLeaseActiveError
+	require.ErrorAs(t, err, &leaseErr)
+	require.Positive(t, leaseErr.RetryAfter)
 }
 
 func TestProductionRunRepositoryToolCallsAreTenantScopedAndDecisionIsCAS(t *testing.T) {
@@ -233,6 +312,101 @@ func TestProductionRunRepositoryToolCallsAreTenantScopedAndDecisionIsCAS(t *test
 	require.False(t, resolved)
 }
 
+func TestProductionRunRepositoryRejectsNonCanonicalToolCallUUIDs(t *testing.T) {
+	repo, db := newProductionRunRepoTestDB(t)
+	run := newTestProductionRun(7)
+	run.Status = types.ProductionRunWaitingApproval
+	require.NoError(t, repo.Create(context.Background(), run))
+	now := time.Now().UTC()
+	call := &types.ProductionToolCall{
+		ID: "{" + uuid.NewString() + "}", RunID: run.ID, TenantID: 7,
+		ProjectID: run.ProjectID, DocumentID: run.DocumentID, SourceSetID: run.SourceSetID,
+		Attempt: 1, CurrentStep: 0, IdempotencyKey: "invalid-call",
+		ProviderType: types.ProductionToolProviderMCP, ProviderID: "search", ToolName: "lookup",
+		RequestSnapshot: types.JSON(`{"query":"ok"}`), Status: types.ProductionToolCallPendingApproval,
+		ApprovalStatus: types.ProductionToolApprovalPending, ApprovalRequestedAt: &now,
+	}
+
+	require.ErrorContains(t, repo.CreateToolCall(context.Background(), call), "canonical UUID")
+	var count int64
+	require.NoError(t, db.Model(&types.ProductionToolCall{}).Count(&count).Error)
+	require.Zero(t, count)
+
+	call.ID = uuid.NewString()
+	call.RunID = "run-1"
+	require.ErrorContains(t, repo.CreateToolCall(context.Background(), call), "run_id")
+}
+
+func TestProductionRunRepositoryToolCompletionRollsBackWithStaleParent(t *testing.T) {
+	repo, db := newProductionRunRepoTestDB(t)
+	uow := NewProductionUnitOfWork(db)
+	run := newTestProductionRun(7)
+	run.Status = types.ProductionRunRunning
+	require.NoError(t, repo.Create(context.Background(), run))
+	now := time.Now().UTC()
+	actor := uuid.NewString()
+	call := &types.ProductionToolCall{
+		ID: uuid.NewString(), RunID: run.ID, TenantID: 7, ProjectID: run.ProjectID,
+		DocumentID: run.DocumentID, SourceSetID: run.SourceSetID, Attempt: 1, CurrentStep: 0,
+		IdempotencyKey: "approved-call", ProviderType: types.ProductionToolProviderMCP,
+		ProviderID: "search", ToolName: "lookup", RequestSnapshot: types.JSON(`{"query":"ok"}`),
+		Status: types.ProductionToolCallApproved, ApprovalStatus: types.ProductionToolApprovalApproved,
+		ApprovalRequestedAt: &now, ApprovedBy: &actor, ApprovedAt: &now,
+	}
+	require.NoError(t, repo.CreateToolCall(context.Background(), call))
+
+	err := uow.WithinTransaction(context.Background(), func(txCtx context.Context) error {
+		completed, transitionErr := repo.TransitionToolCall(
+			txCtx, 7, run.ID, call.ID,
+			interfaces.ProductionToolCallCAS{Status: call.Status, Attempt: 1, CurrentStep: 0},
+			types.ProductionToolCallCompleted,
+			interfaces.ProductionToolCallPatch{
+				ResponseSnapshot: types.JSON(`{"result":true}`), ResponseEvidenceID: ptr(repoEvidenceID),
+				ResponseEvidenceSourceItemID: ptr(repoSourceItemID), CompletedAt: &now,
+			},
+		)
+		require.NoError(t, transitionErr)
+		require.True(t, completed)
+		stale := runCAS(run)
+		stale.Attempt++
+		_, changed, parentErr := repo.Transition(
+			txCtx, 7, run.ID, stale, types.ProductionRunCompleted,
+			interfaces.ProductionRunPatch{CompletedAt: &now},
+		)
+		if parentErr != nil {
+			return parentErr
+		}
+		if !changed {
+			return errors.New("stale parent")
+		}
+		return nil
+	})
+	require.ErrorContains(t, err, "stale parent")
+
+	got, getErr := repo.GetToolCall(context.Background(), 7, call.ID)
+	require.NoError(t, getErr)
+	require.Equal(t, types.ProductionToolCallApproved, got.Status)
+	require.Empty(t, got.ResponseSnapshot)
+}
+
+func TestProductionRunRepositoryWakeupMarkHasSingleWinner(t *testing.T) {
+	repo, _ := newProductionRunRepoTestDB(t)
+	run := newTestProductionRun(7)
+	require.NoError(t, repo.Create(context.Background(), run))
+
+	won, err := repo.MarkWakeupEnqueued(context.Background(), 7, run.ID, 1)
+	require.NoError(t, err)
+	require.True(t, won)
+	won, err = repo.MarkWakeupEnqueued(context.Background(), 7, run.ID, 1)
+	require.NoError(t, err)
+	require.False(t, won)
+	got, err := repo.Get(context.Background(), 7, run.ID)
+	require.NoError(t, err)
+	require.Equal(t, 1, got.WakeupEnqueuedVersion)
+}
+
+func ptr[T any](value T) *T { return &value }
+
 func TestProductionRunRepositoryTransactionRollback(t *testing.T) {
 	repo, db := newProductionRunRepoTestDB(t)
 	uow := NewProductionUnitOfWork(db)
@@ -254,14 +428,14 @@ func TestProductionRunRepositoryTerminalAndCancellationGuards(t *testing.T) {
 	run := newTestProductionRun(7)
 	require.NoError(t, repo.Create(context.Background(), run))
 	completedAt := time.Now().UTC()
-	changed, err := repo.Transition(context.Background(), 7, run.ID, runCAS(run),
+	_, changed, err := repo.Transition(context.Background(), 7, run.ID, runCAS(run),
 		types.ProductionRunCancelled, interfaces.ProductionRunPatch{CompletedAt: &completedAt})
 	require.NoError(t, err)
 	require.True(t, changed)
 
 	cancelled, err := repo.Get(context.Background(), 7, run.ID)
 	require.NoError(t, err)
-	changed, err = repo.Transition(context.Background(), 7, run.ID, runCAS(cancelled),
+	_, changed, err = repo.Transition(context.Background(), 7, run.ID, runCAS(cancelled),
 		types.ProductionRunQueued, interfaces.ProductionRunPatch{})
 	require.ErrorContains(t, err, "terminal")
 	require.False(t, changed)
@@ -273,7 +447,16 @@ func TestProductionRunPostgresSQLContractsScopeCASAndLocking(t *testing.T) {
 	} {
 		require.Contains(t, strings.ToUpper(postgresProductionRunLockSQL), strings.ToUpper(fragment))
 	}
-	for _, fragment := range []string{"tenant_id =", "id =", "status =", "attempt =", "current_step =", "RETURNING"} {
+	for _, fragment := range []string{
+		"tenant_id =", "id =", "status =", "attempt =", "current_step =", "wakeup_version =",
+		"CURRENT_TIMESTAMP", "INTERVAL '1 second'", "RETURNING",
+	} {
 		require.Contains(t, strings.ToUpper(postgresProductionRunClaimSQL), strings.ToUpper(fragment))
+	}
+	for _, fragment := range []string{
+		"tenant_id =", "id =", "status =", "attempt =", "current_step =", "wakeup_version =",
+		"CURRENT_TIMESTAMP", "julianday(updated_at)", "RETURNING",
+	} {
+		require.Contains(t, strings.ToUpper(sqliteProductionRunClaimSQL), strings.ToUpper(fragment))
 	}
 }

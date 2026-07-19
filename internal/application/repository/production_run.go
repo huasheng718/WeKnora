@@ -14,21 +14,36 @@ import (
 	"github.com/Tencent/WeKnora/internal/database"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const postgresProductionRunLockSQL = `
 SELECT * FROM production_runs
-WHERE tenant_id = $1 AND id = $2 AND status = $3 AND attempt = $4 AND current_step = $5
+WHERE tenant_id = $1 AND id = $2 AND status = $3 AND attempt = $4 AND current_step = $5 AND wakeup_version = $6
 FOR UPDATE`
 
 const postgresProductionRunClaimSQL = `
 UPDATE production_runs
 SET status = 'running',
     attempt = CASE WHEN status = 'running' THEN attempt + 1 ELSE attempt END,
-    started_at = COALESCE(started_at, $6),
-    updated_at = $6
-WHERE tenant_id = $1 AND id = $2 AND status = $3 AND attempt = $4 AND current_step = $5
+    started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
+    updated_at = CURRENT_TIMESTAMP
+WHERE tenant_id = $1 AND id = $2 AND status = $3 AND attempt = $4
+  AND current_step = $5 AND wakeup_version = $6
+  AND (status = 'queued' OR updated_at <= CURRENT_TIMESTAMP - ($7 * INTERVAL '1 second'))
+RETURNING *`
+
+const sqliteProductionRunClaimSQL = `
+UPDATE production_runs
+SET status = 'running',
+    attempt = CASE WHEN status = 'running' THEN attempt + 1 ELSE attempt END,
+    started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
+    updated_at = CURRENT_TIMESTAMP
+WHERE tenant_id = ? AND id = ? AND status = ? AND attempt = ?
+  AND current_step = ? AND wakeup_version = ?
+  AND (status = 'queued' OR julianday(updated_at) <= julianday(CURRENT_TIMESTAMP, ?))
 RETURNING *`
 
 type productionRunRepository struct {
@@ -47,11 +62,30 @@ func (r *productionRunRepository) Create(ctx context.Context, run *types.Product
 	if run.TenantID == 0 || run.ID == "" {
 		return errors.New("production run tenant and id are required")
 	}
+	for name, value := range map[string]string{
+		"id": run.ID, "project_id": run.ProjectID, "document_id": run.DocumentID, "source_set_id": run.SourceSetID,
+	} {
+		if err := requireCanonicalProductionUUID(name, value); err != nil {
+			return err
+		}
+	}
+	for name, value := range map[string]*string{
+		"input_version_id": run.InputVersionID, "output_version_id": run.OutputVersionID,
+	} {
+		if value != nil {
+			if err := requireCanonicalProductionUUID(name, *value); err != nil {
+				return err
+			}
+		}
+	}
 	if !run.RunType.IsValid() || !run.Status.IsValid() {
 		return errors.New("production run type and status must be valid")
 	}
 	if run.Attempt < 0 || run.CurrentStep < 0 {
 		return errors.New("production run attempt and current step must be non-negative")
+	}
+	if run.WakeupVersion < 0 || run.WakeupEnqueuedVersion < 0 || run.WakeupEnqueuedVersion > run.WakeupVersion {
+		return errors.New("production run wakeup versions are invalid")
 	}
 	var err error
 	run.StatePayload, err = canonicalProductionSnapshot(run.StatePayload, `{}`)
@@ -100,46 +134,46 @@ func (r *productionRunRepository) Claim(
 	tenantID uint64,
 	runID string,
 	expected interfaces.ProductionRunCAS,
-	staleBefore time.Time,
+	leaseTTL time.Duration,
 ) (*types.ProductionRun, bool, error) {
 	if expected.Status != types.ProductionRunQueued && expected.Status != types.ProductionRunRunning {
 		return nil, false, errors.New("only queued or expired running production runs can be claimed")
 	}
-	if expected.Attempt < 1 || expected.CurrentStep < 0 {
-		return nil, false, errors.New("invalid production run claim fence")
+	if expected.Attempt < 1 || expected.CurrentStep < 0 || expected.WakeupVersion < 1 {
+		return nil, false, fmt.Errorf("invalid production run claim fence: attempt=%d current_step=%d wakeup_version=%d",
+			expected.Attempt, expected.CurrentStep, expected.WakeupVersion)
 	}
-	if expected.Status == types.ProductionRunRunning && staleBefore.IsZero() {
-		return nil, false, errors.New("running production run claims require a stale boundary")
+	if leaseTTL <= 0 {
+		return nil, false, errors.New("production run claim lease must be positive")
 	}
-
-	now := time.Now().UTC()
-	db := database.DBFromContext(ctx, r.db).WithContext(ctx).
-		Model(&types.ProductionRun{}).
-		Where("tenant_id = ? AND id = ?", tenantID, runID).
-		Where("status = ? AND attempt = ? AND current_step = ?", expected.Status, expected.Attempt, expected.CurrentStep)
-	if expected.Status == types.ProductionRunRunning {
-		db = db.Where("updated_at <= ?", staleBefore)
+	db := database.DBFromContext(ctx, r.db).WithContext(ctx)
+	var claimed types.ProductionRun
+	var result *gorm.DB
+	seconds := leaseTTL.Seconds()
+	if db.Dialector.Name() == "postgres" {
+		result = db.Raw(postgresProductionRunClaimSQL,
+			tenantID, runID, expected.Status, expected.Attempt, expected.CurrentStep, expected.WakeupVersion, seconds,
+		).Scan(&claimed)
+	} else {
+		modifier := fmt.Sprintf("-%g seconds", seconds)
+		result = db.Raw(sqliteProductionRunClaimSQL,
+			tenantID, runID, expected.Status, expected.Attempt, expected.CurrentStep, expected.WakeupVersion, modifier,
+		).Scan(&claimed)
 	}
-	updates := map[string]any{
-		"status":     types.ProductionRunRunning,
-		"started_at": gorm.Expr("COALESCE(started_at, ?)", now),
-		"updated_at": now,
-	}
-	if expected.Status == types.ProductionRunRunning {
-		updates["attempt"] = gorm.Expr("attempt + 1")
-	}
-	result := db.Updates(updates)
 	if result.Error != nil {
 		return nil, false, result.Error
 	}
-	if result.RowsAffected == 0 {
-		return nil, false, nil
+	if result.RowsAffected == 1 {
+		return &claimed, true, nil
 	}
-	claimed, err := r.Get(ctx, tenantID, runID)
+	active, err := r.hasActiveLease(ctx, tenantID, runID, leaseTTL)
 	if err != nil {
 		return nil, false, err
 	}
-	return claimed, true, nil
+	if active {
+		return nil, false, &types.ProductionRunLeaseActiveError{RetryAfter: leaseTTL}
+	}
+	return nil, false, nil
 }
 
 func (r *productionRunRepository) Transition(
@@ -149,42 +183,51 @@ func (r *productionRunRepository) Transition(
 	expected interfaces.ProductionRunCAS,
 	to types.ProductionRunStatus,
 	patch interfaces.ProductionRunPatch,
-) (bool, error) {
+) (*types.ProductionRun, bool, error) {
 	if err := validateProductionRunTransition(expected.Status, to); err != nil {
-		return false, err
+		return nil, false, err
 	}
-	if expected.Attempt < 1 || expected.CurrentStep < 0 {
-		return false, errors.New("invalid production run transition fence")
+	if expected.Attempt < 1 || expected.CurrentStep < 0 || expected.WakeupVersion < 1 {
+		return nil, false, errors.New("invalid production run transition fence")
+	}
+	if (to == types.ProductionRunQueued) != patch.IncrementWakeup {
+		return nil, false, errors.New("queued production run transitions must increment wakeup exactly once")
 	}
 	updates := map[string]any{"status": to, "updated_at": time.Now().UTC()}
+	if patch.IncrementWakeup {
+		updates["wakeup_version"] = gorm.Expr("wakeup_version + 1")
+	}
 	if patch.CurrentStep != nil {
 		if *patch.CurrentStep < expected.CurrentStep {
-			return false, errors.New("production run current step cannot move backwards")
+			return nil, false, errors.New("production run current step cannot move backwards")
 		}
 		updates["current_step"] = *patch.CurrentStep
 	}
 	if len(patch.StatePayload) > 0 {
 		canonical, err := canonicalProductionSnapshot(patch.StatePayload, "")
 		if err != nil {
-			return false, fmt.Errorf("canonicalize production run state: %w", err)
+			return nil, false, fmt.Errorf("canonicalize production run state: %w", err)
 		}
 		updates["state_payload"] = canonical
 	}
 	if len(patch.RawModelResponse) > 0 {
 		canonical, err := canonicalProductionSnapshot(patch.RawModelResponse, "")
 		if err != nil {
-			return false, fmt.Errorf("canonicalize raw model response: %w", err)
+			return nil, false, fmt.Errorf("canonicalize raw model response: %w", err)
 		}
 		digest := productionSnapshotDigest(canonical)
 		if patch.RawModelResponseDigest != nil && *patch.RawModelResponseDigest != digest {
-			return false, errors.New("raw model response digest does not match canonical snapshot")
+			return nil, false, errors.New("raw model response digest does not match canonical snapshot")
 		}
 		updates["raw_model_response"] = canonical
 		updates["raw_model_response_digest"] = digest
 	} else if patch.RawModelResponseDigest != nil {
-		return false, errors.New("raw model response digest requires a response snapshot")
+		return nil, false, errors.New("raw model response digest requires a response snapshot")
 	}
 	if patch.OutputVersionID != nil {
+		if err := requireCanonicalProductionUUID("output_version_id", *patch.OutputVersionID); err != nil {
+			return nil, false, err
+		}
 		updates["output_version_id"] = *patch.OutputVersionID
 	}
 	if patch.ErrorCode != nil {
@@ -200,17 +243,41 @@ func (r *productionRunRepository) Transition(
 		updates["completed_at"] = *patch.CompletedAt
 	}
 	if isTerminalProductionRunStatus(to) && patch.CompletedAt == nil {
-		return false, errors.New("terminal production run transition requires completed_at")
+		return nil, false, errors.New("terminal production run transition requires completed_at")
 	}
 	if !isTerminalProductionRunStatus(to) && patch.CompletedAt != nil {
-		return false, errors.New("nonterminal production run transition cannot set completed_at")
+		return nil, false, errors.New("nonterminal production run transition cannot set completed_at")
 	}
+	var transitioned types.ProductionRun
+	result := database.DBFromContext(ctx, r.db).WithContext(ctx).
+		Model(&transitioned).Clauses(clause.Returning{}).
+		Where("tenant_id = ? AND id = ?", tenantID, runID).
+		Where("status = ? AND attempt = ? AND current_step = ? AND wakeup_version = ?",
+			expected.Status, expected.Attempt, expected.CurrentStep, expected.WakeupVersion).
+		Updates(updates)
+	if result.Error != nil {
+		return nil, false, result.Error
+	}
+	if result.RowsAffected == 0 {
+		return nil, false, nil
+	}
+	return &transitioned, true, nil
+}
 
+func (r *productionRunRepository) MarkWakeupEnqueued(
+	ctx context.Context,
+	tenantID uint64,
+	runID string,
+	wakeupVersion int,
+) (bool, error) {
+	if wakeupVersion < 1 {
+		return false, errors.New("wakeup version must be positive")
+	}
 	result := database.DBFromContext(ctx, r.db).WithContext(ctx).
 		Model(&types.ProductionRun{}).
-		Where("tenant_id = ? AND id = ?", tenantID, runID).
-		Where("status = ? AND attempt = ? AND current_step = ?", expected.Status, expected.Attempt, expected.CurrentStep).
-		Updates(updates)
+		Where("tenant_id = ? AND id = ? AND wakeup_version = ?", tenantID, runID, wakeupVersion).
+		Where("wakeup_enqueued_version < ?", wakeupVersion).
+		Update("wakeup_enqueued_version", wakeupVersion)
 	if result.Error != nil {
 		return false, result.Error
 	}
@@ -226,6 +293,24 @@ func (r *productionRunRepository) CreateToolCall(
 	}
 	if call.TenantID == 0 || call.ID == "" || call.RunID == "" {
 		return errors.New("production tool call tenant, run and id are required")
+	}
+	for name, value := range map[string]string{
+		"id": call.ID, "run_id": call.RunID, "project_id": call.ProjectID,
+		"document_id": call.DocumentID, "source_set_id": call.SourceSetID,
+	} {
+		if err := requireCanonicalProductionUUID(name, value); err != nil {
+			return err
+		}
+	}
+	for name, value := range map[string]*string{
+		"response_evidence_id":             call.ResponseEvidenceID,
+		"response_evidence_source_item_id": call.ResponseEvidenceSourceItemID,
+	} {
+		if value != nil {
+			if err := requireCanonicalProductionUUID(name, *value); err != nil {
+				return err
+			}
+		}
 	}
 	if !call.ProviderType.IsValid() || !call.Status.IsValid() || !call.ApprovalStatus.IsValid() {
 		return errors.New("production tool call provider and statuses must be valid")
@@ -328,6 +413,77 @@ func (r *productionRunRepository) ResolveToolCall(
 	return result.RowsAffected == 1, nil
 }
 
+func (r *productionRunRepository) TransitionToolCall(
+	ctx context.Context,
+	tenantID uint64,
+	runID, callID string,
+	expected interfaces.ProductionToolCallCAS,
+	to types.ProductionToolCallStatus,
+	patch interfaces.ProductionToolCallPatch,
+) (bool, error) {
+	if err := requireCanonicalProductionUUID("run_id", runID); err != nil {
+		return false, err
+	}
+	if err := requireCanonicalProductionUUID("call_id", callID); err != nil {
+		return false, err
+	}
+	if expected.Attempt < 1 || expected.CurrentStep < 0 {
+		return false, errors.New("invalid production tool call transition fence")
+	}
+	if err := validateProductionToolCallTransition(expected.Status, to); err != nil {
+		return false, err
+	}
+	updates := map[string]any{"status": to, "updated_at": time.Now().UTC()}
+	if patch.StartedAt != nil {
+		updates["started_at"] = *patch.StartedAt
+	}
+	if patch.ErrorCode != nil {
+		updates["error_code"] = *patch.ErrorCode
+	}
+	if patch.ErrorMessage != nil {
+		updates["error_message"] = *patch.ErrorMessage
+	}
+	if patch.CompletedAt != nil {
+		updates["completed_at"] = *patch.CompletedAt
+	}
+	if to == types.ProductionToolCallCompleted {
+		if patch.CompletedAt == nil || len(patch.ResponseSnapshot) == 0 ||
+			patch.ResponseEvidenceID == nil || patch.ResponseEvidenceSourceItemID == nil {
+			return false, errors.New("completed production tool call requires response, evidence and completed_at")
+		}
+		if err := requireCanonicalProductionUUID("response_evidence_id", *patch.ResponseEvidenceID); err != nil {
+			return false, err
+		}
+		if err := requireCanonicalProductionUUID("response_evidence_source_item_id", *patch.ResponseEvidenceSourceItemID); err != nil {
+			return false, err
+		}
+		canonical, err := canonicalProductionSnapshot(patch.ResponseSnapshot, "")
+		if err != nil {
+			return false, fmt.Errorf("canonicalize production tool response: %w", err)
+		}
+		digest := productionSnapshotDigest(canonical)
+		if patch.ResponseDigest != nil && *patch.ResponseDigest != digest {
+			return false, errors.New("production tool response digest does not match canonical snapshot")
+		}
+		updates["response_snapshot"] = canonical
+		updates["response_digest"] = digest
+		updates["response_evidence_id"] = *patch.ResponseEvidenceID
+		updates["response_evidence_source_item_id"] = *patch.ResponseEvidenceSourceItemID
+	} else if to == types.ProductionToolCallFailed && patch.CompletedAt == nil {
+		return false, errors.New("failed production tool call requires completed_at")
+	}
+	result := database.DBFromContext(ctx, r.db).WithContext(ctx).
+		Model(&types.ProductionToolCall{}).
+		Where("tenant_id = ? AND run_id = ? AND id = ?", tenantID, runID, callID).
+		Where("status = ? AND attempt = ? AND current_step = ?",
+			expected.Status, expected.Attempt, expected.CurrentStep).
+		Updates(updates)
+	if result.Error != nil {
+		return false, result.Error
+	}
+	return result.RowsAffected == 1, nil
+}
+
 func validateProductionRunTransition(from, to types.ProductionRunStatus) error {
 	if !from.IsValid() || !to.IsValid() {
 		return errors.New("invalid production run status")
@@ -347,6 +503,25 @@ func validateProductionRunTransition(from, to types.ProductionRunStatus) error {
 	}
 	if !allowed {
 		return fmt.Errorf("invalid production run transition %s -> %s", from, to)
+	}
+	return nil
+}
+
+func validateProductionToolCallTransition(from, to types.ProductionToolCallStatus) error {
+	if !from.IsValid() || !to.IsValid() {
+		return errors.New("invalid production tool call status")
+	}
+	allowed := false
+	switch from {
+	case types.ProductionToolCallPlanned:
+		allowed = to == types.ProductionToolCallExecuting || to == types.ProductionToolCallFailed
+	case types.ProductionToolCallApproved:
+		allowed = to == types.ProductionToolCallExecuting || to == types.ProductionToolCallCompleted || to == types.ProductionToolCallFailed
+	case types.ProductionToolCallExecuting:
+		allowed = to == types.ProductionToolCallCompleted || to == types.ProductionToolCallFailed
+	}
+	if !allowed {
+		return fmt.Errorf("invalid production tool call transition %s -> %s", from, to)
 	}
 	return nil
 }
@@ -385,10 +560,11 @@ func rejectProductionCredentials(raw types.JSON) error {
 		switch typed := candidate.(type) {
 		case map[string]any:
 			for key, nested := range typed {
-				normalized := strings.NewReplacer("-", "_", " ", "_").Replace(strings.ToLower(key))
+				normalized := strings.NewReplacer("-", "", "_", "", " ", "").Replace(strings.ToLower(key))
 				switch normalized {
-				case "api_key", "apikey", "access_key", "authorization", "credential", "credentials",
-					"password", "passwd", "private_key", "refresh_token", "secret", "token":
+				case "apikey", "accesskey", "accesstoken", "authorization", "clientsecret",
+					"credential", "credentials", "password", "passwd", "privatekey",
+					"refreshtoken", "secret", "token":
 					return fmt.Errorf("credential field %q is not allowed in production snapshots", key)
 				}
 				if err := inspect(nested); err != nil {
@@ -405,6 +581,39 @@ func rejectProductionCredentials(raw types.JSON) error {
 		return nil
 	}
 	return inspect(value)
+}
+
+func requireCanonicalProductionUUID(name, value string) error {
+	parsed, err := uuid.Parse(value)
+	if err != nil || parsed == uuid.Nil || parsed.String() != value {
+		return fmt.Errorf("%s must be a canonical UUID", name)
+	}
+	return nil
+}
+
+func (r *productionRunRepository) hasActiveLease(
+	ctx context.Context,
+	tenantID uint64,
+	runID string,
+	leaseTTL time.Duration,
+) (bool, error) {
+	db := database.DBFromContext(ctx, r.db).WithContext(ctx)
+	var active bool
+	if db.Dialector.Name() == "postgres" {
+		err := db.Raw(`SELECT EXISTS (
+            SELECT 1 FROM production_runs
+            WHERE tenant_id = ? AND id = ? AND status = 'running'
+              AND updated_at > CURRENT_TIMESTAMP - (? * INTERVAL '1 second')
+        )`, tenantID, runID, leaseTTL.Seconds()).Scan(&active).Error
+		return active, err
+	}
+	modifier := fmt.Sprintf("-%g seconds", leaseTTL.Seconds())
+	err := db.Raw(`SELECT EXISTS (
+        SELECT 1 FROM production_runs
+        WHERE tenant_id = ? AND id = ? AND status = 'running'
+          AND julianday(updated_at) > julianday(CURRENT_TIMESTAMP, ?)
+    )`, tenantID, runID, modifier).Scan(&active).Error
+	return active, err
 }
 
 var _ interfaces.ProductionRunRepository = (*productionRunRepository)(nil)

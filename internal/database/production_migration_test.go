@@ -69,6 +69,9 @@ func TestProductionRunsPostgreSQLMigrationDeclaresEquivalentStructure(t *testing
 
 	for _, declaration := range []string{
 		"state_payload JSONB NOT NULL DEFAULT '{}'::jsonb",
+		"wakeup_version INTEGER NOT NULL DEFAULT 0",
+		"wakeup_enqueued_version INTEGER NOT NULL DEFAULT 0",
+		"wakeup_enqueued_version <= wakeup_version",
 		"document_type_snapshot JSONB NOT NULL",
 		"raw_model_response JSONB NULL",
 		"request_snapshot JSONB NOT NULL",
@@ -135,6 +138,22 @@ func TestProductionRunsPostgreSQLMigrationDeclaresEquivalentStructure(t *testing
 	}
 	require.Less(t, strings.Index(down, "DROP TABLE IF EXISTS production_tool_calls"), strings.Index(down, "DROP TABLE IF EXISTS production_runs"))
 	require.Less(t, strings.Index(down, "DROP TABLE IF EXISTS production_runs"), strings.Index(down, "DROP INDEX IF EXISTS uq_production_document_versions_run_context"))
+}
+
+func TestProductionRunsSQLiteMigrationConstrainsWakeupGenerations(t *testing.T) {
+	db := openProductionRunsSQLite(t)
+	seedProductionRunScopes(t, db)
+
+	_, err := db.Exec(`INSERT INTO production_runs
+        (id, tenant_id, project_id, document_id, source_set_id, run_type, model_id,
+         document_type_snapshot, idempotency_key, wakeup_version, wakeup_enqueued_version)
+        VALUES ('run-invalid-wakeup', 1, 'project-1', 'document-1', 'source-set-1',
+                'write', 'model-1', '{}', 'run-invalid-wakeup', 1, 2)`)
+	require.Error(t, err)
+
+	insertProductionRun(t, db, "run-valid-wakeup", 1, "project-1", "document-1", "source-set-1", "version-1", "run-valid-wakeup")
+	_, err = db.Exec(`UPDATE production_runs SET wakeup_version = 3, wakeup_enqueued_version = 2 WHERE id = 'run-valid-wakeup'`)
+	require.NoError(t, err)
 }
 
 func TestProductionRunsSQLiteMigrationFreezesToolCallPrimaryKeyWhilePlanned(t *testing.T) {

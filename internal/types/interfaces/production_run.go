@@ -11,9 +11,10 @@ import (
 // Status alone is insufficient because a reclaimed attempt must fence workers
 // that still hold an older copy of the same step.
 type ProductionRunCAS struct {
-	Status      types.ProductionRunStatus
-	Attempt     int
-	CurrentStep int
+	Status        types.ProductionRunStatus
+	Attempt       int
+	CurrentStep   int
+	WakeupVersion int
 }
 
 // ProductionRunPatch contains the mutable output of one orchestration step.
@@ -28,6 +29,7 @@ type ProductionRunPatch struct {
 	ErrorMessage           *string
 	StartedAt              *time.Time
 	CompletedAt            *time.Time
+	IncrementWakeup        bool
 }
 
 // ProductionToolCallCAS fences approval decisions to the invocation attempt
@@ -38,17 +40,31 @@ type ProductionToolCallCAS struct {
 	CurrentStep int
 }
 
+// ProductionToolCallPatch contains terminal output for one exact invocation.
+type ProductionToolCallPatch struct {
+	ResponseSnapshot             types.JSON
+	ResponseDigest               *string
+	ResponseEvidenceID           *string
+	ResponseEvidenceSourceItemID *string
+	ErrorCode                    *string
+	ErrorMessage                 *string
+	StartedAt                    *time.Time
+	CompletedAt                  *time.Time
+}
+
 // ProductionRunRepository persists tenant-scoped orchestration state. Every
 // read or state decision carries tenant scope to prevent cross-tenant access.
 type ProductionRunRepository interface {
 	Create(ctx context.Context, run *types.ProductionRun) error
 	Get(ctx context.Context, tenantID uint64, runID string) (*types.ProductionRun, error)
-	Claim(ctx context.Context, tenantID uint64, runID string, expected ProductionRunCAS, staleBefore time.Time) (*types.ProductionRun, bool, error)
-	Transition(ctx context.Context, tenantID uint64, runID string, expected ProductionRunCAS, to types.ProductionRunStatus, patch ProductionRunPatch) (bool, error)
+	Claim(ctx context.Context, tenantID uint64, runID string, expected ProductionRunCAS, leaseTTL time.Duration) (*types.ProductionRun, bool, error)
+	Transition(ctx context.Context, tenantID uint64, runID string, expected ProductionRunCAS, to types.ProductionRunStatus, patch ProductionRunPatch) (*types.ProductionRun, bool, error)
+	MarkWakeupEnqueued(ctx context.Context, tenantID uint64, runID string, wakeupVersion int) (bool, error)
 	CreateToolCall(ctx context.Context, call *types.ProductionToolCall) error
 	GetToolCall(ctx context.Context, tenantID uint64, callID string) (*types.ProductionToolCall, error)
 	ListToolCalls(ctx context.Context, tenantID uint64, runID string) ([]*types.ProductionToolCall, error)
 	ResolveToolCall(ctx context.Context, tenantID uint64, callID string, expected ProductionToolCallCAS, decision types.ProductionToolCallStatus, actor string) (bool, error)
+	TransitionToolCall(ctx context.Context, tenantID uint64, runID, callID string, expected ProductionToolCallCAS, to types.ProductionToolCallStatus, patch ProductionToolCallPatch) (bool, error)
 }
 
 // ProductionRunOrchestrator processes a durable run wake-up. The payload is

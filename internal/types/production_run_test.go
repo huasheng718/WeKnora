@@ -140,6 +140,8 @@ func TestProductionRunAndToolCallSchemaTagsMatchMigration(t *testing.T) {
 	runType := reflect.TypeOf(ProductionRun{})
 	assertFieldTag(runType, "OutputVersionID", "output_version_id,omitempty", "type:varchar(36)")
 	assertFieldTag(runType, "RawModelResponseDigest", "raw_model_response_digest,omitempty", "type:varchar(64)")
+	assertFieldTag(runType, "WakeupVersion", "wakeup_version", "not null;default:0")
+	assertFieldTag(runType, "WakeupEnqueuedVersion", "wakeup_enqueued_version", "not null;default:0")
 	assertFieldTag(runType, "CompletedAt", "completed_at,omitempty", "")
 
 	callType := reflect.TypeOf(ProductionToolCall{})
