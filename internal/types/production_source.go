@@ -136,6 +136,9 @@ type ProductionEvidenceSnapshot struct {
 	RedactionMetadata JSON                           `json:"redaction_metadata" gorm:"type:jsonb;not null;default:'{}'"`
 	CapturedByRunID   string                         `json:"captured_by_run_id,omitempty" gorm:"type:varchar(36)"`
 	CreatedAt         time.Time                      `json:"created_at"`
+	// ResolvedContentDigest is hydrated from ResourceCatalog when a governed
+	// operation verifies registry-backed evidence. It is never persisted.
+	ResolvedContentDigest string `json:"-" gorm:"-"`
 }
 
 func (ProductionEvidenceSnapshot) TableName() string { return "production_evidence_snapshots" }

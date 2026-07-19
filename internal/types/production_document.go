@@ -110,6 +110,9 @@ type ProductionDocumentVersion struct {
 	FrozenAt        *time.Time                 `json:"frozen_at,omitempty"`
 	Blocks          []*ProductionDocumentBlock `json:"blocks,omitempty" gorm:"-"`
 	Lineage         []*ProductionBlockLineage  `json:"lineage,omitempty" gorm:"-"`
+	// DocumentTypeCode is hydrated from the immutable document-type reference
+	// before validation. It is validation context, not persisted version data.
+	DocumentTypeCode string `json:"document_type_code,omitempty" gorm:"-"`
 }
 
 func (ProductionDocumentVersion) TableName() string { return "production_document_versions" }
