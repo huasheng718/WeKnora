@@ -393,6 +393,43 @@ func TestProductionRunRepositoryCreateToolCallValidatesPrepopulatedDecisionActor
 	}
 }
 
+func TestProductionRunRepositoryCreateToolCallRejectsEmptyDecisionActorPointers(t *testing.T) {
+	for _, field := range []string{"approved_by", "rejected_by"} {
+		t.Run(field, func(t *testing.T) {
+			repo, db := newProductionRunRepoTestDB(t)
+			run := newTestProductionRun(7)
+			run.Status = types.ProductionRunRunning
+			require.NoError(t, repo.Create(context.Background(), run))
+			now := time.Now().UTC()
+			emptyActor := ""
+			call := &types.ProductionToolCall{
+				ID: uuid.NewString(), RunID: run.ID, TenantID: 7, ProjectID: run.ProjectID,
+				DocumentID: run.DocumentID, SourceSetID: run.SourceSetID, Attempt: 1, CurrentStep: 0,
+				IdempotencyKey: "empty-" + field, ProviderType: types.ProductionToolProviderMCP,
+				ProviderID: "search", ToolName: "lookup", RequestSnapshot: types.JSON(`{"query":"ok"}`),
+				ApprovalRequestedAt: &now,
+			}
+			if field == "approved_by" {
+				call.Status = types.ProductionToolCallApproved
+				call.ApprovalStatus = types.ProductionToolApprovalApproved
+				call.ApprovedBy = &emptyActor
+				call.ApprovedAt = &now
+			} else {
+				call.Status = types.ProductionToolCallRejected
+				call.ApprovalStatus = types.ProductionToolApprovalRejected
+				call.RejectedBy = &emptyActor
+				call.RejectedAt = &now
+				call.CompletedAt = &now
+			}
+
+			require.ErrorContains(t, repo.CreateToolCall(context.Background(), call), "canonical UUID")
+			var count int64
+			require.NoError(t, db.Model(&types.ProductionToolCall{}).Count(&count).Error)
+			require.Zero(t, count)
+		})
+	}
+}
+
 func TestProductionRunRepositoryRejectsNonCanonicalToolCallUUIDs(t *testing.T) {
 	repo, db := newProductionRunRepoTestDB(t)
 	run := newTestProductionRun(7)

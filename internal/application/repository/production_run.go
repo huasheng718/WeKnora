@@ -311,7 +311,7 @@ func (r *productionRunRepository) CreateToolCall(
 		"approved_by":                      call.ApprovedBy,
 		"rejected_by":                      call.RejectedBy,
 	} {
-		if value != nil && *value != "" {
+		if value != nil {
 			if err := requireCanonicalProductionUUID(name, *value); err != nil {
 				return err
 			}
