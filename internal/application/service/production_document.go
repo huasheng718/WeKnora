@@ -126,7 +126,19 @@ func (s *productionDocumentService) CreateDocument(
 		DocumentTypeID: input.DocumentTypeID, DocumentTypeSchemaVersion: documentType.SchemaVersion,
 		Title: title, Status: types.ProductionDocumentDraft, CreatedBy: userID,
 	}
-	if err := s.documents.CreateDocument(ctx, document, input.SourceSetID); err != nil {
+	bootstrapVersion := &types.ProductionDocumentVersion{
+		ID: uuid.NewString(), DocumentID: document.ID, SourceSetID: input.SourceSetID,
+		Origin: types.ProductionDocumentOriginHuman, CreatedBy: userID,
+	}
+	bootstrapVersion.ContentDigest = types.ComputeProductionVersionDigest(bootstrapVersion)
+	if err := s.documents.CreateDocument(ctx, document, bootstrapVersion); err != nil {
+		return nil, err
+	}
+	if err := emitRequiredProductionAudit(ctx, s.audit, &types.AuditLog{
+		TenantID: tenantID, ActorUserID: userID, ActorRole: string(types.TenantRoleFromContext(ctx)),
+		Action: types.AuditActionProductionVersionCreated, TargetType: "production_document_version",
+		TargetID: bootstrapVersion.ID, Outcome: types.AuditOutcomeSuccess,
+	}); err != nil {
 		return nil, err
 	}
 	return document, nil
@@ -289,11 +301,13 @@ func (s *productionDocumentService) AppendVersion(
 	if err := s.documents.AppendVersion(ctx, version, blocks, lineage); err != nil {
 		return nil, err
 	}
-	emitProductionAudit(ctx, s.audit, &types.AuditLog{
+	if err := emitRequiredProductionAudit(ctx, s.audit, &types.AuditLog{
 		TenantID: tenantID, ActorUserID: userID, ActorRole: string(types.TenantRoleFromContext(ctx)),
 		Action: types.AuditActionProductionVersionCreated, TargetType: "production_document_version",
 		TargetID: version.ID, Outcome: types.AuditOutcomeSuccess,
-	})
+	}); err != nil {
+		return nil, err
+	}
 	return version, nil
 }
 

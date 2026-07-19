@@ -38,19 +38,62 @@ func translateProductionDocumentError(err error) error {
 func (r *productionDocumentRepository) CreateDocument(
 	ctx context.Context,
 	document *types.ProductionDocument,
-	sourceSetID string,
+	bootstrapVersion *types.ProductionDocumentVersion,
 ) error {
-	if document == nil || sourceSetID == "" {
-		return errors.New("production document and source set id are required")
+	if document == nil || bootstrapVersion == nil || bootstrapVersion.ID == "" ||
+		bootstrapVersion.SourceSetID == "" || document.ID == "" || document.CreatedBy == "" {
+		return errors.New("production document and bootstrap version are required")
+	}
+	if bootstrapVersion.DocumentID != "" && bootstrapVersion.DocumentID != document.ID {
+		return errors.New("production bootstrap version document id does not match")
+	}
+	if bootstrapVersion.ParentVersionID != nil || len(bootstrapVersion.Blocks) != 0 || len(bootstrapVersion.Lineage) != 0 {
+		return errors.New("production bootstrap version must have no parent, blocks, or lineage")
 	}
 	return database.WithTransactionContext(ctx, r.db, func(txCtx context.Context) error {
 		db := database.DBFromContext(txCtx, r.db).WithContext(txCtx)
-		if err := lockProductionCreateDependencies(db, document, sourceSetID); err != nil {
+		if err := lockProductionCreateDependencies(db, document, bootstrapVersion.SourceSetID); err != nil {
 			return err
 		}
-		return translateProductionDocumentError(db.Create(document).Error)
+		document.CurrentVersionID = nil
+		if err := translateProductionDocumentError(db.Create(document).Error); err != nil {
+			return err
+		}
+
+		bootstrapVersion.DocumentID = document.ID
+		bootstrapVersion.TenantID = document.TenantID
+		bootstrapVersion.ProjectID = document.ProjectID
+		bootstrapVersion.VersionNumber = 1
+		bootstrapVersion.ParentVersionID = nil
+		bootstrapVersion.Origin = types.ProductionDocumentOriginHuman
+		bootstrapVersion.ChangeSummary = ""
+		bootstrapVersion.CreatedBy = document.CreatedBy
+		bootstrapVersion.Blocks = nil
+		bootstrapVersion.Lineage = nil
+		bootstrapVersion.ContentDigest = types.ComputeProductionVersionDigest(bootstrapVersion)
+		now := time.Now().UTC()
+		bootstrapVersion.FrozenAt = &now
+		if err := translateProductionDocumentError(
+			db.Omit("Blocks", "Lineage").Create(bootstrapVersion).Error,
+		); err != nil {
+			return err
+		}
+
+		result := db.Model(&types.ProductionDocument{}).
+			Where("id = ? AND current_version_id IS NULL", document.ID).
+			UpdateColumn("current_version_id", bootstrapVersion.ID)
+		if result.Error != nil {
+			return translateProductionDocumentError(result.Error)
+		}
+		if result.RowsAffected != 1 {
+			return types.ErrProductionDocumentStaleParent
+		}
+		document.CurrentVersionID = productionDocumentStringPointer(bootstrapVersion.ID)
+		return nil
 	})
 }
+
+func productionDocumentStringPointer(value string) *string { return &value }
 
 func (r *productionDocumentRepository) GetDocument(
 	ctx context.Context,

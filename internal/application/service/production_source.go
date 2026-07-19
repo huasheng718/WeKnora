@@ -275,11 +275,13 @@ func (s *productionSourceService) Freeze(ctx context.Context, sourceSetID string
 	if err := s.repo.Freeze(ctx, tenantID, sourceSetID); err != nil {
 		return err
 	}
-	emitProductionAudit(ctx, s.audit, &types.AuditLog{
+	if err := emitRequiredProductionAudit(ctx, s.audit, &types.AuditLog{
 		TenantID: tenantID, ActorUserID: userID, ActorRole: string(types.TenantRoleFromContext(ctx)),
 		Action: types.AuditActionProductionSourceFrozen, TargetType: "production_source_set",
 		TargetID: sourceSetID, Outcome: types.AuditOutcomeSuccess,
-	})
+	}); err != nil {
+		return err
+	}
 	return nil
 }
 

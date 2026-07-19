@@ -12,6 +12,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/middleware"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
@@ -220,6 +221,29 @@ func TestProductionRouteRBACRunsBeforeIdempotencyAndServiceAuthorizationRemainsA
 		require.Equal(t, 1, sources.freezeCalls)
 		require.Empty(t, repo.records)
 	})
+}
+
+func TestProductionCORSAllowsIfMatchPreflight(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.Use(cors.New(routerCORSConfig()))
+	engine.POST("/api/v1/production/documents/:id/versions", func(c *gin.Context) {
+		c.Status(http.StatusNoContent)
+	})
+	request := httptest.NewRequest(
+		http.MethodOptions,
+		"/api/v1/production/documents/66666666-6666-4666-8666-666666666666/versions",
+		nil,
+	)
+	request.Header.Set("Origin", "https://workbench.example")
+	request.Header.Set("Access-Control-Request-Method", http.MethodPost)
+	request.Header.Set("Access-Control-Request-Headers", "Content-Type, Idempotency-Key, If-Match")
+	response := httptest.NewRecorder()
+
+	engine.ServeHTTP(response, request)
+
+	require.Equal(t, http.StatusNoContent, response.Code)
+	require.Contains(t, strings.ToLower(response.Header().Get("Access-Control-Allow-Headers")), "if-match")
 }
 
 func assertProductionRoute(t *testing.T, engine *gin.Engine, method, path string) {

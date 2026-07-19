@@ -315,6 +315,34 @@ func TestProductionIdempotencyRejectsKeyReusedWithDifferentBody(t *testing.T) {
 	require.Contains(t, response.Body.String(), "PRODUCTION_IDEMPOTENCY_KEY_CONFLICT")
 }
 
+func TestProductionIdempotencyIncludesNormalizedIfMatchInRequestIdentity(t *testing.T) {
+	repo := newProductionIdempotencyRepoStub()
+	calls := 0
+	engine := newProductionIdempotencyTestEngine(repo, func(c *gin.Context) {
+		calls++
+		c.JSON(http.StatusCreated, gin.H{"success": true, "version": c.GetHeader("If-Match")})
+	})
+	perform := func(ifMatch string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/production/projects", strings.NewReader(`{"name":"Baseline"}`))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Idempotency-Key", "request-1")
+		request.Header.Set("If-Match", ifMatch)
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, request)
+		return response
+	}
+
+	first := perform(" 11111111-1111-4111-8111-111111111111 ")
+	replay := perform("11111111-1111-4111-8111-111111111111")
+	conflict := perform("22222222-2222-4222-8222-222222222222")
+
+	require.Equal(t, http.StatusCreated, first.Code)
+	require.Equal(t, first.Body.String(), replay.Body.String())
+	require.Equal(t, http.StatusConflict, conflict.Code)
+	require.Contains(t, conflict.Body.String(), productionIdempotencyKeyConflict)
+	require.Equal(t, 1, calls)
+}
+
 func TestProductionIdempotencyRejectsInProgressDuplicateAsRetryable(t *testing.T) {
 	repo := newProductionIdempotencyRepoStub()
 	body := `{"name":"Baseline"}`

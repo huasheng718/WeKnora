@@ -21,12 +21,13 @@ import (
 )
 
 const (
-	documentID       = "66666666-6666-4666-8666-666666666666"
-	firstVersionID   = "77777777-7777-4777-8777-777777777777"
-	secondVersionID  = "88888888-8888-4888-8888-888888888888"
-	thirdVersionID   = "99999999-9999-4999-8999-999999999999"
-	otherProjectID   = "aaaaaaaa-1111-4111-8111-111111111111"
-	otherSourceSetID = "bbbbbbbb-1111-4111-8111-111111111111"
+	documentID         = "66666666-6666-4666-8666-666666666666"
+	bootstrapVersionID = "55555555-5555-4555-8555-555555555555"
+	firstVersionID     = "77777777-7777-4777-8777-777777777777"
+	secondVersionID    = "88888888-8888-4888-8888-888888888888"
+	thirdVersionID     = "99999999-9999-4999-8999-999999999999"
+	otherProjectID     = "aaaaaaaa-1111-4111-8111-111111111111"
+	otherSourceSetID   = "bbbbbbbb-1111-4111-8111-111111111111"
 )
 
 func newProductionDocumentRepoFixture(t *testing.T) (interfaces.ProductionDocumentRepository, interfaces.ProductionSourceRepository, *gorm.DB) {
@@ -73,10 +74,79 @@ func productionVersion(id string, parent *string, blocks ...*types.ProductionDoc
 
 func createDocumentAndFirstVersion(t *testing.T, repo interfaces.ProductionDocumentRepository) *types.ProductionDocumentVersion {
 	t.Helper()
-	require.NoError(t, repo.CreateDocument(context.Background(), productionDocumentFixture(), sourceSetID))
-	version := productionVersion(firstVersionID, nil, productionBlock("block-row-1", "block-a", `"first"`))
+	bootstrap := productionBootstrapVersion()
+	require.NoError(t, repo.CreateDocument(context.Background(), productionDocumentFixture(), bootstrap))
+	version := productionVersion(firstVersionID, stringPointer(bootstrap.ID), productionBlock("block-row-1", "block-a", `"first"`))
 	require.NoError(t, repo.AppendVersion(context.Background(), version, version.Blocks, nil))
 	return version
+}
+
+func productionBootstrapVersion() *types.ProductionDocumentVersion {
+	version := productionVersion(bootstrapVersionID, nil)
+	version.ChangeSummary = ""
+	return version
+}
+
+func TestProductionDocumentRepositoryCreatesBootstrapVersionAndHeadAtomically(t *testing.T) {
+	repo, _, db := newProductionDocumentRepoFixture(t)
+	document := productionDocumentFixture()
+	bootstrap := productionBootstrapVersion()
+
+	err := repo.CreateDocument(context.Background(), document, bootstrap)
+
+	require.NoError(t, err)
+	require.NotNil(t, document.CurrentVersionID)
+	require.Equal(t, bootstrap.ID, *document.CurrentVersionID)
+	require.Equal(t, 1, bootstrap.VersionNumber)
+	require.Equal(t, document.ID, bootstrap.DocumentID)
+	require.Equal(t, document.TenantID, bootstrap.TenantID)
+	require.Equal(t, document.ProjectID, bootstrap.ProjectID)
+	require.Equal(t, sourceSetID, bootstrap.SourceSetID)
+	require.Equal(t, types.ProductionDocumentOriginHuman, bootstrap.Origin)
+	require.Empty(t, bootstrap.Blocks)
+	require.Empty(t, bootstrap.Lineage)
+	require.NotNil(t, bootstrap.FrozenAt)
+	require.Equal(t, types.ComputeProductionVersionDigest(&types.ProductionDocumentVersion{}), bootstrap.ContentDigest)
+
+	var persisted types.ProductionDocument
+	require.NoError(t, db.First(&persisted, "id = ?", document.ID).Error)
+	require.Equal(t, bootstrap.ID, *persisted.CurrentVersionID)
+	var versions []types.ProductionDocumentVersion
+	require.NoError(t, db.Find(&versions).Error)
+	require.Len(t, versions, 1)
+}
+
+func TestProductionDocumentRepositoryBootstrapFailuresRollBackDocumentAndVersion(t *testing.T) {
+	tests := []struct {
+		name    string
+		trigger string
+	}{
+		{
+			name: "version insert",
+			trigger: `CREATE TRIGGER fail_bootstrap_version BEFORE INSERT ON production_document_versions
+				BEGIN SELECT RAISE(ABORT, 'forced bootstrap version failure'); END`,
+		},
+		{
+			name: "head update",
+			trigger: `CREATE TRIGGER fail_bootstrap_head BEFORE UPDATE OF current_version_id ON production_documents
+				WHEN NEW.current_version_id IS NOT NULL BEGIN SELECT RAISE(ABORT, 'forced bootstrap head failure'); END`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			repo, _, db := newProductionDocumentRepoFixture(t)
+			require.NoError(t, db.Exec(test.trigger).Error)
+
+			err := repo.CreateDocument(context.Background(), productionDocumentFixture(), productionBootstrapVersion())
+
+			require.Error(t, err)
+			for _, model := range []any{&types.ProductionDocument{}, &types.ProductionDocumentVersion{}} {
+				var count int64
+				require.NoError(t, db.Model(model).Count(&count).Error)
+				require.Zero(t, count)
+			}
+		})
+	}
 }
 
 func TestProductionDocumentRepositoryHasNoVersionUpdateMethod(t *testing.T) {
@@ -105,7 +175,7 @@ func TestProductionDocumentRepositoryDerivesScopeAndAllocatesVersionNumber(t *te
 
 	require.Equal(t, uint64(7), first.TenantID)
 	require.Equal(t, sourceProjectID, first.ProjectID)
-	require.Equal(t, 1, first.VersionNumber)
+	require.Equal(t, 2, first.VersionNumber)
 	got, err := repo.GetVersion(context.Background(), 7, first.ID)
 	require.NoError(t, err)
 	require.Len(t, got.Blocks, 1)
@@ -128,7 +198,7 @@ func TestProductionDocumentRepositoryRejectsStaleParentWithoutInserts(t *testing
 	require.ErrorIs(t, err, types.ErrProductionDocumentStaleParent)
 	var count int64
 	require.NoError(t, db.Model(&types.ProductionDocumentVersion{}).Count(&count).Error)
-	require.Equal(t, int64(1), count)
+	require.Equal(t, int64(2), count)
 }
 
 func TestProductionDocumentRepositoryConcurrentAppendsHaveOneWinner(t *testing.T) {
@@ -169,11 +239,11 @@ func TestProductionDocumentRepositoryConcurrentAppendsHaveOneWinner(t *testing.T
 
 	var persisted []types.ProductionDocumentVersion
 	require.NoError(t, db.Order("version_number ASC").Find(&persisted).Error)
-	require.Len(t, persisted, 2)
-	require.Equal(t, []int{1, 2}, []int{persisted[0].VersionNumber, persisted[1].VersionNumber})
+	require.Len(t, persisted, 3)
+	require.Equal(t, []int{1, 2, 3}, []int{persisted[0].VersionNumber, persisted[1].VersionNumber, persisted[2].VersionNumber})
 	document, err := repo.GetDocument(context.Background(), 7, documentID)
 	require.NoError(t, err)
-	require.Equal(t, persisted[1].ID, *document.CurrentVersionID)
+	require.Equal(t, persisted[2].ID, *document.CurrentVersionID)
 }
 
 func TestProductionDocumentRepositoryRejectsWrongProjectSourceSet(t *testing.T) {
@@ -185,8 +255,9 @@ func TestProductionDocumentRepositoryRejectsWrongProjectSourceSet(t *testing.T) 
 		ID: otherSourceSetID, TenantID: 7, ProjectID: otherProjectID, DocumentTypeID: sourceTypeID,
 		Status: types.ProductionSourceSetFrozen, CreatedBy: "author", FrozenAt: timePointer(time.Now().UTC()),
 	}))
-	require.NoError(t, repo.CreateDocument(context.Background(), productionDocumentFixture(), sourceSetID))
-	version := productionVersion(firstVersionID, nil, productionBlock("block-row-1", "block-a", `"wrong source"`))
+	bootstrap := productionBootstrapVersion()
+	require.NoError(t, repo.CreateDocument(context.Background(), productionDocumentFixture(), bootstrap))
+	version := productionVersion(firstVersionID, stringPointer(bootstrap.ID), productionBlock("block-row-1", "block-a", `"wrong source"`))
 	version.SourceSetID = otherSourceSetID
 
 	err := repo.AppendVersion(context.Background(), version, version.Blocks, nil)
@@ -194,13 +265,14 @@ func TestProductionDocumentRepositoryRejectsWrongProjectSourceSet(t *testing.T) 
 	require.ErrorIs(t, err, types.ErrProductionDocumentSourceSetInvalid)
 	var count int64
 	require.NoError(t, db.Model(&types.ProductionDocumentVersion{}).Count(&count).Error)
-	require.Zero(t, count)
+	require.Equal(t, int64(1), count)
 }
 
 func TestProductionDocumentRepositoryPersistsSplitAndMergedLineage(t *testing.T) {
 	repo, _, _ := newProductionDocumentRepoFixture(t)
-	require.NoError(t, repo.CreateDocument(context.Background(), productionDocumentFixture(), sourceSetID))
-	first := productionVersion(firstVersionID, nil,
+	bootstrap := productionBootstrapVersion()
+	require.NoError(t, repo.CreateDocument(context.Background(), productionDocumentFixture(), bootstrap))
+	first := productionVersion(firstVersionID, stringPointer(bootstrap.ID),
 		productionBlock("block-row-1", "block-a", `"a"`),
 		productionBlock("block-row-2", "block-b", `"b"`),
 		productionBlock("block-row-6", "block-c", `"c"`),
@@ -263,8 +335,9 @@ func TestProductionDocumentRepositoryRejectsInvalidLineageGraphShapes(t *testing
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			repo, _, db := newProductionDocumentRepoFixture(t)
-			require.NoError(t, repo.CreateDocument(context.Background(), productionDocumentFixture(), sourceSetID))
-			first := productionVersion(firstVersionID, nil,
+			bootstrap := productionBootstrapVersion()
+			require.NoError(t, repo.CreateDocument(context.Background(), productionDocumentFixture(), bootstrap))
+			first := productionVersion(firstVersionID, stringPointer(bootstrap.ID),
 				productionBlock("block-row-1", "block-a", `"a"`),
 				productionBlock("block-row-2", "block-b", `"b"`),
 				productionBlock("block-row-3", "block-c", `"c"`),
@@ -288,7 +361,7 @@ func TestProductionDocumentRepositoryRejectsInvalidLineageGraphShapes(t *testing
 			require.ErrorIs(t, err, types.ErrProductionBlockLineageInvalid)
 			var count int64
 			require.NoError(t, db.Model(&types.ProductionDocumentVersion{}).Count(&count).Error)
-			require.Equal(t, int64(1), count)
+			require.Equal(t, int64(2), count)
 		})
 	}
 }
@@ -307,7 +380,7 @@ func TestProductionDocumentRepositoryRejectsMissingLineageEndpointAndRollsBack(t
 	require.ErrorIs(t, err, types.ErrProductionBlockLineageInvalid)
 	var count int64
 	require.NoError(t, db.Model(&types.ProductionDocumentVersion{}).Count(&count).Error)
-	require.Equal(t, int64(1), count)
+	require.Equal(t, int64(2), count)
 }
 
 func TestProductionDocumentRepositoryRollsBackOnBlockOrLineageInsertFailure(t *testing.T) {
@@ -335,7 +408,7 @@ func TestProductionDocumentRepositoryRollsBackOnBlockOrLineageInsertFailure(t *t
 			require.Error(t, repo.AppendVersion(context.Background(), second, second.Blocks, lineage))
 			var count int64
 			require.NoError(t, db.Model(&types.ProductionDocumentVersion{}).Count(&count).Error)
-			require.Equal(t, int64(1), count)
+			require.Equal(t, int64(2), count)
 			document, err := repo.GetDocument(context.Background(), 7, documentID)
 			require.NoError(t, err)
 			require.Equal(t, first.ID, *document.CurrentVersionID)
@@ -345,7 +418,8 @@ func TestProductionDocumentRepositoryRollsBackOnBlockOrLineageInsertFailure(t *t
 
 func TestProductionDocumentRepositoryRollsBackOnFinalHeadUpdateFailure(t *testing.T) {
 	repo, _, db := newProductionDocumentRepoFixture(t)
-	require.NoError(t, repo.CreateDocument(context.Background(), productionDocumentFixture(), sourceSetID))
+	bootstrap := productionBootstrapVersion()
+	require.NoError(t, repo.CreateDocument(context.Background(), productionDocumentFixture(), bootstrap))
 	require.NoError(t, db.Exec(`
 CREATE TRIGGER fail_production_document_final_head_update
 BEFORE UPDATE OF current_version_id ON production_documents
@@ -354,7 +428,7 @@ WHEN NEW.current_version_id IS NOT OLD.current_version_id
 BEGIN
     SELECT RAISE(ABORT, 'forced final head update failure');
 END`).Error)
-	version := productionVersion(firstVersionID, nil, productionBlock("block-row-1", "block-a", `"first"`))
+	version := productionVersion(firstVersionID, stringPointer(bootstrap.ID), productionBlock("block-row-1", "block-a", `"first"`))
 
 	err := repo.AppendVersion(context.Background(), version, version.Blocks, nil)
 
@@ -362,19 +436,20 @@ END`).Error)
 	var versionCount, blockCount int64
 	require.NoError(t, db.Model(&types.ProductionDocumentVersion{}).Count(&versionCount).Error)
 	require.NoError(t, db.Model(&types.ProductionDocumentBlock{}).Count(&blockCount).Error)
-	require.Zero(t, versionCount)
+	require.Equal(t, int64(1), versionCount)
 	require.Zero(t, blockCount)
 	document, err := repo.GetDocument(context.Background(), 7, documentID)
 	require.NoError(t, err)
-	require.Nil(t, document.CurrentVersionID)
+	require.Equal(t, bootstrap.ID, *document.CurrentVersionID)
 }
 
 func TestProductionDocumentRepositoryJoinsSharedTransactionContext(t *testing.T) {
 	repo, _, db := newProductionDocumentRepoFixture(t)
 	errRollback := context.Canceled
 	err := database.WithTransactionContext(context.Background(), db, func(txCtx context.Context) error {
-		require.NoError(t, repo.CreateDocument(txCtx, productionDocumentFixture(), sourceSetID))
-		version := productionVersion(firstVersionID, nil, productionBlock("block-row-1", "block-a", `"first"`))
+		bootstrap := productionBootstrapVersion()
+		require.NoError(t, repo.CreateDocument(txCtx, productionDocumentFixture(), bootstrap))
+		version := productionVersion(firstVersionID, stringPointer(bootstrap.ID), productionBlock("block-row-1", "block-a", `"first"`))
 		require.NoError(t, repo.AppendVersion(txCtx, version, version.Blocks, nil))
 		return errRollback
 	})
@@ -390,7 +465,7 @@ func TestProductionDocumentRepositoryCreateRejectsRetiredTypeAtomically(t *testi
 		Where("id = ?", sourceTypeID).
 		UpdateColumn("status", types.ProductionDocumentTypeRetired).Error)
 
-	err := repo.CreateDocument(context.Background(), productionDocumentFixture(), sourceSetID)
+	err := repo.CreateDocument(context.Background(), productionDocumentFixture(), productionBootstrapVersion())
 
 	require.ErrorIs(t, err, types.ErrProductionDocumentTypeInactive)
 	var count int64
@@ -425,7 +500,7 @@ func TestProductionDocumentRepositoryPostgresCreateLocksDependenciesAndRollsBack
 		WillReturnError(forced)
 	mock.ExpectRollback()
 
-	err = NewProductionDocumentRepository(db).CreateDocument(context.Background(), document, sourceSetID)
+	err = NewProductionDocumentRepository(db).CreateDocument(context.Background(), document, productionBootstrapVersion())
 
 	require.ErrorIs(t, err, forced)
 	require.NoError(t, mock.ExpectationsWereMet())
@@ -514,7 +589,7 @@ func TestProductionDocumentRepositoryListsVersionsInNumberOrder(t *testing.T) {
 
 	versions, err := repo.ListVersions(context.Background(), 7, documentID)
 	require.NoError(t, err)
-	require.Len(t, versions, 2)
-	numbers := []int{versions[0].VersionNumber, versions[1].VersionNumber}
+	require.Len(t, versions, 3)
+	numbers := []int{versions[0].VersionNumber, versions[1].VersionNumber, versions[2].VersionNumber}
 	require.True(t, sort.IntsAreSorted(numbers))
 }

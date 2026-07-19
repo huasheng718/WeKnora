@@ -2,11 +2,13 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -231,12 +233,36 @@ func (a *productionHTTPAuthorizer) RequireProjectRole(context.Context, string, .
 	return a.err
 }
 
+type productionGovernedAuditService struct {
+	interfaces.AuditLogService
+	mu       sync.Mutex
+	failNext bool
+}
+
+func (s *productionGovernedAuditService) Log(ctx context.Context, entry *types.AuditLog) error {
+	s.mu.Lock()
+	if s.failNext {
+		s.failNext = false
+		s.mu.Unlock()
+		return errors.New("forced governed audit failure")
+	}
+	s.mu.Unlock()
+	return s.AuditLogService.Log(ctx, entry)
+}
+
+func (s *productionGovernedAuditService) FailNext() {
+	s.mu.Lock()
+	s.failNext = true
+	s.mu.Unlock()
+}
+
 type productionDocumentsHTTPFixture struct {
 	db          *gorm.DB
 	engine      *gin.Engine
 	sources     interfaces.ProductionSourceRepository
 	documents   interfaces.ProductionDocumentRepository
 	completion  *productionCompletionFailingRepo
+	audit       *productionGovernedAuditService
 	projectID   string
 	typeID      string
 	sourceSetID string
@@ -287,11 +313,13 @@ func newProductionDocumentsHTTPFixture(t *testing.T) *productionDocumentsHTTPFix
 		CapturedAt: time.Now().UTC(), Metadata: types.JSON(`{}`), Status: types.ProductionSourceItemAccepted,
 	}))
 
-	audit := appservice.NewAuditLogService(apprepository.NewAuditLogRepository(db))
+	fixture.audit = &productionGovernedAuditService{
+		AuditLogService: appservice.NewAuditLogService(apprepository.NewAuditLogRepository(db)),
+	}
 	authorizer := &productionHTTPAuthorizer{}
-	sourceService := appservice.NewProductionSourceService(fixture.sources, authorizer, nil, audit)
+	sourceService := appservice.NewProductionSourceService(fixture.sources, authorizer, nil, fixture.audit)
 	documentService := appservice.NewProductionDocumentService(
-		fixture.documents, fixture.sources, apprepository.NewProductionDocumentTypeRepository(db), authorizer, audit,
+		fixture.documents, fixture.sources, apprepository.NewProductionDocumentTypeRepository(db), authorizer, fixture.audit,
 	)
 	idempotency := apprepository.NewProductionIdempotencyRepository(db)
 	fixture.completion = &productionCompletionFailingRepo{ProductionIdempotencyRepository: idempotency}
@@ -310,6 +338,7 @@ func newProductionDocumentsHTTPFixture(t *testing.T) *productionDocumentsHTTPFix
 	sourceHandler := NewProductionSourceHandler(sourceService)
 	documentHandler := NewProductionDocumentHandler(documentService)
 	fixture.engine.POST("/production/source-sets/:id/freeze", idempotencyMiddleware.Require(), sourceHandler.Freeze)
+	fixture.engine.POST("/production/projects/:id/documents", idempotencyMiddleware.Require(), documentHandler.Create)
 	fixture.engine.POST("/production/documents/:id/versions", idempotencyMiddleware.Require(), documentHandler.AppendVersion)
 	sqlDB.SetMaxOpenConns(1)
 	return fixture
@@ -337,23 +366,27 @@ func countProductionRows(t *testing.T, db *gorm.DB, model any) int64 {
 	return count
 }
 
-func seedProductionDocumentHead(t *testing.T, fixture *productionDocumentsHTTPFixture) string {
+func attachProductionFixtureEvidence(t *testing.T, fixture *productionDocumentsHTTPFixture) {
 	t.Helper()
-	require.NoError(t, fixture.documents.CreateDocument(context.Background(), &types.ProductionDocument{
-		ID: fixture.documentID, TenantID: 7, ProjectID: fixture.projectID, DocumentTypeID: fixture.typeID,
-		DocumentTypeSchemaVersion: 1, Title: "Baseline", Status: types.ProductionDocumentDraft, CreatedBy: "author-1",
-	}, fixture.sourceSetID))
-	versionID := productionVersionID
-	block := &types.ProductionDocumentBlock{
-		ID: "99999999-9999-4999-8999-999999999999", LogicalBlockID: "intro", BlockType: "paragraph",
-		Content: types.JSON(`{"text":"seed"}`), Attributes: types.JSON(`{}`),
-		EvidenceRefs: types.JSON(`[]`), AIProvenance: types.JSON(`{}`),
+	require.NoError(t, fixture.sources.CreateEvidence(context.Background(), 7, productionSourceItemID, &types.ProductionEvidenceSnapshot{
+		ID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", SourceItemID: productionSourceItemID,
+		SnapshotType: types.ProductionEvidenceSnapshotText, InlineContent: types.JSON(`"evidence"`),
+		ContentDigest: strings.Repeat("b", 64), RedactionMetadata: types.JSON(`{}`),
+	}))
+}
+
+func createProductionDocumentRequestBody(fixture *productionDocumentsHTTPFixture) string {
+	return `{"document_type_id":"` + fixture.typeID + `","source_set_id":"` + fixture.sourceSetID + `","title":"Baseline"}`
+}
+
+func decodeProductionDocumentResponse(t *testing.T, response *httptest.ResponseRecorder) *types.ProductionDocument {
+	t.Helper()
+	var payload struct {
+		Data *types.ProductionDocument `json:"data"`
 	}
-	require.NoError(t, fixture.documents.AppendVersion(context.Background(), &types.ProductionDocumentVersion{
-		ID: versionID, DocumentID: fixture.documentID, SourceSetID: fixture.sourceSetID,
-		Origin: types.ProductionDocumentOriginHuman, CreatedBy: "author-1",
-	}, []*types.ProductionDocumentBlock{block}, nil))
-	return versionID
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &payload))
+	require.NotNil(t, payload.Data)
+	return payload.Data
 }
 
 func TestProductionSourceAndDocumentHTTPTransactions(t *testing.T) {
@@ -365,11 +398,7 @@ func TestProductionSourceAndDocumentHTTPTransactions(t *testing.T) {
 	require.Equal(t, types.ProductionSourceSetCollecting, mustProductionSourceSet(t, fixture).Status)
 	require.Zero(t, countProductionRows(t, fixture.db, &types.AuditLog{}))
 
-	require.NoError(t, fixture.sources.CreateEvidence(context.Background(), 7, productionSourceItemID, &types.ProductionEvidenceSnapshot{
-		ID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", SourceItemID: productionSourceItemID,
-		SnapshotType: types.ProductionEvidenceSnapshotText, InlineContent: types.JSON(`"evidence"`),
-		ContentDigest: strings.Repeat("b", 64), RedactionMetadata: types.JSON(`{}`),
-	}))
+	attachProductionFixtureEvidence(t, fixture)
 	freeze := performProductionDocumentsHTTPRequest(fixture, freezePath, "freeze-success", "", "")
 	replayFreeze := performProductionDocumentsHTTPRequest(fixture, freezePath, "freeze-success", "", "")
 	require.Equal(t, http.StatusOK, freeze.Code)
@@ -382,7 +411,22 @@ func TestProductionSourceAndDocumentHTTPTransactions(t *testing.T) {
 	alreadyFrozen := performProductionDocumentsHTTPRequest(fixture, freezePath, "freeze-again", "", "")
 	require.Equal(t, http.StatusConflict, alreadyFrozen.Code)
 
-	headID := seedProductionDocumentHead(t, fixture)
+	createPath := "/production/projects/" + fixture.projectID + "/documents"
+	create := performProductionDocumentsHTTPRequest(
+		fixture, createPath, "document-create", createProductionDocumentRequestBody(fixture), "",
+	)
+	require.Equal(t, http.StatusCreated, create.Code)
+	document := decodeProductionDocumentResponse(t, create)
+	require.NotNil(t, document.CurrentVersionID)
+	fixture.documentID = document.ID
+	headID := *document.CurrentVersionID
+	bootstrap, err := fixture.documents.GetVersion(context.Background(), 7, headID)
+	require.NoError(t, err)
+	require.Equal(t, 1, bootstrap.VersionNumber)
+	require.Empty(t, bootstrap.Blocks)
+	require.Empty(t, bootstrap.Lineage)
+	require.Equal(t, types.ComputeProductionVersionDigest(&types.ProductionDocumentVersion{}), bootstrap.ContentDigest)
+
 	appendPath := "/production/documents/" + fixture.documentID + "/versions"
 	beforeVersions := countProductionRows(t, fixture.db, &types.ProductionDocumentVersion{})
 	beforeBlocks := countProductionRows(t, fixture.db, &types.ProductionDocumentBlock{})
@@ -395,11 +439,18 @@ func TestProductionSourceAndDocumentHTTPTransactions(t *testing.T) {
 	replay := performProductionDocumentsHTTPRequest(fixture, appendPath, "append-success", validProductionVersionBody(), headID)
 	require.Equal(t, http.StatusCreated, created.Code)
 	require.Equal(t, created.Body.String(), replay.Body.String())
+	conflictingReplay := performProductionDocumentsHTTPRequest(
+		fixture, appendPath, "append-success", validProductionVersionBody(), productionStaleID,
+	)
+	require.Equal(t, http.StatusConflict, conflictingReplay.Code)
+	require.Contains(t, conflictingReplay.Body.String(), "PRODUCTION_IDEMPOTENCY_KEY_CONFLICT")
 	require.Equal(t, beforeVersions+1, countProductionRows(t, fixture.db, &types.ProductionDocumentVersion{}))
-	require.Equal(t, int64(2), countProductionRows(t, fixture.db, &types.AuditLog{}))
+	require.Equal(t, int64(3), countProductionRows(t, fixture.db, &types.AuditLog{}))
 	audits = productionAudits(t, fixture.db)
 	require.Equal(t, types.AuditActionProductionVersionCreated, audits[1].Action)
-	require.Equal(t, string(types.TenantRoleContributor), audits[1].ActorRole)
+	require.Equal(t, headID, audits[1].TargetID)
+	require.Equal(t, types.AuditActionProductionVersionCreated, audits[2].Action)
+	require.Equal(t, string(types.TenantRoleContributor), audits[2].ActorRole)
 
 	var current types.ProductionDocument
 	require.NoError(t, fixture.db.First(&current, "id = ?", fixture.documentID).Error)
@@ -408,8 +459,79 @@ func TestProductionSourceAndDocumentHTTPTransactions(t *testing.T) {
 	failed := performProductionDocumentsHTTPRequest(fixture, appendPath, "append-completion-fails", validProductionVersionBody(), *current.CurrentVersionID)
 	require.Equal(t, http.StatusInternalServerError, failed.Code)
 	require.Equal(t, beforeVersions+1, countProductionRows(t, fixture.db, &types.ProductionDocumentVersion{}))
-	require.Equal(t, int64(2), countProductionRows(t, fixture.db, &types.AuditLog{}))
-	require.Equal(t, int64(2), countProductionRows(t, fixture.db, &types.ProductionIdempotencyKey{}))
+	require.Equal(t, int64(3), countProductionRows(t, fixture.db, &types.AuditLog{}))
+	require.Equal(t, int64(3), countProductionRows(t, fixture.db, &types.ProductionIdempotencyKey{}))
+}
+
+func TestProductionGovernedAuditFailuresRollBackHTTPMutations(t *testing.T) {
+	t.Run("freeze", func(t *testing.T) {
+		fixture := newProductionDocumentsHTTPFixture(t)
+		attachProductionFixtureEvidence(t, fixture)
+		fixture.audit.FailNext()
+
+		response := performProductionDocumentsHTTPRequest(
+			fixture, "/production/source-sets/"+fixture.sourceSetID+"/freeze", "freeze-audit-fails", "", "",
+		)
+
+		require.Equal(t, http.StatusInternalServerError, response.Code)
+		require.NotContains(t, response.Body.String(), "forced governed audit failure")
+		require.Equal(t, types.ProductionSourceSetCollecting, mustProductionSourceSet(t, fixture).Status)
+		require.Zero(t, countProductionRows(t, fixture.db, &types.AuditLog{}))
+		require.Zero(t, countProductionRows(t, fixture.db, &types.ProductionIdempotencyKey{}))
+	})
+
+	t.Run("bootstrap", func(t *testing.T) {
+		fixture := newProductionDocumentsHTTPFixture(t)
+		attachProductionFixtureEvidence(t, fixture)
+		freeze := performProductionDocumentsHTTPRequest(
+			fixture, "/production/source-sets/"+fixture.sourceSetID+"/freeze", "freeze-success", "", "",
+		)
+		require.Equal(t, http.StatusOK, freeze.Code)
+		fixture.audit.FailNext()
+
+		response := performProductionDocumentsHTTPRequest(
+			fixture, "/production/projects/"+fixture.projectID+"/documents", "bootstrap-audit-fails",
+			createProductionDocumentRequestBody(fixture), "",
+		)
+
+		require.Equal(t, http.StatusInternalServerError, response.Code)
+		require.Zero(t, countProductionRows(t, fixture.db, &types.ProductionDocument{}))
+		require.Zero(t, countProductionRows(t, fixture.db, &types.ProductionDocumentVersion{}))
+		require.Equal(t, int64(1), countProductionRows(t, fixture.db, &types.AuditLog{}))
+		require.Equal(t, int64(1), countProductionRows(t, fixture.db, &types.ProductionIdempotencyKey{}))
+	})
+
+	t.Run("append", func(t *testing.T) {
+		fixture := newProductionDocumentsHTTPFixture(t)
+		attachProductionFixtureEvidence(t, fixture)
+		freeze := performProductionDocumentsHTTPRequest(
+			fixture, "/production/source-sets/"+fixture.sourceSetID+"/freeze", "freeze-success", "", "",
+		)
+		require.Equal(t, http.StatusOK, freeze.Code)
+		created := performProductionDocumentsHTTPRequest(
+			fixture, "/production/projects/"+fixture.projectID+"/documents", "document-create",
+			createProductionDocumentRequestBody(fixture), "",
+		)
+		require.Equal(t, http.StatusCreated, created.Code)
+		document := decodeProductionDocumentResponse(t, created)
+		require.NotNil(t, document.CurrentVersionID)
+		bootstrapID := *document.CurrentVersionID
+		fixture.audit.FailNext()
+
+		response := performProductionDocumentsHTTPRequest(
+			fixture, "/production/documents/"+document.ID+"/versions", "append-audit-fails",
+			validProductionVersionBody(), bootstrapID,
+		)
+
+		require.Equal(t, http.StatusInternalServerError, response.Code)
+		require.Equal(t, int64(1), countProductionRows(t, fixture.db, &types.ProductionDocumentVersion{}))
+		require.Zero(t, countProductionRows(t, fixture.db, &types.ProductionDocumentBlock{}))
+		var persisted types.ProductionDocument
+		require.NoError(t, fixture.db.First(&persisted, "id = ?", document.ID).Error)
+		require.Equal(t, bootstrapID, *persisted.CurrentVersionID)
+		require.Equal(t, int64(2), countProductionRows(t, fixture.db, &types.AuditLog{}))
+		require.Equal(t, int64(2), countProductionRows(t, fixture.db, &types.ProductionIdempotencyKey{}))
+	})
 }
 
 func productionAudits(t *testing.T, db *gorm.DB) []*types.AuditLog {

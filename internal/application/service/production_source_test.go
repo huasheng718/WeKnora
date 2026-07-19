@@ -98,7 +98,7 @@ func newProductionSourceServiceFixture(t *testing.T) (*productionSourceService, 
 	repo := apprepository.NewProductionSourceRepository(db)
 	authorizer := &productionSourceAuthorizerStub{}
 	resources := &productionSourceResourceCatalogStub{}
-	return NewProductionSourceService(repo, authorizer, resources, nil), repo, db, authorizer, resources
+	return NewProductionSourceService(repo, authorizer, resources, &productionAuditServiceStub{}), repo, db, authorizer, resources
 }
 
 func sourceServiceContext(tenantID uint64) context.Context {
@@ -376,4 +376,15 @@ func TestProductionSourceServiceFreezeRequiresAcceptedEvidenceAndRejectsFrozenMu
 		ContentDigest: strings.Repeat("e", 64), CapturedAt: time.Now().UTC(), Metadata: types.JSON(`{}`),
 	})
 	require.ErrorIs(t, err, types.ErrProductionSourceSetFrozen)
+}
+
+func TestProductionSourceServiceReturnsRequiredFreezeAuditFailure(t *testing.T) {
+	svc, repo, _, _, _ := newProductionSourceServiceFixture(t)
+	audit := &productionAuditServiceStub{err: errors.New("governed audit unavailable")}
+	svc.audit = audit
+	createServiceSourceSet(t, repo, types.ProductionSourceSetCollecting)
+
+	err := svc.Freeze(sourceServiceContext(7), serviceSetID)
+
+	require.ErrorContains(t, err, "governed audit unavailable")
 }

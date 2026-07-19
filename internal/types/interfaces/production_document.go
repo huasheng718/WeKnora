@@ -23,7 +23,11 @@ type AppendProductionVersionInput struct {
 }
 
 type ProductionDocumentRepository interface {
-	CreateDocument(ctx context.Context, document *types.ProductionDocument, sourceSetID string) error
+	CreateDocument(
+		ctx context.Context,
+		document *types.ProductionDocument,
+		bootstrapVersion *types.ProductionDocumentVersion,
+	) error
 	GetDocument(ctx context.Context, tenantID uint64, id string) (*types.ProductionDocument, error)
 	AppendVersion(
 		ctx context.Context,

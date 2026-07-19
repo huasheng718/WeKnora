@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -68,14 +69,62 @@ func newProductionDocumentServiceFixture(t *testing.T) (*productionDocumentServi
 	}).Error)
 	documents := apprepository.NewProductionDocumentRepository(db)
 	authorizer := &productionDocumentAuthorizerStub{}
+	audit := &productionAuditServiceStub{}
 	service := NewProductionDocumentService(
 		documents,
 		apprepository.NewProductionSourceRepository(db),
 		apprepository.NewProductionDocumentTypeRepository(db),
 		authorizer,
-		nil,
+		audit,
 	)
 	return service, documents, db, authorizer
+}
+
+func TestProductionDocumentServiceCreatesBootstrapVersionAndStrictlyAuditsEveryVersion(t *testing.T) {
+	svc, repo, _, _ := newProductionDocumentServiceFixture(t)
+	audit := svc.audit.(*productionAuditServiceStub)
+	ctx := context.WithValue(productionDocumentContext(7), types.TenantRoleContextKey, types.TenantRoleContributor)
+
+	document, err := svc.CreateDocument(ctx, interfaces.CreateProductionDocumentInput{
+		ProjectID: documentServiceProjectID, DocumentTypeID: documentServiceTypeID,
+		SourceSetID: documentServiceSetID, Title: "Baseline",
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, document.CurrentVersionID)
+	versions, err := repo.ListVersions(context.Background(), 7, document.ID)
+	require.NoError(t, err)
+	require.Len(t, versions, 1)
+	require.Equal(t, 1, versions[0].VersionNumber)
+	require.Equal(t, *document.CurrentVersionID, versions[0].ID)
+	require.Equal(t, types.ComputeProductionVersionDigest(&types.ProductionDocumentVersion{}), versions[0].ContentDigest)
+	require.Len(t, audit.entries, 1)
+	require.Equal(t, types.AuditActionProductionVersionCreated, audit.entries[0].Action)
+	require.Equal(t, versions[0].ID, audit.entries[0].TargetID)
+
+	appended, err := svc.AppendVersion(ctx, document.ID, interfaces.AppendProductionVersionInput{
+		ParentVersionID: *document.CurrentVersionID, SourceSetID: documentServiceSetID,
+		Origin: types.ProductionDocumentOriginHuman,
+		Blocks: []types.ProductionDocumentBlockInput{serviceParagraph("block-a", `"a"`)},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 2, appended.VersionNumber)
+	require.Len(t, audit.entries, 2)
+	require.Equal(t, appended.ID, audit.entries[1].TargetID)
+}
+
+func TestProductionDocumentServiceReturnsRequiredAuditFailures(t *testing.T) {
+	svc, _, _, _ := newProductionDocumentServiceFixture(t)
+	audit := svc.audit.(*productionAuditServiceStub)
+	audit.err = errors.New("governed audit unavailable")
+
+	document, err := svc.CreateDocument(productionDocumentContext(7), interfaces.CreateProductionDocumentInput{
+		ProjectID: documentServiceProjectID, DocumentTypeID: documentServiceTypeID,
+		SourceSetID: documentServiceSetID, Title: "Baseline",
+	})
+
+	require.Nil(t, document)
+	require.ErrorContains(t, err, "governed audit unavailable")
 }
 
 func productionDocumentContext(tenantID uint64) context.Context {
@@ -184,7 +233,8 @@ func TestProductionDocumentServicePreservesLogicalIDsAndComputesCanonicalDigests
 	document := createServiceDocument(t, svc)
 
 	version, err := svc.AppendVersion(productionDocumentContext(7), document.ID, interfaces.AppendProductionVersionInput{
-		SourceSetID: documentServiceSetID, Origin: types.ProductionDocumentOriginHuman,
+		ParentVersionID: *document.CurrentVersionID, SourceSetID: documentServiceSetID,
+		Origin: types.ProductionDocumentOriginHuman,
 		Blocks: []types.ProductionDocumentBlockInput{{
 			LogicalBlockID: "block-a", BlockType: "paragraph", Content: types.JSON(`{ "b": 2, "a": 1 }`),
 			Attributes: types.JSON(`{ "z": false, "a": true }`), EvidenceRefs: types.JSON(`[]`), AIProvenance: types.JSON(`{}`),
@@ -192,7 +242,7 @@ func TestProductionDocumentServicePreservesLogicalIDsAndComputesCanonicalDigests
 	})
 
 	require.NoError(t, err)
-	require.Equal(t, 1, version.VersionNumber)
+	require.Equal(t, 2, version.VersionNumber)
 	require.Equal(t, "block-a", version.Blocks[0].LogicalBlockID)
 	require.Len(t, version.Blocks[0].ContentDigest, 64)
 	require.Len(t, version.ContentDigest, 64)
@@ -205,7 +255,8 @@ func TestProductionDocumentServiceRecordsSplitAndMergeLineage(t *testing.T) {
 	svc, _, _, _ := newProductionDocumentServiceFixture(t)
 	document := createServiceDocument(t, svc)
 	first, err := svc.AppendVersion(productionDocumentContext(7), document.ID, interfaces.AppendProductionVersionInput{
-		SourceSetID: documentServiceSetID, Origin: types.ProductionDocumentOriginHuman,
+		ParentVersionID: *document.CurrentVersionID, SourceSetID: documentServiceSetID,
+		Origin: types.ProductionDocumentOriginHuman,
 		Blocks: []types.ProductionDocumentBlockInput{
 			serviceParagraph("block-a", `"a"`), serviceParagraph("block-b", `"b"`), serviceParagraph("block-c", `"c"`),
 		},
@@ -255,7 +306,8 @@ func TestProductionDocumentServiceScopesReadsByTenantAndProjectAuthorization(t *
 	svc, _, _, authorizer := newProductionDocumentServiceFixture(t)
 	document := createServiceDocument(t, svc)
 	version, err := svc.AppendVersion(productionDocumentContext(7), document.ID, interfaces.AppendProductionVersionInput{
-		SourceSetID: documentServiceSetID, Origin: types.ProductionDocumentOriginHuman,
+		ParentVersionID: *document.CurrentVersionID, SourceSetID: documentServiceSetID,
+		Origin: types.ProductionDocumentOriginHuman,
 		Blocks: []types.ProductionDocumentBlockInput{serviceParagraph("block-a", `"a"`)},
 	})
 	require.NoError(t, err)

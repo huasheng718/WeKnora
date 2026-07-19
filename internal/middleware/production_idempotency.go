@@ -90,7 +90,7 @@ func (m *ProductionIdempotencyMiddleware) Require() gin.HandlerFunc {
 				"request body could not be read", false)
 			return
 		}
-		digest := productionRequestDigest(body)
+		digest := productionRequestDigest(body, c.GetHeader("If-Match"))
 		route := c.Request.Method + " " + c.Request.URL.EscapedPath()
 		reservation := &types.ProductionIdempotencyKey{
 			ID:             uuid.NewString(),
@@ -233,13 +233,23 @@ func readAndRestoreProductionBody(c *gin.Context) ([]byte, error) {
 	return body, nil
 }
 
-func productionRequestDigest(body []byte) string {
+func productionRequestDigest(body []byte, ifMatch ...string) string {
 	canonical := body
 	if encoded, ok := canonicalProductionJSON(body); ok {
 		canonical = encoded
 	}
-	sum := sha256.Sum256(canonical)
-	return hex.EncodeToString(sum[:])
+	digest := sha256.New()
+	_, _ = digest.Write(canonical)
+	if len(ifMatch) > 0 {
+		normalized := strings.TrimSpace(ifMatch[0])
+		if normalized != "" {
+			_, _ = digest.Write([]byte{0})
+			_, _ = digest.Write([]byte("if-match"))
+			_, _ = digest.Write([]byte{0})
+			_, _ = digest.Write([]byte(normalized))
+		}
+	}
+	return hex.EncodeToString(digest.Sum(nil))
 }
 
 func canonicalProductionJSON(body []byte) ([]byte, bool) {

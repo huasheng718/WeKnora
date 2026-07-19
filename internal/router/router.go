@@ -114,14 +114,7 @@ func NewRouter(params RouterParams) *gin.Engine {
 	}
 
 	// CORS 中间件应放在最前面
-	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"*"},
-		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization", "X-API-Key", "X-Request-ID", "X-Tenant-ID", "X-Embed-Session", "X-External-User-ID", "X-External-User-Token", "Idempotency-Key"},
-		ExposeHeaders:    []string{"Content-Length", "Access-Control-Allow-Origin"},
-		AllowCredentials: true,
-		MaxAge:           12 * time.Hour,
-	}))
+	r.Use(cors.New(routerCORSConfig()))
 
 	// 基础中间件（不需要认证）
 	r.Use(middleware.RequestID())
@@ -291,6 +284,17 @@ func NewRouter(params RouterParams) *gin.Engine {
 	}
 
 	return r
+}
+
+func routerCORSConfig() cors.Config {
+	return cors.Config{
+		AllowOrigins:     []string{"*"},
+		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization", "X-API-Key", "X-Request-ID", "X-Tenant-ID", "X-Embed-Session", "X-External-User-ID", "X-External-User-Token", "Idempotency-Key", "If-Match"},
+		ExposeHeaders:    []string{"Content-Length", "Access-Control-Allow-Origin"},
+		AllowCredentials: true,
+		MaxAge:           12 * time.Hour,
+	}
 }
 
 // RegisterProductionRoutes wires the tenant-scoped knowledge-production

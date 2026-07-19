@@ -75,6 +75,20 @@ func emitProductionAudit(ctx context.Context, audit interfaces.AuditLogService, 
 	}
 }
 
+func emitRequiredProductionAudit(
+	ctx context.Context,
+	audit interfaces.AuditLogService,
+	entry *types.AuditLog,
+) error {
+	if audit == nil {
+		return fmt.Errorf("required production audit service is unavailable")
+	}
+	if err := audit.Log(ctx, entry); err != nil {
+		return fmt.Errorf("required production audit failed: %w", err)
+	}
+	return nil
+}
+
 func (s *productionProjectService) CreateProject(
 	ctx context.Context,
 	input interfaces.CreateProductionProjectInput,
