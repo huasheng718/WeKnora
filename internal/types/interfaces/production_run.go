@@ -59,7 +59,7 @@ type ProductionRunRepository interface {
 	Get(ctx context.Context, tenantID uint64, runID string) (*types.ProductionRun, error)
 	Claim(ctx context.Context, tenantID uint64, runID string, expected ProductionRunCAS, leaseTTL time.Duration) (*types.ProductionRun, bool, error)
 	Transition(ctx context.Context, tenantID uint64, runID string, expected ProductionRunCAS, to types.ProductionRunStatus, patch ProductionRunPatch) (*types.ProductionRun, bool, error)
-	MarkWakeupEnqueued(ctx context.Context, tenantID uint64, runID string, wakeupVersion int) (bool, error)
+	MarkWakeupEnqueued(ctx context.Context, tenantID uint64, runID string, attempt, currentStep, wakeupVersion int) (bool, error)
 	CreateToolCall(ctx context.Context, call *types.ProductionToolCall) error
 	GetToolCall(ctx context.Context, tenantID uint64, callID string) (*types.ProductionToolCall, error)
 	ListToolCalls(ctx context.Context, tenantID uint64, runID string) ([]*types.ProductionToolCall, error)

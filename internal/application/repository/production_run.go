@@ -268,16 +268,19 @@ func (r *productionRunRepository) MarkWakeupEnqueued(
 	ctx context.Context,
 	tenantID uint64,
 	runID string,
+	attempt, currentStep,
 	wakeupVersion int,
 ) (bool, error) {
-	if wakeupVersion < 1 {
-		return false, errors.New("wakeup version must be positive")
+	if attempt < 1 || currentStep < 0 || wakeupVersion < 1 {
+		return false, errors.New("wakeup mark fence is invalid")
 	}
 	result := database.DBFromContext(ctx, r.db).WithContext(ctx).
 		Model(&types.ProductionRun{}).
-		Where("tenant_id = ? AND id = ? AND wakeup_version = ?", tenantID, runID, wakeupVersion).
+		Where("tenant_id = ? AND id = ?", tenantID, runID).
+		Where("attempt = ? AND current_step = ? AND wakeup_version = ?", attempt, currentStep, wakeupVersion).
+		Where("status IN ?", []types.ProductionRunStatus{types.ProductionRunQueued, types.ProductionRunRunning}).
 		Where("wakeup_enqueued_version < ?", wakeupVersion).
-		Update("wakeup_enqueued_version", wakeupVersion)
+		UpdateColumn("wakeup_enqueued_version", wakeupVersion)
 	if result.Error != nil {
 		return false, result.Error
 	}
@@ -305,8 +308,10 @@ func (r *productionRunRepository) CreateToolCall(
 	for name, value := range map[string]*string{
 		"response_evidence_id":             call.ResponseEvidenceID,
 		"response_evidence_source_item_id": call.ResponseEvidenceSourceItemID,
+		"approved_by":                      call.ApprovedBy,
+		"rejected_by":                      call.RejectedBy,
 	} {
-		if value != nil {
+		if value != nil && *value != "" {
 			if err := requireCanonicalProductionUUID(name, *value); err != nil {
 				return err
 			}
@@ -385,6 +390,9 @@ func (r *productionRunRepository) ResolveToolCall(
 	}
 	if strings.TrimSpace(actor) == "" {
 		return false, errors.New("production tool call decision actor is required")
+	}
+	if err := requireCanonicalProductionUUID("actor", actor); err != nil {
+		return false, err
 	}
 	if expected.Status != types.ProductionToolCallPendingApproval || expected.Attempt < 1 || expected.CurrentStep < 0 {
 		return false, errors.New("invalid production tool call decision fence")

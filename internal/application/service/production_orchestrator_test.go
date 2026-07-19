@@ -291,7 +291,7 @@ func TestProductionOrchestratorApprovedResumeUsesPersistedStepOnFreshInstance(t 
 	require.NoError(t, err)
 
 	resumed, err := f.orchestrator.ResolveDecision(
-		context.Background(), 7, calls[0].ID, types.ProductionToolCallApproved, "reviewer-1",
+		context.Background(), 7, calls[0].ID, types.ProductionToolCallApproved, uuid.NewString(),
 	)
 	require.NoError(t, err)
 	require.True(t, resumed)
@@ -336,7 +336,7 @@ func TestProductionOrchestratorDuplicateApprovalHasOneWinnerAndOneEnqueue(t *tes
 			ready.Done()
 			<-start
 			won, resolveErr := f.orchestrator.ResolveDecision(
-				context.Background(), 7, calls[0].ID, types.ProductionToolCallApproved, "reviewer-1",
+				context.Background(), 7, calls[0].ID, types.ProductionToolCallApproved, uuid.NewString(),
 			)
 			results <- won
 			errs <- resolveErr
@@ -396,7 +396,7 @@ func TestProductionOrchestratorFailureCancellationAndTerminalResumeGuards(t *tes
 
 	t.Run("cancelled cannot resume or execute", func(t *testing.T) {
 		f := newProductionOrchestratorFixture(t, 0)
-		cancelled, err := f.orchestrator.Cancel(context.Background(), 7, f.run.ID, "user-1")
+		cancelled, err := f.orchestrator.Cancel(context.Background(), 7, f.run.ID, uuid.NewString())
 		require.NoError(t, err)
 		require.True(t, cancelled)
 		resumed, err := f.orchestrator.Resume(context.Background(), 7, f.run.ID, 1)
@@ -584,7 +584,7 @@ type failWakeupMarkRepository struct {
 }
 
 func (r *failWakeupMarkRepository) MarkWakeupEnqueued(
-	ctx context.Context, tenantID uint64, runID string, wakeupVersion int,
+	ctx context.Context, tenantID uint64, runID string, attempt, currentStep, wakeupVersion int,
 ) (bool, error) {
 	r.mu.Lock()
 	if r.failOnce {
@@ -593,7 +593,7 @@ func (r *failWakeupMarkRepository) MarkWakeupEnqueued(
 		return false, errors.New("crash before wakeup mark")
 	}
 	r.mu.Unlock()
-	return r.ProductionRunRepository.MarkWakeupEnqueued(ctx, tenantID, runID, wakeupVersion)
+	return r.ProductionRunRepository.MarkWakeupEnqueued(ctx, tenantID, runID, attempt, currentStep, wakeupVersion)
 }
 
 func TestProductionOrchestratorEnqueueBeforeMarkRecoversThroughDeterministicConflict(t *testing.T) {

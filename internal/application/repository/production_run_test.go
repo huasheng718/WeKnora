@@ -28,6 +28,7 @@ const (
 	repoDocumentID   = "00000000-0000-4000-8000-000000000004"
 	repoSourceItemID = "00000000-0000-4000-8000-000000000005"
 	repoEvidenceID   = "00000000-0000-4000-8000-000000000006"
+	repoActorID      = "00000000-0000-4000-8000-000000000007"
 )
 
 func newProductionRunRepoTestDB(t *testing.T) (interfaces.ProductionRunRepository, *gorm.DB) {
@@ -303,13 +304,93 @@ func TestProductionRunRepositoryToolCallsAreTenantScopedAndDecisionIsCAS(t *test
 		Status: types.ProductionToolCallPendingApproval, Attempt: 1, CurrentStep: 0,
 	}
 	resolved, err := repo.ResolveToolCall(context.Background(), 7, call.ID, expected,
-		types.ProductionToolCallApproved, "reviewer-1")
+		types.ProductionToolCallApproved, repoActorID)
 	require.NoError(t, err)
 	require.True(t, resolved)
 	resolved, err = repo.ResolveToolCall(context.Background(), 7, call.ID, expected,
-		types.ProductionToolCallApproved, "reviewer-2")
+		types.ProductionToolCallApproved, uuid.NewString())
 	require.NoError(t, err)
 	require.False(t, resolved)
+}
+
+func TestProductionRunRepositoryApprovalActorsRequireCanonicalUUIDBeforeWrite(t *testing.T) {
+	repo, db := newProductionRunRepoTestDB(t)
+	run := newTestProductionRun(7)
+	run.Status = types.ProductionRunWaitingApproval
+	require.NoError(t, repo.Create(context.Background(), run))
+	now := time.Now().UTC()
+	call := &types.ProductionToolCall{
+		ID: uuid.NewString(), RunID: run.ID, TenantID: 7, ProjectID: run.ProjectID,
+		DocumentID: run.DocumentID, SourceSetID: run.SourceSetID, Attempt: 1, CurrentStep: 0,
+		IdempotencyKey: "actor-call", ProviderType: types.ProductionToolProviderMCP,
+		ProviderID: "search", ToolName: "lookup", RequestSnapshot: types.JSON(`{"query":"ok"}`),
+		Status: types.ProductionToolCallPendingApproval, ApprovalStatus: types.ProductionToolApprovalPending,
+		ApprovalRequestedAt: &now,
+	}
+	require.NoError(t, repo.CreateToolCall(context.Background(), call))
+	expected := interfaces.ProductionToolCallCAS{
+		Status: types.ProductionToolCallPendingApproval, Attempt: 1, CurrentStep: 0,
+	}
+	for _, invalid := range []string{
+		strings.ReplaceAll(uuid.NewString(), "-", ""), "{" + uuid.NewString() + "}",
+		"urn:uuid:" + uuid.NewString(), strings.ToUpper(uuid.NewString()),
+	} {
+		resolved, err := repo.ResolveToolCall(
+			context.Background(), 7, call.ID, expected, types.ProductionToolCallApproved, invalid,
+		)
+		require.ErrorContains(t, err, "canonical UUID")
+		require.False(t, resolved)
+		persisted, getErr := repo.GetToolCall(context.Background(), 7, call.ID)
+		require.NoError(t, getErr)
+		require.Equal(t, types.ProductionToolCallPendingApproval, persisted.Status)
+		require.Nil(t, persisted.ApprovedBy)
+	}
+
+	resolved, err := repo.ResolveToolCall(
+		context.Background(), 7, call.ID, expected, types.ProductionToolCallApproved, repoActorID,
+	)
+	require.NoError(t, err)
+	require.True(t, resolved)
+	var count int64
+	require.NoError(t, db.Model(&types.ProductionToolCall{}).Where("approved_by = ?", repoActorID).Count(&count).Error)
+	require.Equal(t, int64(1), count)
+}
+
+func TestProductionRunRepositoryCreateToolCallValidatesPrepopulatedDecisionActors(t *testing.T) {
+	for _, field := range []string{"approved_by", "rejected_by"} {
+		t.Run(field, func(t *testing.T) {
+			repo, db := newProductionRunRepoTestDB(t)
+			run := newTestProductionRun(7)
+			run.Status = types.ProductionRunRunning
+			require.NoError(t, repo.Create(context.Background(), run))
+			now := time.Now().UTC()
+			invalid := "urn:uuid:" + uuid.NewString()
+			call := &types.ProductionToolCall{
+				ID: uuid.NewString(), RunID: run.ID, TenantID: 7, ProjectID: run.ProjectID,
+				DocumentID: run.DocumentID, SourceSetID: run.SourceSetID, Attempt: 1, CurrentStep: 0,
+				IdempotencyKey: field, ProviderType: types.ProductionToolProviderMCP,
+				ProviderID: "search", ToolName: "lookup", RequestSnapshot: types.JSON(`{"query":"ok"}`),
+				ApprovalRequestedAt: &now,
+			}
+			if field == "approved_by" {
+				call.Status = types.ProductionToolCallApproved
+				call.ApprovalStatus = types.ProductionToolApprovalApproved
+				call.ApprovedBy = &invalid
+				call.ApprovedAt = &now
+			} else {
+				call.Status = types.ProductionToolCallRejected
+				call.ApprovalStatus = types.ProductionToolApprovalRejected
+				call.RejectedBy = &invalid
+				call.RejectedAt = &now
+				call.CompletedAt = &now
+			}
+
+			require.ErrorContains(t, repo.CreateToolCall(context.Background(), call), "canonical UUID")
+			var count int64
+			require.NoError(t, db.Model(&types.ProductionToolCall{}).Count(&count).Error)
+			require.Zero(t, count)
+		})
+	}
 }
 
 func TestProductionRunRepositoryRejectsNonCanonicalToolCallUUIDs(t *testing.T) {
@@ -390,19 +471,47 @@ func TestProductionRunRepositoryToolCompletionRollsBackWithStaleParent(t *testin
 }
 
 func TestProductionRunRepositoryWakeupMarkHasSingleWinner(t *testing.T) {
-	repo, _ := newProductionRunRepoTestDB(t)
+	repo, db := newProductionRunRepoTestDB(t)
 	run := newTestProductionRun(7)
+	run.Status = types.ProductionRunRunning
 	require.NoError(t, repo.Create(context.Background(), run))
+	require.NoError(t, db.Exec(`UPDATE production_runs
+        SET updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') WHERE id = ?`, run.ID).Error)
+	var before string
+	require.NoError(t, db.Raw(`SELECT CAST(updated_at AS TEXT) FROM production_runs WHERE id = ?`, run.ID).Scan(&before).Error)
 
-	won, err := repo.MarkWakeupEnqueued(context.Background(), 7, run.ID, 1)
+	for _, stale := range []struct{ attempt, step, version int }{
+		{2, 0, 1}, {1, 1, 1}, {1, 0, 2},
+	} {
+		won, err := repo.MarkWakeupEnqueued(
+			context.Background(), 7, run.ID, stale.attempt, stale.step, stale.version,
+		)
+		require.NoError(t, err)
+		require.False(t, won)
+	}
+
+	won, err := repo.MarkWakeupEnqueued(context.Background(), 7, run.ID, 1, 0, 1)
 	require.NoError(t, err)
 	require.True(t, won)
-	won, err = repo.MarkWakeupEnqueued(context.Background(), 7, run.ID, 1)
+	var after string
+	require.NoError(t, db.Raw(`SELECT CAST(updated_at AS TEXT) FROM production_runs WHERE id = ?`, run.ID).Scan(&after).Error)
+	require.Equal(t, before, after, "wakeup marking must not renew or alter the database lease timestamp")
+
+	won, err = repo.MarkWakeupEnqueued(context.Background(), 7, run.ID, 1, 0, 1)
 	require.NoError(t, err)
 	require.False(t, won)
 	got, err := repo.Get(context.Background(), 7, run.ID)
 	require.NoError(t, err)
 	require.Equal(t, 1, got.WakeupEnqueuedVersion)
+
+	terminal := newTestProductionRun(7)
+	terminal.Status = types.ProductionRunCancelled
+	completedAt := time.Now().UTC()
+	terminal.CompletedAt = &completedAt
+	require.NoError(t, repo.Create(context.Background(), terminal))
+	won, err = repo.MarkWakeupEnqueued(context.Background(), 7, terminal.ID, 1, 0, 1)
+	require.NoError(t, err)
+	require.False(t, won, "terminal runs cannot mark wakeups")
 }
 
 func ptr[T any](value T) *T { return &value }

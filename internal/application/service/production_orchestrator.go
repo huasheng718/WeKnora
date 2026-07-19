@@ -524,7 +524,9 @@ func (o *ProductionOrchestrator) enqueuePending(ctx context.Context, run *types.
 	if err != nil && !errors.Is(err, asynq.ErrTaskIDConflict) {
 		return false, err
 	}
-	marked, markErr := o.repo.MarkWakeupEnqueued(ctx, run.TenantID, run.ID, run.WakeupVersion)
+	marked, markErr := o.repo.MarkWakeupEnqueued(
+		ctx, run.TenantID, run.ID, run.Attempt, run.CurrentStep, run.WakeupVersion,
+	)
 	if markErr != nil {
 		return owned, markErr
 	}
