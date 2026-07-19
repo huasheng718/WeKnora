@@ -158,16 +158,21 @@ func TestProductionDataSourceAdapterPlanDigestPinsExecuteAndEvidence(t *testing.
 	adapter, call, _ := dataSourceAdapterFixture(t, connector)
 	planningRequest := dataSourceRequestSnapshot(t, adapterSourceItemID, []string{"resource-b", "resource-a"}, "", "")
 	call.Status, call.RequestSnapshot, call.RequestDigest = types.ProductionToolCallPlanned, planningRequest, adapterDigest(planningRequest)
+	originalRequest, originalDigest := append(types.JSON(nil), call.RequestSnapshot...), call.RequestDigest
 
 	plan, err := adapter.Plan(context.Background(), call)
 	require.NoError(t, err)
 	require.NotEmpty(t, plan.ProviderDigest)
+	require.NotEmpty(t, plan.RequestSnapshot)
+	require.NotEmpty(t, plan.RequestDigest)
+	require.Equal(t, originalRequest, call.RequestSnapshot)
+	require.Equal(t, originalDigest, call.RequestDigest)
 
-	executeRequest := dataSourceRequestSnapshot(t, adapterSourceItemID, []string{"resource-b", "resource-a"}, "", plan.ProviderDigest)
-	call.Status, call.RequestSnapshot, call.RequestDigest = types.ProductionToolCallExecuting, executeRequest, adapterDigest(executeRequest)
+	call.Status, call.RequestSnapshot, call.RequestDigest = types.ProductionToolCallExecuting, plan.RequestSnapshot, plan.RequestDigest
 	result, err := adapter.Execute(context.Background(), call)
 	require.NoError(t, err)
 	require.Equal(t, plan.ProviderDigest, result.ProviderDigest)
+	require.Equal(t, plan.Digest, result.PlanDigest)
 	var metadata map[string]any
 	require.NoError(t, json.Unmarshal(result.Evidence.RedactionMetadata, &metadata))
 	require.Equal(t, plan.ProviderDigest, metadata["provider_digest"])
@@ -188,8 +193,7 @@ func TestProductionDataSourceAdapterRejectsPinnedProviderMutationBeforeRegistryP
 			plan, err := adapter.Plan(context.Background(), call)
 			require.NoError(t, err)
 
-			executeRequest := dataSourceRequestSnapshot(t, adapterSourceItemID, []string{"resource-b", "resource-a"}, "", plan.ProviderDigest)
-			call.Status, call.RequestSnapshot, call.RequestDigest = types.ProductionToolCallExecuting, executeRequest, adapterDigest(executeRequest)
+			call.Status, call.RequestSnapshot, call.RequestDigest = types.ProductionToolCallExecuting, plan.RequestSnapshot, plan.RequestDigest
 			dataSources := adapter.dataSources.(*fakeProductionDataSourceService)
 			mutate(dataSources.dataSource)
 			_, err = adapter.Execute(context.Background(), call)
@@ -320,8 +324,7 @@ func pinProductionDataSourceCall(t *testing.T, adapter *ProductionDataSourceAdap
 	call.Status, call.RequestSnapshot, call.RequestDigest = types.ProductionToolCallPlanned, planning, adapterDigest(planning)
 	plan, err := adapter.Plan(context.Background(), call)
 	require.NoError(t, err)
-	executing := dataSourceRequestSnapshot(t, request.SourceItemID, request.ResourceIDs, request.ParentID, plan.ProviderDigest)
-	call.Status, call.RequestSnapshot, call.RequestDigest = types.ProductionToolCallExecuting, executing, adapterDigest(executing)
+	call.Status, call.RequestSnapshot, call.RequestDigest = types.ProductionToolCallExecuting, plan.RequestSnapshot, plan.RequestDigest
 }
 
 func TestProductionDataSourceAdapterSecretValuePolicyAvoidsShortSubstringFalsePositive(t *testing.T) {

@@ -42,13 +42,15 @@ type ProductionToolAdapter interface {
 // ProductionToolPlan is a canonical, side-effect-free description of one
 // durable invocation. Digest is SHA-256 over Canonical.
 type ProductionToolPlan struct {
-	ToolCallID     string
-	ProviderType   types.ProductionToolProviderType
-	ProviderID     string
-	ToolName       string
-	Canonical      types.JSON
-	Digest         string
-	ProviderDigest string
+	ToolCallID      string
+	ProviderType    types.ProductionToolProviderType
+	ProviderID      string
+	ToolName        string
+	Canonical       types.JSON
+	Digest          string
+	ProviderDigest  string
+	RequestSnapshot types.JSON
+	RequestDigest   string
 }
 
 // ProductionToolResult contains only normalized provider output. Evidence has
@@ -409,7 +411,8 @@ func newProductionToolPlan(call *types.ProductionToolCall, providerDigest string
 	return &ProductionToolPlan{
 		ToolCallID: call.ID, ProviderType: call.ProviderType, ProviderID: call.ProviderID,
 		ToolName: call.ToolName, Canonical: canonical, Digest: productionToolDigest(canonical),
-		ProviderDigest: providerDigest,
+		ProviderDigest: providerDigest, RequestSnapshot: append(types.JSON(nil), call.RequestSnapshot...),
+		RequestDigest: call.RequestDigest,
 	}, nil
 }
 

@@ -178,7 +178,19 @@ func (a *ProductionDataSourceAdapter) plan(
 	} else if !canonicalProductionSHA256(providerDigest) {
 		return nil, request, nil, errProductionToolCallInvalid
 	}
-	plan, err := newProductionToolPlan(call, providerDigest)
+	plannedCall := call
+	if resolveProvider {
+		request.ProviderDigest = providerDigest
+		pinnedSnapshot, err := canonicalProductionValue(request)
+		if err != nil {
+			return nil, request, nil, errProductionToolCallInvalid
+		}
+		copy := *call
+		copy.RequestSnapshot = pinnedSnapshot
+		copy.RequestDigest = productionToolDigest(pinnedSnapshot)
+		plannedCall = &copy
+	}
+	plan, err := newProductionToolPlan(plannedCall, providerDigest)
 	return plan, request, item, err
 }
 
