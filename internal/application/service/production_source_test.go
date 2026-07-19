@@ -13,6 +13,7 @@ import (
 	"time"
 
 	apprepository "github.com/Tencent/WeKnora/internal/application/repository"
+	"github.com/Tencent/WeKnora/internal/database"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/stretchr/testify/require"
@@ -449,4 +450,46 @@ func TestProductionSourceDirectServiceAuditFailureRollsBackFreeze(t *testing.T) 
 	require.Equal(t, types.ProductionSourceSetFrozen, set.Status)
 	require.NoError(t, db.Model(&types.AuditLog{}).Count(&auditCount).Error)
 	require.Equal(t, int64(1), auditCount)
+}
+
+func TestProductionSourceNestedUnitOfWorkIsAtomicInsideOuterTransaction(t *testing.T) {
+	t.Run("swallowed audit failure rolls back to savepoint", func(t *testing.T) {
+		svc, repo, db, _, _ := newProductionSourceServiceFixture(t)
+		svc.audit = NewAuditLogService(apprepository.NewAuditLogRepository(db))
+		createServiceSourceSet(t, repo, types.ProductionSourceSetCollecting)
+		require.NoError(t, installServiceAuditFailureTrigger(db))
+		var serviceErr error
+
+		outerErr := database.WithTransactionContext(sourceServiceContext(7), db, func(txCtx context.Context) error {
+			serviceErr = svc.Freeze(txCtx, serviceSetID)
+			return nil
+		})
+
+		require.NoError(t, outerErr)
+		require.ErrorContains(t, serviceErr, "forced governed audit failure")
+		set, err := repo.GetSet(context.Background(), 7, serviceSetID)
+		require.NoError(t, err)
+		require.Equal(t, types.ProductionSourceSetCollecting, set.Status)
+		var auditCount int64
+		require.NoError(t, db.Model(&types.AuditLog{}).Count(&auditCount).Error)
+		require.Zero(t, auditCount)
+	})
+
+	t.Run("success commits", func(t *testing.T) {
+		svc, repo, db, _, _ := newProductionSourceServiceFixture(t)
+		svc.audit = NewAuditLogService(apprepository.NewAuditLogRepository(db))
+		createServiceSourceSet(t, repo, types.ProductionSourceSetCollecting)
+
+		err := database.WithTransactionContext(sourceServiceContext(7), db, func(txCtx context.Context) error {
+			return svc.Freeze(txCtx, serviceSetID)
+		})
+
+		require.NoError(t, err)
+		set, err := repo.GetSet(context.Background(), 7, serviceSetID)
+		require.NoError(t, err)
+		require.Equal(t, types.ProductionSourceSetFrozen, set.Status)
+		var auditCount int64
+		require.NoError(t, db.Model(&types.AuditLog{}).Count(&auditCount).Error)
+		require.Equal(t, int64(1), auditCount)
+	})
 }

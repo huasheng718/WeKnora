@@ -15,6 +15,7 @@ import (
 	"time"
 
 	apprepository "github.com/Tencent/WeKnora/internal/application/repository"
+	"github.com/Tencent/WeKnora/internal/database"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/stretchr/testify/require"
@@ -323,6 +324,89 @@ func TestProductionDocumentDirectServiceAuditFailureRollsBackBootstrapAndAppend(
 		require.NoError(t, db.First(&persisted, "id = ?", document.ID).Error)
 		require.Equal(t, bootstrapID, *persisted.CurrentVersionID)
 	})
+}
+
+func TestProductionDocumentNestedUnitOfWorkRollsBackWhenOuterTransactionSwallowsAuditFailure(t *testing.T) {
+	t.Run("bootstrap", func(t *testing.T) {
+		svc, _, db, _ := newProductionDocumentServiceFixture(t)
+		svc.audit = NewAuditLogService(apprepository.NewAuditLogRepository(db))
+		require.NoError(t, installServiceAuditFailureTrigger(db))
+		var serviceErr error
+
+		outerErr := database.WithTransactionContext(productionDocumentContext(7), db, func(txCtx context.Context) error {
+			_, serviceErr = svc.CreateDocument(txCtx, interfaces.CreateProductionDocumentInput{
+				ProjectID: documentServiceProjectID, DocumentTypeID: documentServiceTypeID,
+				SourceSetID: documentServiceSetID, Title: "Baseline",
+			})
+			return nil
+		})
+
+		require.NoError(t, outerErr)
+		require.ErrorContains(t, serviceErr, "forced governed audit failure")
+		require.Zero(t, countServiceRows(t, db, &types.ProductionDocument{}))
+		require.Zero(t, countServiceRows(t, db, &types.ProductionDocumentVersion{}))
+		require.Zero(t, countServiceRows(t, db, &types.AuditLog{}))
+	})
+
+	t.Run("append", func(t *testing.T) {
+		svc, _, db, _ := newProductionDocumentServiceFixture(t)
+		svc.audit = NewAuditLogService(apprepository.NewAuditLogRepository(db))
+		document := createServiceDocument(t, svc)
+		bootstrapID := *document.CurrentVersionID
+		require.NoError(t, installServiceAuditFailureTrigger(db))
+		var serviceErr error
+
+		outerErr := database.WithTransactionContext(productionDocumentContext(7), db, func(txCtx context.Context) error {
+			_, serviceErr = svc.AppendVersion(txCtx, document.ID, interfaces.AppendProductionVersionInput{
+				ParentVersionID: bootstrapID, SourceSetID: documentServiceSetID,
+				Origin: types.ProductionDocumentOriginHuman,
+				Blocks: governedServiceBlocks(governedServiceParagraph("claim", `"governed claim"`)),
+			})
+			return nil
+		})
+
+		require.NoError(t, outerErr)
+		require.ErrorContains(t, serviceErr, "forced governed audit failure")
+		require.Equal(t, int64(1), countServiceRows(t, db, &types.ProductionDocumentVersion{}))
+		require.Zero(t, countServiceRows(t, db, &types.ProductionDocumentBlock{}))
+		require.Equal(t, int64(1), countServiceRows(t, db, &types.AuditLog{}))
+		var persisted types.ProductionDocument
+		require.NoError(t, db.First(&persisted, "id = ?", document.ID).Error)
+		require.Equal(t, bootstrapID, *persisted.CurrentVersionID)
+	})
+}
+
+func TestProductionDocumentNestedUnitOfWorkSuccessCommits(t *testing.T) {
+	svc, _, db, _ := newProductionDocumentServiceFixture(t)
+	svc.audit = NewAuditLogService(apprepository.NewAuditLogRepository(db))
+	var document *types.ProductionDocument
+	var version *types.ProductionDocumentVersion
+
+	err := database.WithTransactionContext(productionDocumentContext(7), db, func(txCtx context.Context) error {
+		var createErr error
+		document, createErr = svc.CreateDocument(txCtx, interfaces.CreateProductionDocumentInput{
+			ProjectID: documentServiceProjectID, DocumentTypeID: documentServiceTypeID,
+			SourceSetID: documentServiceSetID, Title: "Baseline",
+		})
+		if createErr != nil {
+			return createErr
+		}
+		var appendErr error
+		version, appendErr = svc.AppendVersion(txCtx, document.ID, interfaces.AppendProductionVersionInput{
+			ParentVersionID: *document.CurrentVersionID, SourceSetID: documentServiceSetID,
+			Origin: types.ProductionDocumentOriginHuman,
+			Blocks: governedServiceBlocks(governedServiceParagraph("claim", `"governed claim"`)),
+		})
+		return appendErr
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, document)
+	require.NotNil(t, version)
+	require.Equal(t, int64(1), countServiceRows(t, db, &types.ProductionDocument{}))
+	require.Equal(t, int64(2), countServiceRows(t, db, &types.ProductionDocumentVersion{}))
+	require.Equal(t, int64(len(version.Blocks)), countServiceRows(t, db, &types.ProductionDocumentBlock{}))
+	require.Equal(t, int64(2), countServiceRows(t, db, &types.AuditLog{}))
 }
 
 func installServiceAuditFailureTrigger(db *gorm.DB) error {

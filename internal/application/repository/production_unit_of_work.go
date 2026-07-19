@@ -22,9 +22,6 @@ func (u *productionUnitOfWork) WithinTransaction(
 	if fn == nil {
 		return errors.New("production unit of work callback is required")
 	}
-	if database.DBFromContext(ctx, nil) != nil {
-		return fn(ctx)
-	}
 	return database.WithTransactionContext(ctx, u.db, fn)
 }
 
