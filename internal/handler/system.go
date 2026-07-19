@@ -1542,6 +1542,7 @@ func aggregateRuntimeWorkerPools(pools []RuntimeWorkerPool, servers []types.Work
 		types.WorkerPoolEnrichment:  types.QueueWeightsForPool(types.WorkerPoolEnrichment),
 		types.WorkerPoolMaintenance: types.QueueWeightsForPool(types.WorkerPoolMaintenance),
 		types.WorkerPoolShared:      types.QueueWeightsForSharedPool(),
+		types.WorkerPoolProduction:  types.QueueWeightsForPool(types.WorkerPoolProduction),
 		types.WorkerPoolWiki:        types.QueueWeightsForPool(types.WorkerPoolWiki),
 	}
 	indexes := make(map[string]int, len(pools))
@@ -1617,6 +1618,7 @@ func (h *SystemHandler) GetRuntimeQueues(c *gin.Context) {
 			{Name: types.WorkerPoolEnrichment, Concurrency: allocation.Enrichment, QueueCount: queueCounts[types.WorkerPoolEnrichment]},
 			{Name: types.WorkerPoolMaintenance, Concurrency: allocation.Maintenance, QueueCount: queueCounts[types.WorkerPoolMaintenance]},
 			{Name: types.WorkerPoolShared, Concurrency: allocation.Shared, QueueCount: len(types.QueueWeightsForSharedPool())},
+			{Name: types.WorkerPoolProduction, Concurrency: allocation.Production, QueueCount: queueCounts[types.WorkerPoolProduction]},
 			{Name: types.WorkerPoolWiki, Concurrency: allocation.Wiki, QueueCount: queueCounts[types.WorkerPoolWiki]},
 		},
 		Timestamp: time.Now().Unix(),

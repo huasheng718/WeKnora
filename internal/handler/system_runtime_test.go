@@ -27,6 +27,8 @@ func (runtimeTestSettings) GetInt(_ context.Context, key, _ string, def int64) i
 		return 4
 	case "asynq.shared_concurrency":
 		return 6
+	case "asynq.production_concurrency":
+		return 4
 	case "asynq.wiki_concurrency":
 		return 8
 	default:
@@ -221,13 +223,15 @@ func TestGetRuntimeQueuesReportsIsolatedPoolCapacity(t *testing.T) {
 	want := map[string]struct {
 		concurrency int
 		queueCount  int
+		instances   int
 	}{
-		types.WorkerPoolCore:        {8, 1},
-		types.WorkerPoolPostProcess: {2, 1},
-		types.WorkerPoolEnrichment:  {12, 4},
-		types.WorkerPoolMaintenance: {4, 2},
-		types.WorkerPoolShared:      {6, 5},
-		types.WorkerPoolWiki:        {8, 1},
+		types.WorkerPoolCore:        {8, 1, 1},
+		types.WorkerPoolPostProcess: {2, 1, 1},
+		types.WorkerPoolEnrichment:  {12, 4, 1},
+		types.WorkerPoolMaintenance: {4, 2, 1},
+		types.WorkerPoolShared:      {6, 5, 1},
+		types.WorkerPoolProduction:  {4, 1, 0},
+		types.WorkerPoolWiki:        {8, 1, 1},
 	}
 	if len(response.Pools) != len(want) {
 		t.Fatalf("pool count = %d, want %d", len(response.Pools), len(want))
@@ -241,7 +245,7 @@ func TestGetRuntimeQueuesReportsIsolatedPoolCapacity(t *testing.T) {
 			t.Fatalf("pool %q = %+v, want concurrency=%d queue_count=%d",
 				pool.Name, pool, expected.concurrency, expected.queueCount)
 		}
-		if pool.Instances != 1 || pool.ClusterCapacity != expected.concurrency {
+		if pool.Instances != expected.instances || pool.ClusterCapacity != expected.instances*expected.concurrency {
 			t.Fatalf("pool %q live capacity = %+v", pool.Name, pool)
 		}
 	}

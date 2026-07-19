@@ -240,6 +240,18 @@ var registry = map[string]settingSpec{
 		RequiresRestart: true,
 		Description:     "核心解析与内容富化共用的每实例弹性并发。空闲容量由有积压的一侧借用；修改后需重启。",
 	},
+	// asynq.production_concurrency reserves an independent pool for durable
+	// AI orchestration. It is intentionally excluded from interactive parse
+	// and shared elastic capacity; worker startup is registered separately.
+	"asynq.production_concurrency": {
+		Type:            "int",
+		EnvName:         "WEKNORA_ASYNQ_PRODUCTION_CONCURRENCY",
+		Default:         int64(types.DefaultProductionWorkerConcurrency),
+		Category:        "worker",
+		RequiresRestart: true,
+		Description: "生产知识 AI 编排专用 worker 的每实例并发，与解析和共享弹性池硬隔离。" +
+			"修改后需重启服务进程方可生效。",
+	},
 	// asynq.wiki_concurrency is the size of the DEDICATED wiki worker pool,
 	// separate from the upstream pools. Read once when the wiki asynq server
 	// starts — changing it in the UI requires a process restart. Mirrors
@@ -1277,7 +1289,8 @@ func validateRegistryEntry(key string, rawValue any) error {
 	switch key {
 	case "asynq.core_concurrency", "asynq.postprocess_concurrency",
 		"asynq.enrichment_concurrency", "asynq.maintenance_concurrency",
-		"asynq.shared_concurrency", "asynq.wiki_concurrency":
+		"asynq.shared_concurrency", "asynq.production_concurrency",
+		"asynq.wiki_concurrency":
 		n, err := coerceToPositiveInt64(rawValue)
 		if err != nil {
 			return err
