@@ -221,6 +221,24 @@ func TestProductionSourceServiceCanonicalizesInlineEvidenceAndComputesSHA256(t *
 	require.Equal(t, snapshot.ContentDigest, persisted.ContentDigest)
 }
 
+func TestProductionSourceServiceCanonicalizesInlineEvidenceNumbersExactly(t *testing.T) {
+	svc, repo, _, _, _ := newProductionSourceServiceFixture(t)
+	createServiceSourceSet(t, repo, types.ProductionSourceSetCollecting)
+	createServiceSourceItem(t, repo, types.ProductionSourceItemAccepted)
+
+	snapshot, err := svc.AttachEvidence(sourceServiceContext(7), serviceItemID, interfaces.CreateEvidenceSnapshotInput{
+		SnapshotType:  types.ProductionEvidenceSnapshotJSON,
+		InlineContent: types.JSON(`{"n":1.000e0,"large":123456789012345678901234567890}`),
+	})
+	require.NoError(t, err)
+	require.Equal(t, types.JSON(`{"large":1.2345678901234567890123456789e29,"n":1}`), snapshot.InlineContent)
+
+	canonical, err := types.CanonicalProductionJSON(snapshot.InlineContent)
+	require.NoError(t, err)
+	want := sha256.Sum256(canonical)
+	require.Equal(t, hex.EncodeToString(want[:]), snapshot.ContentDigest)
+}
+
 func TestProductionSourceServiceRejectsMismatchedInlineDigest(t *testing.T) {
 	svc, repo, _, _, _ := newProductionSourceServiceFixture(t)
 	createServiceSourceSet(t, repo, types.ProductionSourceSetCollecting)

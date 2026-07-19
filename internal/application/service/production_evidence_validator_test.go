@@ -97,6 +97,37 @@ func TestProductionEvidenceValidatorRequiresEvidenceOrExplicitConfirmationForFac
 	require.Empty(t, ValidateProductionVersion(version, nil).Errors)
 }
 
+func TestProductionEvidenceValidatorClassifiesClaimCapableBlocksWithoutProducerOptIn(t *testing.T) {
+	version := productionBaselineVersion()
+	position := len(version.Blocks)
+	version.Blocks = append(version.Blocks,
+		productionValidationBlock("paragraph", "paragraph", position, `"claim"`, `{"factual":false}`, `[]`),
+		productionValidationBlock("list", "list", position+1, `["claim"]`, `{}`, `[]`),
+		productionValidationBlock("table", "table", position+2, `{"headers":["claim"],"rows":[["value"]]}`, `{}`, `[]`),
+		productionValidationBlock("quote", "quote", position+3, `"claim"`, `{}`, `[]`),
+		productionValidationBlock("heading", "heading", position+4, `"Non-claim heading"`, `{}`, `[]`),
+		productionValidationBlock("code", "code", position+5, `"const x = 1"`, `{}`, `[]`),
+		productionValidationBlock("image", "image", position+6, `{"alt":"x","url":"https://example.com/x.png"}`, `{}`, `[]`),
+	)
+
+	result := ValidateProductionVersion(version, nil)
+	require.Equal(t, 4, strings.Count(strings.Join(productionIssueCodes(result.Errors), ","), "factual_evidence_required"))
+	require.Contains(t, productionIssueCodes(result.Errors), "unsupported_block_type")
+}
+
+func TestProductionEvidenceValidatorAcceptsGovernedEvidenceOrExplicitConfirmationForClaims(t *testing.T) {
+	version := productionBaselineVersion()
+	position := len(version.Blocks)
+	version.Blocks = append(version.Blocks,
+		productionValidationBlock("with-evidence", "paragraph", position, `"claim"`, `{"factual":false}`, `["e-1"]`),
+		productionValidationBlock("confirmation", "table", position+1, `{"headers":["claim"],"rows":[]}`, `{"needs_confirmation":true}`, `[]`),
+	)
+
+	result := ValidateProductionVersion(version, map[string]struct{}{"e-1": {}})
+	require.NotContains(t, productionIssueCodes(result.Errors), "factual_evidence_required")
+	require.Empty(t, result.Errors)
+}
+
 func TestProductionEvidenceValidatorRejectsMalformedAndUnsupportedBlocksInStableOrder(t *testing.T) {
 	version := productionBaselineVersion()
 	position := len(version.Blocks)
@@ -114,8 +145,11 @@ func TestProductionEvidenceValidatorRejectsMalformedAndUnsupportedBlocksInStable
 	require.Equal(t, []string{
 		"nil_block",
 		"invalid_block_attributes",
+		"factual_evidence_required",
 		"invalid_evidence_refs",
+		"factual_evidence_required",
 		"invalid_block_content",
+		"factual_evidence_required",
 		"unsupported_block_type",
 	}, productionIssueCodes(first.Errors))
 }
@@ -147,6 +181,7 @@ func TestProductionEvidenceValidatorRejectsMalformedIdentityProvenanceAndAttribu
 		"block_position_invalid",
 		"invalid_block_attributes",
 		"invalid_ai_provenance",
+		"factual_evidence_required",
 	}, productionIssueCodes(first.Errors))
 	require.Contains(t, first.Errors[2].Message, "level")
 }
@@ -226,4 +261,52 @@ func TestProductionEvidenceDigestVerificationUsesStableMalformedFieldOrder(t *te
 		err := VerifyProductionVersionDigests(version, nil)
 		require.ErrorContains(t, err, "content JSON")
 	}
+}
+
+func TestProductionEvidenceDigestVerificationRequiresEveryReferencedSnapshot(t *testing.T) {
+	for _, evidenceID := range []string{"inline-1", "registry-1"} {
+		t.Run(evidenceID, func(t *testing.T) {
+			version := productionBaselineVersion()
+			version.Blocks[0].EvidenceRefs = types.JSON(`[` + `"` + evidenceID + `"` + `]`)
+			version.Blocks[0].ContentDigest = types.ComputeProductionBlockDigest(version.Blocks[0])
+			version.ContentDigest = types.ComputeProductionVersionDigest(version)
+
+			err := VerifyProductionVersionDigests(version, map[string]*types.ProductionEvidenceSnapshot{})
+			require.ErrorContains(t, err, "referenced evidence "+evidenceID+" is missing")
+		})
+	}
+}
+
+func TestProductionEvidenceDigestVerificationRejectsMalformedAndDuplicateBlockRefs(t *testing.T) {
+	version := productionBaselineVersion()
+	version.Blocks[0].EvidenceRefs = types.JSON(`["e-1","e-1"]`)
+	version.Blocks[0].ContentDigest = types.ComputeProductionBlockDigest(version.Blocks[0])
+	version.ContentDigest = types.ComputeProductionVersionDigest(version)
+	require.ErrorContains(t, VerifyProductionVersionDigests(version, nil), "duplicate evidence reference")
+
+	version.Blocks[0].EvidenceRefs = types.JSON(`{"evidence":"e-1"}`)
+	version.Blocks[0].ContentDigest = types.ComputeProductionBlockDigest(version.Blocks[0])
+	version.ContentDigest = types.ComputeProductionVersionDigest(version)
+	require.ErrorContains(t, VerifyProductionVersionDigests(version, nil), "invalid evidence references")
+}
+
+func TestProductionEvidenceDigestVerificationCanonicalizesEquivalentNumbersExactly(t *testing.T) {
+	canonical, err := types.CanonicalProductionJSON(types.JSON(`{"n":1}`))
+	require.NoError(t, err)
+	sum := sha256.Sum256(canonical)
+	digest := hex.EncodeToString(sum[:])
+
+	for _, inline := range []types.JSON{types.JSON(`{"n":1}`), types.JSON(`{"n":1.0}`), types.JSON(`{"n":1e0}`)} {
+		snapshot := &types.ProductionEvidenceSnapshot{
+			ID: "e-1", SnapshotType: types.ProductionEvidenceSnapshotJSON,
+			InlineContent: inline, ContentDigest: digest,
+		}
+		require.NoError(t, VerifyProductionVersionDigests(productionBaselineVersion(), map[string]*types.ProductionEvidenceSnapshot{"e-1": snapshot}))
+	}
+
+	largeA, err := types.CanonicalProductionJSON(types.JSON(`{"n":123456789012345678901234567890,"d":0.0000000000000000001234500}`))
+	require.NoError(t, err)
+	largeB, err := types.CanonicalProductionJSON(types.JSON(`{"d":1.2345e-19,"n":12345678901234567890123456789e1}`))
+	require.NoError(t, err)
+	require.Equal(t, largeA, largeB)
 }

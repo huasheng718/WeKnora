@@ -172,22 +172,39 @@ func canonicalProductionDigestJSON(value JSON, fallback string) json.RawMessage 
 	if len(value) == 0 {
 		value = JSON(fallback)
 	}
+	canonical, err := CanonicalProductionJSON(value)
+	if err != nil {
+		return json.RawMessage(strconv.Quote(string(value)))
+	}
+	return json.RawMessage(canonical)
+}
+
+// CanonicalProductionJSON returns the exact arbitrary-precision JSON form used
+// by production content digests. Object keys and equivalent numeric spellings
+// are normalized without converting numbers through float64.
+func CanonicalProductionJSON(value JSON) (JSON, error) {
+	if len(value) == 0 {
+		return nil, errors.New("production JSON value is required")
+	}
 	decoder := json.NewDecoder(bytes.NewReader(value))
 	decoder.UseNumber()
 	var decoded any
 	if err := decoder.Decode(&decoded); err != nil {
-		return json.RawMessage(strconv.Quote(string(value)))
+		return nil, err
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return json.RawMessage(strconv.Quote(string(value)))
+		if err == nil {
+			return nil, errors.New("multiple JSON values are not allowed")
+		}
+		return nil, err
 	}
 	decoded = normalizeProductionDigestNumbers(decoded)
 	canonical, err := json.Marshal(decoded)
 	if err != nil {
-		return json.RawMessage(strconv.Quote(string(value)))
+		return nil, err
 	}
-	return canonical
+	return JSON(canonical), nil
 }
 
 type canonicalProductionNumber string

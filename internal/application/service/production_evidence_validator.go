@@ -282,8 +282,9 @@ func ValidateProductionVersion(version *types.ProductionDocumentVersion, accepte
 				unknownRefs[ref] = struct{}{}
 			}
 		}
-		if attributesErr == nil && attributes.Factual && !hasAcceptedEvidence && !attributes.NeedsConfirmation {
-			result.Errors = append(result.Errors, productionIssue("factual_evidence_required", "factual block requires accepted evidence or needs_confirmation=true", block))
+		claimCapable := block.BlockType == "paragraph" || block.BlockType == "list" || block.BlockType == "table" || block.BlockType == "quote"
+		if claimCapable && !hasAcceptedEvidence && !attributes.NeedsConfirmation {
+			result.Errors = append(result.Errors, productionIssue("factual_evidence_required", "claim-capable block requires accepted evidence or needs_confirmation=true", block))
 		}
 	}
 	return result
@@ -309,7 +310,7 @@ func productionVerifyEvidenceDigest(id string, snapshot *types.ProductionEvidenc
 		return fmt.Errorf("evidence %s must contain exactly one inline value or resource reference", id)
 	}
 	if hasInline {
-		canonical, err := canonicalProductionJSON(snapshot.InlineContent, "")
+		canonical, err := types.CanonicalProductionJSON(snapshot.InlineContent)
 		if err != nil {
 			return fmt.Errorf("evidence %s inline content is invalid: %w", id, err)
 		}
@@ -337,22 +338,55 @@ func VerifyProductionVersionDigests(version *types.ProductionDocumentVersion, ev
 	if version == nil {
 		return errors.New("production document version is required")
 	}
-	evidenceIDs := make([]string, 0, len(evidenceByID))
-	for id := range evidenceByID {
-		evidenceIDs = append(evidenceIDs, id)
+	blocks := productionSortedBlocks(version.Blocks)
+	verifiedEvidence := make(map[string]struct{}, len(evidenceByID))
+	for _, block := range blocks {
+		if block == nil {
+			return errors.New("production document version contains a nil block")
+		}
+		refs, err := productionParseEvidenceRefs(block.EvidenceRefs)
+		if err != nil {
+			return fmt.Errorf("block %s has invalid evidence references: %w", block.LogicalBlockID, err)
+		}
+		seenRefs := make(map[string]struct{}, len(refs))
+		for _, ref := range refs {
+			if _, duplicate := seenRefs[ref]; duplicate {
+				return fmt.Errorf("block %s has duplicate evidence reference %q", block.LogicalBlockID, ref)
+			}
+			seenRefs[ref] = struct{}{}
+		}
+		for _, ref := range refs {
+			if _, verified := verifiedEvidence[ref]; verified {
+				continue
+			}
+			snapshot, exists := evidenceByID[ref]
+			if !exists {
+				return fmt.Errorf("referenced evidence %s is missing", ref)
+			}
+			if err := productionVerifyEvidenceDigest(ref, snapshot); err != nil {
+				return err
+			}
+			verifiedEvidence[ref] = struct{}{}
+		}
 	}
-	sort.Strings(evidenceIDs)
-	for _, id := range evidenceIDs {
+
+	// Extra snapshots are also verified in sorted ID order so callers cannot
+	// smuggle an invalid snapshot through a larger verification batch.
+	extraEvidenceIDs := make([]string, 0, len(evidenceByID))
+	for id := range evidenceByID {
+		if _, verified := verifiedEvidence[id]; !verified {
+			extraEvidenceIDs = append(extraEvidenceIDs, id)
+		}
+	}
+	sort.Strings(extraEvidenceIDs)
+	for _, id := range extraEvidenceIDs {
 		if err := productionVerifyEvidenceDigest(id, evidenceByID[id]); err != nil {
 			return err
 		}
 	}
 
-	recomputedBlocks := make([]*types.ProductionDocumentBlock, 0, len(version.Blocks))
-	for _, block := range productionSortedBlocks(version.Blocks) {
-		if block == nil {
-			return errors.New("production document version contains a nil block")
-		}
+	recomputedBlocks := make([]*types.ProductionDocumentBlock, 0, len(blocks))
+	for _, block := range blocks {
 		for _, field := range []struct {
 			name     string
 			value    types.JSON

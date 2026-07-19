@@ -1,14 +1,11 @@
 package service
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"strings"
 	"time"
 
@@ -65,32 +62,7 @@ func canonicalProductionJSON(value types.JSON, defaultValue string) (types.JSON,
 	if len(value) == 0 {
 		value = types.JSON(defaultValue)
 	}
-	decoder := json.NewDecoder(bytes.NewReader(value))
-	decoder.UseNumber()
-	var decoded any
-	if err := decoder.Decode(&decoded); err != nil {
-		return nil, err
-	}
-	if err := ensureJSONEOF(decoder); err != nil {
-		return nil, err
-	}
-	canonical, err := json.Marshal(decoded)
-	if err != nil {
-		return nil, err
-	}
-	return types.JSON(canonical), nil
-}
-
-func ensureJSONEOF(decoder *json.Decoder) error {
-	var trailing any
-	err := decoder.Decode(&trailing)
-	if errors.Is(err, io.EOF) {
-		return nil
-	}
-	if err == nil {
-		return errors.New("multiple JSON values are not allowed")
-	}
-	return err
+	return types.CanonicalProductionJSON(value)
 }
 
 func (s *productionSourceService) CreateSet(

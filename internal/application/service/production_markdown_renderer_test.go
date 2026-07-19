@@ -78,14 +78,45 @@ func TestProductionMarkdownRendererRejectsUnsafeImageAndEvidenceInjection(t *tes
 	require.Error(t, err)
 }
 
-func TestProductionMarkdownRendererEncodesImageMarkdownDelimiters(t *testing.T) {
+func TestProductionMarkdownRendererRejectsImageURLSecretsAndNonPublicReferences(t *testing.T) {
+	urls := []string{
+		"https://user:secret@example.com/a.png",
+		"https://example.com/a.png?token=secret",
+		"https://example.com/a.png?",
+		"https://example.com/a.png#signed-fragment",
+		"https://example.com/a.png#",
+		"resource://abcdefghijklmnopqrstuv",
+	}
+	for _, imageURL := range urls {
+		t.Run(imageURL, func(t *testing.T) {
+			version := &types.ProductionDocumentVersion{Blocks: []*types.ProductionDocumentBlock{
+				productionValidationBlock("i", "image", 0, `{"alt":"x","url":"`+imageURL+`"}`, `{}`, `[]`),
+			}}
+			_, err := RenderProductionMarkdown(version)
+			require.ErrorContains(t, err, "image URL")
+		})
+	}
+}
+
+func TestProductionMarkdownRendererEscapesEntitiesAndApostrophesFaithfully(t *testing.T) {
 	version := &types.ProductionDocumentVersion{Blocks: []*types.ProductionDocumentBlock{
-		productionValidationBlock("i", "image", 0, `{"alt":"x","url":"https://example.com/a_(b).png?next=(c)"}`, `{}`, `[]`),
+		productionValidationBlock("p", "paragraph", 0, `"Tom & Jerry's <tag> &lt;literal&gt;"`, `{}`, `[]`),
 	}}
 
 	markdown, err := RenderProductionMarkdown(version)
 	require.NoError(t, err)
-	require.Contains(t, markdown, "a_%28b%29.png?next=%28c%29")
+	require.Contains(t, markdown, "Tom &amp; Jerry&#39;s &lt;tag&gt; &amp;lt;literal&amp;gt;")
+	require.NotContains(t, markdown, `&\#39;`)
+}
+
+func TestProductionMarkdownRendererEncodesImageMarkdownDelimiters(t *testing.T) {
+	version := &types.ProductionDocumentVersion{Blocks: []*types.ProductionDocumentBlock{
+		productionValidationBlock("i", "image", 0, `{"alt":"x","url":"https://example.com/a_(b).png"}`, `{}`, `[]`),
+	}}
+
+	markdown, err := RenderProductionMarkdown(version)
+	require.NoError(t, err)
+	require.Contains(t, markdown, "a_%28b%29.png")
 	require.NotContains(t, markdown, "a_(b)")
 }
 

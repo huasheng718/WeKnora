@@ -14,13 +14,15 @@ import (
 var productionCodeLanguagePattern = regexp.MustCompile(`^[A-Za-z0-9_+.-]{0,32}$`)
 
 func productionEscapeMarkdown(value string) string {
-	value = html.EscapeString(value)
 	replacer := strings.NewReplacer(
 		`\`, `\\`, `*`, `\*`, `_`, `\_`, `{`, `\{`, `}`, `\}`,
 		`[`, `\[`, `]`, `\]`, `(`, `\(`, `)`, `\)`, `#`, `\#`,
-		`+`, `\+`, `-`, `\-`, `!`, `\!`, `|`, `\|`, "\r\n", "<br>", "\n", "<br>", "\r", "<br>",
+		`+`, `\+`, `-`, `\-`, `!`, `\!`, `|`, `\|`,
 	)
-	return replacer.Replace(value)
+	value = html.EscapeString(replacer.Replace(value))
+	value = strings.ReplaceAll(value, "\r\n", "<br>")
+	value = strings.ReplaceAll(value, "\n", "<br>")
+	return strings.ReplaceAll(value, "\r", "<br>")
 }
 
 func productionCodeFence(code string) string {
@@ -103,7 +105,8 @@ func productionRenderBlock(block *types.ProductionDocumentBlock) (string, []stri
 		}
 		_ = productionDecodeJSON(block.Content, "", &image)
 		parsed, parseErr := url.Parse(image.URL)
-		if parseErr != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" || parsed.User != nil {
+		if parseErr != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" ||
+			parsed.User != nil || strings.ContainsAny(image.URL, "?#") {
 			return "", nil, fmt.Errorf("cannot render block %s: unsafe image URL", block.LogicalBlockID)
 		}
 		safeURL := strings.NewReplacer("(", "%28", ")", "%29", "<", "%3C", ">", "%3E").Replace(parsed.String())
