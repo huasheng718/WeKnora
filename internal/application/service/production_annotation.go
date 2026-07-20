@@ -22,6 +22,23 @@ type CreateProductionAnnotationInput struct {
 	SuggestedContent *string
 }
 
+type ListProductionAnnotationsInput struct {
+	DocumentID     string
+	VersionID      string
+	AnnotationType types.ProductionAnnotationType
+	Severity       types.ProductionAnnotationSeverity
+	Status         types.ProductionAnnotationStatus
+	Page           int
+	PageSize       int
+}
+
+type ProductionAnnotationPage struct {
+	Data     []*types.ProductionAnnotation
+	Total    int64
+	Page     int
+	PageSize int
+}
+
 type productionAnnotationService struct {
 	reviews   interfaces.ProductionReviewRepository
 	documents interfaces.ProductionDocumentRepository
@@ -34,6 +51,73 @@ func NewProductionAnnotationService(
 	projects interfaces.ProductionProjectAuthorizer,
 ) *productionAnnotationService {
 	return &productionAnnotationService{reviews: reviews, documents: documents, projects: projects}
+}
+
+func (s *productionAnnotationService) List(
+	ctx context.Context,
+	input ListProductionAnnotationsInput,
+) (*ProductionAnnotationPage, error) {
+	tenantID, _, err := productionCaller(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireProductionSourceID(input.DocumentID, "document id"); err != nil {
+		return nil, err
+	}
+	if input.Page < 1 || input.PageSize < 1 || input.PageSize > 100 ||
+		input.Page-1 > int(^uint(0)>>1)/input.PageSize ||
+		(input.AnnotationType != "" && !input.AnnotationType.IsValid()) ||
+		(input.Severity != "" && !input.Severity.IsValid()) ||
+		(input.Status != "" && !input.Status.IsValid()) {
+		return nil, types.ErrProductionReviewScopeInvalid
+	}
+	document, err := s.documents.GetDocument(ctx, tenantID, input.DocumentID)
+	if err != nil {
+		return nil, err
+	}
+	if document == nil || document.TenantID != tenantID || document.ID != input.DocumentID || document.ProjectID == "" {
+		return nil, types.ErrProductionReviewScopeInvalid
+	}
+	if s.projects == nil {
+		return nil, types.ErrProductionForbidden
+	}
+	if err := s.projects.RequireProjectRole(ctx, document.ProjectID,
+		types.ProductionRoleProjectOwner,
+		types.ProductionRoleAuthor,
+		types.ProductionRoleBusinessReviewer,
+		types.ProductionRoleEngineeringReviewer,
+		types.ProductionRoleComplianceReviewer,
+		types.ProductionRoleObserver,
+	); err != nil {
+		return nil, err
+	}
+	if input.VersionID != "" {
+		if err := requireProductionSourceID(input.VersionID, "version id"); err != nil {
+			return nil, err
+		}
+		version, loadErr := s.documents.GetVersion(ctx, tenantID, input.VersionID)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		if version == nil || version.TenantID != tenantID || version.ID != input.VersionID ||
+			version.DocumentID != document.ID || version.ProjectID != document.ProjectID {
+			return nil, types.ErrProductionReviewScopeInvalid
+		}
+	}
+	items, total, err := s.reviews.ListAnnotations(
+		ctx, tenantID, document.ID,
+		interfaces.ListProductionAnnotationsFilter{
+			VersionID: input.VersionID, AnnotationType: input.AnnotationType,
+			Severity: input.Severity, Status: input.Status,
+		},
+		(input.Page-1)*input.PageSize, input.PageSize,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &ProductionAnnotationPage{
+		Data: items, Total: total, Page: input.Page, PageSize: input.PageSize,
+	}, nil
 }
 
 func (s *productionAnnotationService) Create(

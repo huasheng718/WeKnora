@@ -110,6 +110,10 @@ type productionRouterRunService struct{}
 
 type productionRouterAnnotationService struct{}
 
+func (*productionRouterAnnotationService) List(context.Context, appservice.ListProductionAnnotationsInput) (*appservice.ProductionAnnotationPage, error) {
+	return &appservice.ProductionAnnotationPage{Data: []*types.ProductionAnnotation{}}, nil
+}
+
 func (*productionRouterAnnotationService) Create(context.Context, appservice.CreateProductionAnnotationInput) (*types.ProductionAnnotation, error) {
 	return &types.ProductionAnnotation{}, nil
 }
@@ -244,6 +248,18 @@ func TestProductionRouteRBACRunsBeforeIdempotencyAndServiceAuthorizationRemainsA
 		require.Equal(t, http.StatusOK, read.Code)
 		require.Equal(t, 1, documents.listCalls)
 
+		annotations := httptest.NewRecorder()
+		engine.ServeHTTP(annotations, httptest.NewRequest(http.MethodGet,
+			"/api/v1/production/documents/"+documentID+"/annotations", nil))
+		require.Equal(t, http.StatusOK, annotations.Code, annotations.Body.String())
+		require.Empty(t, repo.records)
+
+		review := httptest.NewRecorder()
+		engine.ServeHTTP(review, httptest.NewRequest(http.MethodGet,
+			"/api/v1/production/reviews/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", nil))
+		require.Equal(t, http.StatusOK, review.Code, review.Body.String())
+		require.Empty(t, repo.records)
+
 		write := httptest.NewRecorder()
 		request := httptest.NewRequest(http.MethodPost, "/api/v1/production/source-sets/"+sourceSetID+"/freeze", nil)
 		request.Header.Set("Idempotency-Key", "viewer-write")
@@ -306,6 +322,7 @@ func TestProductionReviewRoutesAreRegistered(t *testing.T) {
 	engine := newProductionRouteTestEngine(&handler.ProductionProjectHandler{}, newProductionRouterIdempotencyRepo())
 
 	for _, route := range []struct{ method, path string }{
+		{http.MethodGet, "/api/v1/production/documents/:id/annotations"},
 		{http.MethodPost, "/api/v1/production/documents/:id/annotations"},
 		{http.MethodPut, "/api/v1/production/annotations/:id/status"},
 		{http.MethodPost, "/api/v1/production/documents/:id/reviews"},

@@ -301,6 +301,63 @@ func (r *productionReviewRepository) GetAnnotation(
 	return &annotation, nil
 }
 
+func (r *productionReviewRepository) ListAnnotations(
+	ctx context.Context,
+	tenantID uint64,
+	documentID string,
+	filter interfaces.ListProductionAnnotationsFilter,
+	offset, limit int,
+) ([]*types.ProductionAnnotation, int64, error) {
+	if tenantID == 0 || offset < 0 || limit < 1 || limit > 100 {
+		return nil, 0, types.ErrProductionReviewScopeInvalid
+	}
+	if err := requireProductionReviewTenantContext(ctx, tenantID); err != nil {
+		return nil, 0, err
+	}
+	if err := requireProductionReviewUUID("document id", documentID); err != nil {
+		return nil, 0, err
+	}
+	if filter.VersionID != "" {
+		if err := requireProductionReviewUUID("version id", filter.VersionID); err != nil {
+			return nil, 0, err
+		}
+	}
+	if filter.AnnotationType != "" && !filter.AnnotationType.IsValid() {
+		return nil, 0, types.ErrProductionReviewScopeInvalid
+	}
+	if filter.Severity != "" && !filter.Severity.IsValid() {
+		return nil, 0, types.ErrProductionReviewScopeInvalid
+	}
+	if filter.Status != "" && !filter.Status.IsValid() {
+		return nil, 0, types.ErrProductionReviewScopeInvalid
+	}
+
+	db := database.DBFromContext(ctx, r.db).WithContext(ctx).
+		Model(&types.ProductionAnnotation{}).
+		Where("tenant_id = ? AND document_id = ?", tenantID, documentID)
+	if filter.VersionID != "" {
+		db = db.Where("version_id = ?", filter.VersionID)
+	}
+	if filter.AnnotationType != "" {
+		db = db.Where("annotation_type = ?", filter.AnnotationType)
+	}
+	if filter.Severity != "" {
+		db = db.Where("severity = ?", filter.Severity)
+	}
+	if filter.Status != "" {
+		db = db.Where("status = ?", filter.Status)
+	}
+	var total int64
+	if err := db.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	annotations := make([]*types.ProductionAnnotation, 0, limit)
+	if err := db.Order("created_at DESC, id DESC").Offset(offset).Limit(limit).Find(&annotations).Error; err != nil {
+		return nil, 0, err
+	}
+	return annotations, total, nil
+}
+
 func (r *productionReviewRepository) ResolveAnnotation(
 	ctx context.Context,
 	tenantID uint64,

@@ -19,10 +19,53 @@ import (
 
 const productionReviewMaxBodyBytes = 512 << 10
 
-// ProductionAnnotationService is the command surface exposed by the review API.
+// ProductionAnnotationService is the governed annotation surface exposed by the review API.
 type ProductionAnnotationService interface {
+	List(context.Context, appservice.ListProductionAnnotationsInput) (*appservice.ProductionAnnotationPage, error)
 	Create(context.Context, appservice.CreateProductionAnnotationInput) (*types.ProductionAnnotation, error)
 	Resolve(context.Context, string, types.ProductionAnnotationStatus) error
+}
+
+func (h *ProductionReviewHandler) ListAnnotations(c *gin.Context) {
+	documentID := strings.TrimSpace(c.Param("id"))
+	if !isProductionUUID(documentID) {
+		c.Error(apperrors.NewValidationError("document id must be a canonical UUID"))
+		return
+	}
+	page, pageSize, ok := parseListPagination(c)
+	if !ok {
+		return
+	}
+	if page-1 > int(^uint(0)>>1)/pageSize {
+		c.Error(apperrors.NewValidationError("page is too large"))
+		return
+	}
+	input := appservice.ListProductionAnnotationsInput{
+		DocumentID: documentID,
+		VersionID:  strings.TrimSpace(c.Query("version_id")),
+		Status:     types.ProductionAnnotationStatus(strings.TrimSpace(c.Query("status"))),
+		AnnotationType: types.ProductionAnnotationType(
+			strings.TrimSpace(c.Query("annotation_type")),
+		),
+		Severity: types.ProductionAnnotationSeverity(strings.TrimSpace(c.Query("severity"))),
+		Page:     page, PageSize: pageSize,
+	}
+	if (input.VersionID != "" && !isProductionUUID(input.VersionID)) ||
+		(input.Status != "" && !input.Status.IsValid()) ||
+		(input.AnnotationType != "" && !input.AnnotationType.IsValid()) ||
+		(input.Severity != "" && !input.Severity.IsValid()) {
+		c.Error(apperrors.NewValidationError("invalid production annotation list filters"))
+		return
+	}
+	result, err := h.annotations.List(c.Request.Context(), input)
+	if err != nil {
+		handleProductionReviewServiceError(c, err, "failed to list production annotations")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true, "data": result.Data, "total": result.Total,
+		"page": result.Page, "page_size": result.PageSize,
+	})
 }
 
 // ProductionReviewService is the governed review surface exposed over HTTP.

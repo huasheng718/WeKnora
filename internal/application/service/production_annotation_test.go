@@ -65,6 +65,12 @@ type productionAnnotationReviewRepoStub struct {
 	resolveOK  bool
 }
 
+func (r *productionAnnotationReviewRepoStub) ListAnnotations(
+	context.Context, uint64, string, interfaces.ListProductionAnnotationsFilter, int, int,
+) ([]*types.ProductionAnnotation, int64, error) {
+	return nil, 0, errors.New("unexpected ListAnnotations")
+}
+
 func (r *productionAnnotationReviewRepoStub) CreateAnnotation(_ context.Context, annotation *types.ProductionAnnotation) error {
 	copy := *annotation
 	r.created = &copy
@@ -188,6 +194,83 @@ func TestProductionAnnotationCreateDerivesTrustedActorAndScope(t *testing.T) {
 		types.ProductionRoleEngineeringReviewer,
 		types.ProductionRoleComplianceReviewer,
 	}, authorizer.roles)
+}
+
+func TestProductionAnnotationListAllowsTenantViewerProjectObserverAndDeniesNonMembers(t *testing.T) {
+	svc, repo, db, _ := newProductionAnnotationWriteBoundaryFixture(t)
+	observerID := "22222222-2222-4222-8222-222222222222"
+	members := newProductionMemberServiceStub()
+	members.add(annotationTenantID, observerID, types.TenantRoleViewer)
+	projectService := NewProductionProjectService(apprepository.NewProductionProjectRepository(db), members, nil)
+	svc.projects = projectService
+	repoAnnotation := &types.ProductionAnnotation{
+		ID: "12345678-1234-4234-8234-123456789012", TenantID: annotationTenantID,
+		ProjectID: annotationProjectID, DocumentID: annotationDocumentID,
+		VersionID: annotationVersionOne, BlockID: annotationBlockOne,
+		AnnotationType: types.ProductionAnnotationComment, Severity: types.ProductionAnnotationInfo,
+		Anchor: types.JSON(`{}`), Body: "observer-visible", Status: types.ProductionAnnotationOpen,
+		CreatedBy: "11111111-1111-4111-8111-111111111111",
+	}
+	require.NoError(t, repo.CreateAnnotation(productionAnnotationContext(), repoAnnotation))
+	require.NoError(t, db.Create(&types.ProductionProjectMember{
+		ProjectID: annotationProjectID, UserID: observerID, Role: types.ProductionRoleObserver,
+		AssignedBy: "33333333-3333-4333-8333-333333333333",
+	}).Error)
+
+	observerCtx := productionAnnotationContextFor(observerID)
+	observerCtx = context.WithValue(observerCtx, types.TenantRoleContextKey, types.TenantRoleViewer)
+	page, err := svc.List(observerCtx, ListProductionAnnotationsInput{
+		DocumentID: annotationDocumentID, VersionID: annotationVersionOne,
+		Status: types.ProductionAnnotationOpen, Page: 1, PageSize: 20,
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), page.Total)
+	require.Equal(t, 1, page.Page)
+	require.Equal(t, 20, page.PageSize)
+	require.Len(t, page.Data, 1)
+	require.Equal(t, "observer-visible", page.Data[0].Body)
+
+	nonMemberID := "33333333-3333-4333-8333-333333333334"
+	members.add(annotationTenantID, nonMemberID, types.TenantRoleViewer)
+	nonMemberCtx := productionAnnotationContextFor(nonMemberID)
+	denied, err := svc.List(nonMemberCtx, ListProductionAnnotationsInput{
+		DocumentID: annotationDocumentID, Page: 1, PageSize: 20,
+	})
+	require.Nil(t, denied)
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
+}
+
+func TestProductionAnnotationListCrossTenantCannotLeakDocumentContent(t *testing.T) {
+	svc, repo, _, _ := newProductionAnnotationWriteBoundaryFixture(t)
+	require.NoError(t, repo.CreateAnnotation(productionAnnotationContext(), &types.ProductionAnnotation{
+		ID: "12345678-1234-4234-8234-123456789013", TenantID: annotationTenantID,
+		ProjectID: annotationProjectID, DocumentID: annotationDocumentID,
+		VersionID: annotationVersionOne, BlockID: annotationBlockOne,
+		AnnotationType: types.ProductionAnnotationComment, Severity: types.ProductionAnnotationInfo,
+		Anchor: types.JSON(`{}`), Body: "cross-tenant-secret", Status: types.ProductionAnnotationOpen,
+		CreatedBy: "11111111-1111-4111-8111-111111111111",
+	}))
+	crossTenant := context.WithValue(context.Background(), types.TenantIDContextKey, annotationTenantID+1)
+	crossTenant = context.WithValue(crossTenant, types.UserIDContextKey, "22222222-2222-4222-8222-222222222222")
+
+	page, err := svc.List(crossTenant, ListProductionAnnotationsInput{
+		DocumentID: annotationDocumentID, Page: 1, PageSize: 20,
+	})
+	require.Nil(t, page)
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "cross-tenant-secret")
+}
+
+func TestProductionAnnotationListRejectsVersionOutsidePathDocument(t *testing.T) {
+	svc, _, _ := newProductionAnnotationFixture(t)
+	documents := svc.documents.(*productionAnnotationDocumentRepoStub)
+	documents.versions[annotationVersionTwo].DocumentID = "12345678-1234-4234-8234-123456789014"
+
+	page, err := svc.List(productionAnnotationContext(), ListProductionAnnotationsInput{
+		DocumentID: annotationDocumentID, VersionID: annotationVersionTwo, Page: 1, PageSize: 20,
+	})
+	require.Nil(t, page)
+	require.ErrorIs(t, err, types.ErrProductionReviewScopeInvalid)
 }
 
 func TestProductionAnnotationResolveAllowsCreator(t *testing.T) {

@@ -43,6 +43,7 @@ func (s *productionReviewService) Get(
 		types.ProductionRoleBusinessReviewer,
 		types.ProductionRoleEngineeringReviewer,
 		types.ProductionRoleComplianceReviewer,
+		types.ProductionRoleObserver,
 	); err != nil {
 		return nil, err
 	}

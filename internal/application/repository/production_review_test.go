@@ -289,6 +289,78 @@ func TestProductionReviewRepositoryGetsAnnotationWithinTenantScope(t *testing.T)
 	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
 }
 
+func TestProductionReviewRepositoryListsAnnotationsWithinTenantDocumentAndBounds(t *testing.T) {
+	repo, db := newProductionReviewRepoFixture(t)
+	require.NoError(t, db.Create(&types.ProductionDocumentBlock{
+		ID: reviewID(930), VersionID: reviewOtherVersionID, LogicalBlockID: reviewID(931),
+		BlockType: "fact", Position: 0, Content: types.JSON(`{}`), Attributes: types.JSON(`{}`),
+		EvidenceRefs: types.JSON(`[]`), AIProvenance: types.JSON(`{}`), ContentDigest: strings.Repeat("9", 64),
+	}).Error)
+	annotations := []*types.ProductionAnnotation{
+		{
+			ID: reviewID(31), TenantID: reviewTenantID, ProjectID: reviewProjectID,
+			DocumentID: reviewDocumentID, VersionID: reviewVersionOne, BlockID: reviewBlockOne,
+			AnnotationType: types.ProductionAnnotationComment, Severity: types.ProductionAnnotationInfo,
+			Anchor: types.JSON(`{}`), Body: "tenant seven first", Status: types.ProductionAnnotationOpen, CreatedBy: reviewAuthorID,
+		},
+		{
+			ID: reviewID(32), TenantID: reviewTenantID, ProjectID: reviewProjectID,
+			DocumentID: reviewDocumentID, VersionID: reviewVersionTwo, BlockID: reviewBlockTwo,
+			AnnotationType: types.ProductionAnnotationSuggestion, Severity: types.ProductionAnnotationWarning,
+			Anchor: types.JSON(`{}`), Body: "tenant seven second", Status: types.ProductionAnnotationOpen, CreatedBy: reviewAuthorID,
+		},
+		{
+			ID: reviewID(33), TenantID: reviewTenantID, ProjectID: reviewProjectID,
+			DocumentID: reviewOtherDocumentID, VersionID: reviewOtherVersionID, BlockID: reviewID(930),
+			AnnotationType: types.ProductionAnnotationComment, Severity: types.ProductionAnnotationInfo,
+			Anchor: types.JSON(`{}`), Body: "other document secret", Status: types.ProductionAnnotationOpen, CreatedBy: reviewAuthorID,
+		},
+	}
+	for _, annotation := range annotations {
+		require.NoError(t, db.Create(annotation).Error)
+	}
+
+	first, total, err := repo.ListAnnotations(
+		productionReviewTenantContext(reviewTenantID), reviewTenantID, reviewDocumentID,
+		interfaces.ListProductionAnnotationsFilter{}, 0, 1,
+	)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), total)
+	require.Len(t, first, 1)
+	require.NotContains(t, first[0].Body, "secret")
+
+	second, total, err := repo.ListAnnotations(
+		productionReviewTenantContext(reviewTenantID), reviewTenantID, reviewDocumentID,
+		interfaces.ListProductionAnnotationsFilter{VersionID: reviewVersionOne, Status: types.ProductionAnnotationOpen,
+			AnnotationType: types.ProductionAnnotationComment, Severity: types.ProductionAnnotationInfo}, 0, 100,
+	)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), total)
+	require.Len(t, second, 1)
+	require.Equal(t, reviewVersionOne, second[0].VersionID)
+
+	crossTenant, total, err := repo.ListAnnotations(
+		productionReviewTenantContext(reviewTenantID+1), reviewTenantID+1, reviewDocumentID,
+		interfaces.ListProductionAnnotationsFilter{}, 0, 100,
+	)
+	require.NoError(t, err)
+	require.Zero(t, total)
+	require.Empty(t, crossTenant)
+}
+
+func TestProductionReviewRepositoryRejectsUnboundedAnnotationList(t *testing.T) {
+	repo, _ := newProductionReviewRepoFixture(t)
+	for _, limit := range []int{0, 101} {
+		items, total, err := repo.ListAnnotations(
+			productionReviewTenantContext(reviewTenantID), reviewTenantID, reviewDocumentID,
+			interfaces.ListProductionAnnotationsFilter{}, 0, limit,
+		)
+		require.Nil(t, items)
+		require.Zero(t, total)
+		require.ErrorIs(t, err, types.ErrProductionReviewScopeInvalid)
+	}
+}
+
 func TestProductionReviewPostgresVersionLockScopesExactImmutableVersion(t *testing.T) {
 	upper := strings.ToUpper(postgresProductionReviewLockSQL)
 	for _, fragment := range []string{"FROM PRODUCTION_DOCUMENT_VERSIONS", "ID = ?", "DOCUMENT_ID = ?", "TENANT_ID = ?", "PROJECT_ID = ?", "FOR UPDATE"} {
@@ -296,9 +368,9 @@ func TestProductionReviewPostgresVersionLockScopesExactImmutableVersion(t *testi
 	}
 }
 
-func TestProductionReviewRepositoryExactTaskFourSurface(t *testing.T) {
+func TestProductionReviewRepositoryExactGovernedSurface(t *testing.T) {
 	repositoryType := reflect.TypeOf((*interfaces.ProductionReviewRepository)(nil)).Elem()
-	require.Equal(t, 12, repositoryType.NumMethod())
+	require.Equal(t, 13, repositoryType.NumMethod())
 	methods := make([]string, 0, repositoryType.NumMethod())
 	for index := range repositoryType.NumMethod() {
 		methods = append(methods, repositoryType.Method(index).Name)
@@ -306,6 +378,7 @@ func TestProductionReviewRepositoryExactTaskFourSurface(t *testing.T) {
 	require.ElementsMatch(t, []string{
 		"CreateAnnotation",
 		"GetAnnotation",
+		"ListAnnotations",
 		"ResolveAnnotation",
 		"CountOpenBlocking",
 		"CreateReview",

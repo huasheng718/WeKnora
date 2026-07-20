@@ -6,9 +6,19 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
+// ListProductionAnnotationsFilter contains only exact, indexed annotation
+// filters. Tenant and document scope are mandatory method parameters.
+type ListProductionAnnotationsFilter struct {
+	VersionID      string
+	AnnotationType types.ProductionAnnotationType
+	Severity       types.ProductionAnnotationSeverity
+	Status         types.ProductionAnnotationStatus
+}
+
 type ProductionReviewRepository interface {
 	CreateAnnotation(ctx context.Context, annotation *types.ProductionAnnotation) error
 	GetAnnotation(ctx context.Context, tenantID uint64, annotationID string) (*types.ProductionAnnotation, error)
+	ListAnnotations(ctx context.Context, tenantID uint64, documentID string, filter ListProductionAnnotationsFilter, offset, limit int) ([]*types.ProductionAnnotation, int64, error)
 	ResolveAnnotation(ctx context.Context, tenantID uint64, annotationID, actorID string, resolution types.ProductionAnnotationStatus) (bool, error)
 	CountOpenBlocking(ctx context.Context, tenantID uint64, versionID string) (int64, error)
 	CreateReview(ctx context.Context, request *types.ProductionReviewRequest, steps []*types.ProductionReviewStep) error

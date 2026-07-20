@@ -322,6 +322,7 @@ func TestProductionReviewGetRequiresTenantScopedProjectAccess(t *testing.T) {
 		types.ProductionRoleBusinessReviewer,
 		types.ProductionRoleEngineeringReviewer,
 		types.ProductionRoleComplianceReviewer,
+		types.ProductionRoleObserver,
 	}, authorizer.roles)
 
 	authorizer.err = types.ErrProductionForbidden
@@ -331,6 +332,46 @@ func TestProductionReviewGetRequiresTenantScopedProjectAccess(t *testing.T) {
 	)
 	require.Nil(t, loaded)
 	require.ErrorIs(t, err, types.ErrProductionForbidden)
+}
+
+func TestProductionReviewGetAllowsTenantViewerProjectObserverAndDeniesNonMembers(t *testing.T) {
+	fixture := newProductionReviewFixture(t)
+	request := fixture.submit(t)
+	observerID := "81000000-0000-4000-8000-00000000000e"
+	fixture.members.add(productionReviewTenantID, observerID, types.TenantRoleViewer)
+	require.NoError(t, fixture.db.Create(&types.ProductionProjectMember{
+		ProjectID: productionReviewProjectID, UserID: observerID,
+		Role: types.ProductionRoleObserver, AssignedBy: productionReviewTenantOwnerID,
+	}).Error)
+	fixture.svc.projects = NewProductionProjectService(
+		apprepository.NewProductionProjectRepository(fixture.db), fixture.members, nil,
+	)
+	observerCtx := productionReviewServiceContext(observerID, types.TenantRoleViewer)
+
+	loaded, err := fixture.svc.Get(observerCtx, request.ID)
+	require.NoError(t, err)
+	require.Equal(t, request.ID, loaded.ID)
+
+	nonMemberID := "81000000-0000-4000-8000-00000000000f"
+	fixture.members.add(productionReviewTenantID, nonMemberID, types.TenantRoleViewer)
+	denied, err := fixture.svc.Get(
+		productionReviewServiceContext(nonMemberID, types.TenantRoleViewer), request.ID,
+	)
+	require.Nil(t, denied)
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
+}
+
+func TestProductionReviewGetCrossTenantCannotLeakAggregate(t *testing.T) {
+	fixture := newProductionReviewFixture(t)
+	request := fixture.submit(t)
+	crossTenant := context.WithValue(context.Background(), types.TenantIDContextKey, productionReviewTenantID+1)
+	crossTenant = context.WithValue(crossTenant, types.UserIDContextKey, productionReviewBusinessID)
+	crossTenant = context.WithValue(crossTenant, types.TenantRoleContextKey, types.TenantRoleViewer)
+
+	loaded, err := fixture.svc.Get(crossTenant, request.ID)
+	require.Nil(t, loaded)
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), request.PolicyDigest)
 }
 
 func TestProductionReviewSubmissionAuditFailureRollsBackAggregate(t *testing.T) {

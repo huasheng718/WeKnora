@@ -27,11 +27,25 @@ const (
 
 type productionReviewAnnotationServiceStub struct {
 	created  appservice.CreateProductionAnnotationInput
+	listed   appservice.ListProductionAnnotationsInput
 	resolved struct {
 		id     string
 		status types.ProductionAnnotationStatus
 	}
 	err error
+}
+
+func (s *productionReviewAnnotationServiceStub) List(
+	_ context.Context, input appservice.ListProductionAnnotationsInput,
+) (*appservice.ProductionAnnotationPage, error) {
+	s.listed = input
+	if s.err != nil {
+		return nil, s.err
+	}
+	return &appservice.ProductionAnnotationPage{
+		Data:  []*types.ProductionAnnotation{{ID: productionReviewAnnotationID}},
+		Total: 1, Page: input.Page, PageSize: input.PageSize,
+	}, nil
 }
 
 func (s *productionReviewAnnotationServiceStub) Create(_ context.Context, input appservice.CreateProductionAnnotationInput) (*types.ProductionAnnotation, error) {
@@ -101,6 +115,7 @@ func productionReviewHandlerEngine(annotation *productionReviewAnnotationService
 	})
 	h := NewProductionReviewHandler(annotation, review)
 	engine.POST("/documents/:id/annotations", h.CreateAnnotation)
+	engine.GET("/documents/:id/annotations", h.ListAnnotations)
 	engine.PUT("/annotations/:id/status", h.UpdateAnnotationStatus)
 	engine.POST("/documents/:id/reviews", h.Submit)
 	engine.GET("/reviews/:id", h.Get)
@@ -125,12 +140,20 @@ func TestProductionReviewHandlerExposesApprovedActions(t *testing.T) {
 
 	create := productionReviewHandlerRequest(engine, http.MethodPost, "/documents/"+productionReviewDocumentID+"/annotations",
 		`{"version_id":"`+productionReviewVersionID+`","block_id":"`+productionReviewBlockID+`","annotation_type":"quality_tag","quality_tag":"missing_evidence","severity":"blocking","anchor":{"path":"/title"},"body":" Needs evidence ","suggested_content":"Cite source"}`)
+	list := productionReviewHandlerRequest(engine, http.MethodGet, "/documents/"+productionReviewDocumentID+"/annotations?version_id="+productionReviewVersionID+"&status=open&annotation_type=comment&severity=info&page=2&page_size=10", "")
 	resolve := productionReviewHandlerRequest(engine, http.MethodPut, "/annotations/"+productionReviewAnnotationID+"/status", `{"status":"resolved"}`)
 	submit := productionReviewHandlerRequest(engine, http.MethodPost, "/documents/"+productionReviewDocumentID+"/reviews", `{"version_id":"`+productionReviewVersionID+`"}`)
 	get := productionReviewHandlerRequest(engine, http.MethodGet, "/reviews/"+productionReviewRequestID, "")
 	decide := productionReviewHandlerRequest(engine, http.MethodPost, "/reviews/"+productionReviewRequestID+"/steps/"+productionReviewStepID+"/decision", `{"decision":"approved","comment":" checked "}`)
 
 	require.Equal(t, http.StatusCreated, create.Code, create.Body.String())
+	require.Equal(t, http.StatusOK, list.Code, list.Body.String())
+	require.Equal(t, productionReviewDocumentID, annotations.listed.DocumentID)
+	require.Equal(t, productionReviewVersionID, annotations.listed.VersionID)
+	require.Equal(t, types.ProductionAnnotationOpen, annotations.listed.Status)
+	require.Equal(t, 2, annotations.listed.Page)
+	require.Equal(t, 10, annotations.listed.PageSize)
+	require.Contains(t, list.Body.String(), `"total":1`)
 	require.Equal(t, productionReviewDocumentID, annotations.created.DocumentID)
 	require.Equal(t, productionReviewVersionID, annotations.created.VersionID)
 	require.Equal(t, types.JSON(`{"path":"/title"}`), annotations.created.Anchor)
@@ -147,6 +170,20 @@ func TestProductionReviewHandlerExposesApprovedActions(t *testing.T) {
 	require.Equal(t, productionReviewStepID, reviews.decidedStepID)
 	require.Equal(t, types.ProductionReviewDecision(types.ProductionReviewApproved), reviews.decision)
 	require.Equal(t, "checked", reviews.comment)
+}
+
+func TestProductionReviewHandlerRejectsInvalidAnnotationListPaginationAndFilters(t *testing.T) {
+	annotations := &productionReviewAnnotationServiceStub{}
+	engine := productionReviewHandlerEngine(annotations, &productionReviewServiceStub{})
+	for _, query := range []string{
+		"?page=0", "?page=9223372036854775807&page_size=100", "?page_size=101", "?page_size=not-a-number", "?version_id=not-a-uuid",
+		"?status=unknown", "?annotation_type=unknown", "?severity=unknown",
+	} {
+		response := productionReviewHandlerRequest(engine, http.MethodGet,
+			"/documents/"+productionReviewDocumentID+"/annotations"+query, "")
+		require.Equal(t, http.StatusBadRequest, response.Code, query+" "+response.Body.String())
+	}
+	require.Empty(t, annotations.listed.DocumentID)
 }
 
 func TestProductionReviewHandlerStrictlyRejectsInvalidScopeAndBodies(t *testing.T) {
