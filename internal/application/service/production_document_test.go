@@ -273,6 +273,40 @@ func TestProductionDocumentServiceGovernedAppendSucceeds(t *testing.T) {
 	require.Equal(t, int64(len(version.Blocks)), countServiceRows(t, db, &types.ProductionDocumentBlock{}))
 }
 
+func TestProductionDocumentServiceBindsInternalPrincipalToAIProvenance(t *testing.T) {
+	svc, _, db, authorizer := newProductionDocumentServiceFixture(t)
+	document := createServiceDocument(t, svc)
+	authorizer.err = types.ErrProductionForbidden
+	runID := "77000000-0000-4000-8000-000000000001"
+	blocks := governedServiceBlocks(governedServiceParagraph("claim", `"governed claim"`))
+	for index := range blocks {
+		blocks[index].AIProvenance = types.JSON(`{"run_id":"` + runID + `"}`)
+	}
+	input := interfaces.AppendProductionVersionInput{
+		ParentVersionID: *document.CurrentVersionID, SourceSetID: documentServiceSetID,
+		Origin: types.ProductionDocumentOriginAI, Blocks: blocks,
+	}
+	mismatchCtx, err := types.WithProductionInternalPrincipal(context.Background(), types.ProductionInternalPrincipal{
+		ActorID: types.ProductionSystemActorID, ActorKind: types.ProductionInternalActorWorker,
+		TenantID: 7, ProjectID: documentServiceProjectID, RunID: "77000000-0000-4000-8000-000000000099",
+	})
+	require.NoError(t, err)
+	version, err := svc.AppendVersion(mismatchCtx, document.ID, input)
+	require.Nil(t, version)
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
+	require.Equal(t, int64(1), countServiceRows(t, db, &types.ProductionDocumentVersion{}))
+
+	exactCtx, err := types.WithProductionInternalPrincipal(context.Background(), types.ProductionInternalPrincipal{
+		ActorID: types.ProductionSystemActorID, ActorKind: types.ProductionInternalActorWorker,
+		TenantID: 7, ProjectID: documentServiceProjectID, RunID: runID,
+	})
+	require.NoError(t, err)
+	version, err = svc.AppendVersion(exactCtx, document.ID, input)
+	require.NoError(t, err)
+	require.NotNil(t, version)
+	require.Equal(t, int64(2), countServiceRows(t, db, &types.ProductionDocumentVersion{}))
+}
+
 func TestProductionDocumentDirectServiceAuditFailureRollsBackBootstrapAndAppend(t *testing.T) {
 	t.Run("bootstrap", func(t *testing.T) {
 		svc, _, db, _ := newProductionDocumentServiceFixture(t)

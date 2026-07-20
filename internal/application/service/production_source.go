@@ -52,6 +52,13 @@ func requireProductionSourceID(value, name string) error {
 }
 
 func requireProductionSourceAuthor(ctx context.Context, projects interfaces.ProductionProjectAuthorizer, projectID string) error {
+	if principal, ok := types.ProductionInternalPrincipalFromContext(ctx); ok {
+		tenantID, tenantOK := types.TenantIDFromContext(ctx)
+		if tenantOK && principal.Matches(tenantID, projectID, principal.RunID) {
+			return nil
+		}
+		return types.ErrProductionForbidden
+	}
 	if projects == nil {
 		return types.ErrProductionForbidden
 	}
@@ -201,6 +208,12 @@ func (s *productionSourceService) AttachEvidence(
 		if err != nil {
 			return nil, err
 		}
+	}
+	if sourceSet.Status == types.ProductionSourceSetFrozen && (runID == "" || input.EvidenceID == "") {
+		return nil, types.ErrProductionSourceSetFrozen
+	}
+	if principal, ok := types.ProductionInternalPrincipalFromContext(ctx); ok && runID != principal.RunID {
+		return nil, types.ErrProductionForbidden
 	}
 	if (input.ResourceReference == "") == (len(input.InlineContent) == 0) {
 		return nil, errors.New("production evidence requires exactly one resource reference or inline content")

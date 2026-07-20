@@ -73,6 +73,7 @@ func TestProductionRunsPostgreSQLMigrationDeclaresEquivalentStructure(t *testing
 		"wakeup_enqueued_version INTEGER NOT NULL DEFAULT 0",
 		"wakeup_enqueued_version <= wakeup_version",
 		"document_type_snapshot JSONB NOT NULL",
+		"workflow_plan_snapshot JSONB NOT NULL",
 		"raw_model_response JSONB NULL",
 		"request_snapshot JSONB NOT NULL",
 		"response_snapshot JSONB NULL",
@@ -140,6 +141,23 @@ func TestProductionRunsPostgreSQLMigrationDeclaresEquivalentStructure(t *testing
 	require.Less(t, strings.Index(down, "DROP TABLE IF EXISTS production_runs"), strings.Index(down, "DROP INDEX IF EXISTS uq_production_document_versions_run_context"))
 }
 
+func TestProductionWorkflowPlanColumnsAreImmutableAndJSONConstrained(t *testing.T) {
+	postgresFoundation := mustReadMigration(t, "../../migrations/versioned/000070_knowledge_production_foundation.up.sql")
+	postgresRuns := mustReadMigration(t, "../../migrations/versioned/000072_knowledge_production_runs.up.sql")
+	sqliteFoundation := mustReadMigration(t, "../../migrations/sqlite/000001_knowledge_production_foundation.up.sql")
+	sqliteRuns := mustReadMigration(t, "../../migrations/sqlite/000003_knowledge_production_runs.up.sql")
+
+	for _, migration := range []string{postgresFoundation, sqliteFoundation} {
+		require.Contains(t, migration, "workflow_plan")
+		require.Contains(t, migration, `'{"steps":[],"version":1}'`)
+		require.Contains(t, migration, "active production document type definitions are immutable")
+	}
+	for _, migration := range []string{postgresRuns, sqliteRuns} {
+		require.Contains(t, migration, "workflow_plan_snapshot")
+		require.Contains(t, migration, `'{"steps":[],"version":1}'`)
+	}
+}
+
 func TestProductionRunsSQLiteMigrationConstrainsWakeupGenerations(t *testing.T) {
 	db := openProductionRunsSQLite(t)
 	seedProductionRunScopes(t, db)
@@ -153,6 +171,28 @@ func TestProductionRunsSQLiteMigrationConstrainsWakeupGenerations(t *testing.T) 
 
 	insertProductionRun(t, db, "run-valid-wakeup", 1, "project-1", "document-1", "source-set-1", "version-1", "run-valid-wakeup")
 	_, err = db.Exec(`UPDATE production_runs SET wakeup_version = 3, wakeup_enqueued_version = 2 WHERE id = 'run-valid-wakeup'`)
+	require.NoError(t, err)
+}
+
+func TestProductionRunsSQLiteCollectIsDocumentIndependentAndOtherRunsAreNot(t *testing.T) {
+	db := openProductionRunsSQLite(t)
+	seedProductionRunScopes(t, db)
+
+	_, err := db.Exec(`INSERT INTO production_runs
+        (id, tenant_id, project_id, document_id, source_set_id, run_type, model_id, document_type_snapshot, idempotency_key)
+        VALUES ('collect-independent', 1, 'project-1', NULL, 'source-set-1', 'collect', 'model-1', '{}', 'collect-independent')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_runs
+        (id, tenant_id, project_id, document_id, source_set_id, run_type, model_id, document_type_snapshot, idempotency_key)
+        VALUES ('collect-with-document', 1, 'project-1', 'document-1', 'source-set-1', 'collect', 'model-1', '{}', 'collect-with-document')`)
+	require.Error(t, err)
+	_, err = db.Exec(`INSERT INTO production_runs
+        (id, tenant_id, project_id, document_id, source_set_id, run_type, model_id, document_type_snapshot, idempotency_key)
+        VALUES ('write-without-document', 1, 'project-1', NULL, 'source-set-1', 'write', 'model-1', '{}', 'write-without-document')`)
+	require.Error(t, err)
+	_, err = db.Exec(`INSERT INTO production_tool_calls
+        (id, run_id, tenant_id, project_id, document_id, source_set_id, attempt, current_step, idempotency_key, provider_type, provider_id, tool_name, request_snapshot, request_digest)
+        VALUES ('collect-call', 'collect-independent', 1, 'project-1', NULL, 'source-set-1', 0, 0, 'collect-call', 'skill', 'baseline', 'load', '{}', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')`)
 	require.NoError(t, err)
 }
 
@@ -876,6 +916,19 @@ func TestProductionDocumentsSQLiteFrozenSetsRejectAllItemAndEvidenceMutations(t 
 	require.ErrorContains(t, err, "source items in frozen source sets are immutable")
 	_, err = db.Exec(`INSERT INTO production_evidence_snapshots (id, source_item_id, snapshot_type, inline_content, content_digest, redaction_metadata) VALUES ('late-evidence', 'frozen-candidate', 'text', '"late"', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', '{}')`)
 	require.ErrorContains(t, err, "evidence cannot be inserted into frozen source sets")
+}
+
+func TestProductionRunsSQLiteFrozenAcceptedItemAllowsOnlyCapturedRunEvidence(t *testing.T) {
+	db := openProductionRunsSQLite(t)
+	seedProductionRunScopes(t, db)
+	insertProductionRun(t, db, "run-frozen-evidence", 1, "project-1", "document-1", "source-set-1", "version-1", "run-frozen-evidence")
+	_, err := db.Exec(`UPDATE production_source_sets SET status = 'frozen', frozen_at = CURRENT_TIMESTAMP WHERE id = 'source-set-1'`)
+	require.NoError(t, err)
+
+	_, err = db.Exec(`INSERT INTO production_evidence_snapshots (id, source_item_id, snapshot_type, inline_content, content_digest, redaction_metadata, captured_by_run_id) VALUES ('run-evidence', 'source-item-1', 'tool_result', '{"ok":true}', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', '{}', 'run-frozen-evidence')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_evidence_snapshots (id, source_item_id, snapshot_type, inline_content, content_digest, redaction_metadata) VALUES ('ordinary-evidence', 'source-item-1', 'text', '"late"', 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', '{}')`)
+	require.ErrorContains(t, err, "frozen source set requires accepted run-captured evidence")
 }
 
 func TestProductionDocumentsSQLiteLineageRequiresRealImmutableEndpoints(t *testing.T) {

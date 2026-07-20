@@ -30,8 +30,7 @@ type startProductionDocumentRunRequest struct {
 }
 
 type startProductionCollectionRequest struct {
-	DocumentID string `json:"document_id"`
-	ModelID    string `json:"model_id"`
+	ModelID string `json:"model_id"`
 }
 
 type productionToolDecisionRequest struct {
@@ -65,12 +64,12 @@ func (h *ProductionRunHandler) StartCollection(c *gin.Context) {
 	sourceSetID := strings.TrimSpace(c.Param("id"))
 	var request startProductionCollectionRequest
 	if !isProductionUUID(sourceSetID) || decodeStrictProductionRunBody(c, &request) != nil ||
-		!isProductionUUID(request.DocumentID) || !isProductionUUID(request.ModelID) {
+		!isProductionUUID(request.ModelID) {
 		c.Error(apperrors.NewValidationError("invalid production collection request"))
 		return
 	}
 	run, err := h.service.StartSourceSetCollection(c.Request.Context(), sourceSetID, interfaces.StartProductionSourceSetCollectionInput{
-		DocumentID: request.DocumentID, ModelID: request.ModelID,
+		ModelID: request.ModelID,
 	})
 	if err != nil {
 		handleProductionServiceError(c, err, "failed to start production collection")

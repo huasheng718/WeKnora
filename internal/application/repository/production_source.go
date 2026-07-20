@@ -270,7 +270,19 @@ func (r *productionSourceRepository) CreateEvidence(
 			return err
 		}
 		if sourceSet.Status == types.ProductionSourceSetFrozen {
-			return types.ErrProductionSourceSetFrozen
+			var allowed int64
+			err = db.Table("production_source_items AS item").
+				Joins("JOIN production_runs AS run ON run.id = ?", evidence.CapturedByRunID).
+				Where("item.id = ? AND item.source_set_id = ? AND item.status = ?", itemID, sourceSet.ID, types.ProductionSourceItemAccepted).
+				Where("run.tenant_id = ? AND run.project_id = ? AND run.source_set_id = ?", tenantID, sourceSet.ProjectID, sourceSet.ID).
+				Where("? <> '' AND ? <> ''", evidence.ID, evidence.CapturedByRunID).
+				Count(&allowed).Error
+			if err != nil {
+				return err
+			}
+			if allowed != 1 {
+				return types.ErrProductionSourceSetFrozen
+			}
 		}
 		evidence.SourceItemID = itemID
 		create := db

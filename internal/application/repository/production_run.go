@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -59,16 +60,20 @@ func NewProductionRunRecoveryRepository(db *gorm.DB) interfaces.ProductionRunRec
 
 func (r *productionRunRepository) ListPendingWakeups(
 	ctx context.Context,
+	afterID string,
 	limit int,
 ) ([]*types.ProductionRun, error) {
 	if limit < 1 || limit > 1000 {
 		limit = 1000
 	}
 	var runs []*types.ProductionRun
-	err := database.DBFromContext(ctx, r.db).WithContext(ctx).
+	query := database.DBFromContext(ctx, r.db).WithContext(ctx).
 		Select("id", "tenant_id", "attempt", "created_at").
-		Where("status = ? AND wakeup_version > wakeup_enqueued_version", types.ProductionRunQueued).
-		Order("created_at ASC, id ASC").Limit(limit).Find(&runs).Error
+		Where("status = ? AND wakeup_version > wakeup_enqueued_version", types.ProductionRunQueued)
+	if afterID != "" {
+		query = query.Where("id > ?", afterID)
+	}
+	err := query.Order("id ASC").Limit(limit).Find(&runs).Error
 	return runs, err
 }
 
@@ -80,7 +85,7 @@ func (r *productionRunRepository) Create(ctx context.Context, run *types.Product
 		return errors.New("production run tenant and id are required")
 	}
 	for name, value := range map[string]string{
-		"id": run.ID, "project_id": run.ProjectID, "document_id": run.DocumentID, "source_set_id": run.SourceSetID,
+		"id": run.ID, "project_id": run.ProjectID, "source_set_id": run.SourceSetID,
 	} {
 		if err := requireCanonicalProductionUUID(name, value); err != nil {
 			return err
@@ -98,6 +103,14 @@ func (r *productionRunRepository) Create(ctx context.Context, run *types.Product
 	if !run.RunType.IsValid() || !run.Status.IsValid() {
 		return errors.New("production run type and status must be valid")
 	}
+	documentID := string(run.DocumentID)
+	if run.RunType == types.ProductionRunCollect {
+		if documentID != "" || run.InputVersionID != nil || run.OutputVersionID != nil {
+			return errors.New("collect production runs must be document-independent")
+		}
+	} else if err := requireCanonicalProductionUUID("document_id", documentID); err != nil {
+		return err
+	}
 	if run.Attempt < 0 || run.CurrentStep < 0 {
 		return errors.New("production run attempt and current step must be non-negative")
 	}
@@ -113,6 +126,15 @@ func (r *productionRunRepository) Create(ctx context.Context, run *types.Product
 	if err != nil {
 		return fmt.Errorf("canonicalize document type snapshot: %w", err)
 	}
+	workflowWasMissing := len(run.WorkflowPlanSnapshot) == 0
+	canonicalWorkflow, err := types.CanonicalProductionWorkflowPlanSnapshot(run.WorkflowPlanSnapshot)
+	if err != nil {
+		return fmt.Errorf("validate production workflow plan snapshot: %w", err)
+	}
+	if !workflowWasMissing && !bytes.Equal(run.WorkflowPlanSnapshot, canonicalWorkflow) {
+		return errors.New("production workflow plan snapshot must be canonical")
+	}
+	run.WorkflowPlanSnapshot = canonicalWorkflow
 	if len(run.RawModelResponse) > 0 {
 		run.RawModelResponse, err = canonicalProductionSnapshot(run.RawModelResponse, "")
 		if err != nil {
@@ -330,9 +352,14 @@ func (r *productionRunRepository) CreateToolCall(
 	}
 	for name, value := range map[string]string{
 		"id": call.ID, "run_id": call.RunID, "project_id": call.ProjectID,
-		"document_id": call.DocumentID, "source_set_id": call.SourceSetID,
+		"source_set_id": call.SourceSetID,
 	} {
 		if err := requireCanonicalProductionUUID(name, value); err != nil {
+			return err
+		}
+	}
+	if call.DocumentID != "" {
+		if err := requireCanonicalProductionUUID("document_id", string(call.DocumentID)); err != nil {
 			return err
 		}
 	}

@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS production_document_types (
     block_schema JSONB NOT NULL DEFAULT '{}'::jsonb,
     source_requirements JSONB NOT NULL DEFAULT '{}'::jsonb,
     skill_bindings JSONB NOT NULL DEFAULT '{}'::jsonb,
+    workflow_plan JSONB NOT NULL DEFAULT '{"steps":[],"version":1}'::jsonb,
     quality_rules JSONB NOT NULL DEFAULT '{}'::jsonb,
     review_policy JSONB NOT NULL DEFAULT '{}'::jsonb,
     publication_policy JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -73,6 +74,7 @@ BEGIN
         NEW.block_schema IS DISTINCT FROM OLD.block_schema OR
         NEW.source_requirements IS DISTINCT FROM OLD.source_requirements OR
         NEW.skill_bindings IS DISTINCT FROM OLD.skill_bindings OR
+        NEW.workflow_plan IS DISTINCT FROM OLD.workflow_plan OR
         NEW.quality_rules IS DISTINCT FROM OLD.quality_rules OR
         NEW.review_policy IS DISTINCT FROM OLD.review_policy OR
         NEW.publication_policy IS DISTINCT FROM OLD.publication_policy OR

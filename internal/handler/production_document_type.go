@@ -31,6 +31,7 @@ type createProductionDocumentTypeRequest struct {
 	BlockSchema        types.JSON `json:"block_schema" binding:"required"`
 	SourceRequirements types.JSON `json:"source_requirements" binding:"required"`
 	SkillBindings      types.JSON `json:"skill_bindings" binding:"required"`
+	WorkflowPlan       types.JSON `json:"workflow_plan"`
 	QualityRules       types.JSON `json:"quality_rules" binding:"required"`
 	ReviewPolicy       types.JSON `json:"review_policy" binding:"required"`
 	PublicationPolicy  types.JSON `json:"publication_policy" binding:"required"`
@@ -82,6 +83,7 @@ func (h *ProductionDocumentTypeHandler) Create(c *gin.Context) {
 			BlockSchema:        request.BlockSchema,
 			SourceRequirements: request.SourceRequirements,
 			SkillBindings:      request.SkillBindings,
+			WorkflowPlan:       request.WorkflowPlan,
 			QualityRules:       request.QualityRules,
 			ReviewPolicy:       request.ReviewPolicy,
 			PublicationPolicy:  request.PublicationPolicy,

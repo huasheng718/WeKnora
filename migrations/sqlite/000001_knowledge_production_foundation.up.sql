@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS production_document_types (
     block_schema TEXT NOT NULL DEFAULT '{}',
     source_requirements TEXT NOT NULL DEFAULT '{}',
     skill_bindings TEXT NOT NULL DEFAULT '{}',
+    workflow_plan TEXT NOT NULL DEFAULT '{"steps":[],"version":1}',
     quality_rules TEXT NOT NULL DEFAULT '{}',
     review_policy TEXT NOT NULL DEFAULT '{}',
     publication_policy TEXT NOT NULL DEFAULT '{}',
@@ -59,7 +60,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_production_document_types_active_code
 
 CREATE TRIGGER IF NOT EXISTS trg_production_document_types_prevent_active_definition_update
     BEFORE UPDATE OF tenant_id, code, name, description, schema_version, block_schema,
-        source_requirements, skill_bindings, quality_rules, review_policy,
+        source_requirements, skill_bindings, workflow_plan, quality_rules, review_policy,
         publication_policy, created_by ON production_document_types
     FOR EACH ROW
     WHEN OLD.status IN ('active', 'retired') AND (
@@ -71,6 +72,7 @@ CREATE TRIGGER IF NOT EXISTS trg_production_document_types_prevent_active_defini
         NEW.block_schema IS NOT OLD.block_schema OR
         NEW.source_requirements IS NOT OLD.source_requirements OR
         NEW.skill_bindings IS NOT OLD.skill_bindings OR
+        NEW.workflow_plan IS NOT OLD.workflow_plan OR
         NEW.quality_rules IS NOT OLD.quality_rules OR
         NEW.review_policy IS NOT OLD.review_policy OR
         NEW.publication_policy IS NOT OLD.publication_policy OR

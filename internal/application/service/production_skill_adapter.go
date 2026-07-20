@@ -341,7 +341,7 @@ func (s productionToolScope) resolve(
 	run, err := s.runs.Get(ctx, call.TenantID, call.RunID)
 	if err != nil || run == nil || run.ID != call.RunID || run.TenantID != call.TenantID ||
 		run.ProjectID != call.ProjectID || run.DocumentID != call.DocumentID || run.SourceSetID != call.SourceSetID ||
-		run.Attempt != call.Attempt || run.CurrentStep != call.CurrentStep {
+		call.Attempt < 1 || call.Attempt > run.Attempt || run.CurrentStep != call.CurrentStep {
 		return nil, nil, nil, errProductionToolScope
 	}
 	item, set, err := s.sources.GetItem(ctx, call.TenantID, sourceItemID)
@@ -360,7 +360,8 @@ func validateProductionToolCall(
 ) error {
 	if call == nil || call.TenantID == 0 || call.Attempt < 1 || call.CurrentStep < 0 ||
 		!canonicalProductionUUID(call.ID) || !canonicalProductionUUID(call.RunID) ||
-		!canonicalProductionUUID(call.ProjectID) || !canonicalProductionUUID(call.DocumentID) ||
+		!canonicalProductionUUID(call.ProjectID) ||
+		(call.DocumentID != "" && !canonicalProductionUUID(string(call.DocumentID))) ||
 		!canonicalProductionUUID(call.SourceSetID) || call.ProviderType != provider || call.Status != status || strings.TrimSpace(call.ProviderID) == "" {
 		return errProductionToolCallInvalid
 	}

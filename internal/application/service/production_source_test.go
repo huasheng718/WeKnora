@@ -89,7 +89,7 @@ func newProductionSourceServiceFixture(t *testing.T) (*productionSourceService, 
 	t.Cleanup(func() { _ = sqlDB.Close() })
 	_, filename, _, ok := runtime.Caller(0)
 	require.True(t, ok)
-	for _, name := range []string{"000001_knowledge_production_foundation.up.sql", "000002_knowledge_production_documents.up.sql"} {
+	for _, name := range []string{"000001_knowledge_production_foundation.up.sql", "000002_knowledge_production_documents.up.sql", "000003_knowledge_production_runs.up.sql"} {
 		migration, readErr := os.ReadFile(filepath.Join(filepath.Dir(filename), "../../../migrations/sqlite", name))
 		require.NoError(t, readErr)
 		require.NoError(t, db.Exec(string(migration)).Error)
@@ -465,6 +465,100 @@ func TestProductionSourceServiceFreezeRequiresAcceptedEvidenceAndRejectsFrozenMu
 		ContentDigest: strings.Repeat("e", 64), CapturedAt: time.Now().UTC(), Metadata: types.JSON(`{}`),
 	})
 	require.ErrorIs(t, err, types.ErrProductionSourceSetFrozen)
+}
+
+func TestProductionSourceServiceFrozenRunEvidenceReplaysAndConflicts(t *testing.T) {
+	svc, repo, db, _, _ := newProductionSourceServiceFixture(t)
+	createServiceSourceSet(t, repo, types.ProductionSourceSetCollecting)
+	createServiceSourceItem(t, repo, types.ProductionSourceItemAccepted)
+	ctx := sourceServiceContext(7)
+	_, err := svc.AttachEvidence(ctx, serviceItemID, interfaces.CreateEvidenceSnapshotInput{
+		SnapshotType: types.ProductionEvidenceSnapshotText, InlineContent: types.JSON(`"seed"`),
+	})
+	require.NoError(t, err)
+	documentID := "71000000-0000-4000-8000-000000000001"
+	runID := "71000000-0000-4000-8000-000000000002"
+	require.NoError(t, db.Create(&types.ProductionDocument{
+		ID: documentID, TenantID: 7, ProjectID: serviceProjectID, DocumentTypeID: serviceTypeID,
+		DocumentTypeSchemaVersion: 1, Title: "Document", CreatedBy: "author",
+	}).Error)
+	require.NoError(t, db.Create(&types.ProductionRun{
+		ID: runID, TenantID: 7, ProjectID: serviceProjectID, DocumentID: types.ProductionDocumentID(documentID), SourceSetID: serviceSetID,
+		RunType: types.ProductionRunWrite, Status: types.ProductionRunRunning, Attempt: 1, CurrentStep: 0,
+		WakeupVersion: 1, StatePayload: types.JSON(`{}`), ModelID: "model", DocumentTypeSnapshot: types.JSON(`{}`),
+		IdempotencyKey: "run-evidence-test",
+	}).Error)
+	require.NoError(t, svc.Freeze(ctx, serviceSetID))
+
+	input := interfaces.CreateEvidenceSnapshotInput{
+		EvidenceID: "71000000-0000-4000-8000-000000000003", SnapshotType: types.ProductionEvidenceSnapshotToolResult,
+		InlineContent: types.JSON(`{"result":"ok"}`), CapturedByRunID: runID,
+	}
+	first, err := svc.AttachEvidence(ctx, serviceItemID, input)
+	require.NoError(t, err)
+	second, err := svc.AttachEvidence(ctx, serviceItemID, input)
+	require.NoError(t, err)
+	require.Equal(t, first.ID, second.ID)
+
+	input.InlineContent = types.JSON(`{"result":"changed"}`)
+	_, err = svc.AttachEvidence(ctx, serviceItemID, input)
+	require.ErrorIs(t, err, types.ErrProductionEvidenceConflict)
+
+	input.EvidenceID = ""
+	input.InlineContent = types.JSON(`{"result":"new"}`)
+	_, err = svc.AttachEvidence(ctx, serviceItemID, input)
+	require.ErrorIs(t, err, types.ErrProductionSourceSetFrozen)
+}
+
+func TestProductionSourceServiceAcceptsOnlyExactRunPrincipalForFrozenEvidence(t *testing.T) {
+	svc, repo, db, authorizer, _ := newProductionSourceServiceFixture(t)
+	authorizer.err = types.ErrProductionForbidden
+	createServiceSourceSet(t, repo, types.ProductionSourceSetCollecting)
+	createServiceSourceItem(t, repo, types.ProductionSourceItemAccepted)
+	ctx := sourceServiceContext(7)
+	_, err := svc.AttachEvidence(ctx, serviceItemID, interfaces.CreateEvidenceSnapshotInput{
+		SnapshotType: types.ProductionEvidenceSnapshotText, InlineContent: types.JSON(`"seed"`),
+	})
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
+	authorizer.err = nil
+	_, err = svc.AttachEvidence(ctx, serviceItemID, interfaces.CreateEvidenceSnapshotInput{
+		SnapshotType: types.ProductionEvidenceSnapshotText, InlineContent: types.JSON(`"seed"`),
+	})
+	require.NoError(t, err)
+	documentID := "72000000-0000-4000-8000-000000000001"
+	runID := "72000000-0000-4000-8000-000000000002"
+	require.NoError(t, db.Create(&types.ProductionDocument{
+		ID: documentID, TenantID: 7, ProjectID: serviceProjectID, DocumentTypeID: serviceTypeID,
+		DocumentTypeSchemaVersion: 1, Title: "Document", CreatedBy: "author",
+	}).Error)
+	require.NoError(t, db.Create(&types.ProductionRun{
+		ID: runID, TenantID: 7, ProjectID: serviceProjectID, DocumentID: types.ProductionDocumentID(documentID), SourceSetID: serviceSetID,
+		RunType: types.ProductionRunWrite, Status: types.ProductionRunRunning, Attempt: 1,
+		WakeupVersion: 1, StatePayload: types.JSON(`{}`), ModelID: "model", DocumentTypeSnapshot: types.JSON(`{}`), IdempotencyKey: runID,
+	}).Error)
+	require.NoError(t, svc.Freeze(ctx, serviceSetID))
+	authorizer.err = types.ErrProductionForbidden
+	principalCtx, err := types.WithProductionInternalPrincipal(context.Background(), types.ProductionInternalPrincipal{
+		ActorID: types.ProductionSystemActorID, ActorKind: types.ProductionInternalActorWorker,
+		TenantID: 7, ProjectID: serviceProjectID, RunID: runID,
+	})
+	require.NoError(t, err)
+	_, err = svc.AttachEvidence(principalCtx, serviceItemID, interfaces.CreateEvidenceSnapshotInput{
+		EvidenceID: "72000000-0000-4000-8000-000000000003", SnapshotType: types.ProductionEvidenceSnapshotToolResult,
+		InlineContent: types.JSON(`{"ok":true}`), CapturedByRunID: runID,
+	})
+	require.NoError(t, err)
+
+	mismatchCtx, err := types.WithProductionInternalPrincipal(context.Background(), types.ProductionInternalPrincipal{
+		ActorID: types.ProductionSystemActorID, ActorKind: types.ProductionInternalActorWorker,
+		TenantID: 7, ProjectID: "72000000-0000-4000-8000-000000000099", RunID: runID,
+	})
+	require.NoError(t, err)
+	_, err = svc.AttachEvidence(mismatchCtx, serviceItemID, interfaces.CreateEvidenceSnapshotInput{
+		EvidenceID: "72000000-0000-4000-8000-000000000004", SnapshotType: types.ProductionEvidenceSnapshotToolResult,
+		InlineContent: types.JSON(`{"ok":true}`), CapturedByRunID: runID,
+	})
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
 }
 
 func TestProductionSourceServiceReturnsRequiredFreezeAuditFailure(t *testing.T) {

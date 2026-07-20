@@ -92,28 +92,38 @@ func (s *productionRunService) StartSourceSetCollection(
 	if err != nil {
 		return nil, err
 	}
-	if !canonicalProductionUUID(sourceSetID) || !canonicalProductionUUID(input.DocumentID) || !canonicalProductionUUID(input.ModelID) {
+	if !canonicalProductionUUID(sourceSetID) || !canonicalProductionUUID(input.ModelID) {
 		return nil, errors.New("invalid production collection run input")
 	}
-	document, err := s.documents.GetDocument(ctx, tenantID, input.DocumentID)
+	if s.sources == nil || s.documentTypes == nil || s.models == nil {
+		return nil, errors.New("production run definition dependencies are required")
+	}
+	sourceSet, err := s.sources.GetSet(ctx, tenantID, sourceSetID)
 	if err != nil {
 		return nil, err
 	}
-	if document == nil || document.TenantID != tenantID || document.ID != input.DocumentID {
+	if sourceSet == nil || sourceSet.ID != sourceSetID || sourceSet.TenantID != tenantID {
 		return nil, errProductionToolScope
 	}
-	if err := requireProductionDocumentAuthor(ctx, s.projects, document.ProjectID); err != nil {
+	if err := requireProductionDocumentAuthor(ctx, s.projects, sourceSet.ProjectID); err != nil {
 		return nil, err
 	}
-	sourceSet, documentType, err := s.loadRunDefinition(ctx, tenantID, document, sourceSetID, input.ModelID)
+	documentType, err := s.documentTypes.GetByID(ctx, tenantID, sourceSet.DocumentTypeID)
 	if err != nil {
+		return nil, err
+	}
+	if documentType == nil || documentType.ID != sourceSet.DocumentTypeID || documentType.TenantID != tenantID ||
+		documentType.Status != types.ProductionDocumentTypeActive {
+		return nil, types.ErrProductionDocumentTypeInactive
+	}
+	if err := s.requireRunModel(ctx, tenantID, input.ModelID); err != nil {
 		return nil, err
 	}
 	if sourceSet.Status == types.ProductionSourceSetFailed {
 		return nil, types.ErrProductionConflict
 	}
 	return s.persistAndResume(ctx, newProductionRun(
-		tenantID, document, sourceSet, documentType, input.ModelID, types.ProductionRunCollect, nil,
+		tenantID, nil, sourceSet, documentType, input.ModelID, types.ProductionRunCollect, nil,
 	))
 }
 
@@ -247,15 +257,22 @@ func (s *productionRunService) loadRunDefinition(
 		documentType.Status != types.ProductionDocumentTypeActive || documentType.SchemaVersion != document.DocumentTypeSchemaVersion {
 		return nil, nil, types.ErrProductionDocumentTypeInactive
 	}
+	if err := s.requireRunModel(ctx, tenantID, modelID); err != nil {
+		return nil, nil, err
+	}
+	return sourceSet, documentType, nil
+}
+
+func (s *productionRunService) requireRunModel(ctx context.Context, tenantID uint64, modelID string) error {
 	model, err := s.models.GetByID(ctx, tenantID, modelID)
 	if err != nil {
-		return nil, nil, err
+		return err
 	}
 	if model == nil || model.ID != modelID || (!model.IsBuiltin && model.TenantID != tenantID) ||
 		model.Status != types.ModelStatusActive || model.Type != types.ModelTypeKnowledgeQA {
-		return nil, nil, errors.New("production model is unavailable")
+		return errors.New("production model is unavailable")
 	}
-	return sourceSet, documentType, nil
+	return nil
 }
 
 func (s *productionRunService) persistAndResume(ctx context.Context, run *types.ProductionRun) (*types.ProductionRun, error) {
@@ -310,11 +327,18 @@ func newProductionRun(
 		"skill_bindings":      productionJSONValue(documentType.SkillBindings), "quality_rules": productionJSONValue(documentType.QualityRules),
 		"review_policy": productionJSONValue(documentType.ReviewPolicy), "publication_policy": productionJSONValue(documentType.PublicationPolicy),
 	})
+	projectID := sourceSet.ProjectID
+	documentID := types.ProductionDocumentID("")
+	if document != nil {
+		projectID = document.ProjectID
+		documentID = types.ProductionDocumentID(document.ID)
+	}
 	return &types.ProductionRun{
-		ID: uuid.NewString(), TenantID: tenantID, ProjectID: document.ProjectID, DocumentID: document.ID,
+		ID: uuid.NewString(), TenantID: tenantID, ProjectID: projectID, DocumentID: documentID,
 		SourceSetID: sourceSet.ID, RunType: runType, Status: types.ProductionRunQueued,
 		Attempt: 1, CurrentStep: 0, WakeupVersion: 1, StatePayload: types.JSON(`{}`),
-		ModelID: modelID, DocumentTypeSnapshot: snapshot, InputVersionID: inputVersionID,
+		ModelID: modelID, DocumentTypeSnapshot: snapshot, WorkflowPlanSnapshot: documentType.WorkflowPlan,
+		InputVersionID: inputVersionID,
 		IdempotencyKey: uuid.NewString(),
 	}
 }

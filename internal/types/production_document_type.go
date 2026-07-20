@@ -37,6 +37,7 @@ type ProductionDocumentType struct {
 	BlockSchema        JSON                         `json:"block_schema" gorm:"type:jsonb;not null;default:'{}'"`
 	SourceRequirements JSON                         `json:"source_requirements" gorm:"type:jsonb;not null;default:'{}'"`
 	SkillBindings      JSON                         `json:"skill_bindings" gorm:"type:jsonb;not null;default:'{}'"`
+	WorkflowPlan       JSON                         `json:"workflow_plan" gorm:"type:jsonb;not null;default:'{\"steps\":[],\"version\":1}'"`
 	QualityRules       JSON                         `json:"quality_rules" gorm:"type:jsonb;not null;default:'{}'"`
 	ReviewPolicy       JSON                         `json:"review_policy" gorm:"type:jsonb;not null;default:'{}'"`
 	PublicationPolicy  JSON                         `json:"publication_policy" gorm:"type:jsonb;not null;default:'{}'"`

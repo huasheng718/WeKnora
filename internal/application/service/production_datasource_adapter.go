@@ -509,11 +509,6 @@ type productionCredentialValue struct {
 	text      string
 }
 
-// Embedded matching is limited to long, varied values. Short ordinary values
-// are still rejected on exact scalar equality but cannot redact prose merely
-// because they appear as a substring.
-const productionEmbeddedCredentialMinLength = 16
-
 func productionCredentialValues(credentials map[string]any) []productionCredentialValue {
 	values := make([]productionCredentialValue, 0)
 	var collect func(any)
@@ -556,7 +551,7 @@ func containsProductionCredentialValue(value any, credentials []productionCreden
 	switch typed := value.(type) {
 	case string:
 		for _, credential := range credentials {
-			if productionEmbeddedCredential(credential.text) && strings.Contains(typed, credential.text) {
+			if credential.text != "" && strings.Contains(typed, credential.text) {
 				return true
 			}
 		}
@@ -574,17 +569,6 @@ func containsProductionCredentialValue(value any, credentials []productionCreden
 		}
 	}
 	return false
-}
-
-func productionEmbeddedCredential(value string) bool {
-	if len(value) < productionEmbeddedCredentialMinLength {
-		return false
-	}
-	unique := make(map[rune]struct{})
-	for _, r := range value {
-		unique[r] = struct{}{}
-	}
-	return len(unique) >= 8
 }
 
 var _ ProductionToolAdapter = (*ProductionDataSourceAdapter)(nil)

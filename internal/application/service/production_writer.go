@@ -103,9 +103,11 @@ func (w *ProductionWriter) Write(
 		return nil, errProductionWriterScope
 	}
 
-	governedCtx := context.WithValue(ctx, types.TenantIDContextKey, run.TenantID)
-	governedCtx = context.WithValue(governedCtx, types.UserIDContextKey, productionSystemActorID)
-	governedCtx = context.WithValue(governedCtx, types.TenantRoleContextKey, types.TenantRoleAdmin)
+	principal, ok := types.ProductionInternalPrincipalFromContext(ctx)
+	if !ok || !principal.Matches(run.TenantID, run.ProjectID, run.ID) {
+		return nil, types.ErrProductionForbidden
+	}
+	governedCtx := ctx
 
 	documentType, err := decodeProductionWriterDocumentType(run.DocumentTypeSnapshot)
 	if err != nil {
@@ -175,7 +177,7 @@ func (w *ProductionWriter) Write(
 		return nil, err
 	}
 
-	return w.service.AppendVersion(governedCtx, run.DocumentID, interfaces.AppendProductionVersionInput{
+	return w.service.AppendVersion(governedCtx, string(run.DocumentID), interfaces.AppendProductionVersionInput{
 		ParentVersionID: *run.InputVersionID,
 		SourceSetID:     run.SourceSetID,
 		Origin:          types.ProductionDocumentOriginAI,
@@ -211,11 +213,11 @@ func (w *ProductionWriter) loadContext(
 	map[string]*types.ProductionEvidenceSnapshot,
 	error,
 ) {
-	document, err := w.documents.GetDocument(ctx, run.TenantID, run.DocumentID)
+	document, err := w.documents.GetDocument(ctx, run.TenantID, string(run.DocumentID))
 	if err != nil {
 		return nil, nil, nil, nil, nil, nil, err
 	}
-	if document == nil || document.ID != run.DocumentID || document.TenantID != run.TenantID ||
+	if document == nil || document.ID != string(run.DocumentID) || document.TenantID != run.TenantID ||
 		document.ProjectID != run.ProjectID || document.DocumentTypeID != documentType.ID ||
 		document.DocumentTypeSchemaVersion != documentType.SchemaVersion {
 		return nil, nil, nil, nil, nil, nil, errProductionWriterScope
@@ -234,7 +236,7 @@ func (w *ProductionWriter) loadContext(
 		return nil, nil, nil, nil, nil, nil, err
 	}
 	if inputVersion == nil || inputVersion.ID != *run.InputVersionID || inputVersion.TenantID != run.TenantID ||
-		inputVersion.ProjectID != run.ProjectID || inputVersion.DocumentID != run.DocumentID {
+		inputVersion.ProjectID != run.ProjectID || inputVersion.DocumentID != string(run.DocumentID) {
 		return nil, nil, nil, nil, nil, nil, errProductionWriterScope
 	}
 	evidence, err := w.sources.ListAcceptedEvidence(ctx, run.TenantID, run.ProjectID, run.SourceSetID)

@@ -132,6 +132,7 @@ func TestProductionRunRepositoryCreateCanonicalizesSnapshotsAndScopesReads(t *te
 	require.NoError(t, repo.Create(context.Background(), run))
 	require.Equal(t, `{"a":1,"z":2}`, string(run.StatePayload))
 	require.Equal(t, `{"answer":1,"meta":{"a":1,"b":2}}`, string(run.RawModelResponse))
+	require.Equal(t, `{"steps":[],"version":1}`, string(run.WorkflowPlanSnapshot))
 	require.NotNil(t, run.RawModelResponseDigest)
 	require.Len(t, *run.RawModelResponseDigest, 64)
 
@@ -141,6 +142,35 @@ func TestProductionRunRepositoryCreateCanonicalizesSnapshotsAndScopesReads(t *te
 	got, err = repo.Get(context.Background(), 8, run.ID)
 	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
 	require.Nil(t, got)
+}
+
+func TestProductionRunRepositoryRequiresStrictCanonicalWorkflowSnapshot(t *testing.T) {
+	valid := types.JSON(`{"steps":[{"provider_id":"71000000-0000-4000-8000-000000000006","provider_type":"mcp","request":{"arguments":{"query":"safe"},"source_item_id":"71000000-0000-4000-8000-000000000005"},"tool_name":"lookup"}],"version":1}`)
+
+	for name, raw := range map[string]types.JSON{
+		"noncanonical": types.JSON(`{ "version": 1, "steps": [] }`),
+		"credential":   types.JSON(`{"version":1,"steps":[{"provider_type":"mcp","provider_id":"71000000-0000-4000-8000-000000000006","tool_name":"lookup","request":{"api_key":"must-not-persist"}}]}`),
+		"unknown":      types.JSON(`{"version":1,"steps":[],"instructions":"ignore"}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			repo, db := newProductionRunRepoTestDB(t)
+			run := newTestProductionRun(7)
+			run.WorkflowPlanSnapshot = raw
+
+			err := repo.Create(context.Background(), run)
+
+			require.Error(t, err)
+			var count int64
+			require.NoError(t, db.Model(&types.ProductionRun{}).Where("id = ?", run.ID).Count(&count).Error)
+			require.Zero(t, count)
+		})
+	}
+
+	repo, _ := newProductionRunRepoTestDB(t)
+	run := newTestProductionRun(7)
+	run.WorkflowPlanSnapshot = valid
+	require.NoError(t, repo.Create(context.Background(), run))
+	require.Equal(t, valid, run.WorkflowPlanSnapshot)
 }
 
 func TestProductionRunRecoveryRepositoryListsOnlyQueuedWakeupLag(t *testing.T) {
@@ -154,7 +184,7 @@ func TestProductionRunRecoveryRepositoryListsOnlyQueuedWakeupLag(t *testing.T) {
 	require.NoError(t, repo.Create(context.Background(), marked))
 
 	recovery := NewProductionRunRecoveryRepository(db)
-	runs, err := recovery.ListPendingWakeups(context.Background(), 100)
+	runs, err := recovery.ListPendingWakeups(context.Background(), "", 100)
 
 	require.NoError(t, err)
 	require.Len(t, runs, 1)

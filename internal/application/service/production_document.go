@@ -71,6 +71,13 @@ func requireProductionDocumentAuthor(
 	projects interfaces.ProductionProjectAuthorizer,
 	projectID string,
 ) error {
+	if principal, ok := types.ProductionInternalPrincipalFromContext(ctx); ok {
+		tenantID, tenantOK := types.TenantIDFromContext(ctx)
+		if tenantOK && principal.Matches(tenantID, projectID, principal.RunID) {
+			return nil
+		}
+		return types.ErrProductionForbidden
+	}
 	if projects == nil {
 		return types.ErrProductionForbidden
 	}
@@ -87,6 +94,13 @@ func requireProductionDocumentReader(
 	projects interfaces.ProductionProjectAuthorizer,
 	projectID string,
 ) error {
+	if principal, ok := types.ProductionInternalPrincipalFromContext(ctx); ok {
+		tenantID, tenantOK := types.TenantIDFromContext(ctx)
+		if tenantOK && principal.Matches(tenantID, projectID, principal.RunID) {
+			return nil
+		}
+		return types.ErrProductionForbidden
+	}
 	if projects == nil {
 		return types.ErrProductionForbidden
 	}
@@ -244,6 +258,32 @@ func buildProductionDocumentBlocks(
 	return blocks, nil
 }
 
+func requireProductionInternalAppendScope(
+	ctx context.Context,
+	origin types.ProductionDocumentOrigin,
+	blocks []*types.ProductionDocumentBlock,
+) error {
+	principal, internal := types.ProductionInternalPrincipalFromContext(ctx)
+	if !internal {
+		return nil
+	}
+	if origin != types.ProductionDocumentOriginAI || len(blocks) == 0 {
+		return types.ErrProductionForbidden
+	}
+	for _, block := range blocks {
+		if block == nil {
+			return types.ErrProductionForbidden
+		}
+		var provenance struct {
+			RunID string `json:"run_id"`
+		}
+		if decodeProductionJSON(block.AIProvenance, &provenance, false) != nil || provenance.RunID != principal.RunID {
+			return types.ErrProductionForbidden
+		}
+	}
+	return nil
+}
+
 func buildProductionBlockLineage(
 	parentVersionID, versionID string,
 	inputs []types.ProductionBlockLineageInput,
@@ -361,6 +401,9 @@ func (s *productionDocumentService) AppendVersion(
 	}
 	if !origin.IsValid() {
 		return nil, errors.New("invalid production document version origin")
+	}
+	if err := requireProductionInternalAppendScope(ctx, origin, blocks); err != nil {
+		return nil, err
 	}
 	version := &types.ProductionDocumentVersion{
 		ID: uuid.NewString(), DocumentID: document.ID, SourceSetID: input.SourceSetID,

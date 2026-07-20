@@ -306,11 +306,21 @@ func productionWriterRawDigest(t *testing.T, raw string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func productionWriterTestContext(t *testing.T, run *types.ProductionRun) context.Context {
+	t.Helper()
+	ctx, err := types.WithProductionInternalPrincipal(context.Background(), types.ProductionInternalPrincipal{
+		ActorID: types.ProductionSystemActorID, ActorKind: types.ProductionInternalActorWorker,
+		TenantID: run.TenantID, ProjectID: run.ProjectID, RunID: run.ID,
+	})
+	require.NoError(t, err)
+	return ctx
+}
+
 func TestProductionWriterNormalizesGroundedFactAndUsesServerOwnedContext(t *testing.T) {
 	fixture := newProductionWriterFixture(t, productionWriterOutput(t,
 		writerFact("block-a", "已上线", []string{writerEvidenceID}, false),
 	))
-	callerCtx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(999))
+	callerCtx := productionWriterTestContext(t, fixture.run)
 
 	version, err := fixture.writer.Write(callerCtx, fixture.run)
 
@@ -345,12 +355,36 @@ func TestProductionWriterNormalizesGroundedFactAndUsesServerOwnedContext(t *test
 	require.Contains(t, fixture.chat.messages[1].Content, writerVersionID)
 }
 
+func TestProductionWriterRequiresExactInternalRunPrincipal(t *testing.T) {
+	fixture := newProductionWriterFixture(t, productionWriterOutput(t,
+		writerFact("block-a", "grounded", []string{writerEvidenceID}, false),
+	))
+	ctx, err := types.WithProductionInternalPrincipal(context.Background(), types.ProductionInternalPrincipal{
+		ActorID: types.ProductionSystemActorID, ActorKind: types.ProductionInternalActorWorker,
+		TenantID: fixture.run.TenantID, ProjectID: fixture.run.ProjectID, RunID: fixture.run.ID,
+	})
+	require.NoError(t, err)
+	_, err = fixture.writer.Write(ctx, fixture.run)
+	require.NoError(t, err)
+	require.Equal(t, types.ProductionSystemActorID, fixture.service.ctx.Value(types.UserIDContextKey))
+	_, roleSet := fixture.service.ctx.Value(types.TenantRoleContextKey).(types.TenantRole)
+	require.False(t, roleSet)
+
+	mismatch, err := types.WithProductionInternalPrincipal(context.Background(), types.ProductionInternalPrincipal{
+		ActorID: types.ProductionSystemActorID, ActorKind: types.ProductionInternalActorWorker,
+		TenantID: fixture.run.TenantID, ProjectID: fixture.run.ProjectID, RunID: "72000000-0000-4000-8000-000000000099",
+	})
+	require.NoError(t, err)
+	_, err = fixture.writer.Write(mismatch, fixture.run)
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
+}
+
 func TestProductionWriterMarksUnsupportedFactsForConfirmation(t *testing.T) {
 	fixture := newProductionWriterFixture(t, productionWriterOutput(t,
 		writerFact("block-a", "转化率提升 30%", []string{}, false),
 	))
 
-	_, err := fixture.writer.Write(context.Background(), fixture.run)
+	_, err := fixture.writer.Write(productionWriterTestContext(t, fixture.run), fixture.run)
 
 	require.NoError(t, err)
 	last := fixture.service.input.Blocks[len(fixture.service.input.Blocks)-1]
@@ -373,7 +407,7 @@ func TestProductionWriterRejectsUnknownOrUnacceptedEvidenceReference(t *testing.
 				writerFact("block-a", "claim", []string{test.ref}, false),
 			))
 
-			_, err := fixture.writer.Write(context.Background(), fixture.run)
+			_, err := fixture.writer.Write(productionWriterTestContext(t, fixture.run), fixture.run)
 
 			require.ErrorIs(t, err, types.ErrProductionEvidenceReferenceInvalid)
 			require.Equal(t, 0, fixture.service.calls)
@@ -411,7 +445,7 @@ func TestProductionWriterStrictlyRejectsInvalidStructuredOutputBeforeAppend(t *t
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newProductionWriterFixture(t, test.raw)
 
-			_, err := fixture.writer.Write(context.Background(), fixture.run)
+			_, err := fixture.writer.Write(productionWriterTestContext(t, fixture.run), fixture.run)
 
 			require.Error(t, err)
 			require.Equal(t, 0, fixture.service.calls)
@@ -432,7 +466,7 @@ func TestProductionWriterRejectsUnsafeImageURLBeforeAppend(t *testing.T) {
 		"evidence_refs": []string{}, "needs_confirmation": false,
 	}))
 
-	_, err := fixture.writer.Write(context.Background(), fixture.run)
+	_, err := fixture.writer.Write(productionWriterTestContext(t, fixture.run), fixture.run)
 
 	require.ErrorIs(t, err, types.ErrProductionDocumentValidation)
 	require.Equal(t, 0, fixture.service.calls)
@@ -443,12 +477,12 @@ func TestProductionWriterCannotReplaceAnAuditedRawResponse(t *testing.T) {
 	firstRaw := productionWriterOutput(t, writerFact("block-a", "first", []string{writerEvidenceID}, false))
 	fixture := newProductionWriterFixture(t, firstRaw)
 
-	_, err := fixture.writer.Write(context.Background(), fixture.run)
+	_, err := fixture.writer.Write(productionWriterTestContext(t, fixture.run), fixture.run)
 	require.NoError(t, err)
 	firstDigest := fixture.runs.digest
 	fixture.chat.response.Content = productionWriterOutput(t, writerFact("block-a", "replacement", []string{writerEvidenceID}, false))
 
-	_, err = fixture.writer.Write(context.Background(), fixture.run)
+	_, err = fixture.writer.Write(productionWriterTestContext(t, fixture.run), fixture.run)
 
 	require.ErrorIs(t, err, errProductionWriterAuditConflict)
 	require.Equal(t, 1, fixture.service.calls)
@@ -461,7 +495,7 @@ func TestProductionWriterCannotReplaceAnAuditedRawResponse(t *testing.T) {
 func TestProductionWriterValidatesCompleteCandidateBeforeAppend(t *testing.T) {
 	fixture := newProductionWriterFixture(t, `{"blocks":[{"logical_block_id":"block-a","block_type":"fact","content":{"text":"claim"},"evidence_refs":[],"needs_confirmation":false}]}`)
 
-	_, err := fixture.writer.Write(context.Background(), fixture.run)
+	_, err := fixture.writer.Write(productionWriterTestContext(t, fixture.run), fixture.run)
 
 	require.ErrorIs(t, err, types.ErrProductionDocumentValidation)
 	require.Equal(t, 0, fixture.service.calls)
@@ -473,7 +507,7 @@ func TestProductionWriterReturnsModelPersistenceAndAppendErrors(t *testing.T) {
 		fixture := newProductionWriterFixture(t, productionWriterOutput(t))
 		expected := errors.New("model unavailable")
 		fixture.writer.modelService = &productionWriterModelServiceStub{err: expected}
-		_, err := fixture.writer.Write(context.Background(), fixture.run)
+		_, err := fixture.writer.Write(productionWriterTestContext(t, fixture.run), fixture.run)
 		require.ErrorIs(t, err, expected)
 		require.Empty(t, *fixture.events)
 	})
@@ -482,7 +516,7 @@ func TestProductionWriterReturnsModelPersistenceAndAppendErrors(t *testing.T) {
 		fixture := newProductionWriterFixture(t, productionWriterOutput(t))
 		expected := errors.New("model failed")
 		fixture.chat.err = expected
-		_, err := fixture.writer.Write(context.Background(), fixture.run)
+		_, err := fixture.writer.Write(productionWriterTestContext(t, fixture.run), fixture.run)
 		require.ErrorIs(t, err, expected)
 		require.Empty(t, *fixture.events)
 	})
@@ -491,7 +525,7 @@ func TestProductionWriterReturnsModelPersistenceAndAppendErrors(t *testing.T) {
 		fixture := newProductionWriterFixture(t, productionWriterOutput(t))
 		fixture.writer.modelService = &productionWriterModelServiceStub{}
 
-		_, err := fixture.writer.Write(context.Background(), fixture.run)
+		_, err := fixture.writer.Write(productionWriterTestContext(t, fixture.run), fixture.run)
 
 		require.ErrorIs(t, err, errProductionWriterConfiguration)
 		require.Empty(t, *fixture.events)
@@ -501,7 +535,7 @@ func TestProductionWriterReturnsModelPersistenceAndAppendErrors(t *testing.T) {
 		fixture := newProductionWriterFixture(t, productionWriterOutput(t))
 		expected := errors.New("database unavailable")
 		fixture.runs.err = expected
-		_, err := fixture.writer.Write(context.Background(), fixture.run)
+		_, err := fixture.writer.Write(productionWriterTestContext(t, fixture.run), fixture.run)
 		require.ErrorIs(t, err, expected)
 		require.Equal(t, 0, fixture.service.calls)
 	})
@@ -510,7 +544,7 @@ func TestProductionWriterReturnsModelPersistenceAndAppendErrors(t *testing.T) {
 		fixture := newProductionWriterFixture(t, productionWriterOutput(t))
 		expected := errors.New("stale parent")
 		fixture.service.err = expected
-		_, err := fixture.writer.Write(context.Background(), fixture.run)
+		_, err := fixture.writer.Write(productionWriterTestContext(t, fixture.run), fixture.run)
 		require.ErrorIs(t, err, expected)
 		require.Equal(t, []string{"persist", "append"}, *fixture.events)
 	})
@@ -526,9 +560,9 @@ func TestProductionWriterPreservesModelOrderAndProducesDeterministicCandidateDig
 	second.run.ID = first.run.ID
 	second.runs.run = second.run
 
-	firstVersion, err := first.writer.Write(context.Background(), first.run)
+	firstVersion, err := first.writer.Write(productionWriterTestContext(t, first.run), first.run)
 	require.NoError(t, err)
-	secondVersion, err := second.writer.Write(context.Background(), second.run)
+	secondVersion, err := second.writer.Write(productionWriterTestContext(t, second.run), second.run)
 	require.NoError(t, err)
 
 	firstInputs := first.service.input.Blocks

@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS production_runs (
     id VARCHAR(36) PRIMARY KEY,
     tenant_id INTEGER NOT NULL,
     project_id VARCHAR(36) NOT NULL,
-    document_id VARCHAR(36) NOT NULL,
+    document_id VARCHAR(36) NULL,
     source_set_id VARCHAR(36) NOT NULL,
     run_type VARCHAR(20) NOT NULL,
     status VARCHAR(24) NOT NULL DEFAULT 'queued',
@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS production_runs (
     state_payload TEXT NOT NULL DEFAULT '{}',
     model_id VARCHAR(64) NOT NULL,
     document_type_snapshot TEXT NOT NULL,
+    workflow_plan_snapshot TEXT NOT NULL DEFAULT '{"steps":[],"version":1}',
     input_version_id VARCHAR(36) NULL,
     output_version_id VARCHAR(36) NULL,
     idempotency_key VARCHAR(255) NOT NULL,
@@ -32,6 +33,10 @@ CREATE TABLE IF NOT EXISTS production_runs (
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT chk_production_runs_type CHECK (run_type IN ('collect', 'write', 'rewrite', 'validate')),
+    CONSTRAINT chk_production_runs_document_scope CHECK (
+        (run_type = 'collect' AND document_id IS NULL AND input_version_id IS NULL AND output_version_id IS NULL) OR
+        (run_type IN ('write', 'rewrite', 'validate') AND document_id IS NOT NULL)
+    ),
     CONSTRAINT chk_production_runs_status CHECK (status IN ('queued', 'running', 'waiting_approval', 'completed', 'failed', 'cancelled')),
     CONSTRAINT chk_production_runs_resume CHECK (attempt >= 0 AND current_step >= 0),
     CONSTRAINT chk_production_runs_wakeup CHECK (
@@ -40,6 +45,7 @@ CREATE TABLE IF NOT EXISTS production_runs (
     ),
     CONSTRAINT chk_production_runs_state_payload CHECK (json_valid(state_payload)),
     CONSTRAINT chk_production_runs_document_type_snapshot CHECK (json_valid(document_type_snapshot)),
+    CONSTRAINT chk_production_runs_workflow_plan_snapshot CHECK (json_valid(workflow_plan_snapshot)),
     CONSTRAINT chk_production_runs_raw_response CHECK (
         (raw_model_response IS NULL AND raw_model_response_digest IS NULL) OR
         (raw_model_response IS NOT NULL AND raw_model_response_digest IS NOT NULL AND json_valid(raw_model_response) AND length(raw_model_response_digest) = 64 AND raw_model_response_digest NOT GLOB '*[^0-9a-f]*')
@@ -65,7 +71,7 @@ CREATE TABLE IF NOT EXISTS production_tool_calls (
     run_id VARCHAR(36) NOT NULL,
     tenant_id INTEGER NOT NULL,
     project_id VARCHAR(36) NOT NULL,
-    document_id VARCHAR(36) NOT NULL,
+    document_id VARCHAR(36) NULL,
     source_set_id VARCHAR(36) NOT NULL,
     attempt INTEGER NOT NULL,
     current_step INTEGER NOT NULL,
@@ -136,6 +142,32 @@ CREATE INDEX IF NOT EXISTS idx_production_tool_calls_run_status
 CREATE INDEX IF NOT EXISTS idx_production_tool_calls_approval
     ON production_tool_calls (tenant_id, status, approval_status);
 
+DROP TRIGGER IF EXISTS trg_production_evidence_snapshots_prevent_frozen_insert;
+CREATE TRIGGER trg_production_evidence_snapshots_prevent_frozen_insert
+    BEFORE INSERT ON production_evidence_snapshots
+    FOR EACH ROW
+    WHEN EXISTS (
+        SELECT 1
+        FROM production_source_items item
+        JOIN production_source_sets source_set ON source_set.id = item.source_set_id
+        WHERE item.id = NEW.source_item_id AND source_set.status = 'frozen'
+    ) AND NOT EXISTS (
+        SELECT 1
+        FROM production_source_items item
+        JOIN production_source_sets source_set ON source_set.id = item.source_set_id
+        JOIN production_runs run
+          ON run.id = NEW.captured_by_run_id
+         AND run.tenant_id = source_set.tenant_id
+         AND run.project_id = source_set.project_id
+         AND run.source_set_id = source_set.id
+        WHERE item.id = NEW.source_item_id
+          AND item.status = 'accepted'
+          AND NEW.id <> ''
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'frozen source set requires accepted run-captured evidence');
+END;
+
 CREATE TRIGGER IF NOT EXISTS trg_production_tool_calls_guard_invocation_identity
     BEFORE UPDATE ON production_tool_calls
     FOR EACH ROW
@@ -191,9 +223,11 @@ END;
 CREATE TRIGGER IF NOT EXISTS trg_production_tool_calls_fence_parent_insert
     BEFORE INSERT ON production_tool_calls
     FOR EACH ROW
-    WHEN EXISTS (
+    WHEN NOT EXISTS (
         SELECT 1 FROM production_runs
-        WHERE id = NEW.run_id AND status IN ('completed', 'failed', 'cancelled')
+        WHERE id = NEW.run_id AND tenant_id = NEW.tenant_id AND project_id = NEW.project_id
+          AND document_id IS NEW.document_id AND source_set_id = NEW.source_set_id
+          AND status NOT IN ('completed', 'failed', 'cancelled')
     )
 BEGIN
     SELECT RAISE(ABORT, 'terminal production runs reject tool calls');

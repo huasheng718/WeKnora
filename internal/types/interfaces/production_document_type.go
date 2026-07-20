@@ -16,6 +16,7 @@ type CreateProductionDocumentTypeInput struct {
 	BlockSchema        types.JSON
 	SourceRequirements types.JSON
 	SkillBindings      types.JSON
+	WorkflowPlan       types.JSON
 	QualityRules       types.JSON
 	ReviewPolicy       types.JSON
 	PublicationPolicy  types.JSON

@@ -181,6 +181,24 @@ func TestProductionMCPExecutePersistsEvidenceAndReplaysWithoutProviderAccess(t *
 	require.Equal(t, 1, client.calls)
 }
 
+func TestProductionMCPReclaimReplaysPriorAttemptEvidenceWithoutProviderAccess(t *testing.T) {
+	adapter, call, manager, client, scope := productionMCPFixture(t, false)
+	plan, err := adapter.Plan(context.Background(), call)
+	require.NoError(t, err)
+	call.RequestSnapshot, call.RequestDigest = plan.RequestSnapshot, plan.RequestDigest
+	call.Status = types.ProductionToolCallExecuting
+	first, err := adapter.Execute(context.Background(), call)
+	require.NoError(t, err)
+	require.Equal(t, 1, client.calls)
+
+	scope.run.Attempt = 2
+	second, err := adapter.Execute(context.Background(), call)
+	require.NoError(t, err)
+	require.Equal(t, first.ResponseDigest, second.ResponseDigest)
+	require.Equal(t, 1, manager.calls)
+	require.Equal(t, 1, client.calls)
+}
+
 func TestProductionMCPRejectsPolicyFailureMutationAndCredentialLeaks(t *testing.T) {
 	t.Run("policy failure", func(t *testing.T) {
 		adapter, call, _, _, _ := productionMCPFixture(t, false)
@@ -212,6 +230,32 @@ func TestProductionMCPRejectsPolicyFailureMutationAndCredentialLeaks(t *testing.
 		require.ErrorIs(t, err, errProductionProviderOutputUnsafe)
 		require.NotContains(t, err.Error(), "super-secret-value")
 	})
+}
+
+func TestProductionMCPRejectsEveryKnownSecretOccurrenceBeforeEvidence(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		secret string
+		text   string
+	}{
+		{name: "short bearer", secret: "Bearer abc123", text: "nested result: Bearer abc123"},
+		{name: "simple repeated token", secret: "aaaa", text: "nested result: aaaa"},
+		{name: "single character", secret: "x", text: "prefix x suffix"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			adapter, call, _, client, scope := productionMCPFixture(t, false)
+			adapter.services.(*productionMCPServiceStub).service.Headers = types.MCPHeaders{"Authorization": test.secret}
+			plan, err := adapter.Plan(context.Background(), call)
+			require.NoError(t, err)
+			call.RequestSnapshot, call.RequestDigest = plan.RequestSnapshot, plan.RequestDigest
+			call.Status = types.ProductionToolCallExecuting
+			client.result.Content = []mcp.ContentItem{{Type: "text", Text: test.text}}
+
+			_, err = adapter.Execute(context.Background(), call)
+			require.ErrorIs(t, err, errProductionProviderOutputUnsafe)
+			require.Nil(t, scope.evidence)
+		})
+	}
 }
 
 var _ mcp.MCPClient = (*productionMCPClientStub)(nil)

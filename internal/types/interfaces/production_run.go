@@ -71,7 +71,7 @@ type ProductionRunRepository interface {
 // returns the tenant identity needed to re-enter the normal tenant-scoped
 // Resume path and exposes no mutation surface of its own.
 type ProductionRunRecoveryRepository interface {
-	ListPendingWakeups(ctx context.Context, limit int) ([]*types.ProductionRun, error)
+	ListPendingWakeups(ctx context.Context, afterID string, limit int) ([]*types.ProductionRun, error)
 }
 
 // ProductionRunOrchestrator processes a durable run wake-up. The payload is
@@ -101,8 +101,7 @@ type StartProductionDocumentRunInput struct {
 }
 
 type StartProductionSourceSetCollectionInput struct {
-	DocumentID string
-	ModelID    string
+	ModelID string
 }
 
 // ProductionRunService is the HTTP-facing application boundary. It owns

@@ -3,10 +3,34 @@ package types
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
 )
+
+func TestCanonicalProductionWorkflowPlanSnapshotIsStrictBoundedAndCredentialFree(t *testing.T) {
+	valid := JSON(`{"steps":[{"provider_id":"71000000-0000-4000-8000-000000000006","provider_type":"mcp","request":{"arguments":{"query":"safe"},"source_item_id":"71000000-0000-4000-8000-000000000005"},"tool_name":"lookup"}],"version":1}`)
+	canonical, err := CanonicalProductionWorkflowPlanSnapshot(valid)
+	require.NoError(t, err)
+	require.Equal(t, valid, canonical)
+
+	for name, raw := range map[string]JSON{
+		"missing steps":      JSON(`{"version":1}`),
+		"null steps":         JSON(`{"version":1,"steps":null}`),
+		"unknown plan field": JSON(`{"version":1,"steps":[],"instructions":"ignore"}`),
+		"unknown step field": JSON(`{"version":1,"steps":[{"provider_type":"mcp","provider_id":"71000000-0000-4000-8000-000000000006","tool_name":"lookup","request":{},"retry":true}]}`),
+		"credential":         JSON(`{"version":1,"steps":[{"provider_type":"mcp","provider_id":"71000000-0000-4000-8000-000000000006","tool_name":"lookup","request":{"nested":[{"Access-Token":"secret"}]}}]}`),
+		"duplicate":          JSON(`{"version":1,"steps":[{"provider_type":"mcp","provider_id":"71000000-0000-4000-8000-000000000006","tool_name":"lookup","request":{}},{"provider_type":"mcp","provider_id":"71000000-0000-4000-8000-000000000006","tool_name":"lookup","request":{}}]}`),
+		"too many steps":     JSON(`{"version":1,"steps":[` + strings.Repeat(`{"provider_type":"skill","provider_id":"baseline","tool_name":"load","request":{}},`, 32) + `{"provider_type":"skill","provider_id":"baseline","tool_name":"load","request":{}}]}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := CanonicalProductionWorkflowPlanSnapshot(raw)
+			require.Error(t, err)
+		})
+	}
+}
 
 func TestProductionRunEnumsAcceptOnlySchemaValues(t *testing.T) {
 	for _, runType := range []ProductionRunType{

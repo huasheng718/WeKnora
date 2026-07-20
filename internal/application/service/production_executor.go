@@ -2,11 +2,14 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/google/uuid"
 )
 
 type productionDocumentWriter interface {
@@ -63,6 +66,16 @@ func (e *ProductionExecutor) ExecuteStep(
 	if len(executable) == 1 {
 		return e.executeTool(ctx, run, executable[0])
 	}
+	workflow, err := productionWorkflowForRun(run)
+	if err != nil {
+		return ProductionStepResult{}, err
+	}
+	if run.CurrentStep < len(workflow.Steps) {
+		return e.planTool(ctx, run, workflow.Steps[run.CurrentStep])
+	}
+	if run.CurrentStep > len(workflow.Steps) {
+		return ProductionStepResult{}, errors.New("production run current step exceeds workflow plan")
+	}
 	switch run.RunType {
 	case types.ProductionRunWrite, types.ProductionRunRewrite:
 		writerRun := *run
@@ -84,6 +97,69 @@ func (e *ProductionExecutor) ExecuteStep(
 	}
 }
 
+func (e *ProductionExecutor) planTool(
+	ctx context.Context,
+	run *types.ProductionRun,
+	step productionWorkflowStep,
+) (ProductionStepResult, error) {
+	callID := uuid.NewSHA1(uuid.MustParse(run.ID), []byte(fmt.Sprintf("workflow:%d:%s", run.CurrentStep, step.Request))).String()
+	request, err := types.CanonicalProductionJSON(types.JSON(step.Request))
+	if err != nil {
+		return ProductionStepResult{}, err
+	}
+	call := &types.ProductionToolCall{
+		ID: callID, RunID: run.ID, TenantID: run.TenantID, ProjectID: run.ProjectID,
+		DocumentID: run.DocumentID, SourceSetID: run.SourceSetID, Attempt: run.Attempt, CurrentStep: run.CurrentStep,
+		IdempotencyKey: fmt.Sprintf("workflow:%d", run.CurrentStep), ProviderType: step.ProviderType,
+		ProviderID: step.ProviderID, ToolName: step.ToolName, RequestSnapshot: request,
+		RequestDigest: productionToolDigest(request), Status: types.ProductionToolCallPlanned,
+		ApprovalStatus: types.ProductionToolApprovalNotRequired,
+	}
+	adapter := e.adapter(step.ProviderType)
+	if adapter == nil {
+		return ProductionStepResult{}, errors.New("production workflow provider is unsupported")
+	}
+	planned, err := adapter.Plan(ctx, call)
+	if err != nil {
+		return ProductionStepResult{}, err
+	}
+	if planned == nil || planned.ToolCallID != call.ID || planned.ProviderType != call.ProviderType ||
+		planned.ProviderID != call.ProviderID || planned.ToolName != call.ToolName ||
+		!canonicalProductionSHA256(planned.ProviderDigest) || !canonicalProductionSHA256(planned.RequestDigest) ||
+		len(planned.RequestSnapshot) == 0 || productionToolDigest(planned.RequestSnapshot) != planned.RequestDigest {
+		return ProductionStepResult{}, errors.New("production adapter returned an invalid plan")
+	}
+	call.RequestSnapshot, call.RequestDigest = planned.RequestSnapshot, planned.RequestDigest
+	if planned.RequiresApproval {
+		requestedAt := e.now().UTC()
+		call.Status = types.ProductionToolCallPendingApproval
+		call.ApprovalStatus = types.ProductionToolApprovalPending
+		call.ApprovalRequestedAt = &requestedAt
+	}
+	return ProductionStepResult{StatePayload: run.StatePayload, ToolCall: call}, nil
+}
+
+func productionWorkflowForRun(run *types.ProductionRun) (*productionWorkflowPlan, error) {
+	var snapshot struct {
+		SkillBindings json.RawMessage `json:"skill_bindings"`
+	}
+	if len(run.DocumentTypeSnapshot) != 0 {
+		if err := decodeProductionJSON(run.DocumentTypeSnapshot, &snapshot, false); err != nil {
+			return nil, err
+		}
+	}
+	bindings := types.JSON(snapshot.SkillBindings)
+	canonical, err := canonicalProductionWorkflowPlan(run.WorkflowPlanSnapshot, bindings)
+	if err != nil {
+		return nil, err
+	}
+	var workflow productionWorkflowPlan
+	if err := decodeProductionJSON(canonical, &workflow, true); err != nil {
+		return nil, err
+	}
+	return &workflow, nil
+}
+
 func (e *ProductionExecutor) executeTool(
 	ctx context.Context,
 	run *types.ProductionRun,
@@ -91,11 +167,26 @@ func (e *ProductionExecutor) executeTool(
 ) (ProductionStepResult, error) {
 	if call == nil || call.RunID != run.ID || call.TenantID != run.TenantID || call.ProjectID != run.ProjectID ||
 		call.DocumentID != run.DocumentID || call.SourceSetID != run.SourceSetID ||
-		call.Attempt != run.Attempt || call.CurrentStep != run.CurrentStep ||
-		(call.Status != types.ProductionToolCallApproved && call.Status != types.ProductionToolCallExecuting) {
+		call.Attempt < 1 || call.Attempt > run.Attempt || call.CurrentStep != run.CurrentStep ||
+		(call.Status != types.ProductionToolCallPlanned && call.Status != types.ProductionToolCallApproved && call.Status != types.ProductionToolCallExecuting &&
+			call.Status != types.ProductionToolCallCompleted) {
 		return ProductionStepResult{}, errors.New("production tool call does not match the claimed run step")
 	}
-	if call.Status == types.ProductionToolCallApproved {
+	if call.Status == types.ProductionToolCallCompleted {
+		if len(call.ResponseSnapshot) == 0 || call.ResponseEvidenceID == nil || call.ResponseEvidenceSourceItemID == nil ||
+			!canonicalProductionUUID(*call.ResponseEvidenceID) || !canonicalProductionUUID(*call.ResponseEvidenceSourceItemID) {
+			return ProductionStepResult{}, errors.New("completed production tool call has invalid durable output")
+		}
+		return ProductionStepResult{
+			StatePayload: run.StatePayload,
+			ToolCallResult: &ProductionToolCallResult{
+				ToolCallID: call.ID, Status: types.ProductionToolCallCompleted,
+				ResponseSnapshot: call.ResponseSnapshot, ResponseEvidenceID: *call.ResponseEvidenceID,
+				ResponseEvidenceSourceItemID: *call.ResponseEvidenceSourceItemID,
+			},
+		}, nil
+	}
+	if call.Status == types.ProductionToolCallApproved || call.Status == types.ProductionToolCallPlanned {
 		startedAt := e.now().UTC()
 		changed, err := e.runs.TransitionToolCall(
 			ctx, run.TenantID, run.ID, call.ID,

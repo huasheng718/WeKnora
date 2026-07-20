@@ -23,20 +23,30 @@ func recoverPendingProductionRunsOnce(
 	if limit < 1 || limit > productionRecoveryBatchSize {
 		limit = productionRecoveryBatchSize
 	}
-	runs, err := repository.ListPendingWakeups(ctx, limit)
-	if err != nil {
-		return err
-	}
 	var joined error
-	for _, run := range runs {
-		if run == nil {
-			continue
+	afterID := ""
+	for {
+		runs, err := repository.ListPendingWakeups(ctx, afterID, limit)
+		if err != nil {
+			return errors.Join(joined, err)
 		}
-		if _, err := resumer.Resume(ctx, run.TenantID, run.ID, run.Attempt); err != nil {
-			joined = errors.Join(joined, fmt.Errorf("resume production run %s: %w", run.ID, err))
+		if len(runs) == 0 {
+			return joined
 		}
+		for _, run := range runs {
+			if run == nil {
+				continue
+			}
+			if _, err := resumer.Resume(ctx, run.TenantID, run.ID, run.Attempt); err != nil {
+				joined = errors.Join(joined, fmt.Errorf("resume production run %s: %w", run.ID, err))
+			}
+		}
+		nextID := runs[len(runs)-1].ID
+		if nextID == "" || nextID <= afterID {
+			return errors.Join(joined, errors.New("production recovery cursor did not advance"))
+		}
+		afterID = nextID
 	}
-	return joined
 }
 
 func recoverPendingProductionRuns(repository interfaces.ProductionRunRecoveryRepository, resumer interfaces.ProductionRunResumer) {

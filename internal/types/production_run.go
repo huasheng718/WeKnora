@@ -1,6 +1,7 @@
 package types
 
 import (
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"time"
@@ -8,6 +9,33 @@ import (
 	apperrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/google/uuid"
 )
+
+// ProductionDocumentID persists an empty value as SQL NULL. Collect runs are
+// document-independent; every other run type requires a canonical value.
+type ProductionDocumentID string
+
+func (id ProductionDocumentID) Value() (driver.Value, error) {
+	if id == "" {
+		return nil, nil
+	}
+	return string(id), nil
+}
+
+func (id *ProductionDocumentID) Scan(value any) error {
+	if value == nil {
+		*id = ""
+		return nil
+	}
+	switch typed := value.(type) {
+	case string:
+		*id = ProductionDocumentID(typed)
+	case []byte:
+		*id = ProductionDocumentID(string(typed))
+	default:
+		return fmt.Errorf("scan production document id from %T", value)
+	}
+	return nil
+}
 
 var ErrProductionRunLeaseActive = errors.New("production run lease is active")
 
@@ -127,31 +155,32 @@ func (s ProductionToolApprovalStatus) IsValid() bool {
 
 // ProductionRun is the durable, tenant-scoped state for an AI orchestration workflow.
 type ProductionRun struct {
-	ID                     string              `json:"id" gorm:"type:varchar(36);primaryKey"`
-	TenantID               uint64              `json:"tenant_id" gorm:"not null;index"`
-	ProjectID              string              `json:"project_id" gorm:"type:varchar(36);not null;index"`
-	DocumentID             string              `json:"document_id" gorm:"type:varchar(36);not null;index"`
-	SourceSetID            string              `json:"source_set_id" gorm:"type:varchar(36);not null;index"`
-	RunType                ProductionRunType   `json:"run_type" gorm:"type:varchar(20);not null"`
-	Status                 ProductionRunStatus `json:"status" gorm:"type:varchar(24);not null;default:'queued'"`
-	Attempt                int                 `json:"attempt" gorm:"not null;default:0"`
-	CurrentStep            int                 `json:"current_step" gorm:"not null;default:0"`
-	WakeupVersion          int                 `json:"wakeup_version" gorm:"not null;default:0"`
-	WakeupEnqueuedVersion  int                 `json:"wakeup_enqueued_version" gorm:"not null;default:0"`
-	StatePayload           JSON                `json:"state_payload" gorm:"type:jsonb;not null"`
-	ModelID                string              `json:"model_id" gorm:"type:varchar(64);not null"`
-	DocumentTypeSnapshot   JSON                `json:"document_type_snapshot" gorm:"type:jsonb;not null"`
-	InputVersionID         *string             `json:"input_version_id,omitempty" gorm:"type:varchar(36)"`
-	OutputVersionID        *string             `json:"output_version_id,omitempty" gorm:"type:varchar(36)"`
-	IdempotencyKey         string              `json:"idempotency_key" gorm:"type:varchar(255);not null"`
-	RawModelResponse       JSON                `json:"raw_model_response,omitempty" gorm:"type:jsonb"`
-	RawModelResponseDigest *string             `json:"raw_model_response_digest,omitempty" gorm:"type:varchar(64)"`
-	ErrorCode              *string             `json:"error_code,omitempty" gorm:"type:varchar(64)"`
-	ErrorMessage           *string             `json:"error_message,omitempty" gorm:"type:text"`
-	StartedAt              *time.Time          `json:"started_at,omitempty"`
-	CompletedAt            *time.Time          `json:"completed_at,omitempty"`
-	CreatedAt              time.Time           `json:"created_at"`
-	UpdatedAt              time.Time           `json:"updated_at"`
+	ID                     string               `json:"id" gorm:"type:varchar(36);primaryKey"`
+	TenantID               uint64               `json:"tenant_id" gorm:"not null;index"`
+	ProjectID              string               `json:"project_id" gorm:"type:varchar(36);not null;index"`
+	DocumentID             ProductionDocumentID `json:"document_id,omitempty" gorm:"type:varchar(36);index"`
+	SourceSetID            string               `json:"source_set_id" gorm:"type:varchar(36);not null;index"`
+	RunType                ProductionRunType    `json:"run_type" gorm:"type:varchar(20);not null"`
+	Status                 ProductionRunStatus  `json:"status" gorm:"type:varchar(24);not null;default:'queued'"`
+	Attempt                int                  `json:"attempt" gorm:"not null;default:0"`
+	CurrentStep            int                  `json:"current_step" gorm:"not null;default:0"`
+	WakeupVersion          int                  `json:"wakeup_version" gorm:"not null;default:0"`
+	WakeupEnqueuedVersion  int                  `json:"wakeup_enqueued_version" gorm:"not null;default:0"`
+	StatePayload           JSON                 `json:"state_payload" gorm:"type:jsonb;not null"`
+	ModelID                string               `json:"model_id" gorm:"type:varchar(64);not null"`
+	DocumentTypeSnapshot   JSON                 `json:"document_type_snapshot" gorm:"type:jsonb;not null"`
+	WorkflowPlanSnapshot   JSON                 `json:"workflow_plan_snapshot" gorm:"type:jsonb;not null;default:'{\"steps\":[],\"version\":1}'"`
+	InputVersionID         *string              `json:"input_version_id,omitempty" gorm:"type:varchar(36)"`
+	OutputVersionID        *string              `json:"output_version_id,omitempty" gorm:"type:varchar(36)"`
+	IdempotencyKey         string               `json:"idempotency_key" gorm:"type:varchar(255);not null"`
+	RawModelResponse       JSON                 `json:"raw_model_response,omitempty" gorm:"type:jsonb"`
+	RawModelResponseDigest *string              `json:"raw_model_response_digest,omitempty" gorm:"type:varchar(64)"`
+	ErrorCode              *string              `json:"error_code,omitempty" gorm:"type:varchar(64)"`
+	ErrorMessage           *string              `json:"error_message,omitempty" gorm:"type:text"`
+	StartedAt              *time.Time           `json:"started_at,omitempty"`
+	CompletedAt            *time.Time           `json:"completed_at,omitempty"`
+	CreatedAt              time.Time            `json:"created_at"`
+	UpdatedAt              time.Time            `json:"updated_at"`
 }
 
 func (ProductionRun) TableName() string { return "production_runs" }
@@ -162,7 +191,7 @@ type ProductionToolCall struct {
 	RunID                        string                       `json:"run_id" gorm:"type:varchar(36);not null;index"`
 	TenantID                     uint64                       `json:"tenant_id" gorm:"not null;index"`
 	ProjectID                    string                       `json:"project_id" gorm:"type:varchar(36);not null;index"`
-	DocumentID                   string                       `json:"document_id" gorm:"type:varchar(36);not null;index"`
+	DocumentID                   ProductionDocumentID         `json:"document_id,omitempty" gorm:"type:varchar(36);index"`
 	SourceSetID                  string                       `json:"source_set_id" gorm:"type:varchar(36);not null;index"`
 	Attempt                      int                          `json:"attempt" gorm:"not null"`
 	CurrentStep                  int                          `json:"current_step" gorm:"not null"`

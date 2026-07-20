@@ -14,7 +14,7 @@ import (
 
 const (
 	defaultProductionRunLeaseTTL = 5 * time.Minute
-	productionSystemActorID      = "00000000-0000-4000-8000-000000000001"
+	productionSystemActorID      = types.ProductionSystemActorID
 )
 
 // ProductionStepResult is the complete durable output of one executor call.
@@ -170,7 +170,7 @@ func (o *ProductionOrchestrator) HandleRun(ctx context.Context, payload types.Pr
 		if len(approved) > 0 || result.ToolCallResult != nil {
 			return o.persistExecutionFailure(ctx, claimed, calls, errors.New("approved tool execution cannot request another tool call"))
 		}
-		return o.persistApprovalWait(ctx, claimed, result.ToolCall)
+		return o.persistToolPlan(ctx, claimed, result.ToolCall)
 	}
 	if len(approved) > 0 && result.ToolCallResult == nil {
 		return o.persistExecutionFailure(ctx, claimed, calls, errors.New("approved tool execution result is required"))
@@ -207,33 +207,43 @@ func (o *ProductionOrchestrator) persistStepResult(
 			if matchErr != nil {
 				return matchErr
 			}
-			completedAt := o.now().UTC()
-			callPatch := interfaces.ProductionToolCallPatch{CompletedAt: &completedAt}
-			if result.ToolCallResult.Status == types.ProductionToolCallCompleted {
-				callPatch.ResponseSnapshot = result.ToolCallResult.ResponseSnapshot
-				callPatch.ResponseEvidenceID = stringPtr(result.ToolCallResult.ResponseEvidenceID)
-				callPatch.ResponseEvidenceSourceItemID = stringPtr(result.ToolCallResult.ResponseEvidenceSourceItemID)
-			} else if result.ToolCallResult.Status == types.ProductionToolCallFailed {
-				callPatch.ErrorCode = stringPtr(result.ToolCallResult.ErrorCode)
-				callPatch.ErrorMessage = stringPtr(result.ToolCallResult.ErrorMessage)
-				to = types.ProductionRunFailed
-				patch.IncrementWakeup = false
-				patch.CompletedAt = &completedAt
-				patch.ErrorCode = callPatch.ErrorCode
-				patch.ErrorMessage = callPatch.ErrorMessage
+			if call.Status == types.ProductionToolCallCompleted {
+				if result.ToolCallResult.Status != types.ProductionToolCallCompleted ||
+					call.ResponseEvidenceID == nil || call.ResponseEvidenceSourceItemID == nil ||
+					*call.ResponseEvidenceID != result.ToolCallResult.ResponseEvidenceID ||
+					*call.ResponseEvidenceSourceItemID != result.ToolCallResult.ResponseEvidenceSourceItemID ||
+					string(call.ResponseSnapshot) != string(result.ToolCallResult.ResponseSnapshot) {
+					return errors.New("completed production tool call replay does not match durable output")
+				}
 			} else {
-				return errors.New("tool call result status must be completed or failed")
-			}
-			changed, callErr := o.repo.TransitionToolCall(
-				txCtx, run.TenantID, run.ID, call.ID,
-				interfaces.ProductionToolCallCAS{Status: call.Status, Attempt: call.Attempt, CurrentStep: call.CurrentStep},
-				result.ToolCallResult.Status, callPatch,
-			)
-			if callErr != nil {
-				return callErr
-			}
-			if !changed {
-				return errors.New("production tool call became stale before output was persisted")
+				completedAt := o.now().UTC()
+				callPatch := interfaces.ProductionToolCallPatch{CompletedAt: &completedAt}
+				if result.ToolCallResult.Status == types.ProductionToolCallCompleted {
+					callPatch.ResponseSnapshot = result.ToolCallResult.ResponseSnapshot
+					callPatch.ResponseEvidenceID = stringPtr(result.ToolCallResult.ResponseEvidenceID)
+					callPatch.ResponseEvidenceSourceItemID = stringPtr(result.ToolCallResult.ResponseEvidenceSourceItemID)
+				} else if result.ToolCallResult.Status == types.ProductionToolCallFailed {
+					callPatch.ErrorCode = stringPtr(result.ToolCallResult.ErrorCode)
+					callPatch.ErrorMessage = stringPtr(result.ToolCallResult.ErrorMessage)
+					to = types.ProductionRunFailed
+					patch.IncrementWakeup = false
+					patch.CompletedAt = &completedAt
+					patch.ErrorCode = callPatch.ErrorCode
+					patch.ErrorMessage = callPatch.ErrorMessage
+				} else {
+					return errors.New("tool call result status must be completed or failed")
+				}
+				changed, callErr := o.repo.TransitionToolCall(
+					txCtx, run.TenantID, run.ID, call.ID,
+					interfaces.ProductionToolCallCAS{Status: call.Status, Attempt: call.Attempt, CurrentStep: call.CurrentStep},
+					result.ToolCallResult.Status, callPatch,
+				)
+				if callErr != nil {
+					return callErr
+				}
+				if !changed {
+					return errors.New("production tool call became stale before output was persisted")
+				}
 			}
 		}
 		if to == types.ProductionRunCompleted {
@@ -300,14 +310,17 @@ func (o *ProductionOrchestrator) persistExecutionFailure(
 	})
 }
 
-func (o *ProductionOrchestrator) persistApprovalWait(
+func (o *ProductionOrchestrator) persistToolPlan(
 	ctx context.Context,
 	run *types.ProductionRun,
 	call *types.ProductionToolCall,
 ) error {
-	if call.Status != types.ProductionToolCallPendingApproval ||
-		call.ApprovalStatus != types.ProductionToolApprovalPending {
-		return errors.New("approval step must return a pending approval tool call")
+	pendingApproval := call.Status == types.ProductionToolCallPendingApproval &&
+		call.ApprovalStatus == types.ProductionToolApprovalPending
+	executable := call.Status == types.ProductionToolCallPlanned &&
+		call.ApprovalStatus == types.ProductionToolApprovalNotRequired
+	if !pendingApproval && !executable {
+		return errors.New("tool plan must be pending approval or executable")
 	}
 	call.RunID = run.ID
 	call.TenantID = run.TenantID
@@ -316,26 +329,37 @@ func (o *ProductionOrchestrator) persistApprovalWait(
 	call.SourceSetID = run.SourceSetID
 	call.Attempt = run.Attempt
 	call.CurrentStep = run.CurrentStep
-	if call.ApprovalRequestedAt == nil {
+	if pendingApproval && call.ApprovalRequestedAt == nil {
 		requestedAt := o.now().UTC()
 		call.ApprovalRequestedAt = &requestedAt
 	}
-	return o.uow.WithinTransaction(ctx, func(txCtx context.Context) error {
+	var transitioned *types.ProductionRun
+	err := o.uow.WithinTransaction(ctx, func(txCtx context.Context) error {
 		if err := o.repo.CreateToolCall(txCtx, call); err != nil {
 			return err
 		}
-		_, changed, err := o.repo.Transition(
-			txCtx, run.TenantID, run.ID, productionRunCAS(run),
-			types.ProductionRunWaitingApproval, interfaces.ProductionRunPatch{},
-		)
+		to := types.ProductionRunWaitingApproval
+		patch := interfaces.ProductionRunPatch{}
+		if executable {
+			to = types.ProductionRunQueued
+			patch.IncrementWakeup = true
+		}
+		var changed bool
+		var err error
+		transitioned, changed, err = o.repo.Transition(txCtx, run.TenantID, run.ID, productionRunCAS(run), to, patch)
 		if err != nil {
 			return err
 		}
 		if !changed {
-			return errors.New("production run became stale before approval wait was persisted")
+			return errors.New("production run became stale before tool plan was persisted")
 		}
 		return nil
 	})
+	if err != nil || pendingApproval {
+		return err
+	}
+	_, err = o.enqueuePending(ctx, transitioned)
+	return err
 }
 
 // ResolveDecision durably records one approval decision and, for approval,
@@ -573,9 +597,11 @@ func approvedCallsForStep(
 ) []*types.ProductionToolCall {
 	approved := make([]*types.ProductionToolCall, 0, len(calls))
 	for _, call := range calls {
-		if call.Attempt == attempt && call.CurrentStep == currentStep &&
-			(call.Status == types.ProductionToolCallApproved || call.Status == types.ProductionToolCallExecuting) &&
-			call.ApprovalStatus == types.ProductionToolApprovalApproved {
+		if call.Attempt > 0 && call.Attempt <= attempt && call.CurrentStep == currentStep &&
+			(call.Status == types.ProductionToolCallPlanned || call.Status == types.ProductionToolCallApproved || call.Status == types.ProductionToolCallExecuting ||
+				call.Status == types.ProductionToolCallCompleted) &&
+			(call.ApprovalStatus == types.ProductionToolApprovalApproved ||
+				call.ApprovalStatus == types.ProductionToolApprovalNotRequired) {
 			approved = append(approved, call)
 		}
 	}
@@ -592,10 +618,11 @@ func matchingToolResultCall(
 			continue
 		}
 		if call.TenantID != run.TenantID || call.RunID != run.ID ||
-			call.Attempt != run.Attempt || call.CurrentStep != run.CurrentStep {
+			call.Attempt < 1 || call.Attempt > run.Attempt || call.CurrentStep != run.CurrentStep {
 			return nil, errors.New("tool call result does not own the claimed run step")
 		}
-		if call.Status != types.ProductionToolCallApproved && call.Status != types.ProductionToolCallExecuting {
+		if call.Status != types.ProductionToolCallApproved && call.Status != types.ProductionToolCallExecuting &&
+			call.Status != types.ProductionToolCallCompleted {
 			return nil, errors.New("tool call result is not approved or executing")
 		}
 		return call, nil

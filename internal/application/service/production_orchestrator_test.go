@@ -281,6 +281,30 @@ func TestProductionOrchestratorWaitingApprovalDoesNotBlockOrEnqueue(t *testing.T
 	require.Len(t, calls, 1)
 }
 
+func TestProductionOrchestratorPersistsNonApprovalPlanAndRequeuesSameStep(t *testing.T) {
+	f := newProductionOrchestratorFixture(t, 0)
+	f.executor.fn = func(run *types.ProductionRun, calls []*types.ProductionToolCall) (ProductionStepResult, error) {
+		require.Empty(t, calls)
+		request := types.JSON(`{"source_item_id":"10000000-0000-4000-8000-000000000005"}`)
+		return ProductionStepResult{ToolCall: &types.ProductionToolCall{
+			ID: uuid.NewString(), ProviderType: types.ProductionToolProviderSkill, ProviderID: "baseline",
+			ToolName: productionSkillToolName, RequestSnapshot: request, RequestDigest: productionToolDigest(request),
+			Status: types.ProductionToolCallPlanned, ApprovalStatus: types.ProductionToolApprovalNotRequired,
+			IdempotencyKey: "workflow:0",
+		}}, nil
+	}
+
+	require.NoError(t, f.orchestrator.HandleRun(context.Background(), f.payload()))
+	run := f.load(t)
+	require.Equal(t, types.ProductionRunQueued, run.Status)
+	require.Equal(t, 0, run.CurrentStep)
+	require.Equal(t, 1, f.enqueuer.count())
+	calls, err := f.repo.ListToolCalls(context.Background(), 7, run.ID)
+	require.NoError(t, err)
+	require.Len(t, calls, 1)
+	require.Equal(t, types.ProductionToolCallPlanned, calls[0].Status)
+}
+
 func TestProductionOrchestratorApprovedResumeUsesPersistedStepOnFreshInstance(t *testing.T) {
 	f := newProductionOrchestratorFixture(t, 2)
 	f.executor.fn = func(*types.ProductionRun, []*types.ProductionToolCall) (ProductionStepResult, error) {
@@ -315,6 +339,7 @@ func TestProductionOrchestratorApprovedResumeUsesPersistedStepOnFreshInstance(t 
 	require.NoError(t, err)
 	require.Equal(t, types.ProductionToolCallCompleted, completedCall.Status)
 	require.Len(t, *completedCall.ResponseDigest, 64)
+	require.Equal(t, 2, f.enqueuer.callCount(), "approval resume and completed step must each enqueue exactly once")
 }
 
 func TestProductionOrchestratorDuplicateApprovalHasOneWinnerAndOneEnqueue(t *testing.T) {
@@ -439,6 +464,46 @@ func TestProductionOrchestratorEarlyRedeliveryReturnsLeaseActiveThenDatabaseExpi
 	require.NoError(t, f.orchestrator.HandleRun(context.Background(), f.payload()))
 	require.Equal(t, 1, f.executor.count())
 	require.Equal(t, 2, f.load(t).Attempt)
+}
+
+func TestProductionOrchestratorReclaimReconcilesPriorAttemptExecutingCall(t *testing.T) {
+	f := newProductionOrchestratorFixture(t, 0)
+	require.NoError(t, f.db.Exec(`UPDATE production_runs
+        SET status = 'running', updated_at = datetime(CURRENT_TIMESTAMP, '-10 minutes') WHERE id = ?`, f.run.ID).Error)
+	request := types.JSON(`{"source_item_id":"10000000-0000-4000-8000-000000000005"}`)
+	approvedAt := time.Now().UTC()
+	approvedBy := uuid.NewString()
+	call := &types.ProductionToolCall{
+		ID: uuid.NewString(), RunID: f.run.ID, TenantID: 7, ProjectID: orchProjectID,
+		DocumentID: orchDocumentID, SourceSetID: orchSourceSetID, Attempt: 1, CurrentStep: 0,
+		IdempotencyKey: "reclaim-call", ProviderType: types.ProductionToolProviderMCP,
+		ProviderID: "mcp-service", ToolName: "lookup", RequestSnapshot: request,
+		RequestDigest: productionToolDigest(request), Status: types.ProductionToolCallExecuting,
+		ApprovalStatus: types.ProductionToolApprovalApproved, ApprovalRequestedAt: &approvedAt,
+		ApprovedBy: &approvedBy, ApprovedAt: &approvedAt,
+	}
+	require.NoError(t, f.repo.CreateToolCall(context.Background(), call))
+	f.executor.fn = func(run *types.ProductionRun, calls []*types.ProductionToolCall) (ProductionStepResult, error) {
+		require.Equal(t, 2, run.Attempt)
+		require.Len(t, calls, 1)
+		require.Equal(t, 1, calls[0].Attempt)
+		return ProductionStepResult{
+			StatePayload: run.StatePayload,
+			ToolCallResult: &ProductionToolCallResult{
+				ToolCallID: call.ID, Status: types.ProductionToolCallCompleted,
+				ResponseSnapshot: types.JSON(`{"ok":true}`), ResponseEvidenceID: orchEvidenceID,
+				ResponseEvidenceSourceItemID: orchSourceItemID,
+			},
+		}, nil
+	}
+
+	require.NoError(t, f.orchestrator.HandleRun(context.Background(), f.payload()))
+	run := f.load(t)
+	require.Equal(t, 2, run.Attempt)
+	require.Equal(t, 1, run.CurrentStep)
+	persisted, err := f.repo.GetToolCall(context.Background(), 7, call.ID)
+	require.NoError(t, err)
+	require.Equal(t, types.ProductionToolCallCompleted, persisted.Status)
 }
 
 func TestProductionOrchestratorApprovedExecutorFailureTerminalizesCallAndRun(t *testing.T) {

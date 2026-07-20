@@ -83,7 +83,7 @@ func TestProductionRunHandlerStartsGetsAndCollects(t *testing.T) {
 	start := productionRunHandlerRequest(t, engine, http.MethodPost, "/documents/"+runHandlerDocumentID+"/runs",
 		`{"run_type":"write","model_id":"`+runHandlerModelID+`"}`)
 	collect := productionRunHandlerRequest(t, engine, http.MethodPost, "/source-sets/"+runHandlerSourceSetID+"/collect",
-		`{"document_id":"`+runHandlerDocumentID+`","model_id":"`+runHandlerModelID+`"}`)
+		`{"model_id":"`+runHandlerModelID+`"}`)
 	get := productionRunHandlerRequest(t, engine, http.MethodGet, "/runs/"+runHandlerRunID, "")
 
 	require.Equal(t, http.StatusAccepted, start.Code)

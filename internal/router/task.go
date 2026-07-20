@@ -47,6 +47,36 @@ type AsynqTaskParams struct {
 	ProductionRun        interfaces.TaskHandler `name:"productionRun"`
 	DeadLetterRepo       interfaces.TaskDeadLetterRepository
 	SpanTracker          service.SpanTracker
+	ResourceCleaner      interfaces.ResourceCleaner
+}
+
+type managedProductionAsynqServer interface {
+	Run(asynq.Handler) error
+	Shutdown()
+}
+
+func startManagedProductionAsynqServer(
+	server managedProductionAsynqServer,
+	handler asynq.Handler,
+	cleaner interfaces.ResourceCleaner,
+) <-chan struct{} {
+	done := make(chan struct{})
+	if server == nil || handler == nil || cleaner == nil {
+		close(done)
+		return done
+	}
+	cleaner.RegisterWithName("ProductionAsynqServer", func() error {
+		server.Shutdown()
+		<-done
+		return nil
+	})
+	go func() {
+		defer close(done)
+		if err := server.Run(handler); err != nil {
+			logger.Errorf(context.Background(), "could not run production-pool asynq server: %v", err)
+		}
+	}()
+	return done
 }
 
 // defaultRedisOpTimeout is the previous hard-coded read timeout. The 100ms
@@ -341,7 +371,7 @@ func RunAsynqServer(params AsynqTaskParams) *asynq.ServeMux {
 	runPool("maintenance-pool", params.MaintenanceServer)
 	runPool("shared-pool", params.SharedServer)
 	runPool("wiki-pool", params.WikiServer)
-	runPool("production-pool", params.ProductionServer)
+	startManagedProductionAsynqServer(params.ProductionServer, mux, params.ResourceCleaner)
 	return mux
 }
 

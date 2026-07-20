@@ -47,6 +47,7 @@ func newProductionSourceRepoTestDB(t *testing.T) (interfaces.ProductionSourceRep
 	for _, name := range []string{
 		"000001_knowledge_production_foundation.up.sql",
 		"000002_knowledge_production_documents.up.sql",
+		"000003_knowledge_production_runs.up.sql",
 	} {
 		migration, readErr := os.ReadFile(filepath.Join(filepath.Dir(filename), "../../../migrations/sqlite", name))
 		require.NoError(t, readErr)
@@ -155,6 +156,36 @@ func TestProductionSourceRepositoryRejectsNewItemsAndEvidenceForFrozenSet(t *tes
 	var count int64
 	require.NoError(t, db.Model(&types.ProductionSourceItem{}).Count(&count).Error)
 	require.Equal(t, int64(1), count)
+}
+
+func TestProductionSourceRepositoryAllowsOnlyRunCapturedEvidenceOnFrozenAcceptedItem(t *testing.T) {
+	repo, db := newProductionSourceRepoTestDB(t)
+	createProductionSourceSet(t, repo, types.ProductionSourceSetCollecting)
+	createProductionSourceItem(t, repo, types.ProductionSourceItemAccepted)
+	require.NoError(t, repo.CreateEvidence(context.Background(), 7, sourceItemID, &types.ProductionEvidenceSnapshot{
+		ID: evidenceID, SnapshotType: types.ProductionEvidenceSnapshotText,
+		InlineContent: types.JSON(`"seed"`), ContentDigest: testDigest, RedactionMetadata: types.JSON(`{}`),
+	}))
+	require.NoError(t, db.Create(&types.ProductionDocument{
+		ID: repoDocumentID, TenantID: 7, ProjectID: sourceProjectID, DocumentTypeID: sourceTypeID,
+		DocumentTypeSchemaVersion: 1, Title: "Document", CreatedBy: "author",
+	}).Error)
+	run := newTestProductionRun(7)
+	run.ProjectID, run.SourceSetID, run.DocumentID = sourceProjectID, sourceSetID, repoDocumentID
+	require.NoError(t, db.Create(run).Error)
+	require.NoError(t, repo.Freeze(context.Background(), 7, sourceSetID))
+
+	late := &types.ProductionEvidenceSnapshot{
+		ID: "77777777-7777-4777-8777-777777777777", SnapshotType: types.ProductionEvidenceSnapshotToolResult,
+		InlineContent: types.JSON(`{"ok":true}`), ContentDigest: strings.Repeat("b", 64),
+		RedactionMetadata: types.JSON(`{}`), CapturedByRunID: run.ID,
+	}
+	require.NoError(t, repo.CreateEvidence(context.Background(), 7, sourceItemID, late))
+
+	ordinary := *late
+	ordinary.ID = "88888888-8888-4888-8888-888888888888"
+	ordinary.CapturedByRunID = ""
+	require.ErrorIs(t, repo.CreateEvidence(context.Background(), 7, sourceItemID, &ordinary), types.ErrProductionSourceSetFrozen)
 }
 
 func TestProductionSourceRepositoryFreezeIsAtomicAndRequiresEvidence(t *testing.T) {

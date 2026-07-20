@@ -32,6 +32,10 @@ func (s *productionDocumentTypeService) CreateDocumentType(
 	if err != nil {
 		return nil, err
 	}
+	workflowPlan, err := canonicalProductionWorkflowPlan(input.WorkflowPlan, input.SkillBindings)
+	if err != nil {
+		return nil, err
+	}
 	documentType := &types.ProductionDocumentType{
 		ID:                 uuid.NewString(),
 		TenantID:           tenantID,
@@ -42,6 +46,7 @@ func (s *productionDocumentTypeService) CreateDocumentType(
 		BlockSchema:        input.BlockSchema,
 		SourceRequirements: input.SourceRequirements,
 		SkillBindings:      input.SkillBindings,
+		WorkflowPlan:       workflowPlan,
 		QualityRules:       input.QualityRules,
 		ReviewPolicy:       input.ReviewPolicy,
 		PublicationPolicy:  input.PublicationPolicy,

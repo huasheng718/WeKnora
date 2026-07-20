@@ -327,7 +327,7 @@ func pinProductionDataSourceCall(t *testing.T, adapter *ProductionDataSourceAdap
 	call.Status, call.RequestSnapshot, call.RequestDigest = types.ProductionToolCallExecuting, plan.RequestSnapshot, plan.RequestDigest
 }
 
-func TestProductionDataSourceAdapterSecretValuePolicyAvoidsShortSubstringFalsePositive(t *testing.T) {
+func TestProductionDataSourceAdapterSecretValuePolicyRejectsShortSubstringOccurrence(t *testing.T) {
 	connector := &fakeProductionConnector{fetch: []types.FetchedItem{{ExternalID: "item-1", Title: "documentary tokenized content"}}}
 	adapter, call, _ := dataSourceAdapterFixture(t, connector)
 	config := types.DataSourceConfig{
@@ -341,7 +341,7 @@ func TestProductionDataSourceAdapterSecretValuePolicyAvoidsShortSubstringFalsePo
 	}}
 	pinProductionDataSourceCall(t, adapter, call)
 	_, err = adapter.Execute(context.Background(), call)
-	require.NoError(t, err)
+	require.ErrorIs(t, err, errProductionProviderOutputUnsafe)
 
 	longToken := "long-token-1234567890-ABCDEFG"
 	config.Credentials = map[string]any{"auth_headers": "Bearer " + longToken, "app_secret": longToken}
