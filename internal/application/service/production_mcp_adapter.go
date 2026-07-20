@@ -92,6 +92,9 @@ func (a *ProductionMCPAdapter) Plan(ctx context.Context, call *types.ProductionT
 	if err != nil {
 		return nil, err
 	}
+	if containsProductionCredentialValue(request.Arguments, productionMCPCredentialValues(service)) {
+		return nil, errProductionToolCallInvalid
+	}
 	required, err := a.approvals.IsRequired(ctx, call.TenantID, call.ProviderID, call.ToolName)
 	if err != nil {
 		return nil, errProductionProviderConfiguration
@@ -301,9 +304,13 @@ func productionMCPCredentialValues(service *types.MCPService) []productionCreden
 	}
 	if service.URL != nil {
 		if parsed, err := url.Parse(*service.URL); err == nil {
-			query := make(map[string][]string)
+			query := make(map[string]any)
 			for key, entry := range parsed.Query() {
-				query[key] = append([]string(nil), entry...)
+				values := make([]any, len(entry))
+				for index := range entry {
+					values[index] = entry[index]
+				}
+				query[key] = values
 			}
 			values["url_query"] = query
 			if parsed.User != nil {

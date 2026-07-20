@@ -336,6 +336,41 @@ func prepareProductionBlocks(version *types.ProductionDocumentVersion, blocks []
 	return nil
 }
 
+func sameProductionVersionCandidate(
+	existing, candidate *types.ProductionDocumentVersion,
+	existingBlocks, candidateBlocks []*types.ProductionDocumentBlock,
+	existingLineage, candidateLineage []*types.ProductionBlockLineage,
+) bool {
+	if existing == nil || candidate == nil || existing.ID != candidate.ID ||
+		existing.DocumentID != candidate.DocumentID || existing.TenantID != candidate.TenantID ||
+		existing.ProjectID != candidate.ProjectID || normalizeProductionParent(existing.ParentVersionID) != normalizeProductionParent(candidate.ParentVersionID) ||
+		existing.SourceSetID != candidate.SourceSetID || existing.Origin != candidate.Origin ||
+		existing.ChangeSummary != candidate.ChangeSummary || existing.ContentDigest != candidate.ContentDigest ||
+		existing.CreatedBy != candidate.CreatedBy || len(existingBlocks) != len(candidateBlocks) ||
+		len(existingLineage) != len(candidateLineage) {
+		return false
+	}
+	for i := range existingBlocks {
+		left, right := existingBlocks[i], candidateBlocks[i]
+		if left == nil || right == nil || left.LogicalBlockID != right.LogicalBlockID ||
+			left.BlockType != right.BlockType || left.Position != right.Position ||
+			string(left.Content) != string(right.Content) || string(left.Attributes) != string(right.Attributes) ||
+			string(left.EvidenceRefs) != string(right.EvidenceRefs) || string(left.AIProvenance) != string(right.AIProvenance) ||
+			left.ContentDigest != right.ContentDigest {
+			return false
+		}
+	}
+	for i := range existingLineage {
+		left, right := existingLineage[i], candidateLineage[i]
+		if left == nil || right == nil || left.FromVersionID != right.FromVersionID ||
+			left.FromLogicalBlockID != right.FromLogicalBlockID || left.ToVersionID != right.ToVersionID ||
+			left.ToLogicalBlockID != right.ToLogicalBlockID || left.Relation != right.Relation {
+			return false
+		}
+	}
+	return true
+}
+
 func (r *productionDocumentRepository) AppendVersion(
 	ctx context.Context,
 	version *types.ProductionDocumentVersion,
@@ -362,6 +397,31 @@ func (r *productionDocumentRepository) AppendVersion(
 		if err := validateProductionAppendDependencies(db, document, version.SourceSetID); err != nil {
 			return err
 		}
+		version.TenantID = document.TenantID
+		version.ProjectID = document.ProjectID
+
+		var existing types.ProductionDocumentVersion
+		existingErr := db.Where("id = ?", version.ID).First(&existing).Error
+		if existingErr == nil {
+			if document.CurrentVersionID == nil || *document.CurrentVersionID != existing.ID {
+				return types.ErrProductionDocumentStaleParent
+			}
+			var existingBlocks []*types.ProductionDocumentBlock
+			if err := db.Where("version_id = ?", existing.ID).Order("position ASC").Find(&existingBlocks).Error; err != nil {
+				return err
+			}
+			var existingLineage []*types.ProductionBlockLineage
+			if err := db.Where("to_version_id = ?", existing.ID).Order("id ASC").Find(&existingLineage).Error; err != nil {
+				return err
+			}
+			if sameProductionVersionCandidate(&existing, version, existingBlocks, blocks, existingLineage, lineage) {
+				return types.ErrProductionDocumentVersionExists
+			}
+			return types.ErrProductionConflict
+		}
+		if !errors.Is(existingErr, gorm.ErrRecordNotFound) {
+			return existingErr
+		}
 
 		parentID := normalizeProductionParent(version.ParentVersionID)
 		if document.CurrentVersionID == nil {
@@ -380,8 +440,6 @@ func (r *productionDocumentRepository) AppendVersion(
 			version.VersionNumber = parent.VersionNumber + 1
 		}
 
-		version.TenantID = document.TenantID
-		version.ProjectID = document.ProjectID
 		now := time.Now().UTC()
 		version.FrozenAt = &now
 		if err := validateProductionLineage(db, version, blocks, lineage); err != nil {

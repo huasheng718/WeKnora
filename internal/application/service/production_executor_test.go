@@ -36,7 +36,7 @@ func (a *productionExecutorAdapterStub) Plan(_ context.Context, call *types.Prod
 func TestProductionStepExecutorPlansFirstServerOwnedWorkflowCall(t *testing.T) {
 	adapter := &productionExecutorAdapterStub{}
 	repo := &productionExecutorRepoStub{}
-	executor := newProductionStepExecutor(repo, adapter, adapter, adapter, &productionExecutorWriterStub{})
+	executor := newProductionStepExecutor(repo, adapter, adapter, adapter, &productionExecutorWriterStub{}, nil)
 	workflow, err := types.CanonicalProductionWorkflowPlanSnapshot(types.JSON(`{"version":1,"steps":[{"provider_type":"skill","provider_id":"baseline","tool_name":"load_instructions","request":{"source_item_id":"71000000-0000-4000-8000-000000000005"}}]}`))
 	require.NoError(t, err)
 	run := &types.ProductionRun{
@@ -72,7 +72,7 @@ func TestProductionExecutorRejectsWorkflowSnapshotOrDigestTamperingBeforePlannin
 	} {
 		t.Run(name, func(t *testing.T) {
 			adapter := &productionExecutorAdapterStub{}
-			executor := newProductionStepExecutor(&productionExecutorRepoStub{}, adapter, adapter, adapter, &productionExecutorWriterStub{})
+			executor := newProductionStepExecutor(&productionExecutorRepoStub{}, adapter, adapter, adapter, &productionExecutorWriterStub{}, nil)
 			run := &types.ProductionRun{
 				ID: mcpAdapterRunID, TenantID: 7, ProjectID: mcpAdapterProjectID,
 				SourceSetID: mcpAdapterSourceSetID, RunType: types.ProductionRunCollect,
@@ -123,6 +123,42 @@ type productionExecutorWriterStub struct {
 	calls int
 }
 
+type productionExecutorValidatorStub struct {
+	calls int
+	err   error
+}
+
+func (v *productionExecutorValidatorStub) Validate(context.Context, *types.ProductionRun) error {
+	v.calls++
+	return v.err
+}
+
+func TestProductionStepExecutorRunsGovernedValidatorAfterWorkflow(t *testing.T) {
+	validator := &productionExecutorValidatorStub{}
+	adapter := &productionExecutorAdapterStub{}
+	executor := newProductionStepExecutor(
+		&productionExecutorRepoStub{}, adapter, adapter, adapter, &productionExecutorWriterStub{}, validator,
+	)
+	workflow := types.JSON(`{"steps":[],"version":1}`)
+	run := &types.ProductionRun{
+		ID: mcpAdapterRunID, TenantID: 7, ProjectID: mcpAdapterProjectID,
+		DocumentID: mcpAdapterDocumentID, SourceSetID: mcpAdapterSourceSetID,
+		RunType: types.ProductionRunValidate, Status: types.ProductionRunRunning, Attempt: 1,
+		DocumentTypeSnapshot: types.JSON(`{"skill_bindings":{"skills":[],"version":1}}`),
+		WorkflowPlanSnapshot: workflow, WorkflowPlanDigest: productionToolDigest(workflow),
+	}
+
+	result, err := executor.ExecuteStep(context.Background(), run, nil)
+	require.NoError(t, err)
+	require.True(t, result.Complete)
+	require.Nil(t, result.OutputVersionID)
+	require.Equal(t, 1, validator.calls)
+
+	validator.err = types.ErrProductionDocumentValidation
+	_, err = executor.ExecuteStep(context.Background(), run, nil)
+	require.ErrorIs(t, err, types.ErrProductionDocumentValidation)
+}
+
 func (w *productionExecutorWriterStub) Write(context.Context, *types.ProductionRun) (*types.ProductionDocumentVersion, error) {
 	w.calls++
 	return &types.ProductionDocumentVersion{ID: mcpAdapterSourceID}, nil
@@ -138,7 +174,7 @@ func TestProductionStepExecutorRunsPersistedMCPCallAndWriter(t *testing.T) {
 	repo := &productionExecutorRepoStub{call: call}
 	mcpAdapter := &productionExecutorAdapterStub{}
 	writer := &productionExecutorWriterStub{}
-	executor := newProductionStepExecutor(repo, &productionExecutorAdapterStub{}, mcpAdapter, &productionExecutorAdapterStub{}, writer)
+	executor := newProductionStepExecutor(repo, &productionExecutorAdapterStub{}, mcpAdapter, &productionExecutorAdapterStub{}, writer, nil)
 	run := &types.ProductionRun{
 		ID: call.RunID, TenantID: call.TenantID, ProjectID: call.ProjectID, DocumentID: call.DocumentID,
 		SourceSetID: call.SourceSetID, Attempt: call.Attempt, CurrentStep: call.CurrentStep,
@@ -174,7 +210,7 @@ func TestProductionStepExecutorReconcilesCompletedPriorAttemptWithoutProvider(t 
 	}
 	repo := &productionExecutorRepoStub{call: call}
 	adapter := &productionExecutorAdapterStub{}
-	executor := newProductionStepExecutor(repo, adapter, adapter, adapter, &productionExecutorWriterStub{})
+	executor := newProductionStepExecutor(repo, adapter, adapter, adapter, &productionExecutorWriterStub{}, nil)
 	run := &types.ProductionRun{
 		ID: call.RunID, TenantID: call.TenantID, ProjectID: call.ProjectID, DocumentID: call.DocumentID,
 		SourceSetID: call.SourceSetID, Attempt: 2, CurrentStep: call.CurrentStep,

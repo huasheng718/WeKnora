@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
 
 const productionRecoveryBatchSize = 1000
+const productionRecoveryLeaseTTL = 5 * time.Minute
 
 func recoverPendingProductionRunsOnce(
 	ctx context.Context,
@@ -26,7 +29,7 @@ func recoverPendingProductionRunsOnce(
 	var joined error
 	afterID := ""
 	for {
-		runs, err := repository.ListPendingWakeups(ctx, afterID, limit)
+		runs, err := repository.ListPendingWakeups(ctx, afterID, limit, productionRecoveryLeaseTTL)
 		if err != nil {
 			return errors.Join(joined, err)
 		}
@@ -37,7 +40,21 @@ func recoverPendingProductionRunsOnce(
 			if run == nil {
 				continue
 			}
-			if _, err := resumer.Resume(ctx, run.TenantID, run.ID, run.Attempt); err != nil {
+			candidate := run
+			if run.Status == types.ProductionRunRunning {
+				var changed bool
+				candidate, changed, err = repository.RearmExpiredRunning(
+					ctx, run.TenantID, run.ID, run.Attempt, productionRecoveryLeaseTTL,
+				)
+				if err != nil {
+					joined = errors.Join(joined, fmt.Errorf("rearm production run %s: %w", run.ID, err))
+					continue
+				}
+				if !changed || candidate == nil {
+					continue
+				}
+			}
+			if _, err := resumer.Resume(ctx, candidate.TenantID, candidate.ID, candidate.Attempt); err != nil {
 				joined = errors.Join(joined, fmt.Errorf("resume production run %s: %w", run.ID, err))
 			}
 		}

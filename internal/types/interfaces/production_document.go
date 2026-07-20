@@ -14,6 +14,7 @@ type CreateProductionDocumentInput struct {
 }
 
 type AppendProductionVersionInput struct {
+	VersionID       string
 	ParentVersionID string
 	SourceSetID     string
 	Origin          types.ProductionDocumentOrigin

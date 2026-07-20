@@ -16,6 +16,10 @@ type productionDocumentWriter interface {
 	Write(ctx context.Context, run *types.ProductionRun) (*types.ProductionDocumentVersion, error)
 }
 
+type productionDocumentValidator interface {
+	Validate(ctx context.Context, run *types.ProductionRun) error
+}
+
 // ProductionStepExecutor composes the governed Task 4 provider adapters and
 // Task 5 writer behind the restart-safe Task 3 state machine.
 type ProductionExecutor struct {
@@ -24,6 +28,7 @@ type ProductionExecutor struct {
 	mcp        ProductionToolAdapter
 	datasource ProductionToolAdapter
 	writer     productionDocumentWriter
+	validator  productionDocumentValidator
 	now        func() time.Time
 }
 
@@ -33,8 +38,9 @@ func NewProductionStepExecutor(
 	mcpAdapter *ProductionMCPAdapter,
 	datasource *ProductionDataSourceAdapter,
 	writer *ProductionWriter,
+	validator *ProductionValidator,
 ) *ProductionExecutor {
-	return newProductionStepExecutor(runs, skill, mcpAdapter, datasource, writer)
+	return newProductionStepExecutor(runs, skill, mcpAdapter, datasource, writer, validator)
 }
 
 func newProductionStepExecutor(
@@ -43,9 +49,10 @@ func newProductionStepExecutor(
 	mcpAdapter ProductionToolAdapter,
 	datasource ProductionToolAdapter,
 	writer productionDocumentWriter,
+	validator productionDocumentValidator,
 ) *ProductionExecutor {
 	return &ProductionExecutor{
-		runs: runs, skill: skill, mcp: mcpAdapter, datasource: datasource, writer: writer, now: time.Now,
+		runs: runs, skill: skill, mcp: mcpAdapter, datasource: datasource, writer: writer, validator: validator, now: time.Now,
 	}
 }
 
@@ -90,7 +97,15 @@ func (e *ProductionExecutor) ExecuteStep(
 		return ProductionStepResult{
 			StatePayload: run.StatePayload, OutputVersionID: &version.ID, Complete: true,
 		}, nil
-	case types.ProductionRunCollect, types.ProductionRunValidate:
+	case types.ProductionRunValidate:
+		if e.validator == nil {
+			return ProductionStepResult{}, errors.New("production validator is required")
+		}
+		if err := e.validator.Validate(ctx, run); err != nil {
+			return ProductionStepResult{}, err
+		}
+		return ProductionStepResult{StatePayload: run.StatePayload, Complete: true}, nil
+	case types.ProductionRunCollect:
 		return ProductionStepResult{StatePayload: run.StatePayload, Complete: true}, nil
 	default:
 		return ProductionStepResult{}, errors.New("unsupported production run type")

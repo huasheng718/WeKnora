@@ -333,6 +333,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(service.NewProductionDataSourceAdapterFromServices))
 	must(container.Provide(service.NewProductionMCPAdapterFromServices))
 	must(container.Provide(service.NewProductionWriter))
+	must(container.Provide(service.NewProductionValidator))
 	must(container.Provide(service.NewProductionStepExecutor))
 	must(container.Provide(service.NewProductionOrchestratorRuntime))
 	must(container.Provide(func(orchestrator *service.ProductionOrchestrator) interfaces.ProductionRunOrchestrator {

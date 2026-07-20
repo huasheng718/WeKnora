@@ -283,6 +283,7 @@ func TestProductionDocumentServiceBindsInternalPrincipalToAIProvenance(t *testin
 		blocks[index].AIProvenance = types.JSON(`{"run_id":"` + runID + `"}`)
 	}
 	input := interfaces.AppendProductionVersionInput{
+		VersionID:       productionRunVersionID(runID),
 		ParentVersionID: *document.CurrentVersionID, SourceSetID: documentServiceSetID,
 		Origin: types.ProductionDocumentOriginAI, Blocks: blocks,
 	}
@@ -305,6 +306,52 @@ func TestProductionDocumentServiceBindsInternalPrincipalToAIProvenance(t *testin
 	require.NoError(t, err)
 	require.NotNil(t, version)
 	require.Equal(t, int64(2), countServiceRows(t, db, &types.ProductionDocumentVersion{}))
+}
+
+func TestProductionDocumentServiceIdempotentlyReplaysExactInternalRunVersion(t *testing.T) {
+	svc, repo, db, _ := newProductionDocumentServiceFixture(t)
+	document := createServiceDocument(t, svc)
+	runID := "77000000-0000-4000-8000-000000000010"
+	blocks := governedServiceBlocks(governedServiceParagraph("claim", `"governed claim"`))
+	for index := range blocks {
+		blocks[index].AIProvenance = types.JSON(`{"run_id":"` + runID + `"}`)
+	}
+	ctx, err := types.WithProductionInternalPrincipal(context.Background(), types.ProductionInternalPrincipal{
+		ActorID: types.ProductionSystemActorID, ActorKind: types.ProductionInternalActorWorker,
+		TenantID: 7, ProjectID: documentServiceProjectID, RunID: runID,
+	})
+	require.NoError(t, err)
+	input := interfaces.AppendProductionVersionInput{
+		VersionID: productionRunVersionID(runID), ParentVersionID: *document.CurrentVersionID,
+		SourceSetID: documentServiceSetID, Origin: types.ProductionDocumentOriginAI,
+		ChangeSummary: "AI evidence-grounded production draft", Blocks: blocks,
+	}
+
+	first, err := svc.AppendVersion(ctx, document.ID, input)
+	require.NoError(t, err)
+	second, err := svc.AppendVersion(ctx, document.ID, input)
+	require.NoError(t, err)
+	require.Equal(t, first.ID, second.ID)
+	require.Equal(t, productionRunVersionID(runID), first.ID)
+	versions, err := repo.ListVersions(context.Background(), 7, document.ID)
+	require.NoError(t, err)
+	require.Len(t, versions, 2)
+
+	conflict := input
+	conflict.Blocks = append([]types.ProductionDocumentBlockInput(nil), blocks...)
+	conflict.Blocks[len(conflict.Blocks)-1].Content = types.JSON(`"changed"`)
+	_, err = svc.AppendVersion(ctx, document.ID, conflict)
+	require.ErrorIs(t, err, types.ErrProductionConflict)
+
+	human, err := svc.AppendVersion(productionDocumentContext(7), document.ID, interfaces.AppendProductionVersionInput{
+		ParentVersionID: first.ID, SourceSetID: documentServiceSetID, Origin: types.ProductionDocumentOriginHuman,
+		Blocks: governedServiceBlocks(governedServiceParagraph("human", `"new head"`)),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, human)
+	_, err = svc.AppendVersion(ctx, document.ID, input)
+	require.ErrorIs(t, err, types.ErrProductionDocumentStaleParent)
+	require.Equal(t, int64(3), countServiceRows(t, db, &types.ProductionDocumentVersion{}))
 }
 
 func TestProductionDocumentDirectServiceAuditFailureRollsBackBootstrapAndAppend(t *testing.T) {

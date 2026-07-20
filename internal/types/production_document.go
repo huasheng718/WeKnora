@@ -22,6 +22,7 @@ var (
 	ErrProductionDocumentVersionImmutable = errors.New("production document versions are immutable")
 	ErrProductionDocumentBlockImmutable   = errors.New("production document blocks are immutable")
 	ErrProductionDocumentValidation       = errors.New("production document version failed governed validation")
+	ErrProductionDocumentVersionExists    = errors.New("production document version already exists for this run")
 )
 
 type ProductionDocumentStatus string

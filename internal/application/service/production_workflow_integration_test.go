@@ -121,6 +121,19 @@ type productionWorkflowGraph struct {
 	chatModel       *productionWriterChatStub
 }
 
+type productionWorkflowFailBeforeAppend struct {
+	interfaces.ProductionDocumentService
+	err error
+}
+
+func (s *productionWorkflowFailBeforeAppend) AppendVersion(
+	context.Context,
+	string,
+	interfaces.AppendProductionVersionInput,
+) (*types.ProductionDocumentVersion, error) {
+	return nil, s.err
+}
+
 func newProductionWorkflowGraph(
 	t *testing.T,
 	path string,
@@ -158,6 +171,7 @@ func newProductionWorkflowGraph(
 	)
 	base := newProductionStepExecutor(
 		runs, &productionExecutorAdapterStub{}, mcpAdapter, &productionExecutorAdapterStub{}, writer,
+		NewProductionValidator(documents, sources, nil),
 	)
 	executor := &productionWorkflowReplayExecutor{base: base, mcp: mcpAdapter}
 	orchestrator := NewProductionOrchestrator(runs, uow, executor, enqueuer)
@@ -339,19 +353,65 @@ func TestProductionWorkflowSQLiteApprovalReplayAndGovernedWrite(t *testing.T) {
 	require.ErrorIs(t, err, types.ErrProductionForbidden)
 	require.Zero(t, writeGraph.chatModel.calls)
 
-	require.NoError(t, writeGraph.orchestrator.HandleRun(productionWorkflowWorkerContext(t, queuedForWrite), payload))
-	finalRun, err := writeGraph.runs.Get(context.Background(), 7, run.ID)
+	claimedForRaw, won, err := writeGraph.runs.Claim(
+		context.Background(), 7, run.ID, productionRunCAS(queuedForWrite), time.Minute,
+	)
+	require.NoError(t, err)
+	require.True(t, won)
+	appendCrash := errors.New("simulated crash before append")
+	writeGraph.writer.service = &productionWorkflowFailBeforeAppend{
+		ProductionDocumentService: writeGraph.documentService, err: appendCrash,
+	}
+	_, err = writeGraph.writer.Write(productionWorkflowWorkerContext(t, claimedForRaw), claimedForRaw)
+	require.ErrorIs(t, err, appendCrash)
+	require.Equal(t, 1, writeGraph.chatModel.calls)
+	rawAudited, err := writeGraph.runs.Get(context.Background(), 7, run.ID)
+	require.NoError(t, err)
+	require.NotEmpty(t, rawAudited.RawModelResponse)
+	require.NotNil(t, rawAudited.RawModelResponseDigest)
+	require.Equal(t, int64(1), countServiceRows(t, writeGraph.db, &types.ProductionDocumentVersion{}))
+	writeGraph.close(t)
+
+	appendGraph := newProductionWorkflowGraph(t, path, false, enqueuer)
+	require.NotSame(t, writeGraph.db, appendGraph.db)
+	require.NoError(t, appendGraph.db.Model(&types.ProductionRun{}).Where("id = ?", run.ID).
+		UpdateColumn("updated_at", time.Now().UTC().Add(-10*time.Minute)).Error)
+	crashedAfterRaw, err := appendGraph.runs.Get(context.Background(), 7, run.ID)
+	require.NoError(t, err)
+	reclaimedForAppend, won, err := appendGraph.runs.Claim(
+		context.Background(), 7, run.ID, productionRunCAS(crashedAfterRaw), time.Minute,
+	)
+	require.NoError(t, err)
+	require.True(t, won)
+	appended, err := appendGraph.writer.Write(productionWorkflowWorkerContext(t, reclaimedForAppend), reclaimedForAppend)
+	require.NoError(t, err)
+	require.Zero(t, appendGraph.chatModel.calls)
+	require.Equal(t, productionRunVersionID(run.ID), appended.ID)
+	require.Equal(t, int64(2), countServiceRows(t, appendGraph.db, &types.ProductionDocumentVersion{}))
+	outputVersionID := appended.ID
+	appendGraph.close(t)
+
+	finalizer := newProductionWorkflowGraph(t, path, false, enqueuer)
+	require.NotSame(t, appendGraph.db, finalizer.db)
+	require.NoError(t, finalizer.db.Model(&types.ProductionRun{}).Where("id = ?", run.ID).
+		UpdateColumn("updated_at", time.Now().UTC().Add(-10*time.Minute)).Error)
+	crashedAfterAppend, err := finalizer.runs.Get(context.Background(), 7, run.ID)
+	require.NoError(t, err)
+	retryPayload := types.ProductionRunPayload{TenantID: 7, RunID: run.ID, Attempt: crashedAfterAppend.Attempt}
+	require.NoError(t, finalizer.orchestrator.HandleRun(productionWorkflowWorkerContext(t, crashedAfterAppend), retryPayload))
+	finalRun, err := finalizer.runs.Get(context.Background(), 7, run.ID)
 	require.NoError(t, err)
 	require.Equal(t, types.ProductionRunCompleted, finalRun.Status)
 	require.NotNil(t, finalRun.OutputVersionID)
+	require.Equal(t, outputVersionID, *finalRun.OutputVersionID)
+	require.Zero(t, finalizer.chatModel.calls)
+	require.Equal(t, int64(2), countServiceRows(t, finalizer.db, &types.ProductionDocumentVersion{}))
 	require.Equal(t, 3, enqueuer.callCount())
-	require.Equal(t, 1, writeGraph.chatModel.calls)
-	outputVersionID := *finalRun.OutputVersionID
-	writeGraph.close(t)
+	finalizer.close(t)
 
 	finalGraph := newProductionWorkflowGraph(t, path, false, enqueuer)
-	require.NotSame(t, writeGraph.db, finalGraph.db)
-	require.NotSame(t, writeGraph.client, finalGraph.client)
+	require.NotSame(t, finalizer.db, finalGraph.db)
+	require.NotSame(t, finalizer.client, finalGraph.client)
 	finalRun, err = finalGraph.runs.Get(context.Background(), 7, run.ID)
 	require.NoError(t, err)
 	require.Equal(t, types.ProductionRunCompleted, finalRun.Status)
@@ -389,7 +449,7 @@ func TestProductionWorkflowSQLiteApprovalReplayAndGovernedWrite(t *testing.T) {
 	require.NoError(t, err)
 	require.NotContains(t, string(encoded), workflowE2ESecret)
 	require.NotContains(t, strings.ToLower(string(encoded)), "authorization")
-	require.Equal(t, 1, initial.client.calls+approval.client.calls+worker.client.calls+writeGraph.client.calls+finalGraph.client.calls)
-	require.Equal(t, 1, initial.manager.calls+approval.manager.calls+worker.manager.calls+writeGraph.manager.calls+finalGraph.manager.calls)
+	require.Equal(t, 1, initial.client.calls+approval.client.calls+worker.client.calls+writeGraph.client.calls+appendGraph.client.calls+finalizer.client.calls+finalGraph.client.calls)
+	require.Equal(t, 1, initial.manager.calls+approval.manager.calls+worker.manager.calls+writeGraph.manager.calls+appendGraph.manager.calls+finalizer.manager.calls+finalGraph.manager.calls)
 	finalGraph.close(t)
 }

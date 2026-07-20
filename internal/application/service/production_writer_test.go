@@ -25,6 +25,18 @@ const (
 	writerDocumentID = "70000000-0000-4000-8000-000000000004"
 	writerVersionID  = "70000000-0000-4000-8000-000000000005"
 	writerEvidenceID = "70000000-0000-4000-8000-000000000006"
+
+	testWriterMaxEvidenceCount        = 128
+	testWriterMaxInlineEvidenceBytes  = 64 * 1024
+	testWriterMaxEvidenceBytes        = 512 * 1024
+	testWriterMaxCurrentVersionBlocks = 512
+	testWriterMaxCurrentVersionBytes  = 512 * 1024
+	testWriterMaxContextBytes         = 1024 * 1024
+	testWriterMaxRawResponseBytes     = 1024 * 1024
+	testWriterMaxOutputBlocks         = 256
+	testWriterMaxOutputBlockBytes     = 64 * 1024
+	testWriterMaxOutputBytes          = 512 * 1024
+	testWriterMaxCompletionTokens     = 8192
 )
 
 type productionWriterChatStub struct {
@@ -198,8 +210,11 @@ func (s *productionWriterDocumentServiceStub) AppendVersion(
 		return nil, err
 	}
 	version := &types.ProductionDocumentVersion{
-		ID: uuid.NewString(), DocumentID: documentID, SourceSetID: input.SourceSetID,
+		ID: input.VersionID, DocumentID: documentID, SourceSetID: input.SourceSetID,
 		Origin: input.Origin, Blocks: blocks,
+	}
+	if version.ID == "" {
+		version.ID = uuid.NewString()
 	}
 	if input.ParentVersionID != "" {
 		version.ParentVersionID = &input.ParentVersionID
@@ -306,6 +321,29 @@ func productionWriterRawDigest(t *testing.T, raw string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func productionWriterAuditedRawSize(t *testing.T, raw string) int {
+	t.Helper()
+	snapshot, err := json.Marshal(raw)
+	require.NoError(t, err)
+	canonical, err := types.CanonicalProductionJSON(snapshot)
+	require.NoError(t, err)
+	return len(canonical)
+}
+
+func productionWriterOutputWithBlockCount(t *testing.T, count int) string {
+	t.Helper()
+	template := BuiltinSoftwareDevelopmentBaseline()
+	require.GreaterOrEqual(t, count, len(template.RequiredSections))
+	extras := make([]map[string]any, 0, count-len(template.RequiredSections))
+	for index := len(template.RequiredSections); index < count; index++ {
+		extras = append(extras, map[string]any{
+			"logical_block_id": fmt.Sprintf("filler-%03d", index), "block_type": "heading",
+			"content": fmt.Sprintf("filler %d", index), "evidence_refs": []string{}, "needs_confirmation": false,
+		})
+	}
+	return productionWriterOutput(t, extras...)
+}
+
 func productionWriterTestContext(t *testing.T, run *types.ProductionRun) context.Context {
 	t.Helper()
 	ctx, err := types.WithProductionInternalPrincipal(context.Background(), types.ProductionInternalPrincipal{
@@ -314,6 +352,55 @@ func productionWriterTestContext(t *testing.T, run *types.ProductionRun) context
 	})
 	require.NoError(t, err)
 	return ctx
+}
+
+func writerEvidenceWithSize(t *testing.T, id string, size int) *types.ProductionEvidenceSnapshot {
+	t.Helper()
+	require.GreaterOrEqual(t, size, 2)
+	inline := types.JSON(strconv.Quote(strings.Repeat("e", size-2)))
+	require.Len(t, inline, size)
+	sum := sha256.Sum256(inline)
+	return &types.ProductionEvidenceSnapshot{
+		ID: id, SourceItemID: uuid.NewString(), SnapshotType: types.ProductionEvidenceSnapshotText,
+		InlineContent: inline, ContentDigest: hex.EncodeToString(sum[:]), RedactionMetadata: types.JSON(`{}`),
+	}
+}
+
+func writerEvidenceSetForTotal(t *testing.T, total int) []*types.ProductionEvidenceSnapshot {
+	t.Helper()
+	chunks := make([]int, 0)
+	for total > 0 {
+		size := testWriterMaxInlineEvidenceBytes
+		if total < size {
+			size = total
+		}
+		if size == 1 {
+			chunks[len(chunks)-1]--
+			size = 2
+		}
+		chunks = append(chunks, size)
+		total -= size
+	}
+	evidence := make([]*types.ProductionEvidenceSnapshot, 0, len(chunks))
+	for index, size := range chunks {
+		id := writerEvidenceID
+		if index > 0 {
+			id = uuid.NewString()
+		}
+		evidence = append(evidence, writerEvidenceWithSize(t, id, size))
+	}
+	return evidence
+}
+
+func requireWriterInputRejectedBeforeModel(t *testing.T, fixture *productionWriterFixture) {
+	t.Helper()
+	_, err := fixture.writer.Write(productionWriterTestContext(t, fixture.run), fixture.run)
+	require.ErrorContains(t, err, "writer input exceeds size limit")
+	require.Zero(t, fixture.chat.calls)
+	require.Empty(t, fixture.chat.messages)
+	require.Empty(t, fixture.runs.persisted)
+	require.Empty(t, *fixture.events)
+	require.Zero(t, fixture.service.calls)
 }
 
 func TestProductionWriterNormalizesGroundedFactAndUsesServerOwnedContext(t *testing.T) {
@@ -347,12 +434,215 @@ func TestProductionWriterNormalizesGroundedFactAndUsesServerOwnedContext(t *test
 	require.Equal(t, productionSystemActorID, fixture.service.ctx.Value(types.UserIDContextKey))
 	require.NotNil(t, fixture.chat.options)
 	require.NotEmpty(t, fixture.chat.options.Format)
+	require.Equal(t, testWriterMaxCompletionTokens, fixture.chat.options.MaxTokens)
 	require.Len(t, fixture.chat.messages, 2)
 	require.NotContains(t, fixture.chat.messages[1].Content, "api_key")
 	require.NotContains(t, fixture.chat.messages[1].Content, "writer-secret")
 	require.Contains(t, fixture.chat.messages[1].Content, strings.Repeat("a", 64))
 	require.Contains(t, fixture.chat.messages[1].Content, "基线范围与目标")
 	require.Contains(t, fixture.chat.messages[1].Content, writerVersionID)
+}
+
+func TestProductionWriterEnforcesEvidenceInputBoundariesBeforeModel(t *testing.T) {
+	t.Run("count", func(t *testing.T) {
+		exact := newProductionWriterFixture(t, productionWriterOutput(t))
+		exact.sources.evidence = make([]*types.ProductionEvidenceSnapshot, 0, testWriterMaxEvidenceCount)
+		for index := 0; index < testWriterMaxEvidenceCount; index++ {
+			exact.sources.evidence = append(exact.sources.evidence, writerEvidenceWithSize(t, uuid.NewString(), 3))
+		}
+		_, err := exact.writer.Write(productionWriterTestContext(t, exact.run), exact.run)
+		require.NoError(t, err)
+		require.Equal(t, 1, exact.chat.calls)
+
+		over := newProductionWriterFixture(t, productionWriterOutput(t))
+		over.sources.evidence = append([]*types.ProductionEvidenceSnapshot(nil), exact.sources.evidence...)
+		over.sources.evidence = append(over.sources.evidence, writerEvidenceWithSize(t, uuid.NewString(), 3))
+		requireWriterInputRejectedBeforeModel(t, over)
+	})
+
+	t.Run("per inline bytes", func(t *testing.T) {
+		exact := newProductionWriterFixture(t, productionWriterOutput(t))
+		exact.sources.evidence = []*types.ProductionEvidenceSnapshot{
+			writerEvidenceWithSize(t, writerEvidenceID, testWriterMaxInlineEvidenceBytes),
+		}
+		_, err := exact.writer.Write(productionWriterTestContext(t, exact.run), exact.run)
+		require.NoError(t, err)
+
+		over := newProductionWriterFixture(t, productionWriterOutput(t))
+		over.sources.evidence = []*types.ProductionEvidenceSnapshot{
+			writerEvidenceWithSize(t, writerEvidenceID, testWriterMaxInlineEvidenceBytes+1),
+		}
+		requireWriterInputRejectedBeforeModel(t, over)
+	})
+
+	t.Run("aggregate inline bytes", func(t *testing.T) {
+		exact := newProductionWriterFixture(t, productionWriterOutput(t))
+		exact.sources.evidence = writerEvidenceSetForTotal(t, testWriterMaxEvidenceBytes)
+		_, err := exact.writer.Write(productionWriterTestContext(t, exact.run), exact.run)
+		require.NoError(t, err)
+
+		over := newProductionWriterFixture(t, productionWriterOutput(t))
+		over.sources.evidence = writerEvidenceSetForTotal(t, testWriterMaxEvidenceBytes+1)
+		requireWriterInputRejectedBeforeModel(t, over)
+	})
+}
+
+func TestProductionWriterEnforcesCurrentVersionBoundariesBeforeModel(t *testing.T) {
+	t.Run("block count", func(t *testing.T) {
+		exact := newProductionWriterFixture(t, productionWriterOutput(t))
+		for index := 0; index < testWriterMaxCurrentVersionBlocks; index++ {
+			exact.documents.version.Blocks = append(exact.documents.version.Blocks, &types.ProductionDocumentBlock{
+				ID: uuid.NewString(), VersionID: writerVersionID, LogicalBlockID: fmt.Sprintf("existing-%03d", index),
+				BlockType: "paragraph", Position: index, Content: types.JSON(`"existing"`),
+				Attributes: types.JSON(`{}`), EvidenceRefs: types.JSON(`[]`), AIProvenance: types.JSON(`{}`),
+			})
+		}
+		_, err := exact.writer.Write(productionWriterTestContext(t, exact.run), exact.run)
+		require.NoError(t, err)
+
+		over := newProductionWriterFixture(t, productionWriterOutput(t))
+		over.documents.version.Blocks = append([]*types.ProductionDocumentBlock(nil), exact.documents.version.Blocks...)
+		over.documents.version.Blocks = append(over.documents.version.Blocks, &types.ProductionDocumentBlock{Content: types.JSON(`"over"`)})
+		requireWriterInputRejectedBeforeModel(t, over)
+	})
+
+	t.Run("serialized bytes", func(t *testing.T) {
+		fixtureAtSize := func(size int) *productionWriterFixture {
+			fixture := newProductionWriterFixture(t, productionWriterOutput(t))
+			block := &types.ProductionDocumentBlock{
+				ID: uuid.NewString(), VersionID: writerVersionID, LogicalBlockID: "existing-large", BlockType: "paragraph",
+				Content: types.JSON(`""`), Attributes: types.JSON(`{}`), EvidenceRefs: types.JSON(`[]`), AIProvenance: types.JSON(`{}`),
+			}
+			fixture.documents.version.Blocks = []*types.ProductionDocumentBlock{block}
+			encoded, err := json.Marshal(fixture.documents.version)
+			require.NoError(t, err)
+			require.LessOrEqual(t, len(encoded), size)
+			block.Content = types.JSON(strconv.Quote(strings.Repeat("v", size-len(encoded))))
+			encoded, err = json.Marshal(fixture.documents.version)
+			require.NoError(t, err)
+			require.Len(t, encoded, size)
+			return fixture
+		}
+
+		exact := fixtureAtSize(testWriterMaxCurrentVersionBytes)
+		_, err := exact.writer.Write(productionWriterTestContext(t, exact.run), exact.run)
+		require.NoError(t, err)
+		over := fixtureAtSize(testWriterMaxCurrentVersionBytes + 1)
+		requireWriterInputRejectedBeforeModel(t, over)
+	})
+}
+
+func TestProductionWriterEnforcesEncodedContextBoundaryBeforeModel(t *testing.T) {
+	fixtureAtSize := func(size int) *productionWriterFixture {
+		fixture := newProductionWriterFixture(t, productionWriterOutput(t))
+		fixture.documents.document.Title = ""
+		messages, err := productionWriterMessages(
+			fixture.run, mustDecodeProductionWriterDocumentType(t, fixture.run.DocumentTypeSnapshot),
+			fixture.documents.document, fixture.sources.set, fixture.documents.version, fixture.sources.evidence,
+		)
+		require.NoError(t, err)
+		require.LessOrEqual(t, len(messages[1].Content), size)
+		fixture.documents.document.Title = strings.Repeat("t", size-len(messages[1].Content))
+		messages, err = productionWriterMessages(
+			fixture.run, mustDecodeProductionWriterDocumentType(t, fixture.run.DocumentTypeSnapshot),
+			fixture.documents.document, fixture.sources.set, fixture.documents.version, fixture.sources.evidence,
+		)
+		require.NoError(t, err)
+		require.Len(t, messages[1].Content, size)
+		return fixture
+	}
+
+	exact := fixtureAtSize(testWriterMaxContextBytes)
+	_, err := exact.writer.Write(productionWriterTestContext(t, exact.run), exact.run)
+	require.NoError(t, err)
+	over := fixtureAtSize(testWriterMaxContextBytes)
+	over.documents.document.Title += "t"
+	requireWriterInputRejectedBeforeModel(t, over)
+}
+
+func TestProductionWriterEnforcesRawModelResponseBoundaryBeforeAudit(t *testing.T) {
+	fixtureAtSize := func(size int) *productionWriterFixture {
+		raw := productionWriterOutput(t)
+		base := productionWriterAuditedRawSize(t, raw)
+		require.LessOrEqual(t, base, size)
+		raw += strings.Repeat(" ", size-base)
+		require.Equal(t, size, productionWriterAuditedRawSize(t, raw))
+		return newProductionWriterFixture(t, raw)
+	}
+
+	exact := fixtureAtSize(testWriterMaxRawResponseBytes)
+	_, err := exact.writer.Write(productionWriterTestContext(t, exact.run), exact.run)
+	require.ErrorContains(t, err, "writer output exceeds size limit")
+	require.Len(t, exact.runs.persisted, testWriterMaxRawResponseBytes)
+	require.Equal(t, 1, exact.chat.calls)
+	require.Zero(t, exact.service.calls)
+
+	over := fixtureAtSize(testWriterMaxRawResponseBytes + 1)
+	_, err = over.writer.Write(productionWriterTestContext(t, over.run), over.run)
+	require.ErrorContains(t, err, "writer output exceeds size limit")
+	require.LessOrEqual(t, len(err.Error()), 128)
+	require.Empty(t, over.runs.persisted)
+	require.Empty(t, *over.events)
+	require.Equal(t, 1, over.chat.calls)
+	require.Zero(t, over.service.calls)
+}
+
+func TestProductionWriterEnforcesStructuredOutputBoundaries(t *testing.T) {
+	t.Run("block count", func(t *testing.T) {
+		exact := newProductionWriterFixture(t, productionWriterOutputWithBlockCount(t, testWriterMaxOutputBlocks))
+		_, err := exact.writer.Write(productionWriterTestContext(t, exact.run), exact.run)
+		require.NoError(t, err)
+		require.Len(t, exact.service.input.Blocks, testWriterMaxOutputBlocks)
+
+		over := newProductionWriterFixture(t, productionWriterOutputWithBlockCount(t, testWriterMaxOutputBlocks+1))
+		_, err = over.writer.Write(productionWriterTestContext(t, over.run), over.run)
+		require.ErrorContains(t, err, "writer output exceeds size limit")
+		require.NotEmpty(t, over.runs.persisted)
+		require.Zero(t, over.service.calls)
+	})
+
+	t.Run("per block content bytes", func(t *testing.T) {
+		fixtureAtSize := func(size int) *productionWriterFixture {
+			return newProductionWriterFixture(t, productionWriterOutput(t, map[string]any{
+				"logical_block_id": "large-block", "block_type": "paragraph",
+				"content": strings.Repeat("b", size-2), "evidence_refs": []string{}, "needs_confirmation": true,
+			}))
+		}
+		exact := fixtureAtSize(testWriterMaxOutputBlockBytes)
+		_, err := exact.writer.Write(productionWriterTestContext(t, exact.run), exact.run)
+		require.NoError(t, err)
+		require.Len(t, exact.service.input.Blocks[len(exact.service.input.Blocks)-1].Content, testWriterMaxOutputBlockBytes)
+
+		over := fixtureAtSize(testWriterMaxOutputBlockBytes + 1)
+		_, err = over.writer.Write(productionWriterTestContext(t, over.run), over.run)
+		require.ErrorContains(t, err, "writer output exceeds size limit")
+		require.Zero(t, over.service.calls)
+	})
+
+	t.Run("total output bytes", func(t *testing.T) {
+		fixtureAtSize := func(size int) *productionWriterFixture {
+			raw := productionWriterOutput(t)
+			require.LessOrEqual(t, len(raw), size)
+			raw += strings.Repeat(" ", size-len(raw))
+			require.Len(t, raw, size)
+			return newProductionWriterFixture(t, raw)
+		}
+		exact := fixtureAtSize(testWriterMaxOutputBytes)
+		_, err := exact.writer.Write(productionWriterTestContext(t, exact.run), exact.run)
+		require.NoError(t, err)
+		over := fixtureAtSize(testWriterMaxOutputBytes + 1)
+		_, err = over.writer.Write(productionWriterTestContext(t, over.run), over.run)
+		require.ErrorContains(t, err, "writer output exceeds size limit")
+		require.NotEmpty(t, over.runs.persisted)
+		require.Zero(t, over.service.calls)
+	})
+}
+
+func mustDecodeProductionWriterDocumentType(t *testing.T, raw types.JSON) *productionWriterDocumentTypeSnapshot {
+	t.Helper()
+	snapshot, err := decodeProductionWriterDocumentType(raw)
+	require.NoError(t, err)
+	return snapshot
 }
 
 func TestProductionWriterRequiresExactInternalRunPrincipal(t *testing.T) {
@@ -420,6 +710,46 @@ func TestProductionWriterRejectsUnknownOrUnacceptedEvidenceReference(t *testing.
 	}
 }
 
+func TestProductionWriterRequiresInlineNormalizedEvidenceBeforeModelCall(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		mixed bool
+	}{
+		{name: "resource only"},
+		{name: "mixed inline and resource", mixed: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newProductionWriterFixture(t, productionWriterOutput(t))
+			resourceID := "70000000-0000-4000-8000-000000000099"
+			resourcePath := "resource://tenant-private/source.pdf"
+			resource := &types.ProductionEvidenceSnapshot{
+				ID: resourceID, SourceItemID: uuid.NewString(), SnapshotType: types.ProductionEvidenceSnapshotFile,
+				StoragePath: resourcePath, ContentDigest: strings.Repeat("b", 64), RedactionMetadata: types.JSON(`{}`),
+			}
+			fixture.sources.evidence = []*types.ProductionEvidenceSnapshot{resource}
+			if test.mixed {
+				fixture.sources.evidence = append(fixture.sources.evidence, &types.ProductionEvidenceSnapshot{
+					ID: writerEvidenceID, SourceItemID: uuid.NewString(), SnapshotType: types.ProductionEvidenceSnapshotText,
+					InlineContent: types.JSON(`"inline"`), ContentDigest: strings.Repeat("c", 64), RedactionMetadata: types.JSON(`{}`),
+				})
+			}
+
+			_, err := fixture.writer.Write(productionWriterTestContext(t, fixture.run), fixture.run)
+
+			require.ErrorContains(t, err, "inline normalized evidence")
+			require.Zero(t, fixture.chat.calls)
+			require.Empty(t, fixture.chat.messages)
+			require.Empty(t, fixture.runs.persisted)
+			require.Empty(t, *fixture.events)
+			require.Zero(t, fixture.service.calls)
+			encoded, marshalErr := json.Marshal(fixture.chat.messages)
+			require.NoError(t, marshalErr)
+			require.NotContains(t, string(encoded), resourceID)
+			require.NotContains(t, string(encoded), resourcePath)
+		})
+	}
+}
+
 func TestProductionWriterStrictlyRejectsInvalidStructuredOutputBeforeAppend(t *testing.T) {
 	valid := productionWriterOutput(t, writerFact("block-a", "claim", []string{writerEvidenceID}, false))
 	for _, test := range []struct {
@@ -473,7 +803,7 @@ func TestProductionWriterRejectsUnsafeImageURLBeforeAppend(t *testing.T) {
 	require.Equal(t, []string{"persist"}, *fixture.events)
 }
 
-func TestProductionWriterCannotReplaceAnAuditedRawResponse(t *testing.T) {
+func TestProductionWriterReplaysAuditedRawInsteadOfReplacementModelResponse(t *testing.T) {
 	firstRaw := productionWriterOutput(t, writerFact("block-a", "first", []string{writerEvidenceID}, false))
 	fixture := newProductionWriterFixture(t, firstRaw)
 
@@ -484,12 +814,51 @@ func TestProductionWriterCannotReplaceAnAuditedRawResponse(t *testing.T) {
 
 	_, err = fixture.writer.Write(productionWriterTestContext(t, fixture.run), fixture.run)
 
-	require.ErrorIs(t, err, errProductionWriterAuditConflict)
-	require.Equal(t, 1, fixture.service.calls)
+	require.NoError(t, err)
+	require.Equal(t, 2, fixture.service.calls)
+	require.Equal(t, 1, fixture.chat.calls)
 	require.Equal(t, firstDigest, fixture.runs.digest)
 	var persisted string
 	require.NoError(t, json.Unmarshal(fixture.runs.persisted, &persisted))
 	require.Equal(t, firstRaw, persisted)
+}
+
+func TestProductionWriterReusesCanonicalAuditedRawWithoutSecondModelCall(t *testing.T) {
+	raw := productionWriterOutput(t, writerFact("block-a", "replayed", []string{writerEvidenceID}, false))
+	fixture := newProductionWriterFixture(t, raw)
+	digest := productionWriterRawDigest(t, raw)
+	canonical, err := types.CanonicalProductionJSON(types.JSON(strconv.Quote(raw)))
+	require.NoError(t, err)
+	fixture.run.RawModelResponse = canonical
+	fixture.run.RawModelResponseDigest = &digest
+	fixture.runs.run = fixture.run
+	fixture.chat.err = errors.New("model must not be called")
+
+	version, err := fixture.writer.Write(productionWriterTestContext(t, fixture.run), fixture.run)
+
+	require.NoError(t, err)
+	require.NotNil(t, version)
+	require.Zero(t, fixture.chat.calls)
+	require.Equal(t, []string{"append"}, *fixture.events)
+	require.Equal(t, productionRunVersionID(fixture.run.ID), fixture.service.input.VersionID)
+	require.Equal(t, 1, fixture.service.calls)
+}
+
+func TestProductionWriterRejectsAuditedRawDigestMismatchWithoutModelOrAppend(t *testing.T) {
+	raw := productionWriterOutput(t)
+	fixture := newProductionWriterFixture(t, raw)
+	canonical, err := types.CanonicalProductionJSON(types.JSON(strconv.Quote(raw)))
+	require.NoError(t, err)
+	badDigest := strings.Repeat("f", 64)
+	fixture.run.RawModelResponse = canonical
+	fixture.run.RawModelResponseDigest = &badDigest
+	fixture.runs.run = fixture.run
+
+	_, err = fixture.writer.Write(productionWriterTestContext(t, fixture.run), fixture.run)
+
+	require.ErrorIs(t, err, errProductionWriterAuditConflict)
+	require.Zero(t, fixture.chat.calls)
+	require.Zero(t, fixture.service.calls)
 }
 
 func TestProductionWriterValidatesCompleteCandidateBeforeAppend(t *testing.T) {

@@ -209,10 +209,7 @@ CREATE TRIGGER trg_production_evidence_snapshots_prevent_frozen_insert
 CREATE OR REPLACE FUNCTION guard_production_tool_call_invocation_identity()
 RETURNS TRIGGER AS $$
 BEGIN
-    IF NEW.id IS DISTINCT FROM OLD.id THEN
-        RAISE EXCEPTION 'production tool call invocation identity is immutable';
-    END IF;
-    IF OLD.status <> 'planned' AND (
+    IF NEW.id IS DISTINCT FROM OLD.id OR
         NEW.run_id IS DISTINCT FROM OLD.run_id OR
         NEW.tenant_id IS DISTINCT FROM OLD.tenant_id OR
         NEW.project_id IS DISTINCT FROM OLD.project_id OR
@@ -226,7 +223,7 @@ BEGIN
         NEW.attempt IS DISTINCT FROM OLD.attempt OR
         NEW.current_step IS DISTINCT FROM OLD.current_step OR
         NEW.idempotency_key IS DISTINCT FROM OLD.idempotency_key
-    ) THEN
+    THEN
         RAISE EXCEPTION 'production tool call invocation identity is immutable';
     END IF;
     IF OLD.approval_status IN ('approved', 'rejected') AND (

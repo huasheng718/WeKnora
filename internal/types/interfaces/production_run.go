@@ -71,7 +71,8 @@ type ProductionRunRepository interface {
 // returns the tenant identity needed to re-enter the normal tenant-scoped
 // Resume path and exposes no mutation surface of its own.
 type ProductionRunRecoveryRepository interface {
-	ListPendingWakeups(ctx context.Context, afterID string, limit int) ([]*types.ProductionRun, error)
+	ListPendingWakeups(ctx context.Context, afterID string, limit int, leaseTTL time.Duration) ([]*types.ProductionRun, error)
+	RearmExpiredRunning(ctx context.Context, tenantID uint64, runID string, attempt int, leaseTTL time.Duration) (*types.ProductionRun, bool, error)
 }
 
 // ProductionRunOrchestrator processes a durable run wake-up. The payload is

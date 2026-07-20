@@ -98,7 +98,6 @@ func TestProductionRunsPostgreSQLMigrationDeclaresEquivalentStructure(t *testing
 		"BEFORE UPDATE OR DELETE ON production_tool_calls",
 		"CREATE OR REPLACE FUNCTION guard_production_tool_call_invocation_identity()",
 		"CREATE TRIGGER trg_production_tool_calls_guard_invocation_identity",
-		"OLD.status <> 'planned'",
 		"CREATE OR REPLACE FUNCTION fence_production_tool_call_parent()",
 		"CREATE TRIGGER trg_production_tool_calls_fence_parent",
 		"FOR UPDATE",
@@ -124,6 +123,7 @@ func TestProductionRunsPostgreSQLMigrationDeclaresEquivalentStructure(t *testing
 	} {
 		require.Contains(t, up, declaration)
 	}
+	require.NotContains(t, up, "OLD.status <> 'planned'")
 	for _, secret := range []string{"api_key", "access_token", "refresh_token", "credential", "secret"} {
 		require.NotContains(t, strings.ToLower(up), secret)
 	}
@@ -234,6 +234,21 @@ func TestProductionRunsSQLiteMigrationFreezesToolCallPrimaryKeyWhilePlanned(t *t
 
 	_, err := db.Exec(`UPDATE production_tool_calls SET id = 'call-changed' WHERE id = 'call-1'`)
 	require.ErrorContains(t, err, "production tool call invocation identity is immutable")
+}
+
+func TestProductionRunsSQLiteMigrationFreezesInvocationIdentityImmediatelyAfterInsert(t *testing.T) {
+	for _, mutation := range productionToolCallIdentityMutations() {
+		t.Run(mutation.name, func(t *testing.T) {
+			db := openProductionRunsSQLite(t)
+			seedProductionRunScopes(t, db)
+			insertProductionRun(t, db, "run-1", 1, "project-1", "document-1", "source-set-1", "version-1", "run-key-1")
+			insertProductionRun(t, db, "run-other", 1, "project-1", "document-1", "source-set-1", "version-1", "run-key-other")
+			insertProductionToolCall(t, db, "call-1", "run-1", "call-key-1", 0, 0)
+
+			_, err := db.Exec(`UPDATE production_tool_calls SET ` + mutation.assignment + ` WHERE id = 'call-1'`)
+			require.ErrorContains(t, err, "production tool call invocation identity is immutable")
+		})
+	}
 }
 
 func TestProductionRunsSQLiteMigrationFreezesInvocationIdentityAfterApprovalRequested(t *testing.T) {

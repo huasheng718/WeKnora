@@ -165,6 +165,45 @@ func TestProductionMCPPlanSnapshotsApprovalWithoutProviderAccessOrSecrets(t *tes
 	require.NotContains(t, strings.ToLower(string(plan.RequestSnapshot)), "authorization")
 }
 
+func TestProductionMCPPlanRejectsKnownCredentialValuesInsideArguments(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		configure func(*types.MCPService)
+		arguments map[string]any
+	}{
+		{name: "bearer text", arguments: map[string]any{"query": "status Bearer super-secret-value"}},
+		{name: "nested repeated token", configure: func(service *types.MCPService) {
+			service.Headers = types.MCPHeaders{"X-Token": "aaaa"}
+		}, arguments: map[string]any{"nested": []any{map[string]any{"query": "prefix aaaa suffix"}}}},
+		{name: "url query secret", configure: func(service *types.MCPService) {
+			value := "https://example.com/mcp?access=actual-url-secret"
+			service.URL = &value
+		}, arguments: map[string]any{"url": "https://consumer.test/?q=actual-url-secret"}},
+		{name: "single character", configure: func(service *types.MCPService) {
+			service.Headers = types.MCPHeaders{"X-Key": "x"}
+		}, arguments: map[string]any{"nested": map[string]any{"value": "prefix x suffix"}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			adapter, call, manager, client, _ := productionMCPFixture(t, false)
+			if test.configure != nil {
+				test.configure(adapter.services.(*productionMCPServiceStub).service)
+			}
+			request, err := canonicalProductionValue(map[string]any{
+				"arguments": test.arguments, "source_item_id": mcpAdapterSourceID,
+			})
+			require.NoError(t, err)
+			call.RequestSnapshot, call.RequestDigest = request, productionToolDigest(request)
+
+			plan, err := adapter.Plan(context.Background(), call)
+
+			require.Nil(t, plan)
+			require.ErrorIs(t, err, errProductionToolCallInvalid)
+			require.Zero(t, manager.calls)
+			require.Zero(t, client.calls)
+		})
+	}
+}
+
 func TestProductionMCPExecutePersistsEvidenceAndReplaysWithoutProviderAccess(t *testing.T) {
 	adapter, call, manager, client, _ := productionMCPFixture(t, true)
 	plan, err := adapter.Plan(context.Background(), call)

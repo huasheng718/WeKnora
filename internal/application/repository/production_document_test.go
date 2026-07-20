@@ -556,6 +556,9 @@ func TestProductionDocumentRepositoryPostgresRollsBackOnFinalHeadUpdateFailure(t
 		WithArgs(sourceSetID, uint64(7), sourceProjectID, sourceTypeID, types.ProductionSourceSetFrozen, 1).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "project_id", "document_type_id", "status"}).
 			AddRow(sourceSetID, 7, sourceProjectID, sourceTypeID, string(types.ProductionSourceSetFrozen)))
+	mock.ExpectQuery(`SELECT \* FROM "production_document_versions" WHERE id = \$1.*LIMIT \$2`).
+		WithArgs(firstVersionID, 1).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}))
 	mock.ExpectExec(`INSERT INTO "production_document_versions"`).
 		WithArgs(
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),

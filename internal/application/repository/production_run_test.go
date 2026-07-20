@@ -199,7 +199,7 @@ func TestProductionRunRecoveryRepositoryListsOnlyQueuedWakeupLag(t *testing.T) {
 	require.NoError(t, repo.Create(context.Background(), marked))
 
 	recovery := NewProductionRunRecoveryRepository(db)
-	runs, err := recovery.ListPendingWakeups(context.Background(), "", 100)
+	runs, err := recovery.ListPendingWakeups(context.Background(), "", 100, 5*time.Minute)
 
 	require.NoError(t, err)
 	require.Len(t, runs, 1)

@@ -364,6 +364,11 @@ func (s *productionDocumentService) AppendVersion(
 			return nil, err
 		}
 	}
+	if input.VersionID != "" {
+		if err := requireProductionSourceID(input.VersionID, "version id"); err != nil {
+			return nil, err
+		}
+	}
 
 	document, err := s.documents.GetDocument(ctx, tenantID, documentID)
 	if err != nil {
@@ -405,8 +410,18 @@ func (s *productionDocumentService) AppendVersion(
 	if err := requireProductionInternalAppendScope(ctx, origin, blocks); err != nil {
 		return nil, err
 	}
+	versionID := uuid.NewString()
+	principal, internal := types.ProductionInternalPrincipalFromContext(ctx)
+	if internal {
+		if input.VersionID == "" || input.VersionID != productionRunVersionID(principal.RunID) {
+			return nil, types.ErrProductionForbidden
+		}
+		versionID = input.VersionID
+	} else if input.VersionID != "" {
+		return nil, types.ErrProductionForbidden
+	}
 	version := &types.ProductionDocumentVersion{
-		ID: uuid.NewString(), DocumentID: document.ID, SourceSetID: input.SourceSetID,
+		ID: versionID, DocumentID: document.ID, SourceSetID: input.SourceSetID,
 		Origin: origin, ChangeSummary: input.ChangeSummary, CreatedBy: userID, Blocks: blocks,
 	}
 	version.DocumentTypeCode = documentType.Code
@@ -444,6 +459,9 @@ func (s *productionDocumentService) AppendVersion(
 			TargetID: version.ID, Outcome: types.AuditOutcomeSuccess,
 		})
 	}); err != nil {
+		if errors.Is(err, types.ErrProductionDocumentVersionExists) {
+			return s.documents.GetVersion(ctx, tenantID, version.ID)
+		}
 		return nil, err
 	}
 	return version, nil

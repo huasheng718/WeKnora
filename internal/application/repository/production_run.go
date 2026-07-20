@@ -62,19 +62,68 @@ func (r *productionRunRepository) ListPendingWakeups(
 	ctx context.Context,
 	afterID string,
 	limit int,
+	leaseTTL time.Duration,
 ) ([]*types.ProductionRun, error) {
 	if limit < 1 || limit > 1000 {
 		limit = 1000
 	}
 	var runs []*types.ProductionRun
-	query := database.DBFromContext(ctx, r.db).WithContext(ctx).
-		Select("id", "tenant_id", "attempt", "created_at").
-		Where("status = ? AND wakeup_version > wakeup_enqueued_version", types.ProductionRunQueued)
+	if leaseTTL <= 0 {
+		return nil, errors.New("production recovery lease must be positive")
+	}
+	db := database.DBFromContext(ctx, r.db).WithContext(ctx)
+	query := db.Select("id", "tenant_id", "status", "attempt", "created_at")
+	if db.Dialector.Name() == "postgres" {
+		query = query.Where(
+			"(status = ? AND wakeup_version > wakeup_enqueued_version) OR (status = ? AND updated_at <= CURRENT_TIMESTAMP - (? * INTERVAL '1 second'))",
+			types.ProductionRunQueued, types.ProductionRunRunning, leaseTTL.Seconds(),
+		)
+	} else {
+		modifier := fmt.Sprintf("-%g seconds", leaseTTL.Seconds())
+		query = query.Where(
+			"(status = ? AND wakeup_version > wakeup_enqueued_version) OR (status = ? AND julianday(updated_at) <= julianday(CURRENT_TIMESTAMP, ?))",
+			types.ProductionRunQueued, types.ProductionRunRunning, modifier,
+		)
+	}
 	if afterID != "" {
 		query = query.Where("id > ?", afterID)
 	}
 	err := query.Order("id ASC").Limit(limit).Find(&runs).Error
 	return runs, err
+}
+
+func (r *productionRunRepository) RearmExpiredRunning(
+	ctx context.Context,
+	tenantID uint64,
+	runID string,
+	attempt int,
+	leaseTTL time.Duration,
+) (*types.ProductionRun, bool, error) {
+	if tenantID == 0 || attempt < 1 || leaseTTL <= 0 {
+		return nil, false, errors.New("production recovery fence is invalid")
+	}
+	db := database.DBFromContext(ctx, r.db).WithContext(ctx)
+	query := db.Model(&types.ProductionRun{}).
+		Where("tenant_id = ? AND id = ? AND status = ? AND attempt = ?", tenantID, runID, types.ProductionRunRunning, attempt)
+	if db.Dialector.Name() == "postgres" {
+		query = query.Where("updated_at <= CURRENT_TIMESTAMP - (? * INTERVAL '1 second')", leaseTTL.Seconds())
+	} else {
+		query = query.Where("julianday(updated_at) <= julianday(CURRENT_TIMESTAMP, ?)", fmt.Sprintf("-%g seconds", leaseTTL.Seconds()))
+	}
+	result := query.Updates(map[string]any{
+		"status":         types.ProductionRunQueued,
+		"attempt":        gorm.Expr("attempt + 1"),
+		"wakeup_version": gorm.Expr("wakeup_version + 1"),
+		"updated_at":     gorm.Expr("CURRENT_TIMESTAMP"),
+	})
+	if result.Error != nil {
+		return nil, false, result.Error
+	}
+	if result.RowsAffected != 1 {
+		return nil, false, nil
+	}
+	rearmed, err := r.Get(ctx, tenantID, runID)
+	return rearmed, err == nil, err
 }
 
 func (r *productionRunRepository) Create(ctx context.Context, run *types.ProductionRun) error {

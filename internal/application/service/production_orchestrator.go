@@ -223,8 +223,9 @@ func (o *ProductionOrchestrator) persistStepResult(
 					callPatch.ResponseEvidenceID = stringPtr(result.ToolCallResult.ResponseEvidenceID)
 					callPatch.ResponseEvidenceSourceItemID = stringPtr(result.ToolCallResult.ResponseEvidenceSourceItemID)
 				} else if result.ToolCallResult.Status == types.ProductionToolCallFailed {
-					callPatch.ErrorCode = stringPtr(result.ToolCallResult.ErrorCode)
-					callPatch.ErrorMessage = stringPtr(result.ToolCallResult.ErrorMessage)
+					failure := productionToolResultFailure(result.ToolCallResult.ErrorCode)
+					callPatch.ErrorCode = stringPtr(failure.code)
+					callPatch.ErrorMessage = stringPtr(failure.message)
 					to = types.ProductionRunFailed
 					patch.IncrementWakeup = false
 					patch.CompletedAt = &completedAt
@@ -287,12 +288,8 @@ func (o *ProductionOrchestrator) persistExecutionFailure(
 	active []*types.ProductionToolCall,
 	executeErr error,
 ) error {
-	code := "STEP_EXECUTION_FAILED"
-	message := executeErr.Error()
-	if errors.Is(executeErr, types.ErrProductionToolReconciliationRequired) {
-		code = "TOOL_RECONCILIATION_REQUIRED"
-		message = types.ErrProductionToolReconciliationRequired.Error()
-	}
+	failure := productionExecutionFailure(executeErr)
+	code, message := failure.code, failure.message
 	completedAt := o.now().UTC()
 	return o.uow.WithinTransaction(ctx, func(txCtx context.Context) error {
 		if err := o.failActiveToolCalls(

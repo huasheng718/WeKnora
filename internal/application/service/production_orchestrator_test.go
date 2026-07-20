@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -410,13 +411,19 @@ func TestProductionOrchestratorFailureCancellationAndTerminalResumeGuards(t *tes
 	t.Run("executor failure is durable", func(t *testing.T) {
 		f := newProductionOrchestratorFixture(t, 0)
 		f.executor.fn = func(*types.ProductionRun, []*types.ProductionToolCall) (ProductionStepResult, error) {
-			return ProductionStepResult{}, errors.New("model failed")
+			return ProductionStepResult{}, errors.New("model failed with Bearer durable-secret " + strings.Repeat("x", 4096))
 		}
 		require.NoError(t, f.orchestrator.HandleRun(context.Background(), f.payload()))
 		run := f.load(t)
 		require.Equal(t, types.ProductionRunFailed, run.Status)
+		require.NotNil(t, run.ErrorCode)
+		require.Equal(t, "STEP_EXECUTION_FAILED", *run.ErrorCode)
 		require.NotNil(t, run.ErrorMessage)
-		require.Contains(t, *run.ErrorMessage, "model failed")
+		require.Equal(t, "production step execution failed", *run.ErrorMessage)
+		require.LessOrEqual(t, len(*run.ErrorMessage), 128)
+		encoded, err := json.Marshal(run)
+		require.NoError(t, err)
+		require.NotContains(t, string(encoded), "durable-secret")
 	})
 
 	t.Run("cancelled cannot resume or execute", func(t *testing.T) {
@@ -555,16 +562,66 @@ func TestProductionOrchestratorApprovedExecutorFailureTerminalizesCallAndRun(t *
 	)
 	require.NoError(t, err)
 	f.executor.fn = func(*types.ProductionRun, []*types.ProductionToolCall) (ProductionStepResult, error) {
-		return ProductionStepResult{}, errors.New("approved tool execution failed")
+		return ProductionStepResult{}, fmt.Errorf("%w: Bearer approved-tool-secret %s", errProductionProviderExecution, strings.Repeat("z", 4096))
 	}
 
 	require.NoError(t, f.orchestrator.HandleRun(context.Background(), f.payload()))
 	run := f.load(t)
 	require.Equal(t, types.ProductionRunFailed, run.Status)
+	require.Equal(t, "PROVIDER_EXECUTION_FAILED", *run.ErrorCode)
+	require.Equal(t, "production provider execution failed", *run.ErrorMessage)
 	call, err := f.repo.GetToolCall(context.Background(), 7, calls[0].ID)
 	require.NoError(t, err)
 	require.Equal(t, types.ProductionToolCallFailed, call.Status)
 	require.NotNil(t, call.CompletedAt)
+	require.Equal(t, run.ErrorCode, call.ErrorCode)
+	require.Equal(t, run.ErrorMessage, call.ErrorMessage)
+	encoded, err := json.Marshal(struct {
+		Run  *types.ProductionRun      `json:"run"`
+		Call *types.ProductionToolCall `json:"call"`
+	}{Run: run, Call: call})
+	require.NoError(t, err)
+	require.NotContains(t, string(encoded), "approved-tool-secret")
+}
+
+func TestProductionOrchestratorSanitizesFailedToolResultMetadata(t *testing.T) {
+	f := newProductionOrchestratorFixture(t, 0)
+	f.executor.fn = func(*types.ProductionRun, []*types.ProductionToolCall) (ProductionStepResult, error) {
+		return ProductionStepResult{ToolCall: approvalRequiredCall()}, nil
+	}
+	require.NoError(t, f.orchestrator.HandleRun(context.Background(), f.payload()))
+	calls, err := f.repo.ListToolCalls(context.Background(), 7, f.run.ID)
+	require.NoError(t, err)
+	_, err = f.orchestrator.ResolveDecision(
+		context.Background(), 7, calls[0].ID, types.ProductionToolCallApproved, uuid.NewString(),
+	)
+	require.NoError(t, err)
+	f.executor.fn = func(*types.ProductionRun, []*types.ProductionToolCall) (ProductionStepResult, error) {
+		return ProductionStepResult{ToolCallResult: &ProductionToolCallResult{
+			ToolCallID: calls[0].ID, Status: types.ProductionToolCallFailed,
+			ErrorCode:    "ATTACKER_" + strings.Repeat("X", 1024),
+			ErrorMessage: "evidence-id-controlled-secret " + strings.Repeat("y", 4096),
+		}}, nil
+	}
+
+	require.NoError(t, f.orchestrator.HandleRun(context.Background(), f.payload()))
+	run := f.load(t)
+	call, err := f.repo.GetToolCall(context.Background(), 7, calls[0].ID)
+	require.NoError(t, err)
+	for _, values := range []struct {
+		code    *string
+		message *string
+	}{{run.ErrorCode, run.ErrorMessage}, {call.ErrorCode, call.ErrorMessage}} {
+		require.NotNil(t, values.code)
+		require.NotNil(t, values.message)
+		require.Equal(t, "TOOL_EXECUTION_FAILED", *values.code)
+		require.Equal(t, "production tool execution failed", *values.message)
+		require.LessOrEqual(t, len(*values.message), 128)
+	}
+	encoded, err := json.Marshal([]any{run, call})
+	require.NoError(t, err)
+	require.NotContains(t, string(encoded), "controlled-secret")
+	require.NotContains(t, string(encoded), "ATTACKER_")
 }
 
 func TestProductionOrchestratorCancelTerminalizesPendingAndApprovedChildren(t *testing.T) {

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -13,13 +14,31 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/Tencent/WeKnora/internal/utils"
+	"github.com/google/uuid"
+)
+
+const (
+	productionWriterMaxEvidenceCount        = 128
+	productionWriterMaxInlineEvidenceBytes  = 64 * 1024
+	productionWriterMaxEvidenceBytes        = 512 * 1024
+	productionWriterMaxCurrentVersionBlocks = 512
+	productionWriterMaxCurrentVersionBytes  = 512 * 1024
+	productionWriterMaxContextBytes         = 1024 * 1024
+	productionWriterMaxRawResponseBytes     = 1024 * 1024
+	productionWriterMaxOutputBlocks         = 256
+	productionWriterMaxOutputBlockBytes     = 64 * 1024
+	productionWriterMaxOutputBytes          = 512 * 1024
+	productionWriterMaxCompletionTokens     = 8192
 )
 
 var (
-	errProductionWriterConfiguration = errors.New("production writer dependencies are required")
-	errProductionWriterScope         = errors.New("production writer input is outside the governed run scope")
-	errProductionWriterOutput        = errors.New("production writer model output is invalid")
-	errProductionWriterAuditConflict = errors.New("production writer raw response audit lost its run fence")
+	errProductionWriterConfiguration         = errors.New("production writer dependencies are required")
+	errProductionWriterScope                 = errors.New("production writer input is outside the governed run scope")
+	errProductionWriterOutput                = errors.New("production writer model output is invalid")
+	errProductionWriterAuditConflict         = errors.New("production writer raw response audit lost its run fence")
+	errProductionWriterEvidenceNormalization = errors.New("production writer requires inline normalized evidence")
+	errProductionWriterInputLimit            = errors.New("production writer input exceeds size limit")
+	errProductionWriterOutputLimit           = errors.New("production writer output exceeds size limit")
 )
 
 type ProductionWriterBlock struct {
@@ -59,7 +78,6 @@ type productionWriterPromptEvidence struct {
 	SnapshotType  types.ProductionEvidenceSnapshotType `json:"snapshot_type"`
 	ContentDigest string                               `json:"content_digest"`
 	Content       any                                  `json:"content,omitempty"`
-	Resource      string                               `json:"resource,omitempty"`
 }
 
 type ProductionWriter struct {
@@ -117,55 +135,66 @@ func (w *ProductionWriter) Write(
 	if err != nil {
 		return nil, err
 	}
-	messages, err := productionWriterMessages(run, documentType, document, sourceSet, inputVersion, evidence)
+	responseContent, rawDigest, audited, err := productionWriterAuditedResponse(run)
 	if err != nil {
 		return nil, err
+	}
+	if !audited {
+		messages, messageErr := productionWriterMessages(run, documentType, document, sourceSet, inputVersion, evidence)
+		if messageErr != nil {
+			return nil, messageErr
+		}
+		chatModel, modelErr := w.modelService.GetChatModel(governedCtx, run.ModelID)
+		if modelErr != nil {
+			return nil, modelErr
+		}
+		if chatModel == nil {
+			return nil, errProductionWriterConfiguration
+		}
+		response, chatErr := chatModel.Chat(governedCtx, messages, &chat.ChatOptions{
+			Temperature: 0,
+			MaxTokens:   productionWriterMaxCompletionTokens,
+			Format:      utils.GenerateSchema[ProductionWriterOutput](),
+		})
+		if chatErr != nil {
+			return nil, chatErr
+		}
+		if response == nil {
+			return nil, fmt.Errorf("%w: model returned no response", errProductionWriterOutput)
+		}
+		rawSnapshot, marshalErr := json.Marshal(response.Content)
+		if marshalErr != nil {
+			return nil, marshalErr
+		}
+		canonicalRaw, canonicalErr := types.CanonicalProductionJSON(rawSnapshot)
+		if canonicalErr != nil {
+			return nil, canonicalErr
+		}
+		if len(canonicalRaw) > productionWriterMaxRawResponseBytes {
+			return nil, errProductionWriterOutputLimit
+		}
+		rawSum := sha256.Sum256(canonicalRaw)
+		rawDigest = hex.EncodeToString(rawSum[:])
+		auditedRun, changed, transitionErr := w.runs.Transition(
+			governedCtx, run.TenantID, run.ID, productionRunCAS(run), types.ProductionRunRunning,
+			interfaces.ProductionRunPatch{RawModelResponse: canonicalRaw, RawModelResponseDigest: &rawDigest},
+		)
+		if transitionErr != nil {
+			return nil, transitionErr
+		}
+		if !changed || auditedRun == nil {
+			auditedRun, transitionErr = w.runs.Get(governedCtx, run.TenantID, run.ID)
+			if transitionErr != nil {
+				return nil, transitionErr
+			}
+		}
+		responseContent, rawDigest, audited, transitionErr = productionWriterAuditedResponse(auditedRun)
+		if transitionErr != nil || !audited {
+			return nil, errProductionWriterAuditConflict
+		}
 	}
 
-	chatModel, err := w.modelService.GetChatModel(governedCtx, run.ModelID)
-	if err != nil {
-		return nil, err
-	}
-	if chatModel == nil {
-		return nil, errProductionWriterConfiguration
-	}
-	response, err := chatModel.Chat(governedCtx, messages, &chat.ChatOptions{
-		Temperature: 0,
-		Format:      utils.GenerateSchema[ProductionWriterOutput](),
-	})
-	if err != nil {
-		return nil, err
-	}
-	if response == nil {
-		return nil, fmt.Errorf("%w: model returned no response", errProductionWriterOutput)
-	}
-
-	rawSnapshot, err := json.Marshal(response.Content)
-	if err != nil {
-		return nil, err
-	}
-	canonicalRaw, err := types.CanonicalProductionJSON(rawSnapshot)
-	if err != nil {
-		return nil, err
-	}
-	rawSum := sha256.Sum256(canonicalRaw)
-	rawDigest := hex.EncodeToString(rawSum[:])
-	auditedRun, changed, err := w.runs.Transition(
-		governedCtx,
-		run.TenantID,
-		run.ID,
-		productionRunCAS(run),
-		types.ProductionRunRunning,
-		interfaces.ProductionRunPatch{RawModelResponse: canonicalRaw, RawModelResponseDigest: &rawDigest},
-	)
-	if err != nil {
-		return nil, err
-	}
-	if !changed || auditedRun == nil || auditedRun.RawModelResponseDigest == nil || *auditedRun.RawModelResponseDigest != rawDigest {
-		return nil, errProductionWriterAuditConflict
-	}
-
-	output, err := decodeProductionWriterOutput(response.Content)
+	output, err := decodeProductionWriterOutput(responseContent)
 	if err != nil {
 		return nil, err
 	}
@@ -178,12 +207,46 @@ func (w *ProductionWriter) Write(
 	}
 
 	return w.service.AppendVersion(governedCtx, string(run.DocumentID), interfaces.AppendProductionVersionInput{
+		VersionID:       productionRunVersionID(run.ID),
 		ParentVersionID: *run.InputVersionID,
 		SourceSetID:     run.SourceSetID,
 		Origin:          types.ProductionDocumentOriginAI,
 		ChangeSummary:   "AI evidence-grounded production draft",
 		Blocks:          inputs,
 	})
+}
+
+func productionRunVersionID(runID string) string {
+	return uuid.NewSHA1(uuid.MustParse("9bc0c43e-38f0-475a-aab3-a1d2c194c93f"), []byte(runID+":ai-version")).String()
+}
+
+func productionWriterAuditedResponse(run *types.ProductionRun) (string, string, bool, error) {
+	if run == nil {
+		return "", "", false, errProductionWriterAuditConflict
+	}
+	if len(run.RawModelResponse) == 0 && run.RawModelResponseDigest == nil {
+		return "", "", false, nil
+	}
+	if len(run.RawModelResponse) == 0 || run.RawModelResponseDigest == nil {
+		return "", "", false, errProductionWriterAuditConflict
+	}
+	if len(run.RawModelResponse) > productionWriterMaxRawResponseBytes {
+		return "", "", false, errProductionWriterOutputLimit
+	}
+	canonical, err := types.CanonicalProductionJSON(run.RawModelResponse)
+	if err != nil || !bytes.Equal(canonical, run.RawModelResponse) {
+		return "", "", false, errProductionWriterAuditConflict
+	}
+	sum := sha256.Sum256(canonical)
+	digest := hex.EncodeToString(sum[:])
+	if digest != *run.RawModelResponseDigest {
+		return "", "", false, errProductionWriterAuditConflict
+	}
+	var content string
+	if err := json.Unmarshal(canonical, &content); err != nil {
+		return "", "", false, errProductionWriterAuditConflict
+	}
+	return content, digest, true, nil
 }
 
 func decodeProductionWriterDocumentType(raw types.JSON) (*productionWriterDocumentTypeSnapshot, error) {
@@ -239,32 +302,40 @@ func (w *ProductionWriter) loadContext(
 		inputVersion.ProjectID != run.ProjectID || inputVersion.DocumentID != string(run.DocumentID) {
 		return nil, nil, nil, nil, nil, nil, errProductionWriterScope
 	}
+	if len(inputVersion.Blocks) > productionWriterMaxCurrentVersionBlocks {
+		return nil, nil, nil, nil, nil, nil, errProductionWriterInputLimit
+	}
+	encodedVersion, err := json.Marshal(inputVersion)
+	if err != nil {
+		return nil, nil, nil, nil, nil, nil, errProductionWriterScope
+	}
+	if len(encodedVersion) > productionWriterMaxCurrentVersionBytes {
+		return nil, nil, nil, nil, nil, nil, errProductionWriterInputLimit
+	}
 	evidence, err := w.sources.ListAcceptedEvidence(ctx, run.TenantID, run.ProjectID, run.SourceSetID)
 	if err != nil {
 		return nil, nil, nil, nil, nil, nil, err
 	}
+	if len(evidence) > productionWriterMaxEvidenceCount {
+		return nil, nil, nil, nil, nil, nil, errProductionWriterInputLimit
+	}
 	accepted := make(map[string]struct{}, len(evidence))
 	evidenceByID := make(map[string]*types.ProductionEvidenceSnapshot, len(evidence))
+	totalEvidenceBytes := 0
 	for _, snapshot := range evidence {
 		if snapshot == nil || snapshot.ID == "" {
 			return nil, nil, nil, nil, nil, nil, fmt.Errorf("%w: accepted evidence snapshot is invalid", errProductionWriterScope)
 		}
 		copy := *snapshot
-		if copy.StoragePath != "" {
-			if w.resources == nil {
-				return nil, nil, nil, nil, nil, nil, fmt.Errorf("%w: resource catalog is required", errProductionWriterConfiguration)
-			}
-			resource, resolveErr := w.resources.ResolveBound(ctx, copy.StoragePath, interfaces.ResourceBindingRequirement{
-				TenantID: run.TenantID, OwnerType: types.ResourceOwnerTypeProductionProject, OwnerID: run.ProjectID,
-			})
-			if resolveErr != nil {
-				return nil, nil, nil, nil, nil, nil, resolveErr
-			}
-			if resource == nil || resource.TenantID != run.TenantID || resource.State != types.ResourceStateActive ||
-				resource.Lifecycle != types.ResourceLifecyclePersistent {
-				return nil, nil, nil, nil, nil, nil, types.ErrProductionEvidenceResourceInvalid
-			}
-			copy.ResolvedContentDigest = resource.ContentHash
+		if copy.StoragePath != "" || len(copy.InlineContent) == 0 {
+			return nil, nil, nil, nil, nil, nil, errProductionWriterEvidenceNormalization
+		}
+		if len(copy.InlineContent) > productionWriterMaxInlineEvidenceBytes {
+			return nil, nil, nil, nil, nil, nil, errProductionWriterInputLimit
+		}
+		totalEvidenceBytes += len(copy.InlineContent)
+		if totalEvidenceBytes > productionWriterMaxEvidenceBytes {
+			return nil, nil, nil, nil, nil, nil, errProductionWriterInputLimit
 		}
 		if _, duplicate := accepted[copy.ID]; duplicate {
 			return nil, nil, nil, nil, nil, nil, fmt.Errorf("%w: duplicate accepted evidence id", errProductionWriterScope)
@@ -298,8 +369,6 @@ func productionWriterMessages(
 				return nil, err
 			}
 			entry.Content = cleaned
-		} else {
-			entry.Resource = snapshot.StoragePath
 		}
 		promptEvidence = append(promptEvidence, entry)
 	}
@@ -329,6 +398,9 @@ func productionWriterMessages(
 	if err != nil {
 		return nil, err
 	}
+	if len(encoded) > productionWriterMaxContextBytes {
+		return nil, errProductionWriterInputLimit
+	}
 	return []chat.Message{
 		{
 			Role: "system",
@@ -340,6 +412,9 @@ func productionWriterMessages(
 }
 
 func decodeProductionWriterOutput(raw string) (*ProductionWriterOutput, error) {
+	if len(raw) > productionWriterMaxOutputBytes {
+		return nil, errProductionWriterOutputLimit
+	}
 	var wire productionWriterOutputWire
 	if err := decodeProductionJSON(types.JSON(raw), &wire, true); err != nil {
 		return nil, fmt.Errorf("%w: %v", errProductionWriterOutput, err)
@@ -347,11 +422,17 @@ func decodeProductionWriterOutput(raw string) (*ProductionWriterOutput, error) {
 	if wire.Blocks == nil || len(*wire.Blocks) == 0 {
 		return nil, fmt.Errorf("%w: blocks are required", errProductionWriterOutput)
 	}
+	if len(*wire.Blocks) > productionWriterMaxOutputBlocks {
+		return nil, errProductionWriterOutputLimit
+	}
 	output := &ProductionWriterOutput{Blocks: make([]ProductionWriterBlock, 0, len(*wire.Blocks))}
 	for index, block := range *wire.Blocks {
 		if block.LogicalBlockID == nil || block.BlockType == nil || len(block.Content) == 0 ||
 			block.EvidenceRefs == nil || block.NeedsConfirmation == nil {
 			return nil, fmt.Errorf("%w: block %d is missing required fields", errProductionWriterOutput, index)
+		}
+		if len(block.Content) > productionWriterMaxOutputBlockBytes {
+			return nil, errProductionWriterOutputLimit
 		}
 		output.Blocks = append(output.Blocks, ProductionWriterBlock{
 			LogicalBlockID: *block.LogicalBlockID, BlockType: *block.BlockType,
