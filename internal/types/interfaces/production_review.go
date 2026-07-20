@@ -1,0 +1,19 @@
+package interfaces
+
+import (
+	"context"
+
+	"github.com/Tencent/WeKnora/internal/types"
+)
+
+type ProductionReviewRepository interface {
+	CreateAnnotation(ctx context.Context, annotation *types.ProductionAnnotation) error
+	ResolveAnnotation(ctx context.Context, tenantID uint64, annotationID, actorID string, resolution types.ProductionAnnotationStatus) (bool, error)
+	CountOpenBlocking(ctx context.Context, tenantID uint64, versionID string) (int64, error)
+	CreateReview(ctx context.Context, request *types.ProductionReviewRequest, steps []*types.ProductionReviewStep) error
+	GetReview(ctx context.Context, tenantID uint64, reviewID string) (*types.ProductionReviewRequest, error)
+	GetReviewStep(ctx context.Context, tenantID uint64, stepID string) (*types.ProductionReviewStep, error)
+	DecideStep(ctx context.Context, tenantID uint64, stepID string, from, to types.ProductionReviewDecision, actorID, comment string) (bool, error)
+	TransitionReview(ctx context.Context, tenantID uint64, reviewID string, from, to types.ProductionReviewStatus, actorID, reason string) (bool, error)
+	ObsoletePendingByDocument(ctx context.Context, tenantID uint64, documentID, exceptVersionID string) error
+}
