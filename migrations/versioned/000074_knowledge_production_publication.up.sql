@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS production_release_targets (
     target_knowledge_base_id VARCHAR(36) NOT NULL,
     knowledge_id VARCHAR(36) NOT NULL UNIQUE,
     release_digest VARCHAR(64) NOT NULL,
+    config_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+    config_digest VARCHAR(64) NOT NULL DEFAULT '44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a',
     status VARCHAR(20) NOT NULL DEFAULT 'building',
     retention_days INTEGER NOT NULL DEFAULT 30,
     retention_until TIMESTAMP NULL,
@@ -52,6 +54,10 @@ CREATE TABLE IF NOT EXISTS production_release_targets (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT chk_production_release_targets_digest CHECK (release_digest ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT chk_production_release_targets_config_snapshot CHECK (
+        jsonb_typeof(config_snapshot) = 'object' AND octet_length(config_snapshot::text) <= 262144
+    ),
+    CONSTRAINT chk_production_release_targets_config_digest CHECK (config_digest ~ '^[0-9a-f]{64}$'),
     CONSTRAINT chk_production_release_targets_status CHECK (status IN ('building', 'ready', 'active', 'failed', 'rolled_back', 'cleanup_pending', 'cleaned')),
     CONSTRAINT chk_production_release_targets_retention CHECK (retention_days >= 1 AND retention_days <= 3650),
     UNIQUE(release_id, target_knowledge_base_id),
@@ -202,6 +208,8 @@ BEGIN
        NEW.target_knowledge_base_id IS DISTINCT FROM OLD.target_knowledge_base_id OR
        NEW.knowledge_id IS DISTINCT FROM OLD.knowledge_id OR
        NEW.release_digest IS DISTINCT FROM OLD.release_digest OR
+       NEW.config_snapshot IS DISTINCT FROM OLD.config_snapshot OR
+       NEW.config_digest IS DISTINCT FROM OLD.config_digest OR
        NEW.retention_days IS DISTINCT FROM OLD.retention_days OR
        NEW.created_at IS DISTINCT FROM OLD.created_at THEN
         RAISE EXCEPTION 'production release target identity is immutable';

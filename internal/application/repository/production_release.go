@@ -1,0 +1,486 @@
+package repository
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/Tencent/WeKnora/internal/database"
+	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/google/uuid"
+	"gorm.io/gorm"
+)
+
+const postgresProductionProjectionHeadCASSQL = `
+UPDATE production_projection_heads
+SET active_release_target_id = ?, lock_version = lock_version + 1, updated_at = ?
+WHERE tenant_id = ? AND document_id = ? AND target_knowledge_base_id = ? AND lock_version = ?`
+
+var productionReleaseDigestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+type ProductionReleaseClock interface {
+	Now() time.Time
+}
+
+type productionReleaseSystemClock struct{}
+
+func (productionReleaseSystemClock) Now() time.Time { return time.Now() }
+
+type productionReleaseRepository struct {
+	db    *gorm.DB
+	clock ProductionReleaseClock
+}
+
+func NewProductionReleaseRepository(db *gorm.DB) interfaces.ProductionReleaseRepository {
+	return NewProductionReleaseRepositoryWithClock(db, productionReleaseSystemClock{})
+}
+
+func NewProductionReleaseRepositoryWithClock(db *gorm.DB, clock ProductionReleaseClock) interfaces.ProductionReleaseRepository {
+	if clock == nil {
+		clock = productionReleaseSystemClock{}
+	}
+	return &productionReleaseRepository{db: db, clock: clock}
+}
+
+func (r *productionReleaseRepository) nowUTC() time.Time {
+	return r.clock.Now().UTC().Truncate(time.Second)
+}
+
+func requireProductionReleaseTenantContext(ctx context.Context, tenantID uint64) error {
+	if ctx == nil || tenantID == 0 {
+		return types.ErrProductionForbidden
+	}
+	contextTenantID, ok := types.TenantIDFromContext(ctx)
+	if ok && contextTenantID != tenantID {
+		return types.ErrProductionForbidden
+	}
+	return nil
+}
+
+func trustedProductionReleaseActor(ctx context.Context, tenantID uint64, suppliedActorID string) (string, error) {
+	if err := requireProductionReleaseTenantContext(ctx, tenantID); err != nil {
+		return "", err
+	}
+	contextTenantID, ok := types.TenantIDFromContext(ctx)
+	if !ok || contextTenantID != tenantID {
+		return "", types.ErrProductionForbidden
+	}
+	actorID, ok := types.UserIDFromContext(ctx)
+	parsed, parseErr := uuid.Parse(actorID)
+	if !ok || parseErr != nil || parsed == uuid.Nil || parsed.String() != actorID || actorID == types.ProductionSystemActorID {
+		return "", types.ErrProductionForbidden
+	}
+	if suppliedActorID != "" && suppliedActorID != actorID {
+		return "", types.ErrProductionForbidden
+	}
+	return actorID, nil
+}
+
+func requireProductionReleaseIdentity(name, value string) error {
+	if strings.TrimSpace(value) == "" || value != strings.TrimSpace(value) {
+		return fmt.Errorf("%w: %s is required", types.ErrProductionReleaseInvalid, name)
+	}
+	return nil
+}
+
+func validateProductionReleaseForCreate(release *types.ProductionRelease, targets []*types.ProductionReleaseTarget) error {
+	if release == nil || len(targets) == 0 {
+		return fmt.Errorf("%w: release and at least one target are required", types.ErrProductionReleaseInvalid)
+	}
+	for name, value := range map[string]string{
+		"id": release.ID, "project_id": release.ProjectID, "document_id": release.DocumentID,
+		"version_id": release.VersionID, "review_request_id": release.ReviewRequestID,
+	} {
+		if err := requireProductionReleaseIdentity(name, value); err != nil {
+			return err
+		}
+	}
+	if release.TenantID == 0 || !productionReleaseDigestPattern.MatchString(release.ReleaseDigest) {
+		return fmt.Errorf("%w: tenant and lowercase SHA-256 release digest are required", types.ErrProductionReleaseInvalid)
+	}
+	if release.Status != "" && release.Status != types.ProductionReleaseBuilding {
+		return types.ErrProductionReleaseLifecycle
+	}
+	if release.RetentionDays < 0 || release.RetentionDays > 3650 {
+		return fmt.Errorf("%w: retention days are out of range", types.ErrProductionReleaseInvalid)
+	}
+	return nil
+}
+
+func (r *productionReleaseRepository) CreateRelease(
+	ctx context.Context,
+	release *types.ProductionRelease,
+	targets []*types.ProductionReleaseTarget,
+) error {
+	if err := validateProductionReleaseForCreate(release, targets); err != nil {
+		return err
+	}
+	actorID, err := trustedProductionReleaseActor(ctx, release.TenantID, release.CreatedBy)
+	if err != nil {
+		return err
+	}
+	now := r.nowUTC()
+	if release.RetentionDays == 0 {
+		release.RetentionDays = types.ProductionReleaseDefaultRetentionDays
+	}
+	release.Status = types.ProductionReleaseBuilding
+	release.CreatedBy = actorID
+	release.CreatedAt = now
+	release.UpdatedAt = now
+
+	seenIDs := make(map[string]struct{}, len(targets))
+	seenKBs := make(map[string]struct{}, len(targets))
+	seenKnowledgeIDs := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		if target == nil {
+			return fmt.Errorf("%w: target is required", types.ErrProductionReleaseInvalid)
+		}
+		for name, value := range map[string]string{
+			"target id": target.ID, "target knowledge base id": target.TargetKnowledgeBaseID,
+			"target knowledge id": target.KnowledgeID,
+		} {
+			if err := requireProductionReleaseIdentity(name, value); err != nil {
+				return err
+			}
+		}
+		if _, exists := seenIDs[target.ID]; exists {
+			return types.ErrProductionConflict
+		}
+		if _, exists := seenKBs[target.TargetKnowledgeBaseID]; exists {
+			return types.ErrProductionConflict
+		}
+		if _, exists := seenKnowledgeIDs[target.KnowledgeID]; exists {
+			return types.ErrProductionConflict
+		}
+		seenIDs[target.ID] = struct{}{}
+		seenKBs[target.TargetKnowledgeBaseID] = struct{}{}
+		seenKnowledgeIDs[target.KnowledgeID] = struct{}{}
+
+		if (target.ReleaseID != "" && target.ReleaseID != release.ID) ||
+			(target.TenantID != 0 && target.TenantID != release.TenantID) ||
+			(target.ProjectID != "" && target.ProjectID != release.ProjectID) ||
+			(target.DocumentID != "" && target.DocumentID != release.DocumentID) ||
+			(target.VersionID != "" && target.VersionID != release.VersionID) ||
+			(target.ReleaseDigest != "" && target.ReleaseDigest != release.ReleaseDigest) {
+			return fmt.Errorf("%w: target scope does not match release", types.ErrProductionReleaseInvalid)
+		}
+		if target.Status != "" && target.Status != types.ReleaseTargetBuilding {
+			return types.ErrProductionReleaseLifecycle
+		}
+		if target.RetentionDays < 0 || target.RetentionDays > 3650 ||
+			target.RetentionUntil != nil || target.ActivatedAt != nil || target.FailedAt != nil ||
+			target.RolledBackAt != nil || target.CleanupRequestedAt != nil || target.CleanedAt != nil {
+			return fmt.Errorf("%w: target lifecycle fields are server-owned", types.ErrProductionReleaseInvalid)
+		}
+		canonicalConfig, configDigest, configErr := types.CanonicalProductionReleaseTargetConfig(target.ConfigSnapshot)
+		if configErr != nil {
+			return configErr
+		}
+		if target.ConfigDigest != "" && target.ConfigDigest != configDigest {
+			return fmt.Errorf("%w: digest does not match canonical configuration", types.ErrProductionReleaseConfigInvalid)
+		}
+		target.ReleaseID = release.ID
+		target.TenantID = release.TenantID
+		target.ProjectID = release.ProjectID
+		target.DocumentID = release.DocumentID
+		target.VersionID = release.VersionID
+		target.ReleaseDigest = release.ReleaseDigest
+		target.ConfigSnapshot = canonicalConfig
+		target.ConfigDigest = configDigest
+		target.Status = types.ReleaseTargetBuilding
+		if target.RetentionDays == 0 {
+			target.RetentionDays = release.RetentionDays
+		}
+		target.CreatedAt = now
+		target.UpdatedAt = now
+	}
+
+	err = database.WithTransactionContext(ctx, r.db, func(txCtx context.Context) error {
+		db := database.DBFromContext(txCtx, r.db).WithContext(txCtx)
+		if createErr := db.Create(release).Error; createErr != nil {
+			return translateProductionReleaseError(createErr)
+		}
+		for _, target := range targets {
+			configValue := any(string(target.ConfigSnapshot))
+			if db.Dialector.Name() == "postgres" {
+				configValue = gorm.Expr("CAST(? AS JSONB)", string(target.ConfigSnapshot))
+			}
+			values := map[string]any{
+				"id": target.ID, "release_id": target.ReleaseID, "tenant_id": target.TenantID,
+				"project_id": target.ProjectID, "document_id": target.DocumentID, "version_id": target.VersionID,
+				"target_knowledge_base_id": target.TargetKnowledgeBaseID, "knowledge_id": target.KnowledgeID,
+				"release_digest": target.ReleaseDigest, "config_snapshot": configValue, "config_digest": target.ConfigDigest,
+				"status": target.Status, "retention_days": target.RetentionDays,
+				"retention_until": nil, "activated_at": nil, "failed_at": nil, "rolled_back_at": nil,
+				"cleanup_requested_at": nil, "cleaned_at": nil,
+				"created_at": target.CreatedAt, "updated_at": target.UpdatedAt,
+			}
+			if createErr := db.Model(&types.ProductionReleaseTarget{}).Create(values).Error; createErr != nil {
+				return translateProductionReleaseError(createErr)
+			}
+		}
+		return nil
+	})
+	return err
+}
+
+func (r *productionReleaseRepository) GetTarget(ctx context.Context, tenantID uint64, targetID string) (*types.ProductionReleaseTarget, error) {
+	if err := requireProductionReleaseTenantContext(ctx, tenantID); err != nil {
+		return nil, err
+	}
+	if err := requireProductionReleaseIdentity("target_id", targetID); err != nil {
+		return nil, err
+	}
+	var target types.ProductionReleaseTarget
+	err := database.DBFromContext(ctx, r.db).WithContext(ctx).
+		Where("tenant_id = ? AND id = ?", tenantID, targetID).First(&target).Error
+	if err != nil {
+		return nil, err
+	}
+	return &target, nil
+}
+
+func (r *productionReleaseRepository) TransitionTarget(
+	ctx context.Context,
+	targetID string,
+	from, to types.ProductionReleaseTargetStatus,
+	patch types.JSONMap,
+) (bool, error) {
+	tenantID, ok := types.TenantIDFromContext(ctx)
+	if !ok || tenantID == 0 {
+		return false, types.ErrProductionForbidden
+	}
+	if err := requireProductionReleaseIdentity("target_id", targetID); err != nil {
+		return false, err
+	}
+	if len(patch) != 0 {
+		return false, types.ErrProductionReleasePatchInvalid
+	}
+	if !types.CanTransitionReleaseTarget(from, to) || to == types.ReleaseTargetActive || from == types.ReleaseTargetActive {
+		return false, types.ErrProductionReleaseLifecycle
+	}
+
+	now := r.nowUTC()
+	updates := map[string]any{"status": to, "updated_at": now}
+	clearLifecycle := func() {
+		updates["retention_until"] = nil
+		updates["activated_at"] = nil
+		updates["failed_at"] = nil
+		updates["rolled_back_at"] = nil
+		updates["cleanup_requested_at"] = nil
+		updates["cleaned_at"] = nil
+	}
+	switch to {
+	case types.ReleaseTargetBuilding, types.ReleaseTargetReady:
+		clearLifecycle()
+	case types.ReleaseTargetFailed:
+		clearLifecycle()
+		updates["failed_at"] = now
+		updates["retention_until"] = r.retentionDeadlineExpression(now)
+	case types.ReleaseTargetRolledBack:
+		clearLifecycle()
+		updates["rolled_back_at"] = now
+		updates["retention_until"] = r.retentionDeadlineExpression(now)
+	case types.ReleaseTargetCleanupPending:
+		updates["activated_at"] = nil
+		updates["cleanup_requested_at"] = now
+		updates["cleaned_at"] = nil
+	case types.ReleaseTargetCleaned:
+		updates["activated_at"] = nil
+		updates["cleaned_at"] = now
+	}
+
+	result := database.DBFromContext(ctx, r.db).WithContext(ctx).
+		Model(&types.ProductionReleaseTarget{}).
+		Where("tenant_id = ? AND id = ? AND status = ?", tenantID, targetID, from).
+		Updates(updates)
+	if result.Error != nil {
+		return false, translateProductionReleaseError(result.Error)
+	}
+	return result.RowsAffected == 1, nil
+}
+
+func (r *productionReleaseRepository) retentionDeadlineExpression(now time.Time) any {
+	if r.db != nil && r.db.Dialector.Name() == "postgres" {
+		return gorm.Expr("? + retention_days * INTERVAL '1 day'", now)
+	}
+	return gorm.Expr("datetime(?, '+' || retention_days || ' days')", now)
+}
+
+type productionScopeRow struct {
+	TargetKnowledgeBaseID string
+	KnowledgeID           string
+	IsActive              bool
+}
+
+func (r *productionReleaseRepository) ResolveScopes(ctx context.Context, tenantID uint64, kbIDs []string) (map[string]types.ProductionKnowledgeScope, error) {
+	if err := requireProductionReleaseTenantContext(ctx, tenantID); err != nil {
+		return nil, err
+	}
+	result := make(map[string]types.ProductionKnowledgeScope, len(kbIDs))
+	uniqueKBs := make([]string, 0, len(kbIDs))
+	for _, kbID := range kbIDs {
+		if strings.TrimSpace(kbID) == "" || kbID != strings.TrimSpace(kbID) {
+			return nil, fmt.Errorf("%w: knowledge base id is required", types.ErrProductionReleaseInvalid)
+		}
+		if _, exists := result[kbID]; !exists {
+			result[kbID] = types.ProductionKnowledgeScope{}
+			uniqueKBs = append(uniqueKBs, kbID)
+		}
+	}
+	if len(uniqueKBs) == 0 {
+		return result, nil
+	}
+
+	var rows []productionScopeRow
+	err := database.DBFromContext(ctx, r.db).WithContext(ctx).
+		Table("production_release_targets AS target").
+		Select(`target.target_knowledge_base_id, target.knowledge_id,
+			CASE WHEN head.active_release_target_id = target.id AND target.status = ? THEN TRUE ELSE FALSE END AS is_active`, types.ReleaseTargetActive).
+		Joins(`LEFT JOIN production_projection_heads AS head
+			ON head.tenant_id = target.tenant_id
+			AND head.document_id = target.document_id
+			AND head.target_knowledge_base_id = target.target_knowledge_base_id
+			AND head.active_release_target_id = target.id`).
+		Where("target.tenant_id = ? AND target.target_knowledge_base_id IN ?", tenantID, uniqueKBs).
+		Order("target.target_knowledge_base_id ASC, target.knowledge_id ASC").
+		Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		scope := result[row.TargetKnowledgeBaseID]
+		scope.AllProductionKnowledgeIDs = append(scope.AllProductionKnowledgeIDs, row.KnowledgeID)
+		if row.IsActive {
+			scope.ActiveKnowledgeIDs = append(scope.ActiveKnowledgeIDs, row.KnowledgeID)
+		} else {
+			scope.InactiveKnowledgeIDs = append(scope.InactiveKnowledgeIDs, row.KnowledgeID)
+		}
+		result[row.TargetKnowledgeBaseID] = scope
+	}
+	for kbID, scope := range result {
+		sort.Strings(scope.ActiveKnowledgeIDs)
+		sort.Strings(scope.InactiveKnowledgeIDs)
+		sort.Strings(scope.AllProductionKnowledgeIDs)
+		result[kbID] = scope
+	}
+	return result, nil
+}
+
+func (r *productionReleaseRepository) SwitchHead(
+	ctx context.Context,
+	tenantID uint64,
+	documentID, kbID, targetID string,
+	expectedLock int,
+) (*types.ProductionProjectionHead, error) {
+	if err := requireProductionReleaseTenantContext(ctx, tenantID); err != nil {
+		return nil, err
+	}
+	for name, value := range map[string]string{"document_id": documentID, "knowledge_base_id": kbID, "target_id": targetID} {
+		if err := requireProductionReleaseIdentity(name, value); err != nil {
+			return nil, err
+		}
+	}
+	if expectedLock < 0 {
+		return nil, types.ErrProductionProjectionConflict
+	}
+
+	var head types.ProductionProjectionHead
+	err := database.WithTransactionContext(ctx, r.db, func(txCtx context.Context) error {
+		db := database.DBFromContext(txCtx, r.db).WithContext(txCtx)
+		now := r.nowUTC()
+		if expectedLock == 0 {
+			head = types.ProductionProjectionHead{
+				TenantID: tenantID, DocumentID: documentID, TargetKnowledgeBaseID: kbID,
+				ActiveReleaseTargetID: targetID, LockVersion: 1, UpdatedAt: now,
+			}
+			if createErr := db.Create(&head).Error; createErr != nil {
+				if isProductionDuplicateKey(createErr) {
+					return errors.Join(types.ErrProductionProjectionConflict, createErr)
+				}
+				return translateProductionReleaseError(createErr)
+			}
+		} else {
+			var update *gorm.DB
+			if db.Dialector.Name() == "postgres" {
+				update = db.Exec(postgresProductionProjectionHeadCASSQL,
+					targetID, now, tenantID, documentID, kbID, expectedLock)
+			} else {
+				update = db.Model(&types.ProductionProjectionHead{}).
+					Where("tenant_id = ? AND document_id = ? AND target_knowledge_base_id = ? AND lock_version = ?",
+						tenantID, documentID, kbID, expectedLock).
+					Updates(map[string]any{
+						"active_release_target_id": targetID,
+						"lock_version":             gorm.Expr("lock_version + 1"),
+						"updated_at":               now,
+					})
+			}
+			if update.Error != nil {
+				return translateProductionReleaseError(update.Error)
+			}
+			if update.RowsAffected != 1 {
+				return types.ErrProductionProjectionConflict
+			}
+		}
+		return db.Where("tenant_id = ? AND document_id = ? AND target_knowledge_base_id = ?",
+			tenantID, documentID, kbID).First(&head).Error
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &head, nil
+}
+
+func (r *productionReleaseRepository) ListProjectionHistory(
+	ctx context.Context,
+	tenantID uint64,
+	documentID, kbID string,
+) ([]*types.ProductionReleaseTarget, error) {
+	if err := requireProductionReleaseTenantContext(ctx, tenantID); err != nil {
+		return nil, err
+	}
+	if err := requireProductionReleaseIdentity("document_id", documentID); err != nil {
+		return nil, err
+	}
+	if err := requireProductionReleaseIdentity("knowledge_base_id", kbID); err != nil {
+		return nil, err
+	}
+	var targets []*types.ProductionReleaseTarget
+	err := database.DBFromContext(ctx, r.db).WithContext(ctx).
+		Where("tenant_id = ? AND document_id = ? AND target_knowledge_base_id = ?", tenantID, documentID, kbID).
+		Order("created_at DESC, id DESC").Find(&targets).Error
+	return targets, err
+}
+
+func translateProductionReleaseError(err error) error {
+	if err == nil {
+		return nil
+	}
+	lower := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(lower, "config_snapshot"), strings.Contains(lower, "config_digest"):
+		return errors.Join(types.ErrProductionReleaseConfigInvalid, err)
+	case strings.Contains(lower, "production projection head updates require cas lock versions"):
+		return errors.Join(types.ErrProductionProjectionConflict, err)
+	case strings.Contains(lower, "invalid production release target status transition"),
+		strings.Contains(lower, "production release targets require"),
+		strings.Contains(lower, "production release target retention has not expired"),
+		strings.Contains(lower, "active projection heads prevent independent target deactivation"),
+		strings.Contains(lower, "production projection heads require ready or active targets"),
+		strings.Contains(lower, "production projection heads must activate selected targets"):
+		return errors.Join(types.ErrProductionReleaseLifecycle, err)
+	case strings.Contains(lower, "production releases require an approved review"),
+		strings.Contains(lower, "production releases must be created building"),
+		strings.Contains(lower, "production release targets must be created building"):
+		return errors.Join(types.ErrProductionReleaseInvalid, err)
+	default:
+		return translateProductionWriteError(err)
+	}
+}
+
+var _ interfaces.ProductionReleaseRepository = (*productionReleaseRepository)(nil)

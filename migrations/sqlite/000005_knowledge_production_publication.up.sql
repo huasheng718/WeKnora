@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS production_release_targets (
     target_knowledge_base_id VARCHAR(36) NOT NULL,
     knowledge_id VARCHAR(36) NOT NULL UNIQUE,
     release_digest VARCHAR(64) NOT NULL,
+    config_snapshot TEXT NOT NULL DEFAULT '{}',
+    config_digest VARCHAR(64) NOT NULL DEFAULT '44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a',
     status VARCHAR(20) NOT NULL DEFAULT 'building',
     retention_days INTEGER NOT NULL DEFAULT 30,
     retention_until DATETIME NULL,
@@ -52,6 +54,13 @@ CREATE TABLE IF NOT EXISTS production_release_targets (
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT chk_production_release_targets_digest CHECK (length(release_digest) = 64 AND release_digest NOT GLOB '*[^0-9a-f]*'),
+    CONSTRAINT chk_production_release_targets_config_snapshot CHECK (
+        json_valid(config_snapshot) AND json_type(config_snapshot) = 'object' AND
+        json(config_snapshot) = config_snapshot AND length(CAST(config_snapshot AS BLOB)) <= 262144
+    ),
+    CONSTRAINT chk_production_release_targets_config_digest CHECK (
+        length(config_digest) = 64 AND config_digest NOT GLOB '*[^0-9a-f]*'
+    ),
     CONSTRAINT chk_production_release_targets_status CHECK (status IN ('building', 'ready', 'active', 'failed', 'rolled_back', 'cleanup_pending', 'cleaned')),
     CONSTRAINT chk_production_release_targets_retention CHECK (retention_days >= 1 AND retention_days <= 3650),
     UNIQUE(release_id, target_knowledge_base_id),
@@ -159,6 +168,7 @@ BEGIN
                           NEW.document_id IS NOT OLD.document_id OR NEW.version_id IS NOT OLD.version_id OR
                           NEW.target_knowledge_base_id IS NOT OLD.target_knowledge_base_id OR
                           NEW.knowledge_id IS NOT OLD.knowledge_id OR NEW.release_digest IS NOT OLD.release_digest OR
+                          NEW.config_snapshot IS NOT OLD.config_snapshot OR NEW.config_digest IS NOT OLD.config_digest OR
                           NEW.retention_days IS NOT OLD.retention_days OR NEW.created_at IS NOT OLD.created_at
         THEN RAISE(ABORT, 'production release target identity is immutable') END;
     SELECT CASE WHEN

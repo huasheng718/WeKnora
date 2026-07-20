@@ -1362,6 +1362,10 @@ func TestProductionPublicationPostgreSQLMigrationDeclaresReleaseAndProjectionInt
 		"FOREIGN KEY (release_id, tenant_id, project_id, document_id, version_id, release_digest)",
 		"production projection heads require ready or active targets",
 		"production projection head updates require CAS lock versions",
+		"config_snapshot JSONB NOT NULL",
+		"config_digest VARCHAR(64) NOT NULL",
+		"chk_production_release_targets_config_digest",
+		"octet_length(config_snapshot::text)",
 	} {
 		require.Contains(t, up, declaration)
 	}
@@ -1379,6 +1383,36 @@ func TestProductionPublicationPostgreSQLMigrationDeclaresReleaseAndProjectionInt
 		require.Contains(t, down, "DROP INDEX IF EXISTS "+index)
 	}
 	require.Contains(t, down, "DROP TRIGGER IF EXISTS trg_production_projection_heads_activate_target ON production_projection_heads")
+}
+
+func TestProductionPublicationSQLiteMigrationGuardsCanonicalTargetConfigIdentity(t *testing.T) {
+	db := openProductionPublicationSQLite(t)
+	seedProductionReleaseScope(t, db)
+	insertProductionPublicationRelease(t, db, "release-config", "version-1", "review-pub-1", strings.Repeat("a", 64))
+
+	_, err := db.Exec(`INSERT INTO production_release_targets
+		(id, release_id, tenant_id, project_id, document_id, version_id, target_knowledge_base_id, knowledge_id, release_digest, config_snapshot, config_digest)
+		VALUES ('target-config', 'release-config', 1, 'project-1', 'document-1', 'version-1', 'kb-1', 'knowledge-config', ?, '{"chunking":{"size":512}}', ?)`,
+		strings.Repeat("a", 64), strings.Repeat("b", 64))
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_release_targets SET config_snapshot = '{}' WHERE id = 'target-config'`)
+	require.ErrorContains(t, err, "target identity is immutable")
+	_, err = db.Exec(`UPDATE production_release_targets SET config_digest = ? WHERE id = 'target-config'`, strings.Repeat("c", 64))
+	require.ErrorContains(t, err, "target identity is immutable")
+
+	for _, tc := range []struct {
+		name, snapshot, digest string
+	}{
+		{name: "non-object", snapshot: `[]`, digest: strings.Repeat("b", 64)},
+		{name: "non-canonical", snapshot: `{ "chunking": {"size":512} }`, digest: strings.Repeat("b", 64)},
+		{name: "bad digest", snapshot: `{}`, digest: "ABC"},
+	} {
+		_, err = db.Exec(`INSERT INTO production_release_targets
+			(id, release_id, tenant_id, project_id, document_id, version_id, target_knowledge_base_id, knowledge_id, release_digest, config_snapshot, config_digest)
+			VALUES (?, 'release-config', 1, 'project-1', 'document-1', 'version-1', 'kb-2', ?, ?, ?, ?)`,
+			"target-config-"+tc.name, "knowledge-config-"+tc.name, strings.Repeat("a", 64), tc.snapshot, tc.digest)
+		require.Errorf(t, err, "case %s", tc.name)
+	}
 }
 
 func TestProductionPublicationSQLiteMigrationEnforcesScopedTargetsAndCASHeads(t *testing.T) {
