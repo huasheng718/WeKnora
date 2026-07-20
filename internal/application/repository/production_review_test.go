@@ -192,7 +192,7 @@ func TestProductionReviewRepositoryCreatesAndResolvesNormalizedAnnotation(t *tes
 	require.NoError(t, err)
 	require.Zero(t, count)
 
-	ok, err := repo.ResolveAnnotation(productionReviewContext(reviewTenantID, reviewBusinessActor), reviewTenantID, annotation.ID, reviewBusinessActor, types.ProductionAnnotationResolved)
+	ok, err := repo.ResolveAnnotation(productionReviewContext(reviewTenantID, reviewAuthorID), reviewTenantID, annotation.ID, reviewAuthorID, types.ProductionAnnotationResolved)
 	require.NoError(t, err)
 	require.True(t, ok)
 	ok, err = repo.ResolveAnnotation(productionReviewContext(reviewTenantID, reviewEngineeringActor), reviewTenantID, annotation.ID, reviewEngineeringActor, types.ProductionAnnotationDismissed)
@@ -204,8 +204,69 @@ func TestProductionReviewRepositoryCreatesAndResolvesNormalizedAnnotation(t *tes
 	require.Equal(t, reviewAuthorID, persisted.CreatedBy)
 	require.Equal(t, types.ProductionAnnotationResolved, persisted.Status)
 	require.NotNil(t, persisted.ResolvedBy)
-	require.Equal(t, reviewBusinessActor, *persisted.ResolvedBy)
+	require.Equal(t, reviewAuthorID, *persisted.ResolvedBy)
 	require.NotNil(t, persisted.ResolvedAt)
+}
+
+func TestProductionReviewRepositoryRejectsRevokedAnnotationResolverAtWriteBoundary(t *testing.T) {
+	repo, db := newProductionReviewRepoFixture(t)
+	require.NoError(t, db.Create(&types.ProductionProjectMember{
+		ProjectID: reviewProjectID, UserID: reviewBusinessActor, Role: types.ProductionRoleAuthor, AssignedBy: reviewAuthorID,
+	}).Error)
+	annotation := &types.ProductionAnnotation{
+		ID: reviewID(3), TenantID: reviewTenantID, ProjectID: reviewProjectID,
+		DocumentID: reviewDocumentID, VersionID: reviewVersionOne, BlockID: reviewBlockOne,
+		AnnotationType: types.ProductionAnnotationComment, Severity: types.ProductionAnnotationWarning,
+		Anchor: types.JSON(`{}`), Body: "revocation", Status: types.ProductionAnnotationOpen, CreatedBy: reviewAuthorID,
+	}
+	require.NoError(t, repo.CreateAnnotation(productionReviewContext(reviewTenantID, reviewAuthorID), annotation))
+
+	// This deletion models a role revocation after an application-layer role read.
+	require.NoError(t, db.Where("project_id = ? AND user_id = ? AND role = ?", reviewProjectID, reviewBusinessActor, types.ProductionRoleAuthor).
+		Delete(&types.ProductionProjectMember{}).Error)
+	ok, err := repo.ResolveAnnotation(productionReviewContext(reviewTenantID, reviewBusinessActor), reviewTenantID,
+		annotation.ID, reviewBusinessActor, types.ProductionAnnotationResolved)
+	require.NoError(t, err)
+	require.False(t, ok)
+
+	var persisted types.ProductionAnnotation
+	require.NoError(t, db.First(&persisted, "id = ?", annotation.ID).Error)
+	require.Equal(t, types.ProductionAnnotationOpen, persisted.Status)
+}
+
+func TestProductionReviewRepositoryResolveComplianceRiskRoleMatrix(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		roles []types.ProductionRole
+		want  bool
+	}{
+		{name: "compliance reviewer", roles: []types.ProductionRole{types.ProductionRoleAuthor, types.ProductionRoleComplianceReviewer}, want: true},
+		{name: "project owner", roles: []types.ProductionRole{types.ProductionRoleProjectOwner}, want: true},
+		{name: "author without compliance", roles: []types.ProductionRole{types.ProductionRoleAuthor}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			repo, db := newProductionReviewRepoFixture(t)
+			for _, role := range test.roles {
+				require.NoError(t, db.Create(&types.ProductionProjectMember{
+					ProjectID: reviewProjectID, UserID: reviewBusinessActor, Role: role, AssignedBy: reviewAuthorID,
+				}).Error)
+			}
+			category := types.ProductionQualityTagComplianceRisk
+			annotation := &types.ProductionAnnotation{
+				ID: reviewID(20), TenantID: reviewTenantID, ProjectID: reviewProjectID,
+				DocumentID: reviewDocumentID, VersionID: reviewVersionOne, BlockID: reviewBlockOne,
+				AnnotationType: types.ProductionAnnotationQualityTag, QualityTag: &category,
+				Severity: types.ProductionAnnotationBlocking, Anchor: types.JSON(`{}`), Body: "compliance",
+				Status: types.ProductionAnnotationOpen, CreatedBy: reviewAuthorID,
+			}
+			require.NoError(t, repo.CreateAnnotation(productionReviewContext(reviewTenantID, reviewAuthorID), annotation))
+
+			ok, err := repo.ResolveAnnotation(productionReviewContext(reviewTenantID, reviewBusinessActor), reviewTenantID,
+				annotation.ID, reviewBusinessActor, types.ProductionAnnotationDismissed)
+			require.NoError(t, err)
+			require.Equal(t, test.want, ok)
+		})
+	}
 }
 
 func TestProductionReviewRepositoryGetsAnnotationWithinTenantScope(t *testing.T) {
@@ -693,8 +754,8 @@ func TestProductionReviewRepositoryOwnsEveryLifecycleTimestamp(t *testing.T) {
 
 	mutatedAt := createdAt.Add(2 * time.Hour)
 	clock.current = mutatedAt
-	ok, err := repo.ResolveAnnotation(productionReviewContext(reviewTenantID, reviewBusinessActor), reviewTenantID,
-		annotation.ID, reviewBusinessActor, types.ProductionAnnotationResolved)
+	ok, err := repo.ResolveAnnotation(productionReviewContext(reviewTenantID, reviewAuthorID), reviewTenantID,
+		annotation.ID, reviewAuthorID, types.ProductionAnnotationResolved)
 	require.NoError(t, err)
 	require.True(t, ok)
 	for index, actor := range []string{reviewBusinessActor, reviewEngineeringActor} {

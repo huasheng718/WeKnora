@@ -25,6 +25,26 @@ FOR UPDATE`
 
 const productionReviewObsoleteReason = "superseded by a newer document version"
 
+const productionAnnotationResolutionAuthorizationSQL = `
+(
+    created_by = ? OR EXISTS (
+        SELECT 1 FROM production_project_members AS member
+        WHERE member.project_id = production_annotations.project_id
+          AND member.user_id = ?
+          AND member.deleted_at IS NULL
+          AND member.role IN (?, ?)
+    )
+)
+AND (
+    NOT (severity = ? AND quality_tag = ?) OR EXISTS (
+        SELECT 1 FROM production_project_members AS member
+        WHERE member.project_id = production_annotations.project_id
+          AND member.user_id = ?
+          AND member.deleted_at IS NULL
+          AND member.role IN (?, ?)
+    )
+)`
+
 type ProductionReviewClock interface {
 	Now() time.Time
 }
@@ -295,6 +315,11 @@ func (r *productionReviewRepository) ResolveAnnotation(
 	result := database.DBFromContext(ctx, r.db).WithContext(ctx).
 		Model(&types.ProductionAnnotation{}).
 		Where("tenant_id = ? AND id = ? AND status = ?", tenantID, annotationID, types.ProductionAnnotationOpen).
+		Where(productionAnnotationResolutionAuthorizationSQL,
+			trustedActorID, trustedActorID, types.ProductionRoleProjectOwner, types.ProductionRoleAuthor,
+			types.ProductionAnnotationBlocking, types.ProductionQualityTagComplianceRisk,
+			trustedActorID, types.ProductionRoleProjectOwner, types.ProductionRoleComplianceReviewer,
+		).
 		Updates(map[string]any{
 			"status": resolution, "resolved_by": trustedActorID, "resolved_at": now, "updated_at": now,
 		})

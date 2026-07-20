@@ -3,11 +3,18 @@ package service
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 
+	apprepository "github.com/Tencent/WeKnora/internal/application/repository"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 const (
@@ -102,10 +109,12 @@ type productionAnnotationAuthorizerStub struct {
 	err     error
 	require func(...types.ProductionRole) error
 	roles   []types.ProductionRole
+	calls   [][]types.ProductionRole
 }
 
 func (a *productionAnnotationAuthorizerStub) RequireProjectRole(_ context.Context, _ string, roles ...types.ProductionRole) error {
 	a.roles = append([]types.ProductionRole(nil), roles...)
+	a.calls = append(a.calls, append([]types.ProductionRole(nil), roles...))
 	if a.require != nil {
 		return a.require(roles...)
 	}
@@ -196,6 +205,126 @@ func TestProductionAnnotationResolveRequiresComplianceForBlockingRisk(t *testing
 	require.ErrorIs(t, err, types.ErrProductionForbidden)
 	require.Empty(t, reviews.resolvedID)
 	require.Equal(t, []types.ProductionRole{types.ProductionRoleProjectOwner, types.ProductionRoleComplianceReviewer}, authorizer.roles)
+}
+
+func TestProductionAnnotationResolveComplianceRoleMatrix(t *testing.T) {
+	category := types.ProductionQualityTagComplianceRisk
+	for _, test := range []struct {
+		name            string
+		baseAllowed     bool
+		complianceAllow bool
+		wantErr         bool
+	}{
+		{name: "compliance reviewer", baseAllowed: true, complianceAllow: true},
+		{name: "project owner", baseAllowed: true, complianceAllow: true},
+		{name: "author without compliance", baseAllowed: true, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			svc, reviews, authorizer := newProductionAnnotationFixture(t)
+			reviews.annotation = &types.ProductionAnnotation{
+				ID: "99999999-9999-4999-8999-999999999999", TenantID: annotationTenantID, ProjectID: annotationProjectID,
+				CreatedBy: "22222222-2222-4222-8222-222222222222", AnnotationType: types.ProductionAnnotationQualityTag,
+				QualityTag: &category, Severity: types.ProductionAnnotationBlocking, Status: types.ProductionAnnotationOpen,
+			}
+			reviews.resolveOK = true
+			authorizer.require = func(roles ...types.ProductionRole) error {
+				if annotationRoleSet(roles, types.ProductionRoleProjectOwner, types.ProductionRoleAuthor) && test.baseAllowed {
+					return nil
+				}
+				if annotationRoleSet(roles, types.ProductionRoleProjectOwner, types.ProductionRoleComplianceReviewer) && test.complianceAllow {
+					return nil
+				}
+				return types.ErrProductionForbidden
+			}
+
+			err := svc.Resolve(productionAnnotationContext(), reviews.annotation.ID, types.ProductionAnnotationDismissed)
+			if test.wantErr {
+				require.ErrorIs(t, err, types.ErrProductionForbidden)
+				require.Empty(t, reviews.resolvedID)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, reviews.annotation.ID, reviews.resolvedID)
+			require.Equal(t, [][]types.ProductionRole{
+				{types.ProductionRoleProjectOwner, types.ProductionRoleAuthor},
+				{types.ProductionRoleProjectOwner, types.ProductionRoleComplianceReviewer},
+			}, authorizer.calls)
+		})
+	}
+}
+
+func TestProductionAnnotationResolveConcurrentRoleRevocationIsRejected(t *testing.T) {
+	svc, repo, db, authorizer := newProductionAnnotationWriteBoundaryFixture(t)
+	const creatorID = "22222222-2222-4222-8222-222222222222"
+	annotation := &types.ProductionAnnotation{
+		ID: "99999999-9999-4999-8999-999999999999", TenantID: annotationTenantID, ProjectID: annotationProjectID,
+		DocumentID: annotationDocumentID, VersionID: annotationVersionOne, BlockID: annotationBlockOne,
+		AnnotationType: types.ProductionAnnotationComment, Severity: types.ProductionAnnotationWarning,
+		Anchor: types.JSON(`{}`), Body: "concurrent revocation", Status: types.ProductionAnnotationOpen, CreatedBy: creatorID,
+	}
+	require.NoError(t, repo.CreateAnnotation(productionAnnotationContextFor(creatorID), annotation))
+	authorizer.require = func(...types.ProductionRole) error {
+		return db.Where("project_id = ? AND user_id = ? AND role = ?", annotationProjectID,
+			"11111111-1111-4111-8111-111111111111", types.ProductionRoleAuthor).
+			Delete(&types.ProductionProjectMember{}).Error
+	}
+
+	err := svc.Resolve(productionAnnotationContext(), annotation.ID, types.ProductionAnnotationResolved)
+	require.ErrorIs(t, err, types.ErrProductionAnnotationLifecycle)
+	var persisted types.ProductionAnnotation
+	require.NoError(t, db.First(&persisted, "id = ?", annotation.ID).Error)
+	require.Equal(t, types.ProductionAnnotationOpen, persisted.Status)
+}
+
+func annotationRoleSet(roles []types.ProductionRole, first, second types.ProductionRole) bool {
+	return len(roles) == 2 && roles[0] == first && roles[1] == second
+}
+
+func newProductionAnnotationWriteBoundaryFixture(t *testing.T) (*productionAnnotationService, interfaces.ProductionReviewRepository, *gorm.DB, *productionAnnotationAuthorizerStub) {
+	t.Helper()
+	dsn := "file:" + filepath.Join(t.TempDir(), "annotation-write-boundary.db") + "?_foreign_keys=1&_busy_timeout=5000"
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	_, filename, _, ok := runtime.Caller(0)
+	require.True(t, ok)
+	for _, name := range []string{
+		"000001_knowledge_production_foundation.up.sql",
+		"000002_knowledge_production_documents.up.sql",
+		"000004_knowledge_production_reviews.up.sql",
+	} {
+		migration, readErr := os.ReadFile(filepath.Join(filepath.Dir(filename), "../../../migrations/sqlite", name))
+		require.NoError(t, readErr)
+		require.NoError(t, db.Exec(string(migration)).Error)
+	}
+	statements := []string{
+		`INSERT INTO production_projects (id, tenant_id, name, owner_user_id) VALUES (?, ?, 'Annotations', ?)`,
+		`INSERT INTO production_document_types (id, tenant_id, code, name, schema_version, status, created_by) VALUES (?, ?, 'annotation', 'Annotation', 1, 'active', ?)`,
+		`INSERT INTO production_source_sets (id, tenant_id, project_id, document_type_id, status, created_by, frozen_at) VALUES (?, ?, ?, ?, 'frozen', ?, CURRENT_TIMESTAMP)`,
+		`INSERT INTO production_documents (id, tenant_id, project_id, document_type_id, document_type_schema_version, title, current_version_id, status, created_by) VALUES (?, ?, ?, ?, 1, 'Annotation', NULL, 'draft', ?)`,
+		`INSERT INTO production_document_versions (id, document_id, tenant_id, project_id, version_number, source_set_id, origin, content_digest, created_by, frozen_at) VALUES (?, ?, ?, ?, 1, ?, 'human', ?, ?, CURRENT_TIMESTAMP)`,
+		`UPDATE production_documents SET current_version_id = ? WHERE id = ?`,
+		`INSERT INTO production_document_blocks (id, version_id, logical_block_id, block_type, position, content, attributes, evidence_refs, ai_provenance, content_digest) VALUES (?, ?, ?, 'fact', 1, '{}', '{}', '[]', '{}', ?)`,
+		`INSERT INTO production_project_members (project_id, user_id, role, assigned_by) VALUES (?, ?, 'author', ?)`,
+	}
+	args := [][]any{
+		{annotationProjectID, annotationTenantID, "33333333-3333-4333-8333-333333333333"},
+		{"44444444-4444-4444-8444-444444444444", annotationTenantID, "33333333-3333-4333-8333-333333333333"},
+		{"55555555-5555-4555-8555-555555555555", annotationTenantID, annotationProjectID, "44444444-4444-4444-8444-444444444444", "33333333-3333-4333-8333-333333333333"},
+		{annotationDocumentID, annotationTenantID, annotationProjectID, "44444444-4444-4444-8444-444444444444", "33333333-3333-4333-8333-333333333333"},
+		{annotationVersionOne, annotationDocumentID, annotationTenantID, annotationProjectID, "55555555-5555-4555-8555-555555555555", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "33333333-3333-4333-8333-333333333333"},
+		{annotationVersionOne, annotationDocumentID},
+		{annotationBlockOne, annotationVersionOne, "block", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+		{annotationProjectID, "11111111-1111-4111-8111-111111111111", "33333333-3333-4333-8333-333333333333"},
+	}
+	for index := range statements {
+		require.NoError(t, db.Exec(statements[index], args[index]...).Error)
+	}
+	authorizer := &productionAnnotationAuthorizerStub{}
+	repo := apprepository.NewProductionReviewRepository(db)
+	return NewProductionAnnotationService(repo, apprepository.NewProductionDocumentRepository(db), authorizer), repo, db, authorizer
 }
 
 var _ interfaces.ProductionDocumentRepository = (*productionAnnotationDocumentRepoStub)(nil)
