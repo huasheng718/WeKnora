@@ -14,8 +14,6 @@ func TestProductionReviewDecisionTransitions(t *testing.T) {
 	require.False(t, CanTransitionReviewStep(ProductionReviewPending, ProductionReviewCancelled))
 	require.False(t, CanTransitionReviewStep(ProductionReviewApproved, ProductionReviewPending))
 	require.False(t, CanTransitionReviewStep(ProductionReviewApproved, ProductionReviewRejected))
-	require.False(t, CanTransitionReviewRequest(ProductionReviewPending, ProductionReviewObsolete))
-	require.True(t, CanTransitionReviewRequest(ProductionReviewPending, ProductionReviewCancelled))
 }
 
 func productionReviewNestedObject(depth int) JSON {

@@ -131,19 +131,6 @@ func CanTransitionReviewStep(from, to ProductionReviewDecision) bool {
 	return from == ProductionReviewPending && to.IsProfessionalDecision()
 }
 
-func CanTransitionReviewRequest(from, to ProductionReviewStatus) bool {
-	if from != ProductionReviewPending {
-		return false
-	}
-	switch to {
-	case ProductionReviewApproved, ProductionReviewRejected,
-		ProductionReviewCancelled, ProductionReviewChangesRequested:
-		return true
-	default:
-		return false
-	}
-}
-
 type ProductionAnnotation struct {
 	ID               string                        `json:"id" gorm:"type:varchar(36);primaryKey"`
 	TenantID         uint64                        `json:"tenant_id" gorm:"not null;index"`

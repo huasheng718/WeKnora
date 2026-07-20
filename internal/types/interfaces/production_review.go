@@ -12,8 +12,6 @@ type ProductionReviewRepository interface {
 	CountOpenBlocking(ctx context.Context, tenantID uint64, versionID string) (int64, error)
 	CreateReview(ctx context.Context, request *types.ProductionReviewRequest, steps []*types.ProductionReviewStep) error
 	GetReview(ctx context.Context, tenantID uint64, reviewID string) (*types.ProductionReviewRequest, error)
-	GetReviewStep(ctx context.Context, tenantID uint64, stepID string) (*types.ProductionReviewStep, error)
 	DecideStep(ctx context.Context, tenantID uint64, stepID string, from, to types.ProductionReviewDecision, actorID, comment string) (bool, error)
-	TransitionReview(ctx context.Context, tenantID uint64, reviewID string, from, to types.ProductionReviewStatus, actorID, reason string) (bool, error)
 	ObsoletePendingByDocument(ctx context.Context, tenantID uint64, documentID, exceptVersionID string) error
 }

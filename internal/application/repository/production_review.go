@@ -120,14 +120,15 @@ func translateProductionReviewError(err error) error {
 		return errors.Join(types.ErrProductionAnnotationImmutable, err)
 	case strings.Contains(lower, "invalid production annotation status transition"):
 		return errors.Join(types.ErrProductionAnnotationLifecycle, err)
+	case strings.Contains(lower, "production review requests cannot be replaced"),
+		strings.Contains(lower, "production review steps cannot be replaced"):
+		return errors.Join(types.ErrProductionConflict, err)
 	case strings.Contains(lower, "terminal production review requests are immutable"),
 		strings.Contains(lower, "production review request identity is immutable"),
 		strings.Contains(lower, "production review requests are append-only"),
-		strings.Contains(lower, "production review requests cannot be replaced"),
 		strings.Contains(lower, "terminal production review steps are immutable"),
 		strings.Contains(lower, "production review step identity is immutable"),
-		strings.Contains(lower, "production review steps are append-only"),
-		strings.Contains(lower, "production review steps cannot be replaced"):
+		strings.Contains(lower, "production review steps are append-only"):
 		return errors.Join(types.ErrProductionReviewImmutable, err)
 	case strings.Contains(lower, "production review requests must be submitted pending"),
 		strings.Contains(lower, "production review steps must be inserted pending"),
@@ -395,6 +396,18 @@ func lockProductionReviewVersion(db *gorm.DB, request *types.ProductionReviewReq
 		}
 		return nil
 	}
+	// SQLite has no row-level locks. Take its write reservation before the
+	// authoritative version read so duplicate submissions serialize and the
+	// loser observes the stable review uniqueness conflict.
+	lockedDocument := db.Model(&types.ProductionDocument{}).
+		Where("id = ? AND tenant_id = ? AND project_id = ?", request.DocumentID, request.TenantID, request.ProjectID).
+		UpdateColumn("updated_at", gorm.Expr("updated_at"))
+	if lockedDocument.Error != nil {
+		return lockedDocument.Error
+	}
+	if lockedDocument.RowsAffected != 1 {
+		return types.ErrProductionReviewScopeInvalid
+	}
 	err := db.Raw(`SELECT id FROM production_document_versions
 WHERE id = ? AND document_id = ? AND tenant_id = ? AND project_id = ?`,
 		request.VersionID, request.DocumentID, request.TenantID, request.ProjectID,
@@ -481,23 +494,6 @@ func (r *productionReviewRepository) GetReview(ctx context.Context, tenantID uin
 	return &request, nil
 }
 
-func (r *productionReviewRepository) GetReviewStep(ctx context.Context, tenantID uint64, stepID string) (*types.ProductionReviewStep, error) {
-	if tenantID == 0 {
-		return nil, types.ErrProductionReviewScopeInvalid
-	}
-	if err := requireProductionReviewUUID("review step id", stepID); err != nil {
-		return nil, err
-	}
-	var step types.ProductionReviewStep
-	err := database.DBFromContext(ctx, r.db).WithContext(ctx).
-		Where("tenant_id = ? AND id = ?", tenantID, stepID).
-		First(&step).Error
-	if err != nil {
-		return nil, err
-	}
-	return &step, nil
-}
-
 func (r *productionReviewRepository) DecideStep(
 	ctx context.Context,
 	tenantID uint64,
@@ -530,53 +526,6 @@ func (r *productionReviewRepository) DecideStep(
 			"decision": to, "reviewer_user_id": trustedActorID, "comment": comment,
 			"decided_at": now, "updated_at": now,
 		})
-	if result.Error != nil {
-		return false, translateProductionReviewError(result.Error)
-	}
-	return result.RowsAffected == 1, nil
-}
-
-func (r *productionReviewRepository) TransitionReview(
-	ctx context.Context,
-	tenantID uint64,
-	reviewID string,
-	from, to types.ProductionReviewStatus,
-	actorID, reason string,
-) (bool, error) {
-	if tenantID == 0 {
-		return false, types.ErrProductionReviewScopeInvalid
-	}
-	trustedActorID, err := trustedProductionReviewActor(ctx, tenantID, actorID)
-	if err != nil {
-		return false, err
-	}
-	if err := requireProductionReviewUUID("review id", reviewID); err != nil {
-		return false, err
-	}
-	if !types.CanTransitionReviewRequest(from, to) {
-		return false, types.ErrProductionReviewLifecycle
-	}
-	reason = strings.TrimSpace(reason)
-	if to == types.ProductionReviewApproved {
-		if reason != "" {
-			return false, errors.New("approved production review cannot have a terminal reason")
-		}
-	} else if length := utf8.RuneCountInString(reason); length < 1 || length > 5000 {
-		return false, errors.New("terminal production review reason must contain between 1 and 5000 characters")
-	}
-	now := r.nowUTC()
-	updates := map[string]any{
-		"status": to, "terminal_by": trustedActorID, "completed_at": now, "updated_at": now,
-	}
-	if to == types.ProductionReviewApproved {
-		updates["terminal_reason"] = nil
-	} else {
-		updates["terminal_reason"] = reason
-	}
-	result := database.DBFromContext(ctx, r.db).WithContext(ctx).
-		Model(&types.ProductionReviewRequest{}).
-		Where("tenant_id = ? AND id = ? AND status = ?", tenantID, reviewID, from).
-		Updates(updates)
 	if result.Error != nil {
 		return false, translateProductionReviewError(result.Error)
 	}

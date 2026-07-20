@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -215,6 +215,24 @@ func TestProductionReviewPostgresVersionLockScopesExactImmutableVersion(t *testi
 	}
 }
 
+func TestProductionReviewRepositoryExactTaskTwoSurface(t *testing.T) {
+	repositoryType := reflect.TypeOf((*interfaces.ProductionReviewRepository)(nil)).Elem()
+	require.Equal(t, 7, repositoryType.NumMethod())
+	methods := make([]string, 0, repositoryType.NumMethod())
+	for index := range repositoryType.NumMethod() {
+		methods = append(methods, repositoryType.Method(index).Name)
+	}
+	require.ElementsMatch(t, []string{
+		"CreateAnnotation",
+		"ResolveAnnotation",
+		"CountOpenBlocking",
+		"CreateReview",
+		"GetReview",
+		"DecideStep",
+		"ObsoletePendingByDocument",
+	}, methods)
+}
+
 func TestProductionReviewRepositoryRejectsInvalidAnnotationScopeAndLifecycle(t *testing.T) {
 	repo, db := newProductionReviewRepoFixture(t)
 	annotation := &types.ProductionAnnotation{
@@ -334,11 +352,11 @@ func TestProductionReviewRepositoryDecisionIsTenantScopedCompareAndSwap(t *testi
 	require.NoError(t, err)
 	require.False(t, ok)
 
-	step, err := repo.GetReviewStep(context.Background(), reviewTenantID, steps[0].ID)
+	persisted, err := repo.GetReview(context.Background(), reviewTenantID, request.ID)
 	require.NoError(t, err)
-	require.Equal(t, types.ProductionReviewDecision(types.ProductionReviewApproved), step.Decision)
-	require.NotNil(t, step.ReviewerUserID)
-	require.Equal(t, reviewBusinessActor, *step.ReviewerUserID)
+	require.Equal(t, types.ProductionReviewDecision(types.ProductionReviewApproved), persisted.Steps[0].Decision)
+	require.NotNil(t, persisted.Steps[0].ReviewerUserID)
+	require.Equal(t, reviewBusinessActor, *persisted.Steps[0].ReviewerUserID)
 }
 
 func TestProductionReviewRepositoryConcurrentDecisionHasSingleWinner(t *testing.T) {
@@ -347,7 +365,11 @@ func TestProductionReviewRepositoryConcurrentDecisionHasSingleWinner(t *testing.
 	steps := productionReviewSteps(request.ID, 300)
 	require.NoError(t, repo.CreateReview(productionReviewContext(reviewTenantID, reviewAuthorID), request, steps))
 
-	var winners atomic.Int32
+	type decisionResult struct {
+		ok  bool
+		err error
+	}
+	results := make(chan decisionResult, 2)
 	var wg sync.WaitGroup
 	for _, decision := range []types.ProductionReviewDecision{types.ProductionReviewApproved, types.ProductionReviewRejected} {
 		wg.Add(1)
@@ -355,31 +377,49 @@ func TestProductionReviewRepositoryConcurrentDecisionHasSingleWinner(t *testing.
 			defer wg.Done()
 			ok, err := repo.DecideStep(productionReviewContext(reviewTenantID, reviewBusinessActor), reviewTenantID, steps[0].ID,
 				types.ProductionReviewPending, decision, reviewBusinessActor, "race")
-			if err == nil && ok {
-				winners.Add(1)
-			}
+			results <- decisionResult{ok: ok, err: err}
 		}(decision)
 	}
 	wg.Wait()
-	require.Equal(t, int32(1), winners.Load())
+	close(results)
+	var trueResults, falseResults int
+	for result := range results {
+		require.NoError(t, result.err)
+		if result.ok {
+			trueResults++
+		} else {
+			falseResults++
+		}
+	}
+	require.Equal(t, 1, trueResults)
+	require.Equal(t, 1, falseResults)
 }
 
 func TestProductionReviewRepositoryConcurrentDuplicateReviewHasSingleWinner(t *testing.T) {
 	repo, db := newProductionReviewRepoFixture(t)
-	var winners atomic.Int32
+	results := make(chan error, 2)
 	var wg sync.WaitGroup
 	for index := 0; index < 2; index++ {
 		wg.Add(1)
 		go func(index int) {
 			defer wg.Done()
 			request := productionReviewRequest(reviewID(400+index*10), reviewVersionOne)
-			if err := repo.CreateReview(productionReviewContext(reviewTenantID, reviewAuthorID), request, productionReviewSteps(request.ID, 400+index*10)); err == nil {
-				winners.Add(1)
-			}
+			results <- repo.CreateReview(productionReviewContext(reviewTenantID, reviewAuthorID), request, productionReviewSteps(request.ID, 400+index*10))
 		}(index)
 	}
 	wg.Wait()
-	require.Equal(t, int32(1), winners.Load())
+	close(results)
+	var winners, conflicts int
+	for err := range results {
+		if err == nil {
+			winners++
+			continue
+		}
+		require.ErrorIs(t, err, types.ErrProductionConflict)
+		conflicts++
+	}
+	require.Equal(t, 1, winners)
+	require.Equal(t, 1, conflicts)
 	var requests, steps int64
 	require.NoError(t, db.Model(&types.ProductionReviewRequest{}).Count(&requests).Error)
 	require.NoError(t, db.Model(&types.ProductionReviewStep{}).Count(&steps).Error)
@@ -470,17 +510,13 @@ func TestProductionReviewRepositoryObsoleteJoinsOuterTransactionRollback(t *test
 	}
 }
 
-func TestProductionReviewRepositoryRejectsGenericSystemTerminalizationSpoofing(t *testing.T) {
+func TestProductionReviewRepositoryRejectsSystemStepTerminalizationSpoofing(t *testing.T) {
 	repo, _ := newProductionReviewRepoFixture(t)
 	request := productionReviewRequest(reviewID(570), reviewVersionOne)
 	steps := productionReviewSteps(request.ID, 570)
 	require.NoError(t, repo.CreateReview(productionReviewContext(reviewTenantID, reviewAuthorID), request, steps))
 
-	ok, err := repo.TransitionReview(productionReviewContext(reviewTenantID, reviewBusinessActor), reviewTenantID, request.ID,
-		types.ProductionReviewPending, types.ProductionReviewObsolete, reviewBusinessActor, "spoof")
-	require.ErrorIs(t, err, types.ErrProductionReviewLifecycle)
-	require.False(t, ok)
-	ok, err = repo.DecideStep(productionReviewContext(reviewTenantID, reviewBusinessActor), reviewTenantID, steps[0].ID,
+	ok, err := repo.DecideStep(productionReviewContext(reviewTenantID, reviewBusinessActor), reviewTenantID, steps[0].ID,
 		types.ProductionReviewPending, types.ProductionReviewCancelled, reviewBusinessActor, "spoof")
 	require.ErrorIs(t, err, types.ErrProductionReviewLifecycle)
 	require.False(t, ok)
@@ -549,16 +585,8 @@ func TestProductionReviewRepositoryMutationActorsMustMatchTrustedContext(t *test
 		types.ProductionReviewPending, types.ProductionReviewApproved, reviewBusinessActor, "spoof")
 	require.ErrorIs(t, err, types.ErrProductionForbidden)
 	require.False(t, ok)
-	ok, err = repo.TransitionReview(productionReviewContext(reviewTenantID, reviewAuthorID), reviewTenantID, request.ID,
-		types.ProductionReviewPending, types.ProductionReviewCancelled, reviewBusinessActor, "spoof")
-	require.ErrorIs(t, err, types.ErrProductionForbidden)
-	require.False(t, ok)
 	ok, err = repo.DecideStep(productionReviewContext(8, reviewBusinessActor), reviewTenantID, steps[0].ID,
 		types.ProductionReviewPending, types.ProductionReviewApproved, reviewBusinessActor, "cross tenant")
-	require.ErrorIs(t, err, types.ErrProductionForbidden)
-	require.False(t, ok)
-	ok, err = repo.TransitionReview(productionReviewContext(reviewTenantID, types.ProductionSystemActorID), reviewTenantID, request.ID,
-		types.ProductionReviewPending, types.ProductionReviewCancelled, types.ProductionSystemActorID, "system spoof")
 	require.ErrorIs(t, err, types.ErrProductionForbidden)
 	require.False(t, ok)
 	err = repo.ObsoletePendingByDocument(productionReviewTenantContext(8), reviewTenantID, reviewDocumentID, reviewVersionTwo)
@@ -654,19 +682,12 @@ func TestProductionReviewRepositoryOwnsEveryLifecycleTimestamp(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, ok)
 	}
-	ok, err = repo.TransitionReview(productionReviewContext(reviewTenantID, reviewEngineeringActor), reviewTenantID,
-		request.ID, types.ProductionReviewPending, types.ProductionReviewApproved, reviewEngineeringActor, "")
-	require.NoError(t, err)
-	require.True(t, ok)
-
 	var persistedAnnotation types.ProductionAnnotation
 	require.NoError(t, db.First(&persistedAnnotation, "id = ?", annotation.ID).Error)
 	require.NotNil(t, persistedAnnotation.ResolvedAt)
 	require.Equal(t, mutatedAt.UTC(), *persistedAnnotation.ResolvedAt)
 	persistedReview, err := repo.GetReview(context.Background(), reviewTenantID, request.ID)
 	require.NoError(t, err)
-	require.NotNil(t, persistedReview.CompletedAt)
-	require.Equal(t, mutatedAt.UTC(), *persistedReview.CompletedAt)
 	for _, step := range persistedReview.Steps {
 		require.NotNil(t, step.DecidedAt)
 		require.Equal(t, mutatedAt.UTC(), *step.DecidedAt)
@@ -697,44 +718,7 @@ func TestProductionReviewRepositoryObsoleteUsesClockForParentAndChildren(t *test
 	}
 }
 
-func TestProductionReviewRepositorySupportsOnlyHumanTerminalPaths(t *testing.T) {
-	for index, status := range []types.ProductionReviewStatus{
-		types.ProductionReviewApproved,
-		types.ProductionReviewRejected,
-		types.ProductionReviewChangesRequested,
-		types.ProductionReviewCancelled,
-	} {
-		t.Run(string(status), func(t *testing.T) {
-			repo, _ := newProductionReviewRepoFixture(t)
-			request := productionReviewRequest(reviewID(760+index*10), reviewVersionOne)
-			steps := productionReviewSteps(request.ID, 760+index*10)
-			require.NoError(t, repo.CreateReview(productionReviewContext(reviewTenantID, reviewAuthorID), request, steps))
-			if status == types.ProductionReviewApproved {
-				for stepIndex, actor := range []string{reviewBusinessActor, reviewEngineeringActor} {
-					ok, err := repo.DecideStep(productionReviewContext(reviewTenantID, actor), reviewTenantID, steps[stepIndex].ID,
-						types.ProductionReviewPending, types.ProductionReviewApproved, actor, "ok")
-					require.NoError(t, err)
-					require.True(t, ok)
-				}
-			}
-			reason := "closed"
-			if status == types.ProductionReviewApproved {
-				reason = ""
-			}
-			ok, err := repo.TransitionReview(productionReviewContext(reviewTenantID, reviewEngineeringActor), reviewTenantID,
-				request.ID, types.ProductionReviewPending, status, reviewEngineeringActor, reason)
-			require.NoError(t, err)
-			require.True(t, ok)
-			persisted, err := repo.GetReview(context.Background(), reviewTenantID, request.ID)
-			require.NoError(t, err)
-			require.Equal(t, status, persisted.Status)
-			require.NotNil(t, persisted.TerminalBy)
-			require.Equal(t, reviewEngineeringActor, *persisted.TerminalBy)
-		})
-	}
-}
-
-func TestProductionReviewRepositoryTransitionsAggregateAndJoinsSharedTransaction(t *testing.T) {
+func TestProductionReviewRepositoryDecisionsAndCreateJoinSharedTransaction(t *testing.T) {
 	repo, db := newProductionReviewRepoFixture(t)
 	request := productionReviewRequest(reviewID(600), reviewVersionOne)
 	steps := productionReviewSteps(request.ID, 600)
@@ -745,17 +729,8 @@ func TestProductionReviewRepositoryTransitionsAggregateAndJoinsSharedTransaction
 		require.NoError(t, err)
 		require.True(t, ok)
 	}
-	ok, err := repo.TransitionReview(productionReviewContext(reviewTenantID, reviewEngineeringActor), reviewTenantID, request.ID,
-		types.ProductionReviewPending, types.ProductionReviewApproved, reviewEngineeringActor, "")
-	require.NoError(t, err)
-	require.True(t, ok)
-	ok, err = repo.TransitionReview(productionReviewContext(reviewTenantID, reviewEngineeringActor), reviewTenantID, request.ID,
-		types.ProductionReviewPending, types.ProductionReviewRejected, reviewEngineeringActor, "late")
-	require.NoError(t, err)
-	require.False(t, ok)
-
 	rollbackRequest := productionReviewRequest(reviewID(610), reviewVersionTwo)
-	err = database.WithTransactionContext(productionReviewContext(reviewTenantID, reviewAuthorID), db, func(txCtx context.Context) error {
+	err := database.WithTransactionContext(productionReviewContext(reviewTenantID, reviewAuthorID), db, func(txCtx context.Context) error {
 		require.NoError(t, repo.CreateReview(txCtx, rollbackRequest, productionReviewSteps(rollbackRequest.ID, 610)))
 		return fmt.Errorf("force outer rollback")
 	})
