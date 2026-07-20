@@ -84,25 +84,36 @@ func TestProductionReviewPostgreSQLMigrationDeclaresIntegrityGuards(t *testing.T
 	for _, declaration := range []string{
 		"policy_snapshot JSONB NOT NULL",
 		"policy_digest VARCHAR(64) NOT NULL",
+		"status IN ('pending', 'approved', 'rejected', 'obsolete', 'cancelled', 'changes_requested')",
+		"decision IN ('pending', 'approved', 'changes_requested', 'rejected', 'cancelled')",
 		"FOREIGN KEY (document_id, tenant_id, project_id)\n        REFERENCES production_documents(id, tenant_id, project_id)",
 		"FOREIGN KEY (version_id, document_id, tenant_id, project_id)\n        REFERENCES production_document_versions(id, document_id, tenant_id, project_id)",
 		"FOREIGN KEY (block_id, version_id)\n        REFERENCES production_document_blocks(id, version_id)",
-		"CREATE UNIQUE INDEX IF NOT EXISTS uq_production_review_requests_pending_version_policy",
+		"CREATE UNIQUE INDEX IF NOT EXISTS uq_production_review_requests_version",
 		"CREATE INDEX IF NOT EXISTS idx_production_review_requests_document_version_status",
 		"CREATE INDEX IF NOT EXISTS idx_production_review_steps_request_sequence",
 		"CREATE INDEX IF NOT EXISTS idx_production_review_steps_request_role_decision",
 		"CREATE TRIGGER trg_production_review_requests_guard_identity",
 		"CREATE TRIGGER trg_production_review_steps_guard_decision",
 		"CREATE TRIGGER trg_production_review_requests_fence_terminal_children",
+		"production review requests must be submitted pending",
+		"production review steps must be inserted pending",
+		"NEW.status IN ('approved', 'rejected', 'cancelled', 'obsolete', 'changes_requested')",
+		"decision = 'cancelled'",
+		"review_request_id = NEW.review_request_id AND sequence = NEW.sequence",
+		"review_request_id = NEW.review_request_id AND required_role = NEW.required_role",
 	} {
 		require.Contains(t, up, declaration)
 	}
+	require.Contains(t, up, "IF NEW.status <> 'pending' OR NEW.terminal_by IS NOT NULL")
+	require.Contains(t, up, "IF NOT EXISTS (SELECT 1 FROM production_review_steps WHERE review_request_id = OLD.id)")
 
 	down := mustReadMigration(t, "../../migrations/versioned/000073_knowledge_production_reviews.down.sql")
 	_, err = pg_query.Parse(down)
 	require.NoError(t, err)
 	require.Less(t, strings.Index(down, "DROP TABLE IF EXISTS production_review_steps"), strings.Index(down, "DROP TABLE IF EXISTS production_review_requests"))
 	require.Less(t, strings.Index(down, "DROP TABLE IF EXISTS production_review_requests"), strings.Index(down, "DROP TABLE IF EXISTS production_annotations"))
+	require.Less(t, strings.Index(down, "DROP TRIGGER IF EXISTS trg_production_review_requests_validate_submission ON production_review_requests"), strings.Index(down, "DROP FUNCTION IF EXISTS validate_production_review_request_submission()"))
 }
 
 func TestProductionReviewSQLiteMigrationEnforcesAnchorsAndTerminalReviewGuards(t *testing.T) {
@@ -136,9 +147,7 @@ func TestProductionReviewSQLiteMigrationEnforcesAnchorsAndTerminalReviewGuards(t
 	require.NoError(t, err, "append-only document versions are immutable review targets without a mutable freeze update")
 	_, err = db.Exec(`INSERT INTO production_review_requests (id, tenant_id, project_id, document_id, version_id, policy_snapshot, policy_digest, submitted_by) VALUES ('review-1', 1, 'project-1', 'document-1', 'version-frozen', '{"steps":["compliance_reviewer"]}', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'author-1')`)
 	require.NoError(t, err)
-	_, err = db.Exec(`INSERT INTO production_review_requests (id, tenant_id, project_id, document_id, version_id, policy_snapshot, policy_digest, submitted_by) VALUES ('review-missing-reason', 1, 'project-1', 'document-1', 'version-frozen', '{}', 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', 'author-1')`)
-	require.NoError(t, err)
-	_, err = db.Exec(`UPDATE production_review_requests SET status = 'rejected', terminal_by = 'owner-1', completed_at = CURRENT_TIMESTAMP WHERE id = 'review-missing-reason'`)
+	_, err = db.Exec(`UPDATE production_review_requests SET status = 'rejected', terminal_by = 'owner-1', completed_at = CURRENT_TIMESTAMP WHERE id = 'review-1'`)
 	require.Error(t, err, "terminal rejection requires a reason")
 	_, err = db.Exec(`INSERT INTO production_review_steps (id, review_request_id, tenant_id, project_id, document_id, version_id, required_role, sequence) VALUES ('step-1', 'review-1', 1, 'project-1', 'document-1', 'version-frozen', 'compliance_reviewer', 1)`)
 	require.NoError(t, err)
@@ -171,6 +180,101 @@ func TestProductionReviewSQLiteMigrationRollsBackPopulatedSchema(t *testing.T) {
 	for _, table := range []string{"production_review_steps", "production_review_requests", "production_annotations"} {
 		require.Empty(t, sqliteMasterSQL(t, db, "table", table))
 	}
+}
+
+func TestProductionReviewSQLiteMigrationRejectsTerminalRequestAndStepInserts(t *testing.T) {
+	db := openProductionReviewSQLite(t)
+	seedProductionReviewFixture(t, db)
+
+	for _, status := range []string{"approved", "rejected", "cancelled", "obsolete", "changes_requested"} {
+		_, err := db.Exec(`INSERT INTO production_review_requests (id, tenant_id, project_id, document_id, version_id, policy_snapshot, policy_digest, status, submitted_by, terminal_by, terminal_reason, completed_at) VALUES (?, 1, 'project-1', 'document-1', 'version-review-fixture', '{}', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', ?, 'author-1', 'owner-1', 'terminal', CURRENT_TIMESTAMP)`, "review-terminal-"+status, status)
+		require.Error(t, err, "terminal review request %s must not be inserted", status)
+	}
+	insertProductionReviewRequest(t, db, "review-insert-guard", "version-review-fixture", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "{}")
+	_, err := db.Exec(`UPDATE production_review_requests SET status = 'approved', terminal_by = 'owner-1', completed_at = CURRENT_TIMESTAMP WHERE id = 'review-insert-guard'`)
+	require.Error(t, err, "zero-step approval must not bypass materialized review steps")
+	for _, decision := range []string{"approved", "rejected", "changes_requested", "cancelled"} {
+		_, err := db.Exec(`INSERT INTO production_review_steps (id, review_request_id, tenant_id, project_id, document_id, version_id, required_role, sequence, reviewer_user_id, decision, comment, decided_at) VALUES (?, 'review-insert-guard', 1, 'project-1', 'document-1', 'version-review-fixture', 'business_reviewer', ?, 'owner-1', ?, 'bypass', CURRENT_TIMESTAMP)`, "step-terminal-"+decision, len(decision), decision)
+		require.Error(t, err, "review step decision %s must only arise through a guarded update", decision)
+	}
+	_, err = db.Exec(`INSERT INTO production_review_steps (id, review_request_id, tenant_id, project_id, document_id, version_id, required_role, sequence, decision, comment, decided_at) VALUES ('step-terminal-no-role', 'review-insert-guard', 1, 'project-1', 'document-1', 'version-review-fixture', 'business_reviewer', 99, 'approved', 'bypass', CURRENT_TIMESTAMP)`)
+	require.Error(t, err, "review step decisions cannot be inserted without the required role")
+}
+
+func TestProductionReviewSQLiteMigrationGuardsReplaceAndTerminalizesNonApproval(t *testing.T) {
+	for _, status := range []string{"rejected", "cancelled", "obsolete", "changes_requested"} {
+		t.Run(status, func(t *testing.T) {
+			db := openProductionReviewSQLite(t)
+			seedProductionReviewFixture(t, db)
+			insertProductionReviewRequest(t, db, "review-"+status, "version-review-fixture", "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "{\"a\":1,\"b\":2}")
+			insertProductionReviewStep(t, db, "step-approved-"+status, "review-"+status, "business_reviewer", 1)
+			insertProductionReviewStep(t, db, "step-pending-"+status, "review-"+status, "engineering_reviewer", 2)
+			_, err := db.Exec(`UPDATE production_review_steps SET decision = 'approved', reviewer_user_id = 'business-1', comment = 'ok', decided_at = CURRENT_TIMESTAMP WHERE id = ?`, "step-approved-"+status)
+			require.NoError(t, err)
+			_, err = db.Exec(`UPDATE production_review_requests SET status = ?, terminal_by = 'owner-1', terminal_reason = 'closed', completed_at = CURRENT_TIMESTAMP WHERE id = ?`, status, "review-"+status)
+			require.NoError(t, err)
+
+			var pending, cancelled int
+			require.NoError(t, db.QueryRow(`SELECT count(*) FROM production_review_steps WHERE review_request_id = ? AND decision = 'pending'`, "review-"+status).Scan(&pending))
+			require.NoError(t, db.QueryRow(`SELECT count(*) FROM production_review_steps WHERE review_request_id = ? AND decision = 'cancelled'`, "review-"+status).Scan(&cancelled))
+			require.Zero(t, pending)
+			require.Equal(t, 1, cancelled)
+			_, err = db.Exec(`UPDATE production_review_steps SET comment = 'mutated' WHERE id = ?`, "step-pending-"+status)
+			require.ErrorContains(t, err, "terminal production review steps are immutable")
+		})
+	}
+
+	db := openProductionReviewSQLite(t)
+	seedProductionReviewFixture(t, db)
+	insertProductionReviewRequest(t, db, "review-replace", "version-review-fixture", "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "{}")
+	insertProductionReviewStep(t, db, "step-replace", "review-replace", "business_reviewer", 1)
+	_, err := db.Exec(`UPDATE production_review_steps SET decision = 'approved', reviewer_user_id = 'business-1', comment = 'ok', decided_at = CURRENT_TIMESTAMP WHERE id = 'step-replace'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_review_requests SET status = 'approved', terminal_by = 'owner-1', completed_at = CURRENT_TIMESTAMP WHERE id = 'review-replace'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT OR REPLACE INTO production_review_requests (id, tenant_id, project_id, document_id, version_id, policy_snapshot, policy_digest, submitted_by) VALUES ('review-replace-new-id', 1, 'project-1', 'document-1', 'version-review-fixture', '{}', 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', 'author-1')`)
+	require.ErrorContains(t, err, "production review requests cannot be replaced")
+	_, err = db.Exec(`INSERT OR REPLACE INTO production_review_steps (id, review_request_id, tenant_id, project_id, document_id, version_id, required_role, sequence) VALUES ('step-replace-new-id', 'review-replace', 1, 'project-1', 'document-1', 'version-review-fixture', 'business_reviewer', 1)`)
+	require.ErrorContains(t, err, "production review steps cannot be replaced")
+	var requestStatus, stepDecision string
+	require.NoError(t, db.QueryRow(`SELECT status FROM production_review_requests WHERE id = 'review-replace'`).Scan(&requestStatus))
+	require.NoError(t, db.QueryRow(`SELECT decision FROM production_review_steps WHERE id = 'step-replace'`).Scan(&stepDecision))
+	require.Equal(t, "approved", requestStatus)
+	require.Equal(t, "approved", stepDecision)
+
+	t.Run("child terminalization rolls back with parent", func(t *testing.T) {
+		db := openProductionReviewSQLite(t)
+		seedProductionReviewFixture(t, db)
+		insertProductionReviewRequest(t, db, "review-rollback-terminalization", "version-review-fixture", "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "{}")
+		insertProductionReviewStep(t, db, "step-rollback-terminalization", "review-rollback-terminalization", "business_reviewer", 1)
+		_, err := db.Exec(`CREATE TRIGGER test_production_review_step_cancel_failure BEFORE UPDATE ON production_review_steps FOR EACH ROW WHEN NEW.decision = 'cancelled' BEGIN SELECT RAISE(ABORT, 'forced child terminalization failure'); END`)
+		require.NoError(t, err)
+		_, err = db.Exec(`UPDATE production_review_requests SET status = 'cancelled', terminal_by = 'owner-1', terminal_reason = 'closed', completed_at = CURRENT_TIMESTAMP WHERE id = 'review-rollback-terminalization'`)
+		require.ErrorContains(t, err, "forced child terminalization failure")
+		var status, decision string
+		require.NoError(t, db.QueryRow(`SELECT status FROM production_review_requests WHERE id = 'review-rollback-terminalization'`).Scan(&status))
+		require.NoError(t, db.QueryRow(`SELECT decision FROM production_review_steps WHERE id = 'step-rollback-terminalization'`).Scan(&decision))
+		require.Equal(t, "pending", status)
+		require.Equal(t, "pending", decision)
+	})
+}
+
+func TestProductionReviewSQLiteMigrationEnforcesOneImmutablePolicyPerVersion(t *testing.T) {
+	db := openProductionReviewSQLite(t)
+	seedProductionReviewFixture(t, db)
+	insertProductionReviewRequest(t, db, "review-policy", "version-review-fixture", "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "{\"a\":1,\"b\":2}")
+	_, err := db.Exec(`INSERT INTO production_review_requests (id, tenant_id, project_id, document_id, version_id, policy_snapshot, policy_digest, submitted_by) VALUES ('review-policy-equivalent', 1, 'project-1', 'document-1', 'version-review-fixture', '{ "b": 2, "a": 1 }', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'author-1')`)
+	require.Error(t, err, "equivalent policy JSON cannot create a second review for one immutable version")
+	_, err = db.Exec(`UPDATE production_review_requests SET policy_snapshot = '{"a":2}', policy_digest = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' WHERE id = 'review-policy'`)
+	require.ErrorContains(t, err, "production review request identity is immutable")
+	insertProductionVersion(t, db, "version-review-policy-whitespace", "document-1", 1, "project-1", 4, "source-set-1", "")
+	_, err = db.Exec(`INSERT INTO production_review_requests (id, tenant_id, project_id, document_id, version_id, policy_snapshot, policy_digest, submitted_by) VALUES ('review-policy-whitespace', 1, 'project-1', 'document-1', 'version-review-policy-whitespace', '{ "a": 1 }', '1111111111111111111111111111111111111111111111111111111111111111', 'author-1')`)
+	require.Error(t, err, "SQLite submission policy text must be normalized JSON")
+	insertProductionVersion(t, db, "version-review-policy-invented", "document-1", 1, "project-1", 5, "source-set-1", "")
+	_, err = db.Exec(`INSERT INTO production_review_requests (id, tenant_id, project_id, document_id, version_id, policy_snapshot, policy_digest, submitted_by) VALUES ('review-policy-invented', 1, 'project-1', 'document-1', 'version-review-policy-invented', '{}', '1111111111111111111111111111111111111111111111111111111111111111', 'author-1')`)
+	require.NoError(t, err, "portable SQL can validate digest shape but cannot recompute SHA-256 without a nonstandard extension")
+	_, err = db.Exec(`INSERT INTO production_review_requests (id, tenant_id, project_id, document_id, version_id, policy_snapshot, policy_digest, submitted_by) VALUES ('review-policy-invented-duplicate', 1, 'project-1', 'document-1', 'version-review-policy-invented', '{"different":true}', '2222222222222222222222222222222222222222222222222222222222222222', 'author-1')`)
+	require.Error(t, err, "an invented digest cannot create a duplicate review or rebind an immutable version")
 }
 
 func TestProductionRunsPostgreSQLMigrationDeclaresEquivalentStructure(t *testing.T) {
@@ -1220,6 +1324,30 @@ func openProductionReviewSQLite(t *testing.T) *sql.DB {
 	_, err := db.Exec(mustReadMigration(t, "../../migrations/sqlite/000004_knowledge_production_reviews.up.sql"))
 	require.NoError(t, err)
 	return db
+}
+
+func seedProductionReviewFixture(t *testing.T, db *sql.DB) {
+	t.Helper()
+
+	seedProductionRunScopes(t, db)
+	insertProductionVersion(t, db, "version-review-fixture", "document-1", 1, "project-1", 3, "source-set-1", "")
+	insertProductionBlock(t, db, "block-review-fixture", "version-review-fixture", "block-review-fixture")
+	_, err := db.Exec(`INSERT INTO production_project_members (project_id, user_id, role, assigned_by) VALUES ('project-1', 'business-1', 'business_reviewer', 'owner-1'), ('project-1', 'engineering-1', 'engineering_reviewer', 'owner-1')`)
+	require.NoError(t, err)
+}
+
+func insertProductionReviewRequest(t *testing.T, db *sql.DB, id, versionID, digest, snapshot string) {
+	t.Helper()
+
+	_, err := db.Exec(`INSERT INTO production_review_requests (id, tenant_id, project_id, document_id, version_id, policy_snapshot, policy_digest, submitted_by) VALUES (?, 1, 'project-1', 'document-1', ?, ?, ?, 'author-1')`, id, versionID, snapshot, digest)
+	require.NoError(t, err)
+}
+
+func insertProductionReviewStep(t *testing.T, db *sql.DB, id, reviewID, role string, sequence int) {
+	t.Helper()
+
+	_, err := db.Exec(`INSERT INTO production_review_steps (id, review_request_id, tenant_id, project_id, document_id, version_id, required_role, sequence) VALUES (?, ?, 1, 'project-1', 'document-1', 'version-review-fixture', ?, ?)`, id, reviewID, role, sequence)
+	require.NoError(t, err)
 }
 
 func seedProductionRunScopes(t *testing.T, db *sql.DB) {

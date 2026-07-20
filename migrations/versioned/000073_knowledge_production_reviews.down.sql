@@ -14,6 +14,7 @@ DROP TRIGGER IF EXISTS trg_production_review_requests_prevent_delete ON producti
 DROP FUNCTION IF EXISTS prevent_production_review_request_delete();
 DROP TRIGGER IF EXISTS trg_production_review_requests_guard_identity ON production_review_requests;
 DROP FUNCTION IF EXISTS guard_production_review_request_identity();
+DROP TRIGGER IF EXISTS trg_production_review_requests_validate_submission ON production_review_requests;
 DROP FUNCTION IF EXISTS validate_production_review_request_submission();
 DROP TRIGGER IF EXISTS trg_production_annotations_prevent_replace ON production_annotations;
 DROP FUNCTION IF EXISTS prevent_production_annotation_replace();
@@ -26,7 +27,7 @@ DROP TABLE IF EXISTS production_review_steps;
 DROP TABLE IF EXISTS production_review_requests;
 DROP TABLE IF EXISTS production_annotations;
 
-DROP INDEX IF EXISTS uq_production_review_requests_pending_version_policy;
+DROP INDEX IF EXISTS uq_production_review_requests_version;
 DROP INDEX IF EXISTS idx_production_review_steps_request_role_decision;
 DROP INDEX IF EXISTS idx_production_review_steps_request_sequence;
 DROP INDEX IF EXISTS idx_production_review_requests_document_version_status;

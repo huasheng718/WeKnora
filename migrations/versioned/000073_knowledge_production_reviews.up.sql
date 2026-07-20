@@ -69,11 +69,11 @@ CREATE TABLE IF NOT EXISTS production_review_requests (
     CONSTRAINT chk_production_review_requests_policy_digest CHECK (
         policy_digest ~ '^[0-9a-f]{64}$'
     ),
-    CONSTRAINT chk_production_review_requests_status CHECK (status IN ('pending', 'approved', 'rejected', 'obsolete', 'cancelled')),
+    CONSTRAINT chk_production_review_requests_status CHECK (status IN ('pending', 'approved', 'rejected', 'obsolete', 'cancelled', 'changes_requested')),
     CONSTRAINT chk_production_review_requests_terminal CHECK (
         (status = 'pending' AND terminal_by IS NULL AND terminal_reason IS NULL AND completed_at IS NULL) OR
         (status = 'approved' AND terminal_by IS NOT NULL AND completed_at IS NOT NULL) OR
-        (status IN ('rejected', 'obsolete', 'cancelled') AND terminal_by IS NOT NULL AND terminal_reason IS NOT NULL AND char_length(terminal_reason) BETWEEN 1 AND 5000 AND completed_at IS NOT NULL)
+        (status IN ('rejected', 'obsolete', 'cancelled', 'changes_requested') AND terminal_by IS NOT NULL AND terminal_reason IS NOT NULL AND char_length(terminal_reason) BETWEEN 1 AND 5000 AND completed_at IS NOT NULL)
     ),
     UNIQUE(id, tenant_id, project_id, document_id, version_id),
     CONSTRAINT fk_production_review_requests_document_context FOREIGN KEY (document_id, tenant_id, project_id)
@@ -82,9 +82,8 @@ CREATE TABLE IF NOT EXISTS production_review_requests (
         REFERENCES production_document_versions(id, document_id, tenant_id, project_id) ON DELETE RESTRICT
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS uq_production_review_requests_pending_version_policy
-    ON production_review_requests (tenant_id, project_id, document_id, version_id, policy_digest)
-    WHERE status = 'pending';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_production_review_requests_version
+    ON production_review_requests (tenant_id, project_id, document_id, version_id);
 CREATE INDEX IF NOT EXISTS idx_production_review_requests_document_version_status
     ON production_review_requests (document_id, version_id, status);
 
@@ -105,11 +104,12 @@ CREATE TABLE IF NOT EXISTS production_review_steps (
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT chk_production_review_steps_role CHECK (required_role IN ('business_reviewer', 'engineering_reviewer', 'compliance_reviewer')),
     CONSTRAINT chk_production_review_steps_sequence CHECK (sequence >= 1),
-    CONSTRAINT chk_production_review_steps_decision CHECK (decision IN ('pending', 'approved', 'changes_requested', 'rejected')),
+    CONSTRAINT chk_production_review_steps_decision CHECK (decision IN ('pending', 'approved', 'changes_requested', 'rejected', 'cancelled')),
     CONSTRAINT chk_production_review_steps_comment CHECK (char_length(comment) <= 5000),
     CONSTRAINT chk_production_review_steps_decision_actor CHECK (
         (decision = 'pending' AND reviewer_user_id IS NULL AND decided_at IS NULL AND comment = '') OR
-        (decision IN ('approved', 'changes_requested', 'rejected') AND reviewer_user_id IS NOT NULL AND decided_at IS NOT NULL)
+        (decision IN ('approved', 'changes_requested', 'rejected') AND reviewer_user_id IS NOT NULL AND decided_at IS NOT NULL) OR
+        (decision = 'cancelled' AND reviewer_user_id IS NULL AND decided_at IS NOT NULL AND comment = '')
     ),
     UNIQUE(review_request_id, sequence),
     UNIQUE(review_request_id, required_role),
@@ -183,6 +183,10 @@ CREATE TRIGGER trg_production_annotations_prevent_replace
 CREATE OR REPLACE FUNCTION validate_production_review_request_submission()
 RETURNS TRIGGER AS $$
 BEGIN
+    IF NEW.status <> 'pending' OR NEW.terminal_by IS NOT NULL OR
+       NEW.terminal_reason IS NOT NULL OR NEW.completed_at IS NOT NULL THEN
+        RAISE EXCEPTION 'production review requests must be submitted pending';
+    END IF;
     IF EXISTS (
         SELECT 1 FROM production_annotations
         WHERE tenant_id = NEW.tenant_id AND project_id = NEW.project_id
@@ -242,7 +246,13 @@ CREATE TRIGGER trg_production_review_requests_prevent_delete
 CREATE OR REPLACE FUNCTION prevent_production_review_request_replace()
 RETURNS TRIGGER AS $$
 BEGIN
-    IF EXISTS (SELECT 1 FROM production_review_requests WHERE id = NEW.id) THEN
+    IF EXISTS (
+        SELECT 1 FROM production_review_requests
+        WHERE id = NEW.id OR (
+            tenant_id = NEW.tenant_id AND project_id = NEW.project_id
+            AND document_id = NEW.document_id AND version_id = NEW.version_id
+        )
+    ) THEN
         RAISE EXCEPTION 'production review requests cannot be replaced';
     END IF;
     RETURN NEW;
@@ -256,11 +266,22 @@ CREATE TRIGGER trg_production_review_requests_prevent_replace
 CREATE OR REPLACE FUNCTION fence_terminal_production_review_children()
 RETURNS TRIGGER AS $$
 BEGIN
-    IF OLD.status = 'pending' AND NEW.status = 'approved' AND (
-        NOT EXISTS (SELECT 1 FROM production_review_steps WHERE review_request_id = OLD.id) OR
-        EXISTS (SELECT 1 FROM production_review_steps WHERE review_request_id = OLD.id AND decision <> 'approved')
-    ) THEN
-        RAISE EXCEPTION 'all production review steps must approve the review';
+    IF OLD.status = 'pending' AND NEW.status IN ('approved', 'rejected', 'cancelled', 'obsolete', 'changes_requested') THEN
+        IF NOT EXISTS (SELECT 1 FROM production_review_steps WHERE review_request_id = OLD.id) THEN
+            RAISE EXCEPTION 'production review requests require materialized review steps';
+        END IF;
+        IF NEW.status = 'approved' AND EXISTS (
+            SELECT 1 FROM production_review_steps
+            WHERE review_request_id = OLD.id AND decision <> 'approved'
+        ) THEN
+            RAISE EXCEPTION 'all production review steps must approve the review';
+        END IF;
+        IF NEW.status IN ('rejected', 'cancelled', 'obsolete', 'changes_requested') THEN
+            UPDATE production_review_steps
+            SET decision = 'cancelled', reviewer_user_id = NULL, comment = '',
+                decided_at = COALESCE(NEW.completed_at, CURRENT_TIMESTAMP)
+            WHERE review_request_id = OLD.id AND decision = 'pending';
+        END IF;
     END IF;
     RETURN NEW;
 END;
@@ -273,6 +294,10 @@ CREATE TRIGGER trg_production_review_requests_fence_terminal_children
 CREATE OR REPLACE FUNCTION validate_production_review_step_parent()
 RETURNS TRIGGER AS $$
 BEGIN
+    IF NEW.decision <> 'pending' OR NEW.reviewer_user_id IS NOT NULL OR
+       NEW.comment <> '' OR NEW.decided_at IS NOT NULL THEN
+        RAISE EXCEPTION 'production review steps must be inserted pending';
+    END IF;
     IF NOT EXISTS (
         SELECT 1 FROM production_review_requests
         WHERE id = NEW.review_request_id AND tenant_id = NEW.tenant_id
@@ -309,7 +334,7 @@ BEGIN
        NEW.created_at IS DISTINCT FROM OLD.created_at THEN
         RAISE EXCEPTION 'production review step identity is immutable';
     END IF;
-    IF NEW.decision <> 'pending' AND NOT EXISTS (
+    IF NEW.decision IN ('approved', 'changes_requested', 'rejected') AND NOT EXISTS (
         SELECT 1 FROM production_project_members
         WHERE project_id = NEW.project_id AND user_id = NEW.reviewer_user_id
           AND role = NEW.required_role AND deleted_at IS NULL
@@ -338,7 +363,12 @@ CREATE TRIGGER trg_production_review_steps_prevent_delete
 CREATE OR REPLACE FUNCTION prevent_production_review_step_replace()
 RETURNS TRIGGER AS $$
 BEGIN
-    IF EXISTS (SELECT 1 FROM production_review_steps WHERE id = NEW.id) THEN
+    IF EXISTS (
+        SELECT 1 FROM production_review_steps
+        WHERE id = NEW.id OR
+            (review_request_id = NEW.review_request_id AND sequence = NEW.sequence) OR
+            (review_request_id = NEW.review_request_id AND required_role = NEW.required_role)
+    ) THEN
         RAISE EXCEPTION 'production review steps cannot be replaced';
     END IF;
     RETURN NEW;
