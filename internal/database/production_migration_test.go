@@ -74,9 +74,12 @@ func TestProductionRunsPostgreSQLMigrationDeclaresEquivalentStructure(t *testing
 		"wakeup_enqueued_version <= wakeup_version",
 		"document_type_snapshot JSONB NOT NULL",
 		"workflow_plan_snapshot JSONB NOT NULL",
+		"workflow_plan_digest VARCHAR(64) NOT NULL",
 		"raw_model_response JSONB NULL",
 		"request_snapshot JSONB NOT NULL",
 		"response_snapshot JSONB NULL",
+		"ADD CONSTRAINT fk_production_evidence_snapshots_captured_tool_call",
+		"FOREIGN KEY (captured_by_tool_call_id) REFERENCES production_tool_calls(id)",
 		"CHECK (run_type IN ('collect', 'write', 'rewrite', 'validate'))",
 		"CHECK (status IN ('queued', 'running', 'waiting_approval', 'completed', 'failed', 'cancelled'))",
 		"CHECK (provider_type IN ('skill', 'mcp', 'datasource'))",
@@ -89,6 +92,7 @@ func TestProductionRunsPostgreSQLMigrationDeclaresEquivalentStructure(t *testing
 		"FOREIGN KEY (response_evidence_id, response_evidence_source_item_id)",
 		"FOREIGN KEY (response_evidence_source_item_id, source_set_id)",
 		"CREATE TRIGGER trg_production_runs_guard_terminal",
+		"CREATE TRIGGER trg_production_runs_guard_workflow_identity",
 		"CREATE TRIGGER trg_production_tool_calls_guard_terminal",
 		"BEFORE UPDATE OR DELETE ON production_runs",
 		"BEFORE UPDATE OR DELETE ON production_tool_calls",
@@ -127,6 +131,11 @@ func TestProductionRunsPostgreSQLMigrationDeclaresEquivalentStructure(t *testing
 	down := mustReadMigration(t, "../../migrations/versioned/000072_knowledge_production_runs.down.sql")
 	_, err = pg_query.Parse(down)
 	require.NoError(t, err)
+	require.Contains(t, down, "DROP CONSTRAINT IF EXISTS fk_production_evidence_snapshots_captured_tool_call")
+	require.Less(t,
+		strings.Index(down, "DROP CONSTRAINT IF EXISTS fk_production_evidence_snapshots_captured_tool_call"),
+		strings.Index(down, "DROP TABLE IF EXISTS production_tool_calls"),
+	)
 	for _, declaration := range []string{
 		"DROP TRIGGER IF EXISTS trg_production_runs_fence_terminal_children ON production_runs",
 		"DROP FUNCTION IF EXISTS fence_terminal_production_run_children()",
@@ -139,6 +148,27 @@ func TestProductionRunsPostgreSQLMigrationDeclaresEquivalentStructure(t *testing
 	}
 	require.Less(t, strings.Index(down, "DROP TABLE IF EXISTS production_tool_calls"), strings.Index(down, "DROP TABLE IF EXISTS production_runs"))
 	require.Less(t, strings.Index(down, "DROP TABLE IF EXISTS production_runs"), strings.Index(down, "DROP INDEX IF EXISTS uq_production_document_versions_run_context"))
+}
+
+func TestProductionRunsSQLiteWorkflowSnapshotAndDigestAreImmutable(t *testing.T) {
+	db := openProductionRunsSQLite(t)
+	seedProductionRunScopes(t, db)
+	insertProductionRun(t, db, "run-workflow-immutable", 1, "project-1", "document-1", "source-set-1", "version-1", "run-workflow-immutable")
+
+	_, err := db.Exec(`UPDATE production_runs SET workflow_plan_snapshot = '{"steps":[{"provider_id":"baseline","provider_type":"skill","request":{},"tool_name":"load"}],"version":1}' WHERE id = 'run-workflow-immutable'`)
+	require.ErrorContains(t, err, "production workflow identity is immutable")
+	_, err = db.Exec(`UPDATE production_runs SET workflow_plan_digest = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' WHERE id = 'run-workflow-immutable'`)
+	require.ErrorContains(t, err, "production workflow identity is immutable")
+	_, err = db.Exec(`UPDATE production_runs SET status = 'running' WHERE id = 'run-workflow-immutable'`)
+	require.NoError(t, err, "ordinary run state must remain mutable")
+}
+
+func TestProductionRunsWorkflowIdentityDownMigrationsRemoveGuards(t *testing.T) {
+	sqliteDown := mustReadMigration(t, "../../migrations/sqlite/000003_knowledge_production_runs.down.sql")
+	postgresDown := mustReadMigration(t, "../../migrations/versioned/000072_knowledge_production_runs.down.sql")
+	require.Contains(t, sqliteDown, "DROP TRIGGER IF EXISTS trg_production_runs_guard_workflow_identity")
+	require.Contains(t, postgresDown, "DROP TRIGGER IF EXISTS trg_production_runs_guard_workflow_identity ON production_runs")
+	require.Contains(t, postgresDown, "DROP FUNCTION IF EXISTS guard_production_run_workflow_identity()")
 }
 
 func TestProductionWorkflowPlanColumnsAreImmutableAndJSONConstrained(t *testing.T) {
@@ -546,6 +576,7 @@ func TestProductionDocumentsPostgreSQLMigrationDeclaresEquivalentStructure(t *te
 	for _, declaration := range []string{
 		"metadata JSONB NOT NULL DEFAULT '{}'::jsonb",
 		"inline_content JSONB NULL",
+		"captured_by_tool_call_id VARCHAR(36) NULL",
 		"content JSONB NOT NULL",
 		"attributes JSONB NOT NULL",
 		"evidence_refs JSONB NOT NULL",
@@ -918,17 +949,36 @@ func TestProductionDocumentsSQLiteFrozenSetsRejectAllItemAndEvidenceMutations(t 
 	require.ErrorContains(t, err, "evidence cannot be inserted into frozen source sets")
 }
 
-func TestProductionRunsSQLiteFrozenAcceptedItemAllowsOnlyCapturedRunEvidence(t *testing.T) {
+func TestProductionRunsSQLiteFrozenAcceptedItemRequiresExactExecutingToolCallEvidence(t *testing.T) {
 	db := openProductionRunsSQLite(t)
 	seedProductionRunScopes(t, db)
 	insertProductionRun(t, db, "run-frozen-evidence", 1, "project-1", "document-1", "source-set-1", "version-1", "run-frozen-evidence")
+	insertProductionToolCall(t, db, "call-frozen-evidence", "run-frozen-evidence", "call-frozen-evidence", 1, 0)
+	setProductionToolCallStatus(t, db, "call-frozen-evidence", "executing")
+	insertProductionToolCall(t, db, "call-planned-evidence", "run-frozen-evidence", "call-planned-evidence", 1, 1)
 	_, err := db.Exec(`UPDATE production_source_sets SET status = 'frozen', frozen_at = CURRENT_TIMESTAMP WHERE id = 'source-set-1'`)
 	require.NoError(t, err)
 
-	_, err = db.Exec(`INSERT INTO production_evidence_snapshots (id, source_item_id, snapshot_type, inline_content, content_digest, redaction_metadata, captured_by_run_id) VALUES ('run-evidence', 'source-item-1', 'tool_result', '{"ok":true}', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', '{}', 'run-frozen-evidence')`)
+	_, err = db.Exec(`INSERT INTO production_evidence_snapshots (id, source_item_id, snapshot_type, inline_content, content_digest, redaction_metadata, captured_by_run_id, captured_by_tool_call_id) VALUES ('run-evidence', 'source-item-1', 'tool_result', '{"ok":true}', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', '{}', 'run-frozen-evidence', 'call-frozen-evidence')`)
 	require.NoError(t, err)
+
+	for _, test := range []struct {
+		name, id, snapshotType, runID, callID string
+	}{
+		{name: "missing call", id: "missing-call-evidence", snapshotType: "tool_result", runID: "run-frozen-evidence", callID: ""},
+		{name: "wrong call", id: "wrong-call-evidence", snapshotType: "tool_result", runID: "run-frozen-evidence", callID: "call-missing"},
+		{name: "planned call", id: "planned-call-evidence", snapshotType: "tool_result", runID: "run-frozen-evidence", callID: "call-planned-evidence"},
+		{name: "wrong run", id: "wrong-run-evidence", snapshotType: "tool_result", runID: "run-missing", callID: "call-frozen-evidence"},
+		{name: "wrong type", id: "wrong-type-evidence", snapshotType: "json", runID: "run-frozen-evidence", callID: "call-frozen-evidence"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, insertErr := db.Exec(`INSERT INTO production_evidence_snapshots (id, source_item_id, snapshot_type, inline_content, content_digest, redaction_metadata, captured_by_run_id, captured_by_tool_call_id) VALUES (?, 'source-item-1', ?, '{"ok":true}', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', '{}', NULLIF(?, ''), NULLIF(?, ''))`, test.id, test.snapshotType, test.runID, test.callID)
+			require.ErrorContains(t, insertErr, "frozen source set requires accepted executing tool-call evidence")
+		})
+	}
+
 	_, err = db.Exec(`INSERT INTO production_evidence_snapshots (id, source_item_id, snapshot_type, inline_content, content_digest, redaction_metadata) VALUES ('ordinary-evidence', 'source-item-1', 'text', '"late"', 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', '{}')`)
-	require.ErrorContains(t, err, "frozen source set requires accepted run-captured evidence")
+	require.ErrorContains(t, err, "frozen source set requires accepted executing tool-call evidence")
 }
 
 func TestProductionDocumentsSQLiteLineageRequiresRealImmutableEndpoints(t *testing.T) {

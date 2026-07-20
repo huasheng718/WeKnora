@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS production_evidence_snapshots (
     content_digest VARCHAR(64) NOT NULL,
     redaction_metadata TEXT NOT NULL DEFAULT '{}',
     captured_by_run_id VARCHAR(36) NULL,
+    captured_by_tool_call_id VARCHAR(36) NULL,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT chk_production_evidence_snapshots_type CHECK (snapshot_type IN ('text', 'json', 'file', 'tool_result')),
     CONSTRAINT chk_production_evidence_snapshots_content CHECK ((storage_path IS NOT NULL) + (inline_content IS NOT NULL) = 1)
@@ -88,6 +89,8 @@ CREATE TABLE IF NOT EXISTS production_evidence_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_production_evidence_snapshots_source_item
     ON production_evidence_snapshots (source_item_id);
+CREATE INDEX IF NOT EXISTS idx_production_evidence_snapshots_captured_tool_call
+    ON production_evidence_snapshots (captured_by_tool_call_id);
 
 CREATE TABLE IF NOT EXISTS production_documents (
     id VARCHAR(36) PRIMARY KEY,

@@ -1,5 +1,7 @@
 DROP TRIGGER IF EXISTS trg_production_runs_fence_terminal_children ON production_runs;
 DROP FUNCTION IF EXISTS fence_terminal_production_run_children();
+DROP TRIGGER IF EXISTS trg_production_runs_guard_workflow_identity ON production_runs;
+DROP FUNCTION IF EXISTS guard_production_run_workflow_identity();
 DROP TRIGGER IF EXISTS trg_production_tool_calls_fence_parent ON production_tool_calls;
 DROP FUNCTION IF EXISTS fence_production_tool_call_parent();
 DROP TRIGGER IF EXISTS trg_production_tool_calls_guard_invocation_identity ON production_tool_calls;
@@ -9,7 +11,10 @@ DROP FUNCTION IF EXISTS guard_terminal_production_tool_call();
 DROP TRIGGER IF EXISTS trg_production_runs_guard_terminal ON production_runs;
 DROP FUNCTION IF EXISTS guard_terminal_production_run();
 DROP TRIGGER IF EXISTS trg_production_evidence_snapshots_prevent_frozen_insert ON production_evidence_snapshots;
-DROP FUNCTION IF EXISTS allow_only_frozen_run_evidence_insert();
+DROP FUNCTION IF EXISTS allow_only_frozen_tool_call_evidence_insert();
+
+ALTER TABLE production_evidence_snapshots
+    DROP CONSTRAINT IF EXISTS fk_production_evidence_snapshots_captured_tool_call;
 
 DROP TABLE IF EXISTS production_tool_calls;
 DROP TABLE IF EXISTS production_runs;

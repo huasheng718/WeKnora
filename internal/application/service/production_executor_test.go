@@ -37,12 +37,14 @@ func TestProductionStepExecutorPlansFirstServerOwnedWorkflowCall(t *testing.T) {
 	adapter := &productionExecutorAdapterStub{}
 	repo := &productionExecutorRepoStub{}
 	executor := newProductionStepExecutor(repo, adapter, adapter, adapter, &productionExecutorWriterStub{})
+	workflow, err := types.CanonicalProductionWorkflowPlanSnapshot(types.JSON(`{"version":1,"steps":[{"provider_type":"skill","provider_id":"baseline","tool_name":"load_instructions","request":{"source_item_id":"71000000-0000-4000-8000-000000000005"}}]}`))
+	require.NoError(t, err)
 	run := &types.ProductionRun{
 		ID: mcpAdapterRunID, TenantID: 7, ProjectID: mcpAdapterProjectID,
 		SourceSetID: mcpAdapterSourceSetID, RunType: types.ProductionRunCollect,
 		Status: types.ProductionRunRunning, Attempt: 1, CurrentStep: 0,
 		DocumentTypeSnapshot: types.JSON(`{"skill_bindings":{"version":1,"skills":[{"name":"baseline","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}}`),
-		WorkflowPlanSnapshot: types.JSON(`{"version":1,"steps":[{"provider_type":"skill","provider_id":"baseline","tool_name":"load_instructions","request":{"source_item_id":"71000000-0000-4000-8000-000000000005"}}]}`),
+		WorkflowPlanSnapshot: workflow, WorkflowPlanDigest: productionToolDigest(workflow),
 	}
 
 	result, err := executor.ExecuteStep(context.Background(), run, nil)
@@ -59,6 +61,34 @@ func TestProductionStepExecutorPlansFirstServerOwnedWorkflowCall(t *testing.T) {
 	require.NotNil(t, second.ToolCallResult)
 	require.Equal(t, types.ProductionToolCallCompleted, second.ToolCallResult.Status)
 	require.Equal(t, 1, adapter.calls)
+}
+
+func TestProductionExecutorRejectsWorkflowSnapshotOrDigestTamperingBeforePlanning(t *testing.T) {
+	workflow, err := types.CanonicalProductionWorkflowPlanSnapshot(types.JSON(`{"version":1,"steps":[{"provider_type":"skill","provider_id":"baseline","tool_name":"load_instructions","request":{"source_item_id":"71000000-0000-4000-8000-000000000005"}}]}`))
+	require.NoError(t, err)
+	for name, mutate := range map[string]func(*types.ProductionRun){
+		"snapshot": func(run *types.ProductionRun) { run.WorkflowPlanSnapshot = types.JSON(`{"steps":[],"version":1}`) },
+		"digest":   func(run *types.ProductionRun) { run.WorkflowPlanDigest = strings.Repeat("b", 64) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			adapter := &productionExecutorAdapterStub{}
+			executor := newProductionStepExecutor(&productionExecutorRepoStub{}, adapter, adapter, adapter, &productionExecutorWriterStub{})
+			run := &types.ProductionRun{
+				ID: mcpAdapterRunID, TenantID: 7, ProjectID: mcpAdapterProjectID,
+				SourceSetID: mcpAdapterSourceSetID, RunType: types.ProductionRunCollect,
+				Status: types.ProductionRunRunning, Attempt: 1, CurrentStep: 0,
+				DocumentTypeSnapshot: types.JSON(`{"skill_bindings":{"version":1,"skills":[{"name":"baseline","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}}`),
+				WorkflowPlanSnapshot: workflow, WorkflowPlanDigest: productionToolDigest(workflow),
+			}
+			mutate(run)
+
+			_, err := executor.ExecuteStep(context.Background(), run, nil)
+
+			require.ErrorContains(t, err, "workflow plan digest")
+			require.Zero(t, adapter.planCalls)
+			require.Zero(t, adapter.calls)
+		})
+	}
 }
 
 func TestProductionWorkflowPlanValidationIsStrictBoundedAndSkillBound(t *testing.T) {
@@ -113,6 +143,8 @@ func TestProductionStepExecutorRunsPersistedMCPCallAndWriter(t *testing.T) {
 		ID: call.RunID, TenantID: call.TenantID, ProjectID: call.ProjectID, DocumentID: call.DocumentID,
 		SourceSetID: call.SourceSetID, Attempt: call.Attempt, CurrentStep: call.CurrentStep,
 		RunType: types.ProductionRunCollect, Status: types.ProductionRunRunning,
+		WorkflowPlanSnapshot: types.JSON(`{"steps":[],"version":1}`),
+		WorkflowPlanDigest:   productionToolDigest(types.JSON(`{"steps":[],"version":1}`)),
 	}
 
 	result, err := executor.ExecuteStep(context.Background(), run, []*types.ProductionToolCall{call})

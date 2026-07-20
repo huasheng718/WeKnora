@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"strconv"
 	"strings"
 
 	"github.com/Tencent/WeKnora/internal/agent/skills"
@@ -179,7 +178,7 @@ func (a *ProductionSkillAdapter) Execute(ctx context.Context, call *types.Produc
 	persisted, err := a.evidence.AttachEvidence(ctx, prepared.item.ID, interfaces.CreateEvidenceSnapshotInput{
 		EvidenceID: evidenceID, SnapshotType: types.ProductionEvidenceSnapshotToolResult,
 		InlineContent: prepared.content, ContentDigest: productionToolDigest(prepared.content),
-		RedactionMetadata: metadata, CapturedByRunID: call.RunID,
+		RedactionMetadata: metadata, CapturedByRunID: call.RunID, CapturedByToolCallID: call.ID,
 	})
 	if err != nil {
 		return nil, err
@@ -440,13 +439,13 @@ func newProductionToolEvidence(call *types.ProductionToolCall, sourceItemID stri
 	return &types.ProductionEvidenceSnapshot{
 		ID: evidenceID, SourceItemID: sourceItemID, SnapshotType: types.ProductionEvidenceSnapshotToolResult,
 		InlineContent: content, ContentDigest: productionToolDigest(content),
-		RedactionMetadata: metadata, CapturedByRunID: call.RunID,
+		RedactionMetadata: metadata, CapturedByRunID: call.RunID, CapturedByToolCallID: call.ID,
 	}
 }
 
 func productionToolEvidenceID(call *types.ProductionToolCall) string {
-	name := call.ID + ":" + string(call.ProviderType) + ":" + call.ProviderID + ":" + call.ToolName + ":" + strconv.Itoa(call.Attempt)
-	return uuid.NewSHA1(uuid.MustParse("a148243e-c5b7-45a1-92f1-c410f317e7f4"), []byte(name)).String()
+	evidenceID, _ := types.ProductionToolEvidenceID(call)
+	return evidenceID
 }
 
 func productionToolResultFromEvidence(
@@ -456,7 +455,7 @@ func productionToolResultFromEvidence(
 	providerDigest string,
 ) (*ProductionToolResult, error) {
 	if evidence == nil || evidence.ID != productionToolEvidenceID(call) || evidence.SnapshotType != types.ProductionEvidenceSnapshotToolResult ||
-		evidence.CapturedByRunID != call.RunID || !canonicalProductionSHA256(evidence.ContentDigest) ||
+		evidence.CapturedByRunID != call.RunID || evidence.CapturedByToolCallID != call.ID || !canonicalProductionSHA256(evidence.ContentDigest) ||
 		productionToolDigest(evidence.InlineContent) != evidence.ContentDigest {
 		return nil, types.ErrProductionEvidenceConflict
 	}

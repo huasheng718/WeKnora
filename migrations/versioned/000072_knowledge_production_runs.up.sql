@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS production_runs (
     model_id VARCHAR(64) NOT NULL,
     document_type_snapshot JSONB NOT NULL,
     workflow_plan_snapshot JSONB NOT NULL DEFAULT '{"steps":[],"version":1}'::jsonb,
+    workflow_plan_digest VARCHAR(64) NOT NULL DEFAULT 'a5dd3ce7993c63ad01d8a9a45922bc5f17d2c41c5f21a10671ec8c05c5ffc4aa',
     input_version_id VARCHAR(36) NULL,
     output_version_id VARCHAR(36) NULL,
     idempotency_key VARCHAR(255) NOT NULL,
@@ -43,6 +44,7 @@ CREATE TABLE IF NOT EXISTS production_runs (
         wakeup_version >= 0 AND wakeup_enqueued_version >= 0 AND
         wakeup_enqueued_version <= wakeup_version
     ),
+    CONSTRAINT chk_production_runs_workflow_plan CHECK (workflow_plan_digest ~ '^[0-9a-f]{64}$'),
     CONSTRAINT chk_production_runs_raw_response CHECK (
         (raw_model_response IS NULL AND raw_model_response_digest IS NULL) OR
         (raw_model_response IS NOT NULL AND raw_model_response_digest IS NOT NULL AND raw_model_response_digest ~ '^[0-9a-f]{64}$')
@@ -62,6 +64,22 @@ CREATE INDEX IF NOT EXISTS idx_production_runs_document_status
     ON production_runs (tenant_id, project_id, document_id, status);
 CREATE INDEX IF NOT EXISTS idx_production_runs_source_set
     ON production_runs (tenant_id, project_id, source_set_id);
+
+CREATE OR REPLACE FUNCTION guard_production_run_workflow_identity()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.workflow_plan_snapshot IS DISTINCT FROM OLD.workflow_plan_snapshot OR
+       NEW.workflow_plan_digest IS DISTINCT FROM OLD.workflow_plan_digest THEN
+        RAISE EXCEPTION 'production workflow identity is immutable';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_production_runs_guard_workflow_identity
+    BEFORE UPDATE ON production_runs
+    FOR EACH ROW
+    EXECUTE FUNCTION guard_production_run_workflow_identity();
 
 CREATE TABLE IF NOT EXISTS production_tool_calls (
     id VARCHAR(36) PRIMARY KEY,
@@ -138,9 +156,13 @@ CREATE INDEX IF NOT EXISTS idx_production_tool_calls_run_status
 CREATE INDEX IF NOT EXISTS idx_production_tool_calls_approval
     ON production_tool_calls (tenant_id, status, approval_status);
 
+ALTER TABLE production_evidence_snapshots
+    ADD CONSTRAINT fk_production_evidence_snapshots_captured_tool_call
+    FOREIGN KEY (captured_by_tool_call_id) REFERENCES production_tool_calls(id) ON DELETE RESTRICT;
+
 DROP TRIGGER IF EXISTS trg_production_evidence_snapshots_prevent_frozen_insert ON production_evidence_snapshots;
 DROP FUNCTION IF EXISTS prevent_frozen_production_evidence_insert();
-CREATE OR REPLACE FUNCTION allow_only_frozen_run_evidence_insert()
+CREATE OR REPLACE FUNCTION allow_only_frozen_tool_call_evidence_insert()
 RETURNS TRIGGER AS $$
 BEGIN
     IF EXISTS (
@@ -152,16 +174,28 @@ BEGIN
         SELECT 1
         FROM production_source_items item
         JOIN production_source_sets source_set ON source_set.id = item.source_set_id
+        JOIN production_tool_calls tool_call
+          ON tool_call.id = NEW.captured_by_tool_call_id
+         AND tool_call.run_id = NEW.captured_by_run_id
+         AND tool_call.tenant_id = source_set.tenant_id
+         AND tool_call.project_id = source_set.project_id
+         AND tool_call.source_set_id = source_set.id
         JOIN production_runs run
-          ON run.id = NEW.captured_by_run_id
-         AND run.tenant_id = source_set.tenant_id
-         AND run.project_id = source_set.project_id
-         AND run.source_set_id = source_set.id
+          ON run.id = tool_call.run_id
+         AND run.tenant_id = tool_call.tenant_id
+         AND run.project_id = tool_call.project_id
+         AND run.document_id IS NOT DISTINCT FROM tool_call.document_id
+         AND run.source_set_id = tool_call.source_set_id
         WHERE item.id = NEW.source_item_id
           AND item.status = 'accepted'
+          AND tool_call.status = 'executing'
+          AND NEW.snapshot_type = 'tool_result'
+          AND NEW.storage_path IS NULL
+          AND NEW.inline_content IS NOT NULL
+          AND NEW.content_digest ~ '^[0-9a-f]{64}$'
           AND NEW.id <> ''
     ) THEN
-        RAISE EXCEPTION 'frozen source set requires accepted run-captured evidence';
+        RAISE EXCEPTION 'frozen source set requires accepted executing tool-call evidence';
     END IF;
     RETURN NEW;
 END;
@@ -170,7 +204,7 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER trg_production_evidence_snapshots_prevent_frozen_insert
     BEFORE INSERT ON production_evidence_snapshots
     FOR EACH ROW
-    EXECUTE FUNCTION allow_only_frozen_run_evidence_insert();
+    EXECUTE FUNCTION allow_only_frozen_tool_call_evidence_insert();
 
 CREATE OR REPLACE FUNCTION guard_production_tool_call_invocation_identity()
 RETURNS TRIGGER AS $$

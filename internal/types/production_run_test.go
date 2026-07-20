@@ -166,6 +166,7 @@ func TestProductionRunAndToolCallSchemaTagsMatchMigration(t *testing.T) {
 	assertFieldTag(runType, "RawModelResponseDigest", "raw_model_response_digest,omitempty", "type:varchar(64)")
 	assertFieldTag(runType, "WakeupVersion", "wakeup_version", "not null;default:0")
 	assertFieldTag(runType, "WakeupEnqueuedVersion", "wakeup_enqueued_version", "not null;default:0")
+	assertFieldTag(runType, "WorkflowPlanDigest", "workflow_plan_digest", "type:varchar(64);not null")
 	assertFieldTag(runType, "CompletedAt", "completed_at,omitempty", "")
 
 	callType := reflect.TypeOf(ProductionToolCall{})
@@ -173,4 +174,40 @@ func TestProductionRunAndToolCallSchemaTagsMatchMigration(t *testing.T) {
 	assertFieldTag(callType, "ResponseEvidenceID", "response_evidence_id,omitempty", "type:varchar(36)")
 	assertFieldTag(callType, "ApprovalRequestedAt", "approval_requested_at,omitempty", "")
 	assertFieldTag(callType, "CompletedAt", "completed_at,omitempty", "")
+
+	evidenceType := reflect.TypeOf(ProductionEvidenceSnapshot{})
+	assertFieldTag(evidenceType, "CapturedByToolCallID", "captured_by_tool_call_id,omitempty", "type:varchar(36)")
+}
+
+func TestProductionToolEvidenceIDBindsExactPersistedInvocation(t *testing.T) {
+	call := &ProductionToolCall{
+		ID: "71000000-0000-4000-8000-000000000001", Attempt: 2,
+		ProviderType: ProductionToolProviderMCP, ProviderID: "provider-1", ToolName: "lookup",
+	}
+	first, err := ProductionToolEvidenceID(call)
+	require.NoError(t, err)
+	second, err := ProductionToolEvidenceID(call)
+	require.NoError(t, err)
+	require.Equal(t, first, second)
+	parsed, err := uuid.Parse(first)
+	require.NoError(t, err)
+	require.Equal(t, first, parsed.String())
+
+	mutations := []*ProductionToolCall{
+		{ID: "71000000-0000-4000-8000-000000000002", Attempt: 2, ProviderType: ProductionToolProviderMCP, ProviderID: "provider-1", ToolName: "lookup"},
+		{ID: call.ID, Attempt: 3, ProviderType: ProductionToolProviderMCP, ProviderID: "provider-1", ToolName: "lookup"},
+		{ID: call.ID, Attempt: 2, ProviderType: ProductionToolProviderDatasource, ProviderID: "provider-1", ToolName: "lookup"},
+		{ID: call.ID, Attempt: 2, ProviderType: ProductionToolProviderMCP, ProviderID: "provider-2", ToolName: "lookup"},
+		{ID: call.ID, Attempt: 2, ProviderType: ProductionToolProviderMCP, ProviderID: "provider-1", ToolName: "other"},
+	}
+	for _, mutated := range mutations {
+		got, err := ProductionToolEvidenceID(mutated)
+		require.NoError(t, err)
+		require.NotEqual(t, first, got)
+	}
+
+	_, err = ProductionToolEvidenceID(nil)
+	require.Error(t, err)
+	_, err = ProductionToolEvidenceID(&ProductionToolCall{ID: "not-a-uuid", ProviderType: ProductionToolProviderMCP, ProviderID: "provider", ToolName: "lookup", Attempt: 1})
+	require.Error(t, err)
 }

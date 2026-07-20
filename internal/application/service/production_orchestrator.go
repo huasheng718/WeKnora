@@ -289,6 +289,10 @@ func (o *ProductionOrchestrator) persistExecutionFailure(
 ) error {
 	code := "STEP_EXECUTION_FAILED"
 	message := executeErr.Error()
+	if errors.Is(executeErr, types.ErrProductionToolReconciliationRequired) {
+		code = "TOOL_RECONCILIATION_REQUIRED"
+		message = types.ErrProductionToolReconciliationRequired.Error()
+	}
 	completedAt := o.now().UTC()
 	return o.uow.WithinTransaction(ctx, func(txCtx context.Context) error {
 		if err := o.failActiveToolCalls(

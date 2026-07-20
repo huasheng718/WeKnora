@@ -27,13 +27,14 @@ type CreateProductionSourceItemInput struct {
 }
 
 type CreateEvidenceSnapshotInput struct {
-	EvidenceID        string
-	SnapshotType      types.ProductionEvidenceSnapshotType
-	ResourceReference string
-	InlineContent     types.JSON
-	ContentDigest     string
-	RedactionMetadata types.JSON
-	CapturedByRunID   string
+	EvidenceID           string
+	SnapshotType         types.ProductionEvidenceSnapshotType
+	ResourceReference    string
+	InlineContent        types.JSON
+	ContentDigest        string
+	RedactionMetadata    types.JSON
+	CapturedByRunID      string
+	CapturedByToolCallID string
 }
 
 type ProductionProjectAuthorizer interface {

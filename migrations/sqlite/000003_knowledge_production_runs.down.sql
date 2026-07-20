@@ -1,4 +1,5 @@
 DROP TRIGGER IF EXISTS trg_production_runs_fence_terminal_children;
+DROP TRIGGER IF EXISTS trg_production_runs_guard_workflow_identity;
 DROP TRIGGER IF EXISTS trg_production_tool_calls_fence_parent_update;
 DROP TRIGGER IF EXISTS trg_production_tool_calls_fence_parent_insert;
 DROP TRIGGER IF EXISTS trg_production_tool_calls_guard_invocation_replace;

@@ -129,15 +129,16 @@ type ProductionSourceItem struct {
 func (ProductionSourceItem) TableName() string { return "production_source_items" }
 
 type ProductionEvidenceSnapshot struct {
-	ID                string                         `json:"id" gorm:"type:varchar(36);primaryKey"`
-	SourceItemID      string                         `json:"source_item_id" gorm:"type:varchar(36);not null;index"`
-	SnapshotType      ProductionEvidenceSnapshotType `json:"snapshot_type" gorm:"type:varchar(24);not null"`
-	StoragePath       string                         `json:"storage_path,omitempty" gorm:"type:text"`
-	InlineContent     JSON                           `json:"inline_content,omitempty" gorm:"type:jsonb"`
-	ContentDigest     string                         `json:"content_digest" gorm:"type:varchar(64);not null"`
-	RedactionMetadata JSON                           `json:"redaction_metadata" gorm:"type:jsonb;not null;default:'{}'"`
-	CapturedByRunID   string                         `json:"captured_by_run_id,omitempty" gorm:"type:varchar(36)"`
-	CreatedAt         time.Time                      `json:"created_at"`
+	ID                   string                         `json:"id" gorm:"type:varchar(36);primaryKey"`
+	SourceItemID         string                         `json:"source_item_id" gorm:"type:varchar(36);not null;index"`
+	SnapshotType         ProductionEvidenceSnapshotType `json:"snapshot_type" gorm:"type:varchar(24);not null"`
+	StoragePath          string                         `json:"storage_path,omitempty" gorm:"type:text"`
+	InlineContent        JSON                           `json:"inline_content,omitempty" gorm:"type:jsonb"`
+	ContentDigest        string                         `json:"content_digest" gorm:"type:varchar(64);not null"`
+	RedactionMetadata    JSON                           `json:"redaction_metadata" gorm:"type:jsonb;not null;default:'{}'"`
+	CapturedByRunID      string                         `json:"captured_by_run_id,omitempty" gorm:"type:varchar(36)"`
+	CapturedByToolCallID string                         `json:"captured_by_tool_call_id,omitempty" gorm:"type:varchar(36)"`
+	CreatedAt            time.Time                      `json:"created_at"`
 	// ResolvedContentDigest is hydrated from ResourceCatalog when a governed
 	// operation verifies registry-backed evidence. It is never persisted.
 	ResolvedContentDigest string `json:"-" gorm:"-"`

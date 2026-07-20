@@ -4,6 +4,8 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	apperrors "github.com/Tencent/WeKnora/internal/errors"
@@ -38,6 +40,7 @@ func (id *ProductionDocumentID) Scan(value any) error {
 }
 
 var ErrProductionRunLeaseActive = errors.New("production run lease is active")
+var ErrProductionToolReconciliationRequired = errors.New("production tool call requires explicit operator reconciliation")
 
 // ProductionRunLeaseActiveError tells the task runner to retry an early
 // redelivery instead of acknowledging a run still owned by another worker.
@@ -170,6 +173,7 @@ type ProductionRun struct {
 	ModelID                string               `json:"model_id" gorm:"type:varchar(64);not null"`
 	DocumentTypeSnapshot   JSON                 `json:"document_type_snapshot" gorm:"type:jsonb;not null"`
 	WorkflowPlanSnapshot   JSON                 `json:"workflow_plan_snapshot" gorm:"type:jsonb;not null;default:'{\"steps\":[],\"version\":1}'"`
+	WorkflowPlanDigest     string               `json:"workflow_plan_digest" gorm:"type:varchar(64);not null"`
 	InputVersionID         *string              `json:"input_version_id,omitempty" gorm:"type:varchar(36)"`
 	OutputVersionID        *string              `json:"output_version_id,omitempty" gorm:"type:varchar(36)"`
 	IdempotencyKey         string               `json:"idempotency_key" gorm:"type:varchar(255);not null"`
@@ -221,6 +225,24 @@ type ProductionToolCall struct {
 }
 
 func (ProductionToolCall) TableName() string { return "production_tool_calls" }
+
+// ProductionToolEvidenceID derives the immutable evidence identity from the
+// exact durable invocation identity.
+func ProductionToolEvidenceID(call *ProductionToolCall) (string, error) {
+	if call == nil {
+		return "", errors.New("production tool call is required")
+	}
+	parsed, err := uuid.Parse(call.ID)
+	if err != nil || parsed == uuid.Nil || parsed.String() != call.ID {
+		return "", errors.New("production tool call id must be a canonical UUID")
+	}
+	if !call.ProviderType.IsValid() || strings.TrimSpace(call.ProviderID) == "" ||
+		strings.TrimSpace(call.ToolName) == "" || call.Attempt < 0 {
+		return "", errors.New("production tool invocation identity is invalid")
+	}
+	name := call.ID + ":" + string(call.ProviderType) + ":" + call.ProviderID + ":" + call.ToolName + ":" + strconv.Itoa(call.Attempt)
+	return uuid.NewSHA1(uuid.MustParse("a148243e-c5b7-45a1-92f1-c410f317e7f4"), []byte(name)).String(), nil
+}
 
 // ProductionRunPayload is the complete queue transport contract. Durable
 // orchestration state remains in ProductionRun and ProductionToolCall rows.

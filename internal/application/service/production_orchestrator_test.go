@@ -506,6 +506,42 @@ func TestProductionOrchestratorReclaimReconcilesPriorAttemptExecutingCall(t *tes
 	require.Equal(t, types.ProductionToolCallCompleted, persisted.Status)
 }
 
+func TestProductionOrchestratorDurablyParksReconciliationWithoutWorkerRetry(t *testing.T) {
+	f := newProductionOrchestratorFixture(t, 0)
+	request := types.JSON(`{"approval_required":true,"arguments":{"query":"status"},"provider_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_item_id":"10000000-0000-4000-8000-000000000005"}`)
+	startedAt := time.Now().UTC()
+	approvedBy := uuid.NewString()
+	call := &types.ProductionToolCall{
+		ID: uuid.NewString(), RunID: f.run.ID, TenantID: 7, ProjectID: orchProjectID,
+		DocumentID: orchDocumentID, SourceSetID: orchSourceSetID, Attempt: 1, CurrentStep: 0,
+		IdempotencyKey: "reconciliation:0", ProviderType: types.ProductionToolProviderMCP,
+		ProviderID: uuid.NewString(), ToolName: "lookup", RequestSnapshot: request,
+		RequestDigest: productionToolDigest(request), Status: types.ProductionToolCallExecuting,
+		ApprovalStatus: types.ProductionToolApprovalApproved, ApprovalRequestedAt: &startedAt,
+		ApprovedBy: &approvedBy, ApprovedAt: &startedAt, StartedAt: &startedAt,
+	}
+	require.NoError(t, f.repo.CreateToolCall(context.Background(), call))
+	f.executor.fn = func(*types.ProductionRun, []*types.ProductionToolCall) (ProductionStepResult, error) {
+		return ProductionStepResult{}, types.ErrProductionToolReconciliationRequired
+	}
+
+	require.NoError(t, f.orchestrator.HandleRun(context.Background(), f.payload()))
+	require.NoError(t, f.orchestrator.HandleRun(context.Background(), f.payload()))
+	require.Equal(t, 1, f.executor.count(), "terminal reconciliation state must suppress task retries")
+
+	storedRun := f.load(t)
+	require.Equal(t, types.ProductionRunFailed, storedRun.Status)
+	require.NotNil(t, storedRun.ErrorCode)
+	require.Equal(t, "TOOL_RECONCILIATION_REQUIRED", *storedRun.ErrorCode)
+	require.NotNil(t, storedRun.ErrorMessage)
+	require.NotContains(t, *storedRun.ErrorMessage, "provider")
+	storedCall, err := f.repo.GetToolCall(context.Background(), 7, call.ID)
+	require.NoError(t, err)
+	require.Equal(t, types.ProductionToolCallFailed, storedCall.Status)
+	require.NotNil(t, storedCall.ErrorCode)
+	require.Equal(t, "TOOL_RECONCILIATION_REQUIRED", *storedCall.ErrorCode)
+}
+
 func TestProductionOrchestratorApprovedExecutorFailureTerminalizesCallAndRun(t *testing.T) {
 	f := newProductionOrchestratorFixture(t, 0)
 	f.executor.fn = func(*types.ProductionRun, []*types.ProductionToolCall) (ProductionStepResult, error) {

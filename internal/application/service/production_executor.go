@@ -153,6 +153,9 @@ func productionWorkflowForRun(run *types.ProductionRun) (*productionWorkflowPlan
 	if err != nil {
 		return nil, err
 	}
+	if !canonicalProductionSHA256(run.WorkflowPlanDigest) || productionToolDigest(canonical) != run.WorkflowPlanDigest {
+		return nil, errors.New("production workflow plan digest does not match canonical snapshot")
+	}
 	var workflow productionWorkflowPlan
 	if err := decodeProductionJSON(canonical, &workflow, true); err != nil {
 		return nil, err

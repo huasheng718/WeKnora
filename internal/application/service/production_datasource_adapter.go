@@ -136,7 +136,7 @@ func (a *ProductionDataSourceAdapter) Execute(ctx context.Context, call *types.P
 	persisted, err := a.evidence.AttachEvidence(ctx, prepared.item.ID, interfaces.CreateEvidenceSnapshotInput{
 		EvidenceID: productionToolEvidenceID(call), SnapshotType: types.ProductionEvidenceSnapshotToolResult,
 		InlineContent: content, ContentDigest: productionToolDigest(content),
-		RedactionMetadata: metadata, CapturedByRunID: call.RunID,
+		RedactionMetadata: metadata, CapturedByRunID: call.RunID, CapturedByToolCallID: call.ID,
 	})
 	if err != nil {
 		return nil, err

@@ -133,6 +133,7 @@ func TestProductionRunRepositoryCreateCanonicalizesSnapshotsAndScopesReads(t *te
 	require.Equal(t, `{"a":1,"z":2}`, string(run.StatePayload))
 	require.Equal(t, `{"answer":1,"meta":{"a":1,"b":2}}`, string(run.RawModelResponse))
 	require.Equal(t, `{"steps":[],"version":1}`, string(run.WorkflowPlanSnapshot))
+	require.Equal(t, productionSnapshotDigest(run.WorkflowPlanSnapshot), run.WorkflowPlanDigest)
 	require.NotNil(t, run.RawModelResponseDigest)
 	require.Len(t, *run.RawModelResponseDigest, 64)
 
@@ -142,6 +143,20 @@ func TestProductionRunRepositoryCreateCanonicalizesSnapshotsAndScopesReads(t *te
 	got, err = repo.Get(context.Background(), 8, run.ID)
 	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
 	require.Nil(t, got)
+}
+
+func TestProductionRunRepositoryValidatesSuppliedWorkflowDigest(t *testing.T) {
+	repo, db := newProductionRunRepoTestDB(t)
+	run := newTestProductionRun(7)
+	run.WorkflowPlanSnapshot = types.JSON(`{"steps":[],"version":1}`)
+	run.WorkflowPlanDigest = strings.Repeat("b", 64)
+
+	err := repo.Create(context.Background(), run)
+
+	require.ErrorContains(t, err, "workflow plan digest")
+	var count int64
+	require.NoError(t, db.Model(&types.ProductionRun{}).Where("id = ?", run.ID).Count(&count).Error)
+	require.Zero(t, count)
 }
 
 func TestProductionRunRepositoryRequiresStrictCanonicalWorkflowSnapshot(t *testing.T) {

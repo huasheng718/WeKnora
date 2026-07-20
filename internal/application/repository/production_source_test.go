@@ -158,7 +158,7 @@ func TestProductionSourceRepositoryRejectsNewItemsAndEvidenceForFrozenSet(t *tes
 	require.Equal(t, int64(1), count)
 }
 
-func TestProductionSourceRepositoryAllowsOnlyRunCapturedEvidenceOnFrozenAcceptedItem(t *testing.T) {
+func TestProductionSourceRepositoryRejectsRunOnlyEvidenceOnFrozenAcceptedItem(t *testing.T) {
 	repo, db := newProductionSourceRepoTestDB(t)
 	createProductionSourceSet(t, repo, types.ProductionSourceSetCollecting)
 	createProductionSourceItem(t, repo, types.ProductionSourceItemAccepted)
@@ -172,6 +172,8 @@ func TestProductionSourceRepositoryAllowsOnlyRunCapturedEvidenceOnFrozenAccepted
 	}).Error)
 	run := newTestProductionRun(7)
 	run.ProjectID, run.SourceSetID, run.DocumentID = sourceProjectID, sourceSetID, repoDocumentID
+	run.WorkflowPlanSnapshot = types.JSON(`{"steps":[],"version":1}`)
+	run.WorkflowPlanDigest = "a5dd3ce7993c63ad01d8a9a45922bc5f17d2c41c5f21a10671ec8c05c5ffc4aa"
 	require.NoError(t, db.Create(run).Error)
 	require.NoError(t, repo.Freeze(context.Background(), 7, sourceSetID))
 
@@ -180,12 +182,80 @@ func TestProductionSourceRepositoryAllowsOnlyRunCapturedEvidenceOnFrozenAccepted
 		InlineContent: types.JSON(`{"ok":true}`), ContentDigest: strings.Repeat("b", 64),
 		RedactionMetadata: types.JSON(`{}`), CapturedByRunID: run.ID,
 	}
-	require.NoError(t, repo.CreateEvidence(context.Background(), 7, sourceItemID, late))
+	require.ErrorIs(t, repo.CreateEvidence(context.Background(), 7, sourceItemID, late), types.ErrProductionSourceSetFrozen)
 
 	ordinary := *late
 	ordinary.ID = "88888888-8888-4888-8888-888888888888"
 	ordinary.CapturedByRunID = ""
 	require.ErrorIs(t, repo.CreateEvidence(context.Background(), 7, sourceItemID, &ordinary), types.ErrProductionSourceSetFrozen)
+}
+
+func TestProductionSourceRepositoryFrozenEvidenceBindsExactExecutingToolCall(t *testing.T) {
+	repo, db := newProductionSourceRepoTestDB(t)
+	createProductionSourceSet(t, repo, types.ProductionSourceSetCollecting)
+	createProductionSourceItem(t, repo, types.ProductionSourceItemAccepted)
+	require.NoError(t, repo.CreateEvidence(context.Background(), 7, sourceItemID, &types.ProductionEvidenceSnapshot{
+		ID: evidenceID, SnapshotType: types.ProductionEvidenceSnapshotText,
+		InlineContent: types.JSON(`"seed"`), ContentDigest: testDigest, RedactionMetadata: types.JSON(`{}`),
+	}))
+	require.NoError(t, db.Create(&types.ProductionDocument{
+		ID: repoDocumentID, TenantID: 7, ProjectID: sourceProjectID, DocumentTypeID: sourceTypeID,
+		DocumentTypeSchemaVersion: 1, Title: "Document", CreatedBy: "author",
+	}).Error)
+	run := newTestProductionRun(7)
+	run.ProjectID, run.SourceSetID, run.DocumentID = sourceProjectID, sourceSetID, repoDocumentID
+	run.WorkflowPlanSnapshot = types.JSON(`{"steps":[],"version":1}`)
+	run.WorkflowPlanDigest = "a5dd3ce7993c63ad01d8a9a45922bc5f17d2c41c5f21a10671ec8c05c5ffc4aa"
+	require.NoError(t, db.Create(run).Error)
+	startedAt := time.Now().UTC()
+	call := &types.ProductionToolCall{
+		ID: "74000000-0000-4000-8000-000000000001", RunID: run.ID, TenantID: 7,
+		ProjectID: sourceProjectID, DocumentID: repoDocumentID, SourceSetID: sourceSetID,
+		Attempt: 1, CurrentStep: 0, IdempotencyKey: "frozen-evidence-call",
+		ProviderType: types.ProductionToolProviderMCP, ProviderID: "provider", ToolName: "lookup",
+		RequestSnapshot: types.JSON(`{}`), RequestDigest: testDigest,
+		Status: types.ProductionToolCallExecuting, ApprovalStatus: types.ProductionToolApprovalNotRequired, StartedAt: &startedAt,
+	}
+	require.NoError(t, db.Create(call).Error)
+	require.NoError(t, repo.Freeze(context.Background(), 7, sourceSetID))
+	boundEvidenceID, err := types.ProductionToolEvidenceID(call)
+	require.NoError(t, err)
+	valid := &types.ProductionEvidenceSnapshot{
+		ID: boundEvidenceID, SnapshotType: types.ProductionEvidenceSnapshotToolResult,
+		InlineContent: types.JSON(`{"ok":true}`), RedactionMetadata: types.JSON(`{}`),
+		CapturedByRunID: run.ID, CapturedByToolCallID: call.ID,
+	}
+	valid.ContentDigest = productionSnapshotDigest(valid.InlineContent)
+	require.NoError(t, repo.CreateEvidence(context.Background(), 7, sourceItemID, valid))
+
+	tests := map[string]func(*types.ProductionEvidenceSnapshot){
+		"wrong call": func(e *types.ProductionEvidenceSnapshot) {
+			e.CapturedByToolCallID = "74000000-0000-4000-8000-000000000099"
+		},
+		"wrong run":      func(e *types.ProductionEvidenceSnapshot) { e.CapturedByRunID = "74000000-0000-4000-8000-000000000098" },
+		"wrong evidence": func(e *types.ProductionEvidenceSnapshot) { e.ID = "74000000-0000-4000-8000-000000000097" },
+		"wrong type":     func(e *types.ProductionEvidenceSnapshot) { e.SnapshotType = types.ProductionEvidenceSnapshotJSON },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			candidate := *valid
+			candidate.ID = "74000000-0000-4000-8000-000000000096"
+			mutate(&candidate)
+			require.ErrorIs(t, repo.CreateEvidence(context.Background(), 7, sourceItemID, &candidate), types.ErrProductionSourceSetFrozen)
+		})
+	}
+
+	otherItem := &types.ProductionSourceItem{
+		ID: "74000000-0000-4000-8000-000000000095", SourceSetID: sourceSetID, SourceKind: types.ProductionSourceKindManual,
+		Title: "Other", MimeType: "text/plain", ContentDigest: testDigest, CapturedAt: time.Now().UTC(), Metadata: types.JSON(`{}`),
+		Status: types.ProductionSourceItemAccepted,
+	}
+	require.ErrorIs(t, repo.CreateItem(context.Background(), 7, sourceSetID, otherItem), types.ErrProductionSourceSetFrozen)
+
+	require.NoError(t, db.Exec(`UPDATE production_tool_calls SET status = 'failed', error_code = 'FAILED', error_message = 'failed', completed_at = CURRENT_TIMESTAMP WHERE id = ?`, call.ID).Error)
+	terminal := *valid
+	terminal.ID = "74000000-0000-4000-8000-000000000094"
+	require.ErrorIs(t, repo.CreateEvidence(context.Background(), 7, sourceItemID, &terminal), types.ErrProductionSourceSetFrozen)
 }
 
 func TestProductionSourceRepositoryFreezeIsAtomicAndRequiresEvidence(t *testing.T) {

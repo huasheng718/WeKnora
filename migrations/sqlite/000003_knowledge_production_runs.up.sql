@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS production_runs (
     model_id VARCHAR(64) NOT NULL,
     document_type_snapshot TEXT NOT NULL,
     workflow_plan_snapshot TEXT NOT NULL DEFAULT '{"steps":[],"version":1}',
+    workflow_plan_digest VARCHAR(64) NOT NULL DEFAULT 'a5dd3ce7993c63ad01d8a9a45922bc5f17d2c41c5f21a10671ec8c05c5ffc4aa',
     input_version_id VARCHAR(36) NULL,
     output_version_id VARCHAR(36) NULL,
     idempotency_key VARCHAR(255) NOT NULL,
@@ -45,7 +46,10 @@ CREATE TABLE IF NOT EXISTS production_runs (
     ),
     CONSTRAINT chk_production_runs_state_payload CHECK (json_valid(state_payload)),
     CONSTRAINT chk_production_runs_document_type_snapshot CHECK (json_valid(document_type_snapshot)),
-    CONSTRAINT chk_production_runs_workflow_plan_snapshot CHECK (json_valid(workflow_plan_snapshot)),
+    CONSTRAINT chk_production_runs_workflow_plan_snapshot CHECK (
+        json_valid(workflow_plan_snapshot) AND length(workflow_plan_digest) = 64 AND
+        workflow_plan_digest NOT GLOB '*[^0-9a-f]*'
+    ),
     CONSTRAINT chk_production_runs_raw_response CHECK (
         (raw_model_response IS NULL AND raw_model_response_digest IS NULL) OR
         (raw_model_response IS NOT NULL AND raw_model_response_digest IS NOT NULL AND json_valid(raw_model_response) AND length(raw_model_response_digest) = 64 AND raw_model_response_digest NOT GLOB '*[^0-9a-f]*')
@@ -65,6 +69,15 @@ CREATE INDEX IF NOT EXISTS idx_production_runs_document_status
     ON production_runs (tenant_id, project_id, document_id, status);
 CREATE INDEX IF NOT EXISTS idx_production_runs_source_set
     ON production_runs (tenant_id, project_id, source_set_id);
+
+CREATE TRIGGER IF NOT EXISTS trg_production_runs_guard_workflow_identity
+    BEFORE UPDATE OF workflow_plan_snapshot, workflow_plan_digest ON production_runs
+    FOR EACH ROW
+    WHEN NEW.workflow_plan_snapshot IS NOT OLD.workflow_plan_snapshot OR
+         NEW.workflow_plan_digest IS NOT OLD.workflow_plan_digest
+BEGIN
+    SELECT RAISE(ABORT, 'production workflow identity is immutable');
+END;
 
 CREATE TABLE IF NOT EXISTS production_tool_calls (
     id VARCHAR(36) PRIMARY KEY,
@@ -155,17 +168,30 @@ CREATE TRIGGER trg_production_evidence_snapshots_prevent_frozen_insert
         SELECT 1
         FROM production_source_items item
         JOIN production_source_sets source_set ON source_set.id = item.source_set_id
+        JOIN production_tool_calls tool_call
+          ON tool_call.id = NEW.captured_by_tool_call_id
+         AND tool_call.run_id = NEW.captured_by_run_id
+         AND tool_call.tenant_id = source_set.tenant_id
+         AND tool_call.project_id = source_set.project_id
+         AND tool_call.source_set_id = source_set.id
         JOIN production_runs run
-          ON run.id = NEW.captured_by_run_id
-         AND run.tenant_id = source_set.tenant_id
-         AND run.project_id = source_set.project_id
-         AND run.source_set_id = source_set.id
+          ON run.id = tool_call.run_id
+         AND run.tenant_id = tool_call.tenant_id
+         AND run.project_id = tool_call.project_id
+         AND run.document_id IS tool_call.document_id
+         AND run.source_set_id = tool_call.source_set_id
         WHERE item.id = NEW.source_item_id
           AND item.status = 'accepted'
+          AND tool_call.status = 'executing'
+          AND NEW.snapshot_type = 'tool_result'
+          AND NEW.storage_path IS NULL
+          AND NEW.inline_content IS NOT NULL
+          AND length(NEW.content_digest) = 64
+          AND NEW.content_digest NOT GLOB '*[^0-9a-f]*'
           AND NEW.id <> ''
     )
 BEGIN
-    SELECT RAISE(ABORT, 'frozen source set requires accepted run-captured evidence');
+    SELECT RAISE(ABORT, 'frozen source set requires accepted executing tool-call evidence');
 END;
 
 CREATE TRIGGER IF NOT EXISTS trg_production_tool_calls_guard_invocation_identity

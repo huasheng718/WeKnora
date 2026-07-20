@@ -135,6 +135,11 @@ func (r *productionRunRepository) Create(ctx context.Context, run *types.Product
 		return errors.New("production workflow plan snapshot must be canonical")
 	}
 	run.WorkflowPlanSnapshot = canonicalWorkflow
+	workflowDigest := productionSnapshotDigest(canonicalWorkflow)
+	if run.WorkflowPlanDigest != "" && run.WorkflowPlanDigest != workflowDigest {
+		return errors.New("production workflow plan digest does not match canonical snapshot")
+	}
+	run.WorkflowPlanDigest = workflowDigest
 	if len(run.RawModelResponse) > 0 {
 		run.RawModelResponse, err = canonicalProductionSnapshot(run.RawModelResponse, "")
 		if err != nil {

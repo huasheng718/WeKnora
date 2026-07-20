@@ -121,12 +121,15 @@ func (a *ProductionMCPAdapter) Execute(ctx context.Context, call *types.Producti
 	if err := a.validateDependencies(true); err != nil {
 		return nil, err
 	}
-	request, item, plan, err := a.executablePlan(ctx, call)
+	request, run, item, plan, err := a.executablePlan(ctx, call)
 	if err != nil {
 		return nil, err
 	}
 	if result, found, replayErr := a.persistedResult(ctx, call, plan, item, request.ProviderDigest); replayErr != nil || found {
 		return result, replayErr
+	}
+	if call.Attempt < run.Attempt && call.StartedAt != nil {
+		return nil, types.ErrProductionToolReconciliationRequired
 	}
 	service, err := a.authoritativeService(ctx, call)
 	if err != nil {
@@ -170,7 +173,7 @@ func (a *ProductionMCPAdapter) Execute(ctx context.Context, call *types.Producti
 	persisted, err := a.evidence.AttachEvidence(ctx, item.ID, interfaces.CreateEvidenceSnapshotInput{
 		EvidenceID: productionToolEvidenceID(call), SnapshotType: types.ProductionEvidenceSnapshotToolResult,
 		InlineContent: content, ContentDigest: productionToolDigest(content), RedactionMetadata: metadata,
-		CapturedByRunID: call.RunID,
+		CapturedByRunID: call.RunID, CapturedByToolCallID: call.ID,
 	})
 	if err != nil {
 		return nil, err
@@ -181,39 +184,39 @@ func (a *ProductionMCPAdapter) Execute(ctx context.Context, call *types.Producti
 func (a *ProductionMCPAdapter) executablePlan(
 	ctx context.Context,
 	call *types.ProductionToolCall,
-) (productionMCPRequest, *types.ProductionSourceItem, *ProductionToolPlan, error) {
+) (productionMCPRequest, *types.ProductionRun, *types.ProductionSourceItem, *ProductionToolPlan, error) {
 	var request productionMCPRequest
 	if call == nil || strings.TrimSpace(call.ToolName) == "" || len(call.ToolName) > 255 {
-		return request, nil, nil, errProductionToolCallInvalid
+		return request, nil, nil, nil, errProductionToolCallInvalid
 	}
 	if call.Status != types.ProductionToolCallApproved && call.Status != types.ProductionToolCallExecuting {
-		return request, nil, nil, errProductionToolCallInvalid
+		return request, nil, nil, nil, errProductionToolCallInvalid
 	}
 	status := call.Status
 	if err := validateProductionToolCall(call, types.ProductionToolProviderMCP, status, call.ToolName); err != nil {
-		return request, nil, nil, err
+		return request, nil, nil, nil, err
 	}
 	if err := decodeProductionToolRequest(call, &request); err != nil ||
 		!canonicalProductionUUID(request.SourceItemID) || request.Arguments == nil ||
 		!canonicalProductionSHA256(request.ProviderDigest) || request.ApprovalRequired == nil {
-		return request, nil, nil, errProductionToolCallInvalid
+		return request, nil, nil, nil, errProductionToolCallInvalid
 	}
 	if *request.ApprovalRequired {
 		if call.ApprovalStatus != types.ProductionToolApprovalApproved {
-			return request, nil, nil, errProductionToolCallInvalid
+			return request, nil, nil, nil, errProductionToolCallInvalid
 		}
 	} else if call.ApprovalStatus != types.ProductionToolApprovalNotRequired {
-		return request, nil, nil, errProductionToolCallInvalid
+		return request, nil, nil, nil, errProductionToolCallInvalid
 	}
-	_, item, _, err := a.scope.resolve(ctx, call, request.SourceItemID, types.ProductionSourceKindMCP)
+	run, item, _, err := a.scope.resolve(ctx, call, request.SourceItemID, types.ProductionSourceKindMCP)
 	if err != nil || item.ExternalID != call.ProviderID {
-		return request, nil, nil, errProductionToolScope
+		return request, nil, nil, nil, errProductionToolScope
 	}
 	plan, err := newProductionToolPlan(call, request.ProviderDigest)
 	if err == nil {
 		plan.RequiresApproval = *request.ApprovalRequired
 	}
-	return request, item, plan, err
+	return request, run, item, plan, err
 }
 
 func (a *ProductionMCPAdapter) persistedResult(

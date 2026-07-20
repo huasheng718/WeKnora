@@ -467,7 +467,7 @@ func TestProductionSourceServiceFreezeRequiresAcceptedEvidenceAndRejectsFrozenMu
 	require.ErrorIs(t, err, types.ErrProductionSourceSetFrozen)
 }
 
-func TestProductionSourceServiceFrozenRunEvidenceReplaysAndConflicts(t *testing.T) {
+func TestProductionSourceServiceFrozenEvidenceRejectsAuthorWithGuessedRunAndCall(t *testing.T) {
 	svc, repo, db, _, _ := newProductionSourceServiceFixture(t)
 	createServiceSourceSet(t, repo, types.ProductionSourceSetCollecting)
 	createServiceSourceItem(t, repo, types.ProductionSourceItemAccepted)
@@ -486,28 +486,19 @@ func TestProductionSourceServiceFrozenRunEvidenceReplaysAndConflicts(t *testing.
 		ID: runID, TenantID: 7, ProjectID: serviceProjectID, DocumentID: types.ProductionDocumentID(documentID), SourceSetID: serviceSetID,
 		RunType: types.ProductionRunWrite, Status: types.ProductionRunRunning, Attempt: 1, CurrentStep: 0,
 		WakeupVersion: 1, StatePayload: types.JSON(`{}`), ModelID: "model", DocumentTypeSnapshot: types.JSON(`{}`),
-		IdempotencyKey: "run-evidence-test",
+		IdempotencyKey:       "run-evidence-test",
+		WorkflowPlanSnapshot: types.JSON(`{"steps":[],"version":1}`),
+		WorkflowPlanDigest:   "a5dd3ce7993c63ad01d8a9a45922bc5f17d2c41c5f21a10671ec8c05c5ffc4aa",
 	}).Error)
 	require.NoError(t, svc.Freeze(ctx, serviceSetID))
 
 	input := interfaces.CreateEvidenceSnapshotInput{
 		EvidenceID: "71000000-0000-4000-8000-000000000003", SnapshotType: types.ProductionEvidenceSnapshotToolResult,
 		InlineContent: types.JSON(`{"result":"ok"}`), CapturedByRunID: runID,
+		CapturedByToolCallID: "71000000-0000-4000-8000-000000000004",
 	}
-	first, err := svc.AttachEvidence(ctx, serviceItemID, input)
-	require.NoError(t, err)
-	second, err := svc.AttachEvidence(ctx, serviceItemID, input)
-	require.NoError(t, err)
-	require.Equal(t, first.ID, second.ID)
-
-	input.InlineContent = types.JSON(`{"result":"changed"}`)
 	_, err = svc.AttachEvidence(ctx, serviceItemID, input)
-	require.ErrorIs(t, err, types.ErrProductionEvidenceConflict)
-
-	input.EvidenceID = ""
-	input.InlineContent = types.JSON(`{"result":"new"}`)
-	_, err = svc.AttachEvidence(ctx, serviceItemID, input)
-	require.ErrorIs(t, err, types.ErrProductionSourceSetFrozen)
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
 }
 
 func TestProductionSourceServiceAcceptsOnlyExactRunPrincipalForFrozenEvidence(t *testing.T) {
@@ -535,7 +526,19 @@ func TestProductionSourceServiceAcceptsOnlyExactRunPrincipalForFrozenEvidence(t 
 		ID: runID, TenantID: 7, ProjectID: serviceProjectID, DocumentID: types.ProductionDocumentID(documentID), SourceSetID: serviceSetID,
 		RunType: types.ProductionRunWrite, Status: types.ProductionRunRunning, Attempt: 1,
 		WakeupVersion: 1, StatePayload: types.JSON(`{}`), ModelID: "model", DocumentTypeSnapshot: types.JSON(`{}`), IdempotencyKey: runID,
+		WorkflowPlanSnapshot: types.JSON(`{"steps":[],"version":1}`),
+		WorkflowPlanDigest:   "a5dd3ce7993c63ad01d8a9a45922bc5f17d2c41c5f21a10671ec8c05c5ffc4aa",
 	}).Error)
+	startedAt := time.Now().UTC()
+	call := &types.ProductionToolCall{
+		ID: "72000000-0000-4000-8000-000000000003", RunID: runID, TenantID: 7,
+		ProjectID: serviceProjectID, DocumentID: types.ProductionDocumentID(documentID), SourceSetID: serviceSetID,
+		Attempt: 1, CurrentStep: 0, IdempotencyKey: "principal-frozen-evidence",
+		ProviderType: types.ProductionToolProviderMCP, ProviderID: "provider", ToolName: "lookup",
+		RequestSnapshot: types.JSON(`{}`), RequestDigest: strings.Repeat("a", 64),
+		Status: types.ProductionToolCallExecuting, ApprovalStatus: types.ProductionToolApprovalNotRequired, StartedAt: &startedAt,
+	}
+	require.NoError(t, db.Create(call).Error)
 	require.NoError(t, svc.Freeze(ctx, serviceSetID))
 	authorizer.err = types.ErrProductionForbidden
 	principalCtx, err := types.WithProductionInternalPrincipal(context.Background(), types.ProductionInternalPrincipal{
@@ -543,9 +546,11 @@ func TestProductionSourceServiceAcceptsOnlyExactRunPrincipalForFrozenEvidence(t 
 		TenantID: 7, ProjectID: serviceProjectID, RunID: runID,
 	})
 	require.NoError(t, err)
+	evidenceID, err := types.ProductionToolEvidenceID(call)
+	require.NoError(t, err)
 	_, err = svc.AttachEvidence(principalCtx, serviceItemID, interfaces.CreateEvidenceSnapshotInput{
-		EvidenceID: "72000000-0000-4000-8000-000000000003", SnapshotType: types.ProductionEvidenceSnapshotToolResult,
-		InlineContent: types.JSON(`{"ok":true}`), CapturedByRunID: runID,
+		EvidenceID: evidenceID, SnapshotType: types.ProductionEvidenceSnapshotToolResult,
+		InlineContent: types.JSON(`{"ok":true}`), CapturedByRunID: runID, CapturedByToolCallID: call.ID,
 	})
 	require.NoError(t, err)
 
@@ -555,9 +560,98 @@ func TestProductionSourceServiceAcceptsOnlyExactRunPrincipalForFrozenEvidence(t 
 	})
 	require.NoError(t, err)
 	_, err = svc.AttachEvidence(mismatchCtx, serviceItemID, interfaces.CreateEvidenceSnapshotInput{
-		EvidenceID: "72000000-0000-4000-8000-000000000004", SnapshotType: types.ProductionEvidenceSnapshotToolResult,
-		InlineContent: types.JSON(`{"ok":true}`), CapturedByRunID: runID,
+		EvidenceID: evidenceID, SnapshotType: types.ProductionEvidenceSnapshotToolResult,
+		InlineContent: types.JSON(`{"ok":true}`), CapturedByRunID: runID, CapturedByToolCallID: call.ID,
 	})
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
+}
+
+func TestProductionSourceServiceFrozenEvidenceRequiresExactInternalToolCallIdentity(t *testing.T) {
+	svc, repo, db, _, _ := newProductionSourceServiceFixture(t)
+	createServiceSourceSet(t, repo, types.ProductionSourceSetCollecting)
+	createServiceSourceItem(t, repo, types.ProductionSourceItemAccepted)
+	authorCtx := sourceServiceContext(7)
+	_, err := svc.AttachEvidence(authorCtx, serviceItemID, interfaces.CreateEvidenceSnapshotInput{
+		SnapshotType: types.ProductionEvidenceSnapshotText, InlineContent: types.JSON(`"seed"`),
+	})
+	require.NoError(t, err)
+	documentID := "73000000-0000-4000-8000-000000000001"
+	runID := "73000000-0000-4000-8000-000000000002"
+	callID := "73000000-0000-4000-8000-000000000003"
+	require.NoError(t, db.Create(&types.ProductionDocument{
+		ID: documentID, TenantID: 7, ProjectID: serviceProjectID, DocumentTypeID: serviceTypeID,
+		DocumentTypeSchemaVersion: 1, Title: "Document", CreatedBy: "author",
+	}).Error)
+	require.NoError(t, db.Create(&types.ProductionRun{
+		ID: runID, TenantID: 7, ProjectID: serviceProjectID, DocumentID: types.ProductionDocumentID(documentID), SourceSetID: serviceSetID,
+		RunType: types.ProductionRunWrite, Status: types.ProductionRunRunning, Attempt: 1,
+		WakeupVersion: 1, StatePayload: types.JSON(`{}`), ModelID: "model", DocumentTypeSnapshot: types.JSON(`{}`), IdempotencyKey: runID,
+		WorkflowPlanSnapshot: types.JSON(`{"steps":[],"version":1}`),
+		WorkflowPlanDigest:   "a5dd3ce7993c63ad01d8a9a45922bc5f17d2c41c5f21a10671ec8c05c5ffc4aa",
+	}).Error)
+	startedAt := time.Now().UTC()
+	call := &types.ProductionToolCall{
+		ID: callID, RunID: runID, TenantID: 7, ProjectID: serviceProjectID,
+		DocumentID: types.ProductionDocumentID(documentID), SourceSetID: serviceSetID,
+		Attempt: 1, CurrentStep: 0, IdempotencyKey: callID,
+		ProviderType: types.ProductionToolProviderMCP, ProviderID: "provider", ToolName: "lookup",
+		RequestSnapshot: types.JSON(`{}`), RequestDigest: strings.Repeat("a", 64),
+		Status: types.ProductionToolCallExecuting, ApprovalStatus: types.ProductionToolApprovalNotRequired, StartedAt: &startedAt,
+	}
+	require.NoError(t, db.Create(call).Error)
+	require.NoError(t, svc.Freeze(authorCtx, serviceSetID))
+	evidenceID, err := types.ProductionToolEvidenceID(call)
+	require.NoError(t, err)
+	input := interfaces.CreateEvidenceSnapshotInput{
+		EvidenceID: evidenceID, SnapshotType: types.ProductionEvidenceSnapshotToolResult,
+		InlineContent: types.JSON(`{"ok":true}`), CapturedByRunID: runID, CapturedByToolCallID: callID,
+	}
+
+	_, err = svc.AttachEvidence(authorCtx, serviceItemID, input)
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
+
+	principalCtx, err := types.WithProductionInternalPrincipal(context.Background(), types.ProductionInternalPrincipal{
+		ActorID: types.ProductionSystemActorID, ActorKind: types.ProductionInternalActorWorker,
+		TenantID: 7, ProjectID: serviceProjectID, RunID: runID,
+	})
+	require.NoError(t, err)
+	first, err := svc.AttachEvidence(principalCtx, serviceItemID, input)
+	require.NoError(t, err)
+	require.Equal(t, callID, first.CapturedByToolCallID)
+	second, err := svc.AttachEvidence(principalCtx, serviceItemID, input)
+	require.NoError(t, err)
+	require.Equal(t, first.ID, second.ID)
+
+	conflict := input
+	conflict.InlineContent = types.JSON(`{"ok":false}`)
+	_, err = svc.AttachEvidence(principalCtx, serviceItemID, conflict)
+	require.ErrorIs(t, err, types.ErrProductionEvidenceConflict)
+
+	for name, mutate := range map[string]func(*interfaces.CreateEvidenceSnapshotInput){
+		"wrong call": func(in *interfaces.CreateEvidenceSnapshotInput) {
+			in.CapturedByToolCallID = "73000000-0000-4000-8000-000000000099"
+		},
+		"wrong evidence": func(in *interfaces.CreateEvidenceSnapshotInput) {
+			in.EvidenceID = "73000000-0000-4000-8000-000000000098"
+		},
+		"wrong type": func(in *interfaces.CreateEvidenceSnapshotInput) {
+			in.SnapshotType = types.ProductionEvidenceSnapshotJSON
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := input
+			mutate(&candidate)
+			_, err := svc.AttachEvidence(principalCtx, serviceItemID, candidate)
+			require.Error(t, err)
+		})
+	}
+
+	wrongRunCtx, err := types.WithProductionInternalPrincipal(context.Background(), types.ProductionInternalPrincipal{
+		ActorID: types.ProductionSystemActorID, ActorKind: types.ProductionInternalActorWorker,
+		TenantID: 7, ProjectID: serviceProjectID, RunID: "73000000-0000-4000-8000-000000000097",
+	})
+	require.NoError(t, err)
+	_, err = svc.AttachEvidence(wrongRunCtx, serviceItemID, input)
 	require.ErrorIs(t, err, types.ErrProductionForbidden)
 }
 

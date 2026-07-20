@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -270,17 +271,26 @@ func (r *productionSourceRepository) CreateEvidence(
 			return err
 		}
 		if sourceSet.Status == types.ProductionSourceSetFrozen {
-			var allowed int64
-			err = db.Table("production_source_items AS item").
-				Joins("JOIN production_runs AS run ON run.id = ?", evidence.CapturedByRunID).
-				Where("item.id = ? AND item.source_set_id = ? AND item.status = ?", itemID, sourceSet.ID, types.ProductionSourceItemAccepted).
-				Where("run.tenant_id = ? AND run.project_id = ? AND run.source_set_id = ?", tenantID, sourceSet.ProjectID, sourceSet.ID).
-				Where("? <> '' AND ? <> ''", evidence.ID, evidence.CapturedByRunID).
-				Count(&allowed).Error
+			var call types.ProductionToolCall
+			err = db.Table("production_tool_calls AS tool_call").
+				Select("tool_call.*").
+				Joins("JOIN production_runs AS run ON run.id = tool_call.run_id AND run.tenant_id = tool_call.tenant_id AND run.project_id = tool_call.project_id AND (run.document_id = tool_call.document_id OR (run.document_id IS NULL AND tool_call.document_id IS NULL)) AND run.source_set_id = tool_call.source_set_id").
+				Joins("JOIN production_source_items AS item ON item.id = ? AND item.source_set_id = tool_call.source_set_id", itemID).
+				Where("tool_call.id = ? AND tool_call.run_id = ?", evidence.CapturedByToolCallID, evidence.CapturedByRunID).
+				Where("tool_call.tenant_id = ? AND tool_call.project_id = ? AND tool_call.source_set_id = ?", tenantID, sourceSet.ProjectID, sourceSet.ID).
+				Where("tool_call.status = ? AND item.status = ?", types.ProductionToolCallExecuting, types.ProductionSourceItemAccepted).
+				First(&call).Error
 			if err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return types.ErrProductionSourceSetFrozen
+				}
 				return err
 			}
-			if allowed != 1 {
+			expectedEvidenceID, identityErr := types.ProductionToolEvidenceID(&call)
+			canonicalContent, contentErr := types.CanonicalProductionJSON(evidence.InlineContent)
+			if identityErr != nil || contentErr != nil || expectedEvidenceID != evidence.ID ||
+				evidence.SnapshotType != types.ProductionEvidenceSnapshotToolResult || evidence.StoragePath != "" ||
+				!bytes.Equal(canonicalContent, evidence.InlineContent) || productionSnapshotDigest(canonicalContent) != evidence.ContentDigest {
 				return types.ErrProductionSourceSetFrozen
 			}
 		}

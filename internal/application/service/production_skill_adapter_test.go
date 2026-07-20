@@ -70,7 +70,7 @@ func (f *fakeProductionEvidenceService) AttachEvidence(_ context.Context, itemID
 	candidate := &types.ProductionEvidenceSnapshot{
 		ID: input.EvidenceID, SourceItemID: itemID, SnapshotType: input.SnapshotType,
 		InlineContent: canonical, ContentDigest: adapterDigest(canonical), RedactionMetadata: metadata,
-		CapturedByRunID: input.CapturedByRunID,
+		CapturedByRunID: input.CapturedByRunID, CapturedByToolCallID: input.CapturedByToolCallID,
 	}
 	if existing := f.scope.evidence[input.EvidenceID]; existing != nil {
 		if existing.SourceItemID != candidate.SourceItemID || existing.SnapshotType != candidate.SnapshotType ||

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/mcp"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -115,6 +116,7 @@ func (s *productionMCPEvidenceStub) AttachEvidence(_ context.Context, itemID str
 		ID: input.EvidenceID, SourceItemID: itemID, SnapshotType: input.SnapshotType,
 		InlineContent: input.InlineContent, ContentDigest: input.ContentDigest,
 		RedactionMetadata: input.RedactionMetadata, CapturedByRunID: input.CapturedByRunID,
+		CapturedByToolCallID: input.CapturedByToolCallID,
 	}
 	s.scope.evidence = evidence
 	return evidence, nil
@@ -197,6 +199,26 @@ func TestProductionMCPReclaimReplaysPriorAttemptEvidenceWithoutProviderAccess(t 
 	require.Equal(t, first.ResponseDigest, second.ResponseDigest)
 	require.Equal(t, 1, manager.calls)
 	require.Equal(t, 1, client.calls)
+}
+
+func TestProductionMCPReclaimedExecutingCallWithoutEvidenceRequiresReconciliation(t *testing.T) {
+	adapter, call, manager, client, scope := productionMCPFixture(t, true)
+	plan, err := adapter.Plan(context.Background(), call)
+	require.NoError(t, err)
+	call.RequestSnapshot, call.RequestDigest = plan.RequestSnapshot, plan.RequestDigest
+	call.Status = types.ProductionToolCallExecuting
+	call.ApprovalStatus = types.ProductionToolApprovalApproved
+	startedAt := time.Now().UTC()
+	call.StartedAt = &startedAt
+	scope.run.Attempt = 2
+
+	result, err := adapter.Execute(context.Background(), call)
+
+	require.Nil(t, result)
+	require.ErrorIs(t, err, types.ErrProductionToolReconciliationRequired)
+	require.Zero(t, manager.calls)
+	require.Zero(t, client.calls)
+	require.Nil(t, scope.evidence)
 }
 
 func TestProductionMCPRejectsPolicyFailureMutationAndCredentialLeaks(t *testing.T) {

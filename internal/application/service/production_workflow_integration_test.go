@@ -76,9 +76,8 @@ func (e *productionWorkflowReplayExecutor) ExecuteStep(
 	return result, nil
 }
 
-func openProductionWorkflowE2EDB(t *testing.T) *gorm.DB {
+func openProductionWorkflowE2EDB(t *testing.T, path string, migrate bool) *gorm.DB {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "production-workflow-e2e.db")
 	db, err := gorm.Open(sqlite.Open(
 		"file:"+path+"?_foreign_keys=1&_busy_timeout=10000&_journal_mode=WAL",
 	), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
@@ -86,7 +85,9 @@ func openProductionWorkflowE2EDB(t *testing.T) *gorm.DB {
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(8)
-	t.Cleanup(func() { _ = sqlDB.Close() })
+	if !migrate {
+		return db
+	}
 
 	_, filename, _, ok := runtime.Caller(0)
 	require.True(t, ok)
@@ -102,6 +103,84 @@ func openProductionWorkflowE2EDB(t *testing.T) *gorm.DB {
 	}
 	require.NoError(t, db.AutoMigrate(&types.AuditLog{}))
 	return db
+}
+
+type productionWorkflowGraph struct {
+	db              *gorm.DB
+	runs            interfaces.ProductionRunRepository
+	sources         interfaces.ProductionSourceRepository
+	documents       interfaces.ProductionDocumentRepository
+	documentTypes   interfaces.ProductionDocumentTypeRepository
+	documentService *productionDocumentService
+	runService      *productionRunService
+	writer          *ProductionWriter
+	executor        *productionWorkflowReplayExecutor
+	orchestrator    *ProductionOrchestrator
+	manager         *productionMCPManagerStub
+	client          *productionMCPClientStub
+	chatModel       *productionWriterChatStub
+}
+
+func newProductionWorkflowGraph(
+	t *testing.T,
+	path string,
+	migrate bool,
+	enqueuer *productionTaskEnqueuerFake,
+) *productionWorkflowGraph {
+	t.Helper()
+	db := openProductionWorkflowE2EDB(t, path, migrate)
+	runs := repository.NewProductionRunRepository(db)
+	sources := repository.NewProductionSourceRepository(db)
+	documents := repository.NewProductionDocumentRepository(db)
+	documentTypes := repository.NewProductionDocumentTypeRepository(db)
+	uow := repository.NewProductionUnitOfWork(db)
+	audit := NewAuditLogService(repository.NewAuditLogRepository(db))
+	authorizer := &productionDocumentAuthorizerStub{}
+	documentService := NewProductionDocumentService(documents, sources, documentTypes, authorizer, nil, audit, uow)
+	mcpService := &types.MCPService{
+		ID: workflowE2EMCPServiceID, TenantID: 7, Name: "workflow-mcp", Enabled: true,
+		TransportType: types.MCPTransportHTTPStreamable,
+		Headers:       types.MCPHeaders{"Authorization": workflowE2ESecret},
+	}
+	client := &productionMCPClientStub{
+		serviceID: workflowE2EMCPServiceID,
+		result:    &mcp.CallToolResult{Content: []mcp.ContentItem{{Type: "text", Text: "healthy"}}},
+	}
+	manager := &productionMCPManagerStub{client: client}
+	sourceService := NewProductionSourceService(sources, authorizer, nil, audit, uow)
+	mcpAdapter := NewProductionMCPAdapter(
+		&productionMCPApprovalStub{required: true}, &productionMCPServiceStub{service: mcpService},
+		manager, runs, sources, sourceService,
+	)
+	chatModel := &productionWriterChatStub{}
+	writer := NewProductionWriter(
+		&productionWriterModelServiceStub{model: chatModel}, runs, sources, documents, nil, documentService,
+	)
+	base := newProductionStepExecutor(
+		runs, &productionExecutorAdapterStub{}, mcpAdapter, &productionExecutorAdapterStub{}, writer,
+	)
+	executor := &productionWorkflowReplayExecutor{base: base, mcp: mcpAdapter}
+	orchestrator := NewProductionOrchestrator(runs, uow, executor, enqueuer)
+	modelRepo := &productionWorkflowModelRepository{model: &types.Model{
+		ID: workflowE2EModelID, TenantID: 7, Name: "writer", Type: types.ModelTypeKnowledgeQA,
+		Status: types.ModelStatusActive,
+	}}
+	runService := NewProductionRunService(
+		runs, documents, sources, documentTypes, modelRepo, authorizer, audit, uow, orchestrator,
+	)
+	return &productionWorkflowGraph{
+		db: db, runs: runs, sources: sources, documents: documents, documentTypes: documentTypes,
+		documentService: documentService, runService: runService, writer: writer,
+		executor: executor, orchestrator: orchestrator, manager: manager, client: client, chatModel: chatModel,
+	}
+}
+
+func (g *productionWorkflowGraph) close(t *testing.T) {
+	t.Helper()
+	require.NotNil(t, g)
+	sqlDB, err := g.db.DB()
+	require.NoError(t, err)
+	require.NoError(t, sqlDB.Close())
 }
 
 func productionWorkflowUserContext() context.Context {
@@ -121,23 +200,17 @@ func productionWorkflowWorkerContext(t *testing.T, run *types.ProductionRun) con
 }
 
 func TestProductionWorkflowSQLiteApprovalReplayAndGovernedWrite(t *testing.T) {
-	db := openProductionWorkflowE2EDB(t)
-	runs := repository.NewProductionRunRepository(db)
-	sources := repository.NewProductionSourceRepository(db)
-	documents := repository.NewProductionDocumentRepository(db)
-	documentTypes := repository.NewProductionDocumentTypeRepository(db)
-	uow := repository.NewProductionUnitOfWork(db)
-	audit := NewAuditLogService(repository.NewAuditLogRepository(db))
-	authorizer := &productionDocumentAuthorizerStub{}
-
+	path := filepath.Join(t.TempDir(), "production-workflow-e2e.db")
+	enqueuer := newProductionTaskEnqueuerFake()
+	initial := newProductionWorkflowGraph(t, path, true, enqueuer)
 	skillBindings := types.JSON(`{"version":1,"skills":[]}`)
 	workflow, err := canonicalProductionWorkflowPlan(types.JSON(`{"version":1,"steps":[{"provider_type":"mcp","provider_id":"`+workflowE2EMCPServiceID+`","tool_name":"lookup","request":{"source_item_id":"`+workflowE2ESourceItemID+`","arguments":{"query":"status"}}}]}`), skillBindings)
 	require.NoError(t, err)
-	require.NoError(t, db.Create(&types.ProductionProject{
+	require.NoError(t, initial.db.Create(&types.ProductionProject{
 		ID: workflowE2EProjectID, TenantID: 7, Name: "Workflow E2E", OwnerUserID: workflowE2EActorID,
 		Status: types.ProductionProjectActive,
 	}).Error)
-	require.NoError(t, db.Create(&types.ProductionDocumentType{
+	require.NoError(t, initial.db.Create(&types.ProductionDocumentType{
 		ID: workflowE2ETypeID, TenantID: 7, Code: "software-development-baseline", Name: "Baseline",
 		SchemaVersion: 3, BlockSchema: types.JSON(`{}`), SourceRequirements: types.JSON(`{}`),
 		SkillBindings: skillBindings, WorkflowPlan: workflow, QualityRules: types.JSON(`{}`),
@@ -145,127 +218,114 @@ func TestProductionWorkflowSQLiteApprovalReplayAndGovernedWrite(t *testing.T) {
 		Status: types.ProductionDocumentTypeActive, CreatedBy: workflowE2EActorID,
 	}).Error)
 	frozenAt := time.Now().UTC()
-	require.NoError(t, db.Create(&types.ProductionSourceSet{
+	require.NoError(t, initial.db.Create(&types.ProductionSourceSet{
 		ID: workflowE2ESourceSetID, TenantID: 7, ProjectID: workflowE2EProjectID,
 		DocumentTypeID: workflowE2ETypeID, Status: types.ProductionSourceSetCollecting,
 		CreatedBy: workflowE2EActorID,
 	}).Error)
-	require.NoError(t, db.Create(&types.ProductionSourceItem{
+	require.NoError(t, initial.db.Create(&types.ProductionSourceItem{
 		ID: workflowE2ESourceItemID, SourceSetID: workflowE2ESourceSetID,
 		SourceKind: types.ProductionSourceKindMCP, ExternalID: workflowE2EMCPServiceID,
 		Title: "MCP status", MimeType: "application/json", ContentDigest: strings.Repeat("a", 64),
 		CapturedAt: frozenAt, Metadata: types.JSON(`{}`), Status: types.ProductionSourceItemAccepted,
 	}).Error)
-	require.NoError(t, db.Model(&types.ProductionSourceSet{}).Where("id = ?", workflowE2ESourceSetID).
+	require.NoError(t, initial.db.Model(&types.ProductionSourceSet{}).Where("id = ?", workflowE2ESourceSetID).
 		Updates(map[string]any{"status": types.ProductionSourceSetFrozen, "frozen_at": frozenAt}).Error)
 
-	documentService := NewProductionDocumentService(
-		documents, sources, documentTypes, authorizer, nil, audit, uow,
-	)
-	document, err := documentService.CreateDocument(productionWorkflowUserContext(), interfaces.CreateProductionDocumentInput{
+	document, err := initial.documentService.CreateDocument(productionWorkflowUserContext(), interfaces.CreateProductionDocumentInput{
 		ProjectID: workflowE2EProjectID, DocumentTypeID: workflowE2ETypeID,
 		SourceSetID: workflowE2ESourceSetID, Title: "Workflow report",
 	})
 	require.NoError(t, err)
 	require.NotNil(t, document.CurrentVersionID)
 
-	approvalPolicy := &productionMCPApprovalStub{required: true}
-	mcpService := &types.MCPService{
-		ID: workflowE2EMCPServiceID, TenantID: 7, Name: "workflow-mcp", Enabled: true,
-		TransportType: types.MCPTransportHTTPStreamable,
-		Headers:       types.MCPHeaders{"Authorization": workflowE2ESecret},
-	}
-	client := &productionMCPClientStub{
-		serviceID: workflowE2EMCPServiceID,
-		result:    &mcp.CallToolResult{Content: []mcp.ContentItem{{Type: "text", Text: "healthy"}}},
-	}
-	manager := &productionMCPManagerStub{client: client}
-	sourceService := NewProductionSourceService(sources, authorizer, nil, audit, uow)
-	mcpAdapter := NewProductionMCPAdapter(
-		approvalPolicy, &productionMCPServiceStub{service: mcpService}, manager, runs, sources, sourceService,
-	)
-	chatModel := &productionWriterChatStub{}
-	writer := NewProductionWriter(
-		&productionWriterModelServiceStub{model: chatModel}, runs, sources, documents, nil, documentService,
-	)
-	newExecutor := func() *productionWorkflowReplayExecutor {
-		base := newProductionStepExecutor(
-			runs, &productionExecutorAdapterStub{}, mcpAdapter, &productionExecutorAdapterStub{}, writer,
-		)
-		return &productionWorkflowReplayExecutor{base: base, mcp: mcpAdapter}
-	}
-	enqueuer := newProductionTaskEnqueuerFake()
-	firstExecutor := newExecutor()
-	firstOrchestrator := NewProductionOrchestrator(runs, uow, firstExecutor, enqueuer)
-	modelRepo := &productionWorkflowModelRepository{model: &types.Model{
-		ID: workflowE2EModelID, TenantID: 7, Name: "writer", Type: types.ModelTypeKnowledgeQA,
-		Status: types.ModelStatusActive,
-	}}
-	startService := NewProductionRunService(
-		runs, documents, sources, documentTypes, modelRepo, authorizer, audit, uow, firstOrchestrator,
-	)
-
-	run, err := startService.StartDocumentRun(productionWorkflowUserContext(), document.ID, interfaces.StartProductionDocumentRunInput{
+	run, err := initial.runService.StartDocumentRun(productionWorkflowUserContext(), document.ID, interfaces.StartProductionDocumentRunInput{
 		RunType: types.ProductionRunWrite, ModelID: workflowE2EModelID,
 	})
 	require.NoError(t, err)
 	require.Equal(t, 1, enqueuer.callCount())
 	payload := types.ProductionRunPayload{TenantID: run.TenantID, RunID: run.ID, Attempt: run.Attempt}
-	require.NoError(t, firstOrchestrator.HandleRun(productionWorkflowWorkerContext(t, run), payload))
+	require.NoError(t, initial.orchestrator.HandleRun(productionWorkflowWorkerContext(t, run), payload))
 
-	waiting, err := runs.Get(context.Background(), 7, run.ID)
+	waiting, err := initial.runs.Get(context.Background(), 7, run.ID)
 	require.NoError(t, err)
 	require.Equal(t, types.ProductionRunWaitingApproval, waiting.Status)
-	calls, err := runs.ListToolCalls(context.Background(), 7, run.ID)
+	calls, err := initial.runs.ListToolCalls(context.Background(), 7, run.ID)
 	require.NoError(t, err)
 	require.Len(t, calls, 1)
 	require.Equal(t, types.ProductionToolCallPendingApproval, calls[0].Status)
-	require.Zero(t, manager.calls)
-	require.Zero(t, client.calls)
+	require.Zero(t, initial.manager.calls)
+	require.Zero(t, initial.client.calls)
 	require.NotContains(t, string(calls[0].RequestSnapshot), workflowE2ESecret)
+	callID := calls[0].ID
+	initial.close(t)
 
-	secondExecutor := newExecutor()
-	secondOrchestrator := NewProductionOrchestrator(runs, uow, secondExecutor, enqueuer)
-	approvalService := NewProductionRunService(
-		runs, documents, sources, documentTypes, modelRepo, authorizer, audit, uow, secondOrchestrator,
-	)
-	approved, err := approvalService.DecideToolCall(
+	approval := newProductionWorkflowGraph(t, path, false, enqueuer)
+	require.NotSame(t, initial.db, approval.db)
+	require.NotSame(t, initial.client, approval.client)
+	reopenedWaiting, err := approval.runs.Get(context.Background(), 7, run.ID)
+	require.NoError(t, err)
+	require.Equal(t, types.ProductionRunWaitingApproval, reopenedWaiting.Status)
+	reopenedCalls, err := approval.runs.ListToolCalls(context.Background(), 7, run.ID)
+	require.NoError(t, err)
+	require.Len(t, reopenedCalls, 1)
+	require.Equal(t, callID, reopenedCalls[0].ID)
+	approved, err := approval.runService.DecideToolCall(
 		productionWorkflowUserContext(), calls[0].ID, interfaces.ProductionToolDecisionApprove,
 	)
 	require.NoError(t, err)
 	require.Equal(t, types.ProductionToolCallApproved, approved.Status)
 	require.Equal(t, 2, enqueuer.callCount())
 
-	_, err = approvalService.DecideToolCall(
+	_, err = approval.runService.DecideToolCall(
 		productionWorkflowUserContext(), calls[0].ID, interfaces.ProductionToolDecisionApprove,
 	)
 	require.ErrorIs(t, err, types.ErrProductionConflict)
 	require.Equal(t, 2, enqueuer.callCount(), "duplicate approval must not enqueue")
+	require.Zero(t, approval.manager.calls)
+	require.Zero(t, approval.client.calls)
+	approval.close(t)
 
-	queued, err := runs.Get(context.Background(), 7, run.ID)
+	worker := newProductionWorkflowGraph(t, path, false, enqueuer)
+	require.NotSame(t, approval.db, worker.db)
+	require.NotSame(t, approval.client, worker.client)
+	queued, err := worker.runs.Get(context.Background(), 7, run.ID)
 	require.NoError(t, err)
-	require.NoError(t, secondOrchestrator.HandleRun(productionWorkflowWorkerContext(t, queued), payload))
-	require.Equal(t, 1, client.calls)
-	require.Equal(t, 1, manager.calls)
-	require.Equal(t, 1, secondExecutor.replayCalls)
+	durableCalls, err := worker.runs.ListToolCalls(context.Background(), 7, run.ID)
+	require.NoError(t, err)
+	require.Len(t, durableCalls, 1)
+	require.Equal(t, types.ProductionToolCallApproved, durableCalls[0].Status)
+	require.NoError(t, worker.orchestrator.HandleRun(productionWorkflowWorkerContext(t, queued), payload))
+	require.Equal(t, 1, worker.client.calls)
+	require.Equal(t, 1, worker.manager.calls)
+	require.Equal(t, 1, worker.executor.replayCalls)
 	require.Equal(t, 3, enqueuer.callCount())
 
-	completedCall, err := runs.GetToolCall(context.Background(), 7, calls[0].ID)
+	completedCall, err := worker.runs.GetToolCall(context.Background(), 7, callID)
 	require.NoError(t, err)
 	require.Equal(t, types.ProductionToolCallCompleted, completedCall.Status)
 	require.NotNil(t, completedCall.ResponseEvidenceID)
-	evidence, item, set, err := sources.GetEvidence(context.Background(), 7, *completedCall.ResponseEvidenceID)
+	evidence, item, set, err := worker.sources.GetEvidence(context.Background(), 7, *completedCall.ResponseEvidenceID)
 	require.NoError(t, err)
 	require.Equal(t, workflowE2ESourceItemID, item.ID)
 	require.Equal(t, types.ProductionSourceItemAccepted, item.Status)
 	require.Equal(t, types.ProductionSourceSetFrozen, set.Status)
 	require.Equal(t, run.ID, evidence.CapturedByRunID)
+	require.Equal(t, callID, evidence.CapturedByToolCallID)
 	require.NotContains(t, string(evidence.InlineContent), workflowE2ESecret)
 
-	queuedForWrite, err := runs.Get(context.Background(), 7, run.ID)
+	queuedForWrite, err := worker.runs.Get(context.Background(), 7, run.ID)
 	require.NoError(t, err)
 	require.Equal(t, 1, queuedForWrite.CurrentStep)
-	chatModel.response = &types.ChatResponse{Content: productionWriterOutput(t,
+	evidenceID := evidence.ID
+	worker.close(t)
+
+	writeGraph := newProductionWorkflowGraph(t, path, false, enqueuer)
+	require.NotSame(t, worker.db, writeGraph.db)
+	require.NotSame(t, worker.client, writeGraph.client)
+	queuedForWrite, err = writeGraph.runs.Get(context.Background(), 7, run.ID)
+	require.NoError(t, err)
+	writeGraph.chatModel.response = &types.ChatResponse{Content: productionWriterOutput(t,
 		writerFact("workflow-fact", "MCP reports healthy", []string{evidence.ID}, false),
 	)}
 	mismatchCtx, err := types.WithProductionInternalPrincipal(context.Background(), types.ProductionInternalPrincipal{
@@ -275,27 +335,38 @@ func TestProductionWorkflowSQLiteApprovalReplayAndGovernedWrite(t *testing.T) {
 	require.NoError(t, err)
 	mismatchRun := *queuedForWrite
 	mismatchRun.Status = types.ProductionRunRunning
-	_, err = writer.Write(mismatchCtx, &mismatchRun)
+	_, err = writeGraph.writer.Write(mismatchCtx, &mismatchRun)
 	require.ErrorIs(t, err, types.ErrProductionForbidden)
-	require.Zero(t, chatModel.calls)
+	require.Zero(t, writeGraph.chatModel.calls)
 
-	thirdExecutor := newExecutor()
-	thirdOrchestrator := NewProductionOrchestrator(runs, uow, thirdExecutor, enqueuer)
-	require.NoError(t, thirdOrchestrator.HandleRun(productionWorkflowWorkerContext(t, queuedForWrite), payload))
-	finalRun, err := runs.Get(context.Background(), 7, run.ID)
+	require.NoError(t, writeGraph.orchestrator.HandleRun(productionWorkflowWorkerContext(t, queuedForWrite), payload))
+	finalRun, err := writeGraph.runs.Get(context.Background(), 7, run.ID)
 	require.NoError(t, err)
 	require.Equal(t, types.ProductionRunCompleted, finalRun.Status)
 	require.NotNil(t, finalRun.OutputVersionID)
 	require.Equal(t, 3, enqueuer.callCount())
-	require.Equal(t, 1, chatModel.calls)
-	version, err := documents.GetVersion(context.Background(), 7, *finalRun.OutputVersionID)
+	require.Equal(t, 1, writeGraph.chatModel.calls)
+	outputVersionID := *finalRun.OutputVersionID
+	writeGraph.close(t)
+
+	finalGraph := newProductionWorkflowGraph(t, path, false, enqueuer)
+	require.NotSame(t, writeGraph.db, finalGraph.db)
+	require.NotSame(t, writeGraph.client, finalGraph.client)
+	finalRun, err = finalGraph.runs.Get(context.Background(), 7, run.ID)
+	require.NoError(t, err)
+	require.Equal(t, types.ProductionRunCompleted, finalRun.Status)
+	require.Equal(t, outputVersionID, *finalRun.OutputVersionID)
+	version, err := finalGraph.documents.GetVersion(context.Background(), 7, outputVersionID)
 	require.NoError(t, err)
 	require.Equal(t, 2, version.VersionNumber)
 	require.Equal(t, types.ProductionDocumentOriginAI, version.Origin)
 	require.NotEmpty(t, version.Blocks)
+	finalEvidence, _, _, err := finalGraph.sources.GetEvidence(context.Background(), 7, evidenceID)
+	require.NoError(t, err)
+	require.Equal(t, callID, finalEvidence.CapturedByToolCallID)
 
 	var audits []*types.AuditLog
-	require.NoError(t, db.Order("id ASC").Find(&audits).Error)
+	require.NoError(t, finalGraph.db.Order("id ASC").Find(&audits).Error)
 	approvedAudits := 0
 	for _, entry := range audits {
 		if entry.Action == types.AuditActionProductionToolCallApproved {
@@ -310,12 +381,15 @@ func TestProductionWorkflowSQLiteApprovalReplayAndGovernedWrite(t *testing.T) {
 		Evidence []*types.ProductionEvidenceSnapshot
 		Audits   []*types.AuditLog
 	}
-	require.NoError(t, db.Find(&durable.Runs).Error)
-	require.NoError(t, db.Find(&durable.Calls).Error)
-	require.NoError(t, db.Find(&durable.Evidence).Error)
+	require.NoError(t, finalGraph.db.Find(&durable.Runs).Error)
+	require.NoError(t, finalGraph.db.Find(&durable.Calls).Error)
+	require.NoError(t, finalGraph.db.Find(&durable.Evidence).Error)
 	durable.Audits = audits
 	encoded, err := json.Marshal(durable)
 	require.NoError(t, err)
 	require.NotContains(t, string(encoded), workflowE2ESecret)
 	require.NotContains(t, strings.ToLower(string(encoded)), "authorization")
+	require.Equal(t, 1, initial.client.calls+approval.client.calls+worker.client.calls+writeGraph.client.calls+finalGraph.client.calls)
+	require.Equal(t, 1, initial.manager.calls+approval.manager.calls+worker.manager.calls+writeGraph.manager.calls+finalGraph.manager.calls)
+	finalGraph.close(t)
 }

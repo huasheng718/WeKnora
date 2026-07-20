@@ -209,10 +209,23 @@ func (s *productionSourceService) AttachEvidence(
 			return nil, err
 		}
 	}
-	if sourceSet.Status == types.ProductionSourceSetFrozen && (runID == "" || input.EvidenceID == "") {
-		return nil, types.ErrProductionSourceSetFrozen
+	toolCallID := ""
+	if input.CapturedByToolCallID != "" {
+		toolCallID, err = canonicalProductionSourceID(input.CapturedByToolCallID, "tool call id", false)
+		if err != nil {
+			return nil, err
+		}
 	}
-	if principal, ok := types.ProductionInternalPrincipalFromContext(ctx); ok && runID != principal.RunID {
+	principal, internal := types.ProductionInternalPrincipalFromContext(ctx)
+	if sourceSet.Status == types.ProductionSourceSetFrozen {
+		if runID == "" || toolCallID == "" || input.EvidenceID == "" ||
+			input.SnapshotType != types.ProductionEvidenceSnapshotToolResult {
+			return nil, types.ErrProductionSourceSetFrozen
+		}
+		if !internal || !principal.Matches(tenantID, sourceSet.ProjectID, runID) {
+			return nil, types.ErrProductionForbidden
+		}
+	} else if internal && !principal.Matches(tenantID, sourceSet.ProjectID, runID) {
 		return nil, types.ErrProductionForbidden
 	}
 	if (input.ResourceReference == "") == (len(input.InlineContent) == 0) {
@@ -231,7 +244,7 @@ func (s *productionSourceService) AttachEvidence(
 	}
 	snapshot := &types.ProductionEvidenceSnapshot{
 		ID: evidenceID, SourceItemID: itemID, SnapshotType: input.SnapshotType,
-		RedactionMetadata: redaction, CapturedByRunID: runID,
+		RedactionMetadata: redaction, CapturedByRunID: runID, CapturedByToolCallID: toolCallID,
 	}
 	if input.ResourceReference != "" {
 		handle, ok := types.ParseResourcePath(input.ResourceReference)
@@ -338,7 +351,8 @@ func sameProductionEvidence(
 		existingSet.ID == candidateSet.ID && existingSet.TenantID == candidateSet.TenantID && existingSet.ProjectID == candidateSet.ProjectID &&
 		existing.SnapshotType == candidate.SnapshotType && existing.StoragePath == candidate.StoragePath &&
 		bytes.Equal(existing.InlineContent, candidate.InlineContent) && existing.ContentDigest == candidate.ContentDigest &&
-		bytes.Equal(existing.RedactionMetadata, candidate.RedactionMetadata) && existing.CapturedByRunID == candidate.CapturedByRunID
+		bytes.Equal(existing.RedactionMetadata, candidate.RedactionMetadata) && existing.CapturedByRunID == candidate.CapturedByRunID &&
+		existing.CapturedByToolCallID == candidate.CapturedByToolCallID
 }
 
 func (s *productionSourceService) Freeze(ctx context.Context, sourceSetID string) error {
