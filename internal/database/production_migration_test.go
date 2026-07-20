@@ -107,6 +107,11 @@ func TestProductionReviewPostgreSQLMigrationDeclaresIntegrityGuards(t *testing.T
 	}
 	require.Contains(t, up, "IF NEW.status <> 'pending' OR NEW.terminal_by IS NOT NULL")
 	require.Contains(t, up, "IF NOT EXISTS (SELECT 1 FROM production_review_steps WHERE review_request_id = OLD.id)")
+	guardStart := strings.Index(up, "CREATE OR REPLACE FUNCTION guard_production_review_request_identity()")
+	guardEnd := strings.Index(up[guardStart:], "$$ LANGUAGE plpgsql;")
+	require.NotEqual(t, -1, guardStart)
+	require.NotEqual(t, -1, guardEnd)
+	require.Contains(t, up[guardStart:guardStart+guardEnd], "NEW.status NOT IN ('pending', 'approved', 'rejected', 'obsolete', 'cancelled', 'changes_requested')")
 
 	down := mustReadMigration(t, "../../migrations/versioned/000073_knowledge_production_reviews.down.sql")
 	_, err = pg_query.Parse(down)

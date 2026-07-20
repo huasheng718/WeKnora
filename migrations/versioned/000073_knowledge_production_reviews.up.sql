@@ -221,7 +221,7 @@ BEGIN
        NEW.created_at IS DISTINCT FROM OLD.created_at THEN
         RAISE EXCEPTION 'production review request identity is immutable';
     END IF;
-    IF NEW.status NOT IN ('pending', 'approved', 'rejected', 'obsolete', 'cancelled') THEN
+    IF NEW.status NOT IN ('pending', 'approved', 'rejected', 'obsolete', 'cancelled', 'changes_requested') THEN
         RAISE EXCEPTION 'invalid production review request status transition';
     END IF;
     RETURN NEW;
