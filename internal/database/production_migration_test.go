@@ -76,6 +76,41 @@ func TestProductionReviewMigrationsDeclareRequiredTables(t *testing.T) {
 	}
 }
 
+func TestProductionReviewMigrationsProvideBlockingCountIndex(t *testing.T) {
+	const indexName = "idx_production_annotations_blocking_count"
+	const declaration = "CREATE INDEX IF NOT EXISTS " + indexName + "\n    ON production_annotations (tenant_id, version_id, severity, status);"
+	for _, path := range []string{
+		"../../migrations/versioned/000073_knowledge_production_reviews.up.sql",
+		"../../migrations/sqlite/000004_knowledge_production_reviews.up.sql",
+	} {
+		require.Contains(t, mustReadMigration(t, path), declaration)
+	}
+	for _, path := range []string{
+		"../../migrations/versioned/000073_knowledge_production_reviews.down.sql",
+		"../../migrations/sqlite/000004_knowledge_production_reviews.down.sql",
+	} {
+		require.Contains(t, mustReadMigration(t, path), "DROP INDEX IF EXISTS "+indexName+";")
+	}
+
+	db := openProductionReviewSQLite(t)
+	indexSQL := sqliteMasterSQL(t, db, "index", indexName)
+	require.Contains(t, indexSQL, "tenant_id, version_id, severity, status")
+	rows, err := db.Query(`EXPLAIN QUERY PLAN SELECT count(*) FROM production_annotations
+		WHERE tenant_id = ? AND version_id = ? AND severity = ? AND status = ?`,
+		1, "version-1", "blocking", "open")
+	require.NoError(t, err)
+	defer rows.Close()
+	var plan []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		require.NoError(t, rows.Scan(&id, &parent, &unused, &detail))
+		plan = append(plan, detail)
+	}
+	require.NoError(t, rows.Err())
+	require.Contains(t, strings.Join(plan, "\n"), indexName)
+}
+
 func TestProductionReviewPostgreSQLMigrationDeclaresIntegrityGuards(t *testing.T) {
 	up := mustReadMigration(t, "../../migrations/versioned/000073_knowledge_production_reviews.up.sql")
 	_, err := pg_query.Parse(up)
@@ -185,6 +220,7 @@ func TestProductionReviewSQLiteMigrationRollsBackPopulatedSchema(t *testing.T) {
 	for _, table := range []string{"production_review_steps", "production_review_requests", "production_annotations"} {
 		require.Empty(t, sqliteMasterSQL(t, db, "table", table))
 	}
+	require.Empty(t, sqliteMasterSQL(t, db, "index", "idx_production_annotations_blocking_count"))
 }
 
 func TestProductionReviewSQLiteMigrationRejectsTerminalRequestAndStepInserts(t *testing.T) {

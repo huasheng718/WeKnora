@@ -309,6 +309,23 @@ func (s *productionReviewService) terminalizeByTenantAuthority(
 			return terminalErr
 		}
 		if !changed {
+			liveMembership, _, liveErr := productionMembership(txCtx, s.members, tenantID)
+			if liveErr != nil {
+				return liveErr
+			}
+			if !liveMembership.Role.HasPermission(types.TenantRoleAdmin) {
+				return types.ErrProductionForbidden
+			}
+			review, loadErr := s.reviews.GetReview(txCtx, tenantID, reviewID)
+			if loadErr != nil {
+				return loadErr
+			}
+			if review != nil && review.Status == status {
+				return nil
+			}
+			if review != nil && review.Status != types.ProductionReviewPending {
+				return types.ErrProductionConflict
+			}
 			return types.ErrProductionForbidden
 		}
 		return emitProductionReviewDecisionAudit(

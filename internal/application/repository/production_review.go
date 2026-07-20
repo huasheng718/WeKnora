@@ -23,6 +23,40 @@ FROM production_document_versions
 WHERE id = ? AND document_id = ? AND tenant_id = ? AND project_id = ?
 FOR UPDATE`
 
+const postgresProductionAnnotationCreateRoleLockSQL = `
+SELECT member.project_id
+FROM production_project_members AS member
+JOIN production_projects AS project ON project.id = member.project_id
+WHERE project.tenant_id = ?
+  AND project.deleted_at IS NULL
+  AND member.project_id = ?
+  AND member.user_id = ?
+  AND member.deleted_at IS NULL
+  AND member.role IN (?, ?, ?, ?)
+ORDER BY member.role
+LIMIT 1
+FOR UPDATE OF member`
+
+const postgresProductionReviewDecisionDocumentLookupSQL = `
+SELECT request.document_id
+FROM production_review_requests AS request
+JOIN production_review_steps AS step ON step.review_request_id = request.id
+WHERE request.tenant_id = ? AND step.tenant_id = ? AND step.id = ?`
+
+const postgresProductionReviewDecisionDocumentLockSQL = `
+SELECT id, current_version_id, status
+FROM production_documents
+WHERE id = ? AND tenant_id = ?
+FOR UPDATE`
+
+const postgresProductionReviewDecisionScopeLockSQL = `
+SELECT request.id AS review_id, request.project_id, request.document_id,
+       request.version_id, request.status
+FROM production_review_requests AS request
+JOIN production_review_steps AS step ON step.review_request_id = request.id
+WHERE request.tenant_id = ? AND step.tenant_id = ? AND step.id = ?
+FOR UPDATE OF request, step`
+
 const productionReviewObsoleteReason = "superseded by a newer document version"
 
 const productionTenantReviewAuthoritySQL = `EXISTS (
@@ -247,12 +281,11 @@ func (r *productionReviewRepository) CreateAnnotation(ctx context.Context, annot
 	if err := validateProductionAnnotation(annotation); err != nil {
 		return err
 	}
-	db := database.DBFromContext(ctx, r.db).WithContext(ctx)
 	now := r.nowUTC()
 	annotation.CreatedAt = now
 	annotation.UpdatedAt = now
 	anchorValue := any(string(annotation.Anchor))
-	if db.Dialector.Name() == "postgres" {
+	if r.db.Dialector.Name() == "postgres" {
 		anchorValue = gorm.Expr("CAST(? AS JSONB)", string(annotation.Anchor))
 	}
 	var qualityTag, suggestedContent any
@@ -270,11 +303,56 @@ func (r *productionReviewRepository) CreateAnnotation(ctx context.Context, annot
 		"status": annotation.Status, "created_by": annotation.CreatedBy,
 		"resolved_by": nil, "resolved_at": nil, "created_at": annotation.CreatedAt, "updated_at": annotation.UpdatedAt,
 	}
-	err = db.Model(&types.ProductionAnnotation{}).Create(values).Error
-	if isProductionForeignKeyError(err) {
-		return errors.Join(types.ErrProductionAnnotationAnchorInvalid, err)
+	return database.WithTransactionContext(ctx, r.db, func(txCtx context.Context) error {
+		db := database.DBFromContext(txCtx, r.db).WithContext(txCtx)
+		allowed, lockErr := lockProductionAnnotationCreateRole(
+			db, annotation.TenantID, annotation.ProjectID, actorID,
+		)
+		if lockErr != nil {
+			return translateProductionReviewError(lockErr)
+		}
+		if !allowed {
+			return types.ErrProductionForbidden
+		}
+		createErr := db.Model(&types.ProductionAnnotation{}).Create(values).Error
+		if isProductionForeignKeyError(createErr) {
+			return errors.Join(types.ErrProductionAnnotationAnchorInvalid, createErr)
+		}
+		return translateProductionReviewError(createErr)
+	})
+}
+
+func lockProductionAnnotationCreateRole(db *gorm.DB, tenantID uint64, projectID, actorID string) (bool, error) {
+	roles := []types.ProductionRole{
+		types.ProductionRoleAuthor,
+		types.ProductionRoleBusinessReviewer,
+		types.ProductionRoleEngineeringReviewer,
+		types.ProductionRoleComplianceReviewer,
 	}
-	return translateProductionReviewError(err)
+	if db.Dialector.Name() == "postgres" {
+		var lockedProjectID string
+		err := db.Raw(postgresProductionAnnotationCreateRoleLockSQL,
+			tenantID, projectID, actorID, roles[0], roles[1], roles[2], roles[3],
+		).Scan(&lockedProjectID).Error
+		return lockedProjectID == projectID, err
+	}
+
+	result := db.Exec(`UPDATE production_project_members
+SET created_at = created_at
+WHERE rowid = (
+    SELECT member.rowid
+    FROM production_project_members AS member
+    JOIN production_projects AS project ON project.id = member.project_id
+    WHERE project.tenant_id = ?
+      AND project.deleted_at IS NULL
+      AND member.project_id = ?
+      AND member.user_id = ?
+      AND member.deleted_at IS NULL
+      AND member.role IN (?, ?, ?, ?)
+    ORDER BY member.role
+    LIMIT 1
+)`, tenantID, projectID, actorID, roles[0], roles[1], roles[2], roles[3])
+	return result.RowsAffected == 1, result.Error
 }
 
 func (r *productionReviewRepository) GetAnnotation(
@@ -308,7 +386,7 @@ func (r *productionReviewRepository) ListAnnotations(
 	filter interfaces.ListProductionAnnotationsFilter,
 	offset, limit int,
 ) ([]*types.ProductionAnnotation, int64, error) {
-	if tenantID == 0 || offset < 0 || limit < 1 || limit > 100 {
+	if tenantID == 0 || offset < 0 || offset > types.ProductionAnnotationMaxOffset || limit < 1 || limit > 100 {
 		return nil, 0, types.ErrProductionReviewScopeInvalid
 	}
 	if err := requireProductionReviewTenantContext(ctx, tenantID); err != nil {
@@ -822,6 +900,9 @@ type productionReviewDecisionScope struct {
 }
 
 func lockProductionReviewDecisionScope(db *gorm.DB, tenantID uint64, stepID string) (*productionReviewDecisionScope, error) {
+	if db.Dialector.Name() == "postgres" {
+		return lockPostgresProductionReviewDecisionScope(db, tenantID, stepID)
+	}
 	if db.Dialector.Name() != "postgres" {
 		// SQLite has no row locks. Reserve its single writer before reading the
 		// aggregate so concurrent decisions do not both begin as readers and
@@ -841,9 +922,6 @@ FROM production_review_requests AS request
 JOIN production_review_steps AS step ON step.review_request_id = request.id
 JOIN production_documents AS document ON document.id = request.document_id
 WHERE request.tenant_id = ? AND step.tenant_id = ? AND step.id = ?`
-	if db.Dialector.Name() == "postgres" {
-		query += " FOR UPDATE OF request, document"
-	}
 	var scope productionReviewDecisionScope
 	if err := db.Raw(query, tenantID, tenantID, stepID).Scan(&scope).Error; err != nil {
 		return nil, err
@@ -851,6 +929,51 @@ WHERE request.tenant_id = ? AND step.tenant_id = ? AND step.id = ?`
 	if scope.ReviewID == "" {
 		return nil, gorm.ErrRecordNotFound
 	}
+	return &scope, nil
+}
+
+func lockPostgresProductionReviewDecisionScope(
+	db *gorm.DB,
+	tenantID uint64,
+	stepID string,
+) (*productionReviewDecisionScope, error) {
+	var documentID string
+	if err := db.Raw(
+		postgresProductionReviewDecisionDocumentLookupSQL, tenantID, tenantID, stepID,
+	).Scan(&documentID).Error; err != nil {
+		return nil, err
+	}
+	if documentID == "" {
+		return nil, gorm.ErrRecordNotFound
+	}
+
+	var document struct {
+		ID               string
+		CurrentVersionID *string
+		Status           types.ProductionDocumentStatus
+	}
+	if err := db.Raw(
+		postgresProductionReviewDecisionDocumentLockSQL, documentID, tenantID,
+	).Scan(&document).Error; err != nil {
+		return nil, err
+	}
+	if document.ID == "" {
+		return nil, gorm.ErrRecordNotFound
+	}
+
+	var scope productionReviewDecisionScope
+	if err := db.Raw(
+		postgresProductionReviewDecisionScopeLockSQL, tenantID, tenantID, stepID,
+	).Scan(&scope).Error; err != nil {
+		return nil, err
+	}
+	if scope.ReviewID == "" || scope.DocumentID != document.ID {
+		return nil, gorm.ErrRecordNotFound
+	}
+	if document.CurrentVersionID != nil {
+		scope.CurrentVersionID = *document.CurrentVersionID
+	}
+	scope.DocumentStatus = document.Status
 	return &scope, nil
 }
 

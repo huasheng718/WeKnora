@@ -49,6 +49,22 @@ type productionReviewFixture struct {
 	audit     *productionAuditServiceStub
 }
 
+type revokingTerminalReplayRepository struct {
+	interfaces.ProductionReviewRepository
+	members  *productionMemberServiceStub
+	tenantID uint64
+	actorID  string
+}
+
+func (r *revokingTerminalReplayRepository) RejectReviewByTenantAuthority(
+	ctx context.Context, tenantID uint64, reviewID, actorID, reason string,
+) (bool, error) {
+	delete(r.members.members[r.tenantID], r.actorID)
+	return r.ProductionReviewRepository.RejectReviewByTenantAuthority(
+		ctx, tenantID, reviewID, actorID, reason,
+	)
+}
+
 type retiringProductionDocumentTypeRepository struct {
 	interfaces.ProductionDocumentTypeRepository
 	db *gorm.DB
@@ -623,6 +639,36 @@ func TestTenantAdminAndOwnerUseExplicitRejectAndCancelPaths(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, types.ProductionReviewStatus(types.ProductionReviewCancelled), loaded.Status)
 	})
+}
+
+func TestProductionReviewTenantAuthorityTerminalizationIsIdempotentAndConflictsAcrossOutcomes(t *testing.T) {
+	fixture := newProductionReviewFixture(t)
+	request := fixture.submit(t)
+	ctx := productionReviewServiceContext(productionReviewTenantAdminID, types.TenantRoleAdmin)
+
+	require.NoError(t, fixture.svc.Reject(ctx, request.ID, "emergency rejection"))
+	require.NoError(t, fixture.svc.Reject(ctx, request.ID, "replayed rejection"))
+	require.ErrorIs(t, fixture.svc.Cancel(ctx, request.ID, "conflicting cancellation"), types.ErrProductionConflict)
+
+	loaded, err := fixture.reviews.GetReview(ctx, productionReviewTenantID, request.ID)
+	require.NoError(t, err)
+	require.Equal(t, types.ProductionReviewStatus(types.ProductionReviewRejected), loaded.Status)
+	require.NotNil(t, loaded.TerminalReason)
+	require.Equal(t, "emergency rejection", *loaded.TerminalReason)
+}
+
+func TestProductionReviewTerminalReplayRevalidatesLiveTenantAuthority(t *testing.T) {
+	fixture := newProductionReviewFixture(t)
+	request := fixture.submit(t)
+	ctx := productionReviewServiceContext(productionReviewTenantAdminID, types.TenantRoleAdmin)
+	require.NoError(t, fixture.svc.Reject(ctx, request.ID, "initial rejection"))
+	fixture.svc.reviews = &revokingTerminalReplayRepository{
+		ProductionReviewRepository: fixture.reviews,
+		members:                    fixture.members, tenantID: productionReviewTenantID, actorID: productionReviewTenantAdminID,
+	}
+
+	err := fixture.svc.Reject(ctx, request.ID, "replayed after revocation")
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
 }
 
 func TestProductionReviewRevokedTenantAuthorityAtMutationBoundaryCannotCancel(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -68,6 +69,10 @@ type productionReviewServiceStub struct {
 	decidedStepID       string
 	decision            types.ProductionReviewDecision
 	comment             string
+	rejectedReviewID    string
+	rejectedReason      string
+	cancelledReviewID   string
+	cancelledReason     string
 	review              *types.ProductionReviewRequest
 	err                 error
 }
@@ -99,8 +104,14 @@ func (s *productionReviewServiceStub) Decide(_ context.Context, stepID string, d
 	return s.err
 }
 
-func (*productionReviewServiceStub) Reject(context.Context, string, string) error { return nil }
-func (*productionReviewServiceStub) Cancel(context.Context, string, string) error { return nil }
+func (s *productionReviewServiceStub) Reject(_ context.Context, reviewID, reason string) error {
+	s.rejectedReviewID, s.rejectedReason = reviewID, reason
+	return s.err
+}
+func (s *productionReviewServiceStub) Cancel(_ context.Context, reviewID, reason string) error {
+	s.cancelledReviewID, s.cancelledReason = reviewID, reason
+	return s.err
+}
 
 func productionReviewHandlerEngine(annotation *productionReviewAnnotationServiceStub, review *productionReviewServiceStub) *gin.Engine {
 	gin.SetMode(gin.TestMode)
@@ -120,6 +131,8 @@ func productionReviewHandlerEngine(annotation *productionReviewAnnotationService
 	engine.POST("/documents/:id/reviews", h.Submit)
 	engine.GET("/reviews/:id", h.Get)
 	engine.POST("/reviews/:id/steps/:step_id/decision", h.Decide)
+	engine.POST("/reviews/:id/reject", h.Reject)
+	engine.POST("/reviews/:id/cancel", h.Cancel)
 	return engine
 }
 
@@ -145,6 +158,8 @@ func TestProductionReviewHandlerExposesApprovedActions(t *testing.T) {
 	submit := productionReviewHandlerRequest(engine, http.MethodPost, "/documents/"+productionReviewDocumentID+"/reviews", `{"version_id":"`+productionReviewVersionID+`"}`)
 	get := productionReviewHandlerRequest(engine, http.MethodGet, "/reviews/"+productionReviewRequestID, "")
 	decide := productionReviewHandlerRequest(engine, http.MethodPost, "/reviews/"+productionReviewRequestID+"/steps/"+productionReviewStepID+"/decision", `{"decision":"approved","comment":" checked "}`)
+	reject := productionReviewHandlerRequest(engine, http.MethodPost, "/reviews/"+productionReviewRequestID+"/reject", `{"reason":" rejected by admin "}`)
+	cancel := productionReviewHandlerRequest(engine, http.MethodPost, "/reviews/"+productionReviewRequestID+"/cancel", `{"reason":" cancelled by owner "}`)
 
 	require.Equal(t, http.StatusCreated, create.Code, create.Body.String())
 	require.Equal(t, http.StatusOK, list.Code, list.Body.String())
@@ -170,6 +185,12 @@ func TestProductionReviewHandlerExposesApprovedActions(t *testing.T) {
 	require.Equal(t, productionReviewStepID, reviews.decidedStepID)
 	require.Equal(t, types.ProductionReviewDecision(types.ProductionReviewApproved), reviews.decision)
 	require.Equal(t, "checked", reviews.comment)
+	require.Equal(t, http.StatusOK, reject.Code, reject.Body.String())
+	require.Equal(t, productionReviewRequestID, reviews.rejectedReviewID)
+	require.Equal(t, "rejected by admin", reviews.rejectedReason)
+	require.Equal(t, http.StatusOK, cancel.Code, cancel.Body.String())
+	require.Equal(t, productionReviewRequestID, reviews.cancelledReviewID)
+	require.Equal(t, "cancelled by owner", reviews.cancelledReason)
 }
 
 func TestProductionReviewHandlerRejectsInvalidAnnotationListPaginationAndFilters(t *testing.T) {
@@ -177,6 +198,8 @@ func TestProductionReviewHandlerRejectsInvalidAnnotationListPaginationAndFilters
 	engine := productionReviewHandlerEngine(annotations, &productionReviewServiceStub{})
 	for _, query := range []string{
 		"?page=0", "?page=9223372036854775807&page_size=100", "?page_size=101", "?page_size=not-a-number", "?version_id=not-a-uuid",
+		"?page=" + strconv.Itoa(types.ProductionAnnotationMaxPage+1) + "&page_size=1",
+		"?page=" + strconv.Itoa(types.ProductionAnnotationMaxOffset/100+2) + "&page_size=100",
 		"?status=unknown", "?annotation_type=unknown", "?severity=unknown",
 	} {
 		response := productionReviewHandlerRequest(engine, http.MethodGet,
@@ -184,6 +207,13 @@ func TestProductionReviewHandlerRejectsInvalidAnnotationListPaginationAndFilters
 		require.Equal(t, http.StatusBadRequest, response.Code, query+" "+response.Body.String())
 	}
 	require.Empty(t, annotations.listed.DocumentID)
+
+	boundary := productionReviewHandlerRequest(engine, http.MethodGet,
+		"/documents/"+productionReviewDocumentID+"/annotations?page="+
+			strconv.Itoa(types.ProductionAnnotationMaxPage)+"&page_size=1", "")
+	require.Equal(t, http.StatusOK, boundary.Code, boundary.Body.String())
+	require.Equal(t, types.ProductionAnnotationMaxPage, annotations.listed.Page)
+	require.Equal(t, 1, annotations.listed.PageSize)
 }
 
 func TestProductionReviewHandlerStrictlyRejectsInvalidScopeAndBodies(t *testing.T) {
@@ -205,6 +235,9 @@ func TestProductionReviewHandlerStrictlyRejectsInvalidScopeAndBodies(t *testing.
 		{"pending decision unsupported", http.MethodPost, "/reviews/" + productionReviewRequestID + "/steps/" + productionReviewStepID + "/decision", `{"decision":"pending"}`, http.StatusBadRequest},
 		{"nonapproval needs comment", http.MethodPost, "/reviews/" + productionReviewRequestID + "/steps/" + productionReviewStepID + "/decision", `{"decision":"rejected","comment":" "}`, http.StatusBadRequest},
 		{"multiple json values", http.MethodPost, "/documents/" + productionReviewDocumentID + "/reviews", `{"version_id":"` + productionReviewVersionID + `"}{}`, http.StatusBadRequest},
+		{"terminal unknown field", http.MethodPost, "/reviews/" + productionReviewRequestID + "/reject", `{"reason":"valid","extra":true}`, http.StatusBadRequest},
+		{"terminal empty reason", http.MethodPost, "/reviews/" + productionReviewRequestID + "/cancel", `{"reason":" "}`, http.StatusBadRequest},
+		{"terminal invalid review", http.MethodPost, "/reviews/not-a-uuid/reject", `{"reason":"valid"}`, http.StatusBadRequest},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -216,6 +249,8 @@ func TestProductionReviewHandlerStrictlyRejectsInvalidScopeAndBodies(t *testing.
 	require.Empty(t, annotations.resolved.id)
 	require.Empty(t, reviews.submittedDocumentID)
 	require.Empty(t, reviews.decidedStepID)
+	require.Empty(t, reviews.rejectedReviewID)
+	require.Empty(t, reviews.cancelledReviewID)
 }
 
 func TestProductionReviewHandlerRejectsOversizedFieldsBeforeService(t *testing.T) {
@@ -227,11 +262,35 @@ func TestProductionReviewHandlerRejectsOversizedFieldsBeforeService(t *testing.T
 		`{"version_id":"`+productionReviewVersionID+`","block_id":"`+productionReviewBlockID+`","annotation_type":"comment","severity":"info","anchor":{},"body":"`+strings.Repeat("x", 20001)+`"}`)
 	decision := productionReviewHandlerRequest(engine, http.MethodPost, "/reviews/"+productionReviewRequestID+"/steps/"+productionReviewStepID+"/decision",
 		`{"decision":"approved","comment":"`+strings.Repeat("x", 5001)+`"}`)
+	terminal := productionReviewHandlerRequest(engine, http.MethodPost, "/reviews/"+productionReviewRequestID+"/reject",
+		`{"reason":"`+strings.Repeat("x", 5001)+`"}`)
 
 	require.Equal(t, http.StatusBadRequest, annotation.Code)
 	require.Equal(t, http.StatusBadRequest, decision.Code)
+	require.Equal(t, http.StatusBadRequest, terminal.Code)
 	require.Empty(t, annotations.created.DocumentID)
 	require.Empty(t, reviews.decidedStepID)
+	require.Empty(t, reviews.rejectedReviewID)
+}
+
+func TestProductionReviewHandlerMapsTerminalConflictAndForbidden(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		want int
+	}{
+		{name: "conflict", err: types.ErrProductionConflict, want: http.StatusConflict},
+		{name: "forbidden", err: types.ErrProductionForbidden, want: http.StatusForbidden},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			reviews := &productionReviewServiceStub{err: test.err}
+			engine := productionReviewHandlerEngine(&productionReviewAnnotationServiceStub{}, reviews)
+			response := productionReviewHandlerRequest(engine, http.MethodPost,
+				"/reviews/"+productionReviewRequestID+"/reject", `{"reason":"governed reason"}`)
+			require.Equal(t, test.want, response.Code, response.Body.String())
+			require.Equal(t, productionReviewRequestID, reviews.rejectedReviewID)
+		})
+	}
 }
 
 func TestProductionReviewHandlerRequiresStepToBelongToPathReview(t *testing.T) {

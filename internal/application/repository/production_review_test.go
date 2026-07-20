@@ -13,10 +13,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/Tencent/WeKnora/internal/database"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -118,6 +120,7 @@ func seedProductionReviewScope(t *testing.T, db *gorm.DB) {
 		`UPDATE production_documents SET current_version_id = ? WHERE id = ?`,
 		`INSERT INTO production_project_members (project_id, user_id, role, assigned_by) VALUES (?, ?, 'business_reviewer', ?)`,
 		`INSERT INTO production_project_members (project_id, user_id, role, assigned_by) VALUES (?, ?, 'engineering_reviewer', ?)`,
+		`INSERT INTO production_project_members (project_id, user_id, role, assigned_by) VALUES (?, ?, 'author', ?)`,
 		`INSERT INTO production_documents (id, tenant_id, project_id, document_type_id, document_type_schema_version, title, current_version_id, status, created_by) VALUES (?, ?, ?, ?, 1, 'Other', NULL, 'draft', ?)`,
 		`INSERT INTO production_document_versions (id, document_id, tenant_id, project_id, version_number, source_set_id, origin, content_digest, created_by, frozen_at) VALUES (?, ?, ?, ?, 1, ?, 'human', ?, ?, CURRENT_TIMESTAMP)`,
 		`INSERT INTO production_projects (id, tenant_id, name, owner_user_id) VALUES (?, 8, 'Other tenant', ?)`,
@@ -138,6 +141,7 @@ func seedProductionReviewScope(t *testing.T, db *gorm.DB) {
 		{reviewVersionTwo, reviewDocumentID},
 		{reviewProjectID, reviewBusinessActor, reviewAuthorID},
 		{reviewProjectID, reviewEngineeringActor, reviewAuthorID},
+		{reviewProjectID, reviewAuthorID, reviewAuthorID},
 		{reviewOtherDocumentID, reviewTenantID, reviewProjectID, reviewTypeID, reviewAuthorID},
 		{reviewOtherVersionID, reviewOtherDocumentID, reviewTenantID, reviewProjectID, reviewSourceID, strings.Repeat("e", 64), reviewAuthorID},
 		{reviewTenantEightProjectID, reviewAuthorID},
@@ -359,6 +363,21 @@ func TestProductionReviewRepositoryRejectsUnboundedAnnotationList(t *testing.T) 
 		require.Zero(t, total)
 		require.ErrorIs(t, err, types.ErrProductionReviewScopeInvalid)
 	}
+	items, total, err := repo.ListAnnotations(
+		productionReviewTenantContext(reviewTenantID), reviewTenantID, reviewDocumentID,
+		interfaces.ListProductionAnnotationsFilter{}, types.ProductionAnnotationMaxOffset+1, 1,
+	)
+	require.Nil(t, items)
+	require.Zero(t, total)
+	require.ErrorIs(t, err, types.ErrProductionReviewScopeInvalid)
+
+	items, total, err = repo.ListAnnotations(
+		productionReviewTenantContext(reviewTenantID), reviewTenantID, reviewDocumentID,
+		interfaces.ListProductionAnnotationsFilter{}, types.ProductionAnnotationMaxOffset, 1,
+	)
+	require.NoError(t, err)
+	require.Empty(t, items)
+	require.Zero(t, total)
 }
 
 func TestProductionReviewPostgresVersionLockScopesExactImmutableVersion(t *testing.T) {
@@ -366,6 +385,45 @@ func TestProductionReviewPostgresVersionLockScopesExactImmutableVersion(t *testi
 	for _, fragment := range []string{"FROM PRODUCTION_DOCUMENT_VERSIONS", "ID = ?", "DOCUMENT_ID = ?", "TENANT_ID = ?", "PROJECT_ID = ?", "FOR UPDATE"} {
 		require.Contains(t, upper, fragment)
 	}
+}
+
+func TestProductionReviewPostgresAnnotationCreateLocksLiveAllowedMembership(t *testing.T) {
+	upper := strings.ToUpper(postgresProductionAnnotationCreateRoleLockSQL)
+	for _, fragment := range []string{
+		"FROM PRODUCTION_PROJECT_MEMBERS", "JOIN PRODUCTION_PROJECTS", "PROJECT.TENANT_ID = ?",
+		"MEMBER.PROJECT_ID = ?", "MEMBER.USER_ID = ?", "MEMBER.DELETED_AT IS NULL",
+		"MEMBER.ROLE IN (?, ?, ?, ?)", "FOR UPDATE OF MEMBER",
+	} {
+		require.Contains(t, upper, fragment)
+	}
+}
+
+func TestProductionReviewPostgresDecisionLocksDocumentBeforeReviewAggregate(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+
+	mock.ExpectQuery(`SELECT request\.document_id.*FROM production_review_requests AS request.*JOIN production_review_steps AS step`).
+		WithArgs(reviewTenantID, reviewTenantID, reviewID(301)).
+		WillReturnRows(sqlmock.NewRows([]string{"document_id"}).AddRow(reviewDocumentID))
+	mock.ExpectQuery(`SELECT id, current_version_id, status.*FROM production_documents.*FOR UPDATE`).
+		WithArgs(reviewDocumentID, reviewTenantID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "current_version_id", "status"}).
+			AddRow(reviewDocumentID, reviewVersionOne, string(types.ProductionDocumentInReview)))
+	mock.ExpectQuery(`SELECT request\.id AS review_id.*FOR UPDATE OF request, step`).
+		WithArgs(reviewTenantID, reviewTenantID, reviewID(301)).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"review_id", "project_id", "document_id", "version_id", "status",
+		}).AddRow(reviewID(300), reviewProjectID, reviewDocumentID, reviewVersionOne, string(types.ProductionReviewPending)))
+
+	scope, err := lockProductionReviewDecisionScope(db, reviewTenantID, reviewID(301))
+	require.NoError(t, err)
+	require.Equal(t, reviewDocumentID, scope.DocumentID)
+	require.Equal(t, reviewVersionOne, scope.CurrentVersionID)
+	require.Equal(t, types.ProductionDocumentInReview, scope.DocumentStatus)
+	require.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestProductionReviewRepositoryExactGovernedSurface(t *testing.T) {

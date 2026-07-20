@@ -339,6 +339,8 @@ func RegisterProductionRoutes(
 	production.POST("/documents/:id/reviews", g.Contributor(), idempotency.Require(), reviewHandler.Submit)
 	production.GET("/reviews/:id", g.Viewer(), reviewHandler.Get)
 	production.POST("/reviews/:id/steps/:step_id/decision", g.Contributor(), idempotency.Require(), reviewHandler.Decide)
+	production.POST("/reviews/:id/reject", g.Admin(), idempotency.Require(), reviewHandler.Reject)
+	production.POST("/reviews/:id/cancel", g.Admin(), idempotency.Require(), reviewHandler.Cancel)
 }
 
 // RegisterChunkerDebugRoutes wires the read-only chunker preview endpoint

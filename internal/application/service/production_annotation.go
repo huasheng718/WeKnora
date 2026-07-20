@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -43,14 +44,20 @@ type productionAnnotationService struct {
 	reviews   interfaces.ProductionReviewRepository
 	documents interfaces.ProductionDocumentRepository
 	projects  interfaces.ProductionProjectAuthorizer
+	audit     interfaces.AuditLogService
+	uow       interfaces.ProductionUnitOfWork
 }
 
 func NewProductionAnnotationService(
 	reviews interfaces.ProductionReviewRepository,
 	documents interfaces.ProductionDocumentRepository,
 	projects interfaces.ProductionProjectAuthorizer,
+	audit interfaces.AuditLogService,
+	uow interfaces.ProductionUnitOfWork,
 ) *productionAnnotationService {
-	return &productionAnnotationService{reviews: reviews, documents: documents, projects: projects}
+	return &productionAnnotationService{
+		reviews: reviews, documents: documents, projects: projects, audit: audit, uow: uow,
+	}
 }
 
 func (s *productionAnnotationService) List(
@@ -64,11 +71,16 @@ func (s *productionAnnotationService) List(
 	if err := requireProductionSourceID(input.DocumentID, "document id"); err != nil {
 		return nil, err
 	}
-	if input.Page < 1 || input.PageSize < 1 || input.PageSize > 100 ||
+	if input.Page < 1 || input.Page > types.ProductionAnnotationMaxPage ||
+		input.PageSize < 1 || input.PageSize > 100 ||
 		input.Page-1 > int(^uint(0)>>1)/input.PageSize ||
 		(input.AnnotationType != "" && !input.AnnotationType.IsValid()) ||
 		(input.Severity != "" && !input.Severity.IsValid()) ||
 		(input.Status != "" && !input.Status.IsValid()) {
+		return nil, types.ErrProductionReviewScopeInvalid
+	}
+	offset := (input.Page - 1) * input.PageSize
+	if offset > types.ProductionAnnotationMaxOffset {
 		return nil, types.ErrProductionReviewScopeInvalid
 	}
 	document, err := s.documents.GetDocument(ctx, tenantID, input.DocumentID)
@@ -110,7 +122,7 @@ func (s *productionAnnotationService) List(
 			VersionID: input.VersionID, AnnotationType: input.AnnotationType,
 			Severity: input.Severity, Status: input.Status,
 		},
-		(input.Page-1)*input.PageSize, input.PageSize,
+		offset, input.PageSize,
 	)
 	if err != nil {
 		return nil, err
@@ -161,7 +173,21 @@ func (s *productionAnnotationService) Create(
 		SuggestedContent: input.SuggestedContent, Status: types.ProductionAnnotationOpen,
 		CreatedBy: actorID,
 	}
-	if err := s.reviews.CreateAnnotation(ctx, annotation); err != nil {
+	if s.uow == nil {
+		return nil, types.ErrProductionForbidden
+	}
+	err = s.uow.WithinTransaction(ctx, func(txCtx context.Context) error {
+		if err := s.projects.RequireProjectRole(txCtx, document.ProjectID,
+			types.ProductionRoleAuthor,
+			types.ProductionRoleBusinessReviewer,
+			types.ProductionRoleEngineeringReviewer,
+			types.ProductionRoleComplianceReviewer,
+		); err != nil {
+			return err
+		}
+		return s.reviews.CreateAnnotation(txCtx, annotation)
+	})
+	if err != nil {
 		return nil, err
 	}
 	return annotation, nil
@@ -217,14 +243,33 @@ func (s *productionAnnotationService) Resolve(
 			return err
 		}
 	}
-	updated, err := s.reviews.ResolveAnnotation(ctx, tenantID, annotation.ID, actorID, status)
+	if s.uow == nil {
+		return types.ErrProductionForbidden
+	}
+	details, err := json.Marshal(map[string]string{
+		"actor_user_id": actorID,
+		"from_status":   string(types.ProductionAnnotationOpen),
+		"status":        string(status),
+	})
 	if err != nil {
 		return err
 	}
-	if !updated {
-		return types.ErrProductionAnnotationLifecycle
-	}
-	return nil
+	return s.uow.WithinTransaction(ctx, func(txCtx context.Context) error {
+		updated, resolveErr := s.reviews.ResolveAnnotation(
+			txCtx, tenantID, annotation.ID, actorID, status,
+		)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		if !updated {
+			return types.ErrProductionAnnotationLifecycle
+		}
+		return emitRequiredProductionAudit(txCtx, s.audit, &types.AuditLog{
+			TenantID: tenantID, ActorUserID: actorID, ActorRole: string(types.TenantRoleFromContext(ctx)),
+			Action: types.AuditActionProductionAnnotationResolved, TargetType: "production_annotation",
+			TargetID: annotation.ID, Outcome: types.AuditOutcomeSuccess, Details: types.JSON(details),
+		})
+	})
 }
 
 func productionAnnotationRequiresComplianceResolution(annotation *types.ProductionAnnotation) bool {

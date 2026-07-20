@@ -36,7 +36,9 @@ func (h *ProductionReviewHandler) ListAnnotations(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if page-1 > int(^uint(0)>>1)/pageSize {
+	if page > types.ProductionAnnotationMaxPage ||
+		page-1 > int(^uint(0)>>1)/pageSize ||
+		(page-1)*pageSize > types.ProductionAnnotationMaxOffset {
 		c.Error(apperrors.NewValidationError("page is too large"))
 		return
 	}
@@ -73,6 +75,8 @@ type ProductionReviewService interface {
 	Submit(context.Context, string, string) (*types.ProductionReviewRequest, error)
 	Get(context.Context, string) (*types.ProductionReviewRequest, error)
 	Decide(context.Context, string, types.ProductionReviewDecision, string) error
+	Reject(context.Context, string, string) error
+	Cancel(context.Context, string, string) error
 }
 
 // ProductionReviewHandler exposes annotation and review governance without
@@ -111,6 +115,10 @@ type submitProductionReviewRequest struct {
 type decideProductionReviewStepRequest struct {
 	Decision types.ProductionReviewDecision `json:"decision"`
 	Comment  string                         `json:"comment"`
+}
+
+type terminalProductionReviewRequest struct {
+	Reason string `json:"reason"`
 }
 
 func (h *ProductionReviewHandler) CreateAnnotation(c *gin.Context) {
@@ -269,6 +277,45 @@ func (h *ProductionReviewHandler) Decide(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+func (h *ProductionReviewHandler) Reject(c *gin.Context) {
+	reviewID, reason, ok := productionReviewTerminalRequest(c)
+	if !ok {
+		return
+	}
+	if err := h.reviews.Reject(c.Request.Context(), reviewID, reason); err != nil {
+		handleProductionReviewServiceError(c, err, "failed to reject production review")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+func (h *ProductionReviewHandler) Cancel(c *gin.Context) {
+	reviewID, reason, ok := productionReviewTerminalRequest(c)
+	if !ok {
+		return
+	}
+	if err := h.reviews.Cancel(c.Request.Context(), reviewID, reason); err != nil {
+		handleProductionReviewServiceError(c, err, "failed to cancel production review")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+func productionReviewTerminalRequest(c *gin.Context) (string, string, bool) {
+	reviewID := strings.TrimSpace(c.Param("id"))
+	var request terminalProductionReviewRequest
+	if !isProductionUUID(reviewID) || decodeStrictProductionReviewBody(c, &request) != nil {
+		c.Error(apperrors.NewValidationError("invalid production review terminal request"))
+		return "", "", false
+	}
+	request.Reason = strings.TrimSpace(request.Reason)
+	if length := utf8.RuneCountInString(request.Reason); length < 1 || length > 5000 {
+		c.Error(apperrors.NewValidationError("production review terminal reason must contain 1 to 5000 characters"))
+		return "", "", false
+	}
+	return reviewID, request.Reason, true
 }
 
 func productionReviewOwnsStep(review *types.ProductionReviewRequest, reviewID, stepID string) bool {

@@ -32,6 +32,7 @@ DROP INDEX IF EXISTS idx_production_review_steps_request_role_decision;
 DROP INDEX IF EXISTS idx_production_review_steps_request_sequence;
 DROP INDEX IF EXISTS idx_production_review_requests_document_version_status;
 DROP INDEX IF EXISTS idx_production_annotations_block_status;
+DROP INDEX IF EXISTS idx_production_annotations_blocking_count;
 DROP INDEX IF EXISTS idx_production_annotations_document_version_status;
 DROP INDEX IF EXISTS uq_production_document_blocks_review_anchor;
 DROP INDEX IF EXISTS uq_production_document_versions_review_context;

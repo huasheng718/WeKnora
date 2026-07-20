@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -63,12 +64,15 @@ type productionAnnotationReviewRepoStub struct {
 	resolvedBy string
 	resolution types.ProductionAnnotationStatus
 	resolveOK  bool
+	listOffset int
+	listLimit  int
 }
 
 func (r *productionAnnotationReviewRepoStub) ListAnnotations(
-	context.Context, uint64, string, interfaces.ListProductionAnnotationsFilter, int, int,
+	_ context.Context, _ uint64, _ string, _ interfaces.ListProductionAnnotationsFilter, offset, limit int,
 ) ([]*types.ProductionAnnotation, int64, error) {
-	return nil, 0, errors.New("unexpected ListAnnotations")
+	r.listOffset, r.listLimit = offset, limit
+	return []*types.ProductionAnnotation{}, 0, nil
 }
 
 func (r *productionAnnotationReviewRepoStub) CreateAnnotation(_ context.Context, annotation *types.ProductionAnnotation) error {
@@ -134,6 +138,12 @@ type productionAnnotationAuthorizerStub struct {
 	calls   [][]types.ProductionRole
 }
 
+type productionAnnotationUOWStub struct{}
+
+func (productionAnnotationUOWStub) WithinTransaction(ctx context.Context, fn func(context.Context) error) error {
+	return fn(ctx)
+}
+
 func (a *productionAnnotationAuthorizerStub) RequireProjectRole(_ context.Context, _ string, roles ...types.ProductionRole) error {
 	a.roles = append([]types.ProductionRole(nil), roles...)
 	a.calls = append(a.calls, append([]types.ProductionRole(nil), roles...))
@@ -154,7 +164,9 @@ func newProductionAnnotationFixture(t *testing.T) (*productionAnnotationService,
 	}
 	reviews := &productionAnnotationReviewRepoStub{}
 	authorizer := &productionAnnotationAuthorizerStub{}
-	return NewProductionAnnotationService(reviews, documents, authorizer), reviews, authorizer
+	return NewProductionAnnotationService(
+		reviews, documents, authorizer, &productionAuditServiceStub{}, productionAnnotationUOWStub{},
+	), reviews, authorizer
 }
 
 func productionAnnotationContext() context.Context {
@@ -163,7 +175,8 @@ func productionAnnotationContext() context.Context {
 
 func productionAnnotationContextFor(actorID string) context.Context {
 	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, annotationTenantID)
-	return context.WithValue(ctx, types.UserIDContextKey, actorID)
+	ctx = context.WithValue(ctx, types.UserIDContextKey, actorID)
+	return context.WithValue(ctx, types.TenantRoleContextKey, types.TenantRoleContributor)
 }
 
 func TestProductionAnnotationRejectsBlockFromAnotherVersion(t *testing.T) {
@@ -273,6 +286,26 @@ func TestProductionAnnotationListRejectsVersionOutsidePathDocument(t *testing.T)
 	require.ErrorIs(t, err, types.ErrProductionReviewScopeInvalid)
 }
 
+func TestProductionAnnotationListBoundsDeepOffsets(t *testing.T) {
+	svc, reviews, _ := newProductionAnnotationFixture(t)
+	page, err := svc.List(productionAnnotationContext(), ListProductionAnnotationsInput{
+		DocumentID: annotationDocumentID, Page: types.ProductionAnnotationMaxPage, PageSize: 1,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, page)
+	require.Equal(t, types.ProductionAnnotationMaxOffset, reviews.listOffset)
+	require.Equal(t, 1, reviews.listLimit)
+
+	for _, input := range []ListProductionAnnotationsInput{
+		{DocumentID: annotationDocumentID, Page: types.ProductionAnnotationMaxPage + 1, PageSize: 1},
+		{DocumentID: annotationDocumentID, Page: types.ProductionAnnotationMaxOffset/100 + 2, PageSize: 100},
+	} {
+		page, err = svc.List(productionAnnotationContext(), input)
+		require.Nil(t, page)
+		require.ErrorIs(t, err, types.ErrProductionReviewScopeInvalid)
+	}
+}
+
 func TestProductionAnnotationResolveAllowsCreator(t *testing.T) {
 	svc, reviews, authorizer := newProductionAnnotationFixture(t)
 	reviews.annotation = &types.ProductionAnnotation{
@@ -288,6 +321,53 @@ func TestProductionAnnotationResolveAllowsCreator(t *testing.T) {
 	require.Equal(t, reviews.annotation.ID, reviews.resolvedID)
 	require.Equal(t, "11111111-1111-4111-8111-111111111111", reviews.resolvedBy)
 	require.Equal(t, types.ProductionAnnotationResolved, reviews.resolution)
+}
+
+func TestProductionAnnotationResolveEmitsRequiredTrustedAudit(t *testing.T) {
+	svc, reviews, authorizer := newProductionAnnotationFixture(t)
+	reviews.annotation = &types.ProductionAnnotation{
+		ID: "99999999-9999-4999-8999-999999999999", TenantID: annotationTenantID, ProjectID: annotationProjectID,
+		CreatedBy: "11111111-1111-4111-8111-111111111111", Severity: types.ProductionAnnotationWarning,
+		Status: types.ProductionAnnotationOpen,
+	}
+	reviews.resolveOK = true
+	authorizer.err = types.ErrProductionForbidden
+
+	require.NoError(t, svc.Resolve(productionAnnotationContext(), reviews.annotation.ID, types.ProductionAnnotationDismissed))
+	audit := svc.audit.(*productionAuditServiceStub)
+	require.Len(t, audit.entries, 1)
+	entry := audit.entries[0]
+	require.Equal(t, types.AuditActionProductionAnnotationResolved, entry.Action)
+	require.Equal(t, "11111111-1111-4111-8111-111111111111", entry.ActorUserID)
+	require.Equal(t, string(types.TenantRoleContributor), entry.ActorRole)
+	require.Equal(t, "production_annotation", entry.TargetType)
+	require.Equal(t, reviews.annotation.ID, entry.TargetID)
+	var details map[string]string
+	require.NoError(t, json.Unmarshal(entry.Details, &details))
+	require.Equal(t, "11111111-1111-4111-8111-111111111111", details["actor_user_id"])
+	require.Equal(t, string(types.ProductionAnnotationOpen), details["from_status"])
+	require.Equal(t, string(types.ProductionAnnotationDismissed), details["status"])
+}
+
+func TestProductionAnnotationAuditFailureRollsBackResolution(t *testing.T) {
+	svc, repo, db, _ := newProductionAnnotationWriteBoundaryFixture(t)
+	annotation := &types.ProductionAnnotation{
+		ID: "99999999-9999-4999-8999-999999999999", TenantID: annotationTenantID, ProjectID: annotationProjectID,
+		DocumentID: annotationDocumentID, VersionID: annotationVersionOne, BlockID: annotationBlockOne,
+		AnnotationType: types.ProductionAnnotationComment, Severity: types.ProductionAnnotationWarning,
+		Anchor: types.JSON(`{}`), Body: "audit rollback", Status: types.ProductionAnnotationOpen,
+		CreatedBy: "11111111-1111-4111-8111-111111111111",
+	}
+	require.NoError(t, repo.CreateAnnotation(productionAnnotationContext(), annotation))
+	svc.audit = &productionAuditServiceStub{err: errors.New("annotation audit unavailable")}
+
+	err := svc.Resolve(productionAnnotationContext(), annotation.ID, types.ProductionAnnotationResolved)
+	require.ErrorContains(t, err, "annotation audit unavailable")
+	var persisted types.ProductionAnnotation
+	require.NoError(t, db.First(&persisted, "id = ?", annotation.ID).Error)
+	require.Equal(t, types.ProductionAnnotationOpen, persisted.Status)
+	require.Nil(t, persisted.ResolvedBy)
+	require.Nil(t, persisted.ResolvedAt)
 }
 
 func TestProductionAnnotationResolveRequiresComplianceForBlockingRisk(t *testing.T) {
@@ -375,6 +455,26 @@ func TestProductionAnnotationResolveConcurrentRoleRevocationIsRejected(t *testin
 	require.Equal(t, types.ProductionAnnotationOpen, persisted.Status)
 }
 
+func TestProductionAnnotationCreateConcurrentRoleRevocationIsRejected(t *testing.T) {
+	svc, _, db, authorizer := newProductionAnnotationWriteBoundaryFixture(t)
+	authorizer.require = func(...types.ProductionRole) error {
+		return db.Where("project_id = ? AND user_id = ? AND role = ?", annotationProjectID,
+			"11111111-1111-4111-8111-111111111111", types.ProductionRoleAuthor).
+			Delete(&types.ProductionProjectMember{}).Error
+	}
+
+	annotation, err := svc.Create(productionAnnotationContext(), CreateProductionAnnotationInput{
+		DocumentID: annotationDocumentID, VersionID: annotationVersionOne, BlockID: annotationBlockOne,
+		AnnotationType: types.ProductionAnnotationComment, Severity: types.ProductionAnnotationWarning,
+		Anchor: types.JSON(`{}`), Body: "revoked before insert",
+	})
+	require.Nil(t, annotation)
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
+	var count int64
+	require.NoError(t, db.Model(&types.ProductionAnnotation{}).Count(&count).Error)
+	require.Zero(t, count)
+}
+
 func annotationRoleSet(roles []types.ProductionRole, first, second types.ProductionRole) bool {
 	return len(roles) == 2 && roles[0] == first && roles[1] == second
 }
@@ -407,6 +507,7 @@ func newProductionAnnotationWriteBoundaryFixture(t *testing.T) (*productionAnnot
 		`UPDATE production_documents SET current_version_id = ? WHERE id = ?`,
 		`INSERT INTO production_document_blocks (id, version_id, logical_block_id, block_type, position, content, attributes, evidence_refs, ai_provenance, content_digest) VALUES (?, ?, ?, 'fact', 1, '{}', '{}', '[]', '{}', ?)`,
 		`INSERT INTO production_project_members (project_id, user_id, role, assigned_by) VALUES (?, ?, 'author', ?)`,
+		`INSERT INTO production_project_members (project_id, user_id, role, assigned_by) VALUES (?, ?, 'author', ?)`,
 	}
 	args := [][]any{
 		{annotationProjectID, annotationTenantID, "33333333-3333-4333-8333-333333333333"},
@@ -417,13 +518,18 @@ func newProductionAnnotationWriteBoundaryFixture(t *testing.T) (*productionAnnot
 		{annotationVersionOne, annotationDocumentID},
 		{annotationBlockOne, annotationVersionOne, "block", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
 		{annotationProjectID, "11111111-1111-4111-8111-111111111111", "33333333-3333-4333-8333-333333333333"},
+		{annotationProjectID, "22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333"},
 	}
 	for index := range statements {
 		require.NoError(t, db.Exec(statements[index], args[index]...).Error)
 	}
 	authorizer := &productionAnnotationAuthorizerStub{}
 	repo := apprepository.NewProductionReviewRepository(db)
-	return NewProductionAnnotationService(repo, apprepository.NewProductionDocumentRepository(db), authorizer), repo, db, authorizer
+	return NewProductionAnnotationService(
+		repo, apprepository.NewProductionDocumentRepository(db), authorizer,
+		&productionAuditServiceStub{},
+		apprepository.NewProductionUnitOfWork(db),
+	), repo, db, authorizer
 }
 
 var _ interfaces.ProductionDocumentRepository = (*productionAnnotationDocumentRepoStub)(nil)

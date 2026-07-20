@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS production_annotations (
 
 CREATE INDEX IF NOT EXISTS idx_production_annotations_document_version_status
     ON production_annotations (document_id, version_id, status);
+CREATE INDEX IF NOT EXISTS idx_production_annotations_blocking_count
+    ON production_annotations (tenant_id, version_id, severity, status);
 CREATE INDEX IF NOT EXISTS idx_production_annotations_block_status
     ON production_annotations (block_id, status);
 

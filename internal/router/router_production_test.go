@@ -121,7 +121,10 @@ func (*productionRouterAnnotationService) Resolve(context.Context, string, types
 	return nil
 }
 
-type productionRouterReviewService struct{}
+type productionRouterReviewService struct {
+	rejectCalls int
+	cancelCalls int
+}
 
 func (*productionRouterReviewService) Submit(context.Context, string, string) (*types.ProductionReviewRequest, error) {
 	return &types.ProductionReviewRequest{}, nil
@@ -132,8 +135,14 @@ func (*productionRouterReviewService) Get(context.Context, string) (*types.Produ
 func (*productionRouterReviewService) Decide(context.Context, string, types.ProductionReviewDecision, string) error {
 	return nil
 }
-func (*productionRouterReviewService) Reject(context.Context, string, string) error { return nil }
-func (*productionRouterReviewService) Cancel(context.Context, string, string) error { return nil }
+func (s *productionRouterReviewService) Reject(context.Context, string, string) error {
+	s.rejectCalls++
+	return nil
+}
+func (s *productionRouterReviewService) Cancel(context.Context, string, string) error {
+	s.cancelCalls++
+	return nil
+}
 
 func (s *productionRouterRunService) StartDocumentRun(context.Context, string, interfaces.StartProductionDocumentRunInput) (*types.ProductionRun, error) {
 	return &types.ProductionRun{}, nil
@@ -204,6 +213,21 @@ func newProductionRouteTestEngineForRole(
 	repo interfaces.ProductionIdempotencyRepository,
 	role types.TenantRole,
 ) *gin.Engine {
+	return newProductionRouteTestEngineForRoleAndReview(
+		projectHandler, sourceHandler, documentHandler, runHandler,
+		&productionRouterReviewService{}, repo, role,
+	)
+}
+
+func newProductionRouteTestEngineForRoleAndReview(
+	projectHandler *handler.ProductionProjectHandler,
+	sourceHandler *handler.ProductionSourceHandler,
+	documentHandler *handler.ProductionDocumentHandler,
+	runHandler *handler.ProductionRunHandler,
+	reviewService *productionRouterReviewService,
+	repo interfaces.ProductionIdempotencyRepository,
+	role types.TenantRole,
+) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	enforce := true
 	guards := &rbacGuards{cfg: &config.Config{Tenant: &config.TenantConfig{EnableRBAC: &enforce}}}
@@ -224,7 +248,7 @@ func newProductionRouteTestEngineForRole(
 		sourceHandler,
 		documentHandler,
 		runHandler,
-		handler.NewProductionReviewHandler(&productionRouterAnnotationService{}, &productionRouterReviewService{}),
+		handler.NewProductionReviewHandler(&productionRouterAnnotationService{}, reviewService),
 		guards,
 		middleware.NewProductionIdempotencyMiddleware(repo),
 	)
@@ -328,9 +352,53 @@ func TestProductionReviewRoutesAreRegistered(t *testing.T) {
 		{http.MethodPost, "/api/v1/production/documents/:id/reviews"},
 		{http.MethodGet, "/api/v1/production/reviews/:id"},
 		{http.MethodPost, "/api/v1/production/reviews/:id/steps/:step_id/decision"},
+		{http.MethodPost, "/api/v1/production/reviews/:id/reject"},
+		{http.MethodPost, "/api/v1/production/reviews/:id/cancel"},
 	} {
 		assertProductionRoute(t, engine, route.method, route.path)
 	}
+}
+
+func TestProductionReviewTerminalRoutesRequireAdminBeforeIdempotencyAndReplay(t *testing.T) {
+	const reviewID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+	t.Run("admin reject replays", func(t *testing.T) {
+		repo := newProductionRouterIdempotencyRepo()
+		reviews := &productionRouterReviewService{}
+		engine := newProductionRouteTestEngineForRoleAndReview(
+			&handler.ProductionProjectHandler{}, handler.NewProductionSourceHandler(&productionRouterSourceService{}),
+			handler.NewProductionDocumentHandler(&productionRouterDocumentService{}), handler.NewProductionRunHandler(&productionRouterRunService{}),
+			reviews, repo, types.TenantRoleAdmin,
+		)
+		for range 2 {
+			response := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, "/api/v1/production/reviews/"+reviewID+"/reject", strings.NewReader(`{"reason":"admin rejection"}`))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Idempotency-Key", "terminal-replay")
+			engine.ServeHTTP(response, request)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		}
+		require.Equal(t, 1, reviews.rejectCalls)
+		require.Len(t, repo.records, 1)
+	})
+
+	t.Run("contributor professional cannot enter terminal route", func(t *testing.T) {
+		repo := newProductionRouterIdempotencyRepo()
+		reviews := &productionRouterReviewService{}
+		engine := newProductionRouteTestEngineForRoleAndReview(
+			&handler.ProductionProjectHandler{}, handler.NewProductionSourceHandler(&productionRouterSourceService{}),
+			handler.NewProductionDocumentHandler(&productionRouterDocumentService{}), handler.NewProductionRunHandler(&productionRouterRunService{}),
+			reviews, repo, types.TenantRoleContributor,
+		)
+		response := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, "/api/v1/production/reviews/"+reviewID+"/cancel", strings.NewReader(`{"reason":"professional cancellation"}`))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Idempotency-Key", "forbidden-terminal")
+		engine.ServeHTTP(response, request)
+		require.Equal(t, http.StatusForbidden, response.Code, response.Body.String())
+		require.Zero(t, reviews.cancelCalls)
+		require.Empty(t, repo.records)
+	})
 }
 
 func TestProductionFoundationRoutesAreRegistered(t *testing.T) {

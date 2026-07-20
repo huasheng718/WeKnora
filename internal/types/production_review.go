@@ -12,8 +12,14 @@ import (
 const (
 	ProductionAnnotationAnchorMaxBytes = 32 * 1024
 	ProductionAnnotationAnchorMaxDepth = 16
-	ProductionReviewPolicyMaxBytes     = 256 * 1024
-	ProductionReviewPolicyMaxDepth     = 32
+	// ProductionAnnotationMaxOffset bounds the legacy page/offset contract so
+	// callers cannot force arbitrarily deep database scans.
+	ProductionAnnotationMaxOffset = 10_000
+	// ProductionAnnotationMaxPage is the largest reachable page at the minimum
+	// supported page size of one.
+	ProductionAnnotationMaxPage    = ProductionAnnotationMaxOffset + 1
+	ProductionReviewPolicyMaxBytes = 256 * 1024
+	ProductionReviewPolicyMaxDepth = 32
 )
 
 var (
