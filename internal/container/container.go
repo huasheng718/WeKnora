@@ -240,6 +240,8 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	}))
 	must(container.Provide(service.NewProductionSourceService, dig.As(new(interfaces.ProductionSourceService))))
 	must(container.Provide(service.NewProductionDocumentService, dig.As(new(interfaces.ProductionDocumentService))))
+	must(container.Provide(service.NewProductionAnnotationService, dig.As(new(handler.ProductionAnnotationService))))
+	must(container.Provide(service.NewProductionReviewService, dig.As(new(handler.ProductionReviewService))))
 	must(container.Provide(middleware.NewProductionIdempotencyMiddleware))
 
 	// Web search service (needed by AgentService)
@@ -422,6 +424,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(handler.NewProductionSourceHandler))
 	must(container.Provide(handler.NewProductionDocumentHandler))
 	must(container.Provide(handler.NewProductionRunHandler))
+	must(container.Provide(handler.NewProductionReviewHandler))
 	logger.Debugf(ctx, "[Container] HTTP handlers registered")
 
 	// Wire the chat package's local image resolver so multimodal chat can read

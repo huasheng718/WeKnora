@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	appservice "github.com/Tencent/WeKnora/internal/application/service"
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/handler"
 	"github.com/Tencent/WeKnora/internal/middleware"
@@ -107,6 +108,29 @@ type productionRouterDocumentService struct {
 
 type productionRouterRunService struct{}
 
+type productionRouterAnnotationService struct{}
+
+func (*productionRouterAnnotationService) Create(context.Context, appservice.CreateProductionAnnotationInput) (*types.ProductionAnnotation, error) {
+	return &types.ProductionAnnotation{}, nil
+}
+func (*productionRouterAnnotationService) Resolve(context.Context, string, types.ProductionAnnotationStatus) error {
+	return nil
+}
+
+type productionRouterReviewService struct{}
+
+func (*productionRouterReviewService) Submit(context.Context, string, string) (*types.ProductionReviewRequest, error) {
+	return &types.ProductionReviewRequest{}, nil
+}
+func (*productionRouterReviewService) Get(context.Context, string) (*types.ProductionReviewRequest, error) {
+	return &types.ProductionReviewRequest{}, nil
+}
+func (*productionRouterReviewService) Decide(context.Context, string, types.ProductionReviewDecision, string) error {
+	return nil
+}
+func (*productionRouterReviewService) Reject(context.Context, string, string) error { return nil }
+func (*productionRouterReviewService) Cancel(context.Context, string, string) error { return nil }
+
 func (s *productionRouterRunService) StartDocumentRun(context.Context, string, interfaces.StartProductionDocumentRunInput) (*types.ProductionRun, error) {
 	return &types.ProductionRun{}, nil
 }
@@ -196,6 +220,7 @@ func newProductionRouteTestEngineForRole(
 		sourceHandler,
 		documentHandler,
 		runHandler,
+		handler.NewProductionReviewHandler(&productionRouterAnnotationService{}, &productionRouterReviewService{}),
 		guards,
 		middleware.NewProductionIdempotencyMiddleware(repo),
 	)
@@ -277,6 +302,20 @@ func assertProductionRoute(t *testing.T, engine *gin.Engine, method, path string
 	t.Fatalf("route %s %s is not registered", method, path)
 }
 
+func TestProductionReviewRoutesAreRegistered(t *testing.T) {
+	engine := newProductionRouteTestEngine(&handler.ProductionProjectHandler{}, newProductionRouterIdempotencyRepo())
+
+	for _, route := range []struct{ method, path string }{
+		{http.MethodPost, "/api/v1/production/documents/:id/annotations"},
+		{http.MethodPut, "/api/v1/production/annotations/:id/status"},
+		{http.MethodPost, "/api/v1/production/documents/:id/reviews"},
+		{http.MethodGet, "/api/v1/production/reviews/:id"},
+		{http.MethodPost, "/api/v1/production/reviews/:id/steps/:step_id/decision"},
+	} {
+		assertProductionRoute(t, engine, route.method, route.path)
+	}
+}
+
 func TestProductionFoundationRoutesAreRegistered(t *testing.T) {
 	engine := newProductionRouteTestEngine(&handler.ProductionProjectHandler{}, newProductionRouterIdempotencyRepo())
 
@@ -320,6 +359,10 @@ func TestEveryProductionWriteRouteRequiresIdempotencyKey(t *testing.T) {
 		{http.MethodPost, "/api/v1/production/documents/document-1/runs", `{}`},
 		{http.MethodPost, "/api/v1/production/source-sets/set-1/collect", `{}`},
 		{http.MethodPost, "/api/v1/production/tool-calls/call-1/decision", `{}`},
+		{http.MethodPost, "/api/v1/production/documents/document-1/annotations", `{}`},
+		{http.MethodPut, "/api/v1/production/annotations/annotation-1/status", `{}`},
+		{http.MethodPost, "/api/v1/production/documents/document-1/reviews", `{}`},
+		{http.MethodPost, "/api/v1/production/reviews/review-1/steps/step-1/decision", `{}`},
 	} {
 		t.Run(request.method+" "+request.path, func(t *testing.T) {
 			recorder := httptest.NewRecorder()

@@ -96,6 +96,7 @@ type RouterParams struct {
 	ProductionSourceHandler      *handler.ProductionSourceHandler
 	ProductionDocumentHandler    *handler.ProductionDocumentHandler
 	ProductionRunHandler         *handler.ProductionRunHandler
+	ProductionReviewHandler      *handler.ProductionReviewHandler
 	ProductionIdempotency        *middleware.ProductionIdempotencyMiddleware
 }
 
@@ -274,6 +275,7 @@ func NewRouter(params RouterParams) *gin.Engine {
 			params.ProductionSourceHandler,
 			params.ProductionDocumentHandler,
 			params.ProductionRunHandler,
+			params.ProductionReviewHandler,
 			rbacGuards,
 			params.ProductionIdempotency,
 		)
@@ -309,6 +311,7 @@ func RegisterProductionRoutes(
 	sourceHandler *handler.ProductionSourceHandler,
 	documentHandler *handler.ProductionDocumentHandler,
 	runHandler *handler.ProductionRunHandler,
+	reviewHandler *handler.ProductionReviewHandler,
 	g *rbacGuards,
 	idempotency *middleware.ProductionIdempotencyMiddleware,
 ) {
@@ -330,6 +333,11 @@ func RegisterProductionRoutes(
 	production.POST("/source-sets/:id/collect", g.Contributor(), idempotency.Require(), runHandler.StartCollection)
 	production.GET("/runs/:id", g.Viewer(), runHandler.Get)
 	production.POST("/tool-calls/:id/decision", g.Contributor(), idempotency.Require(), runHandler.DecideToolCall)
+	production.POST("/documents/:id/annotations", g.Contributor(), idempotency.Require(), reviewHandler.CreateAnnotation)
+	production.PUT("/annotations/:id/status", g.Contributor(), idempotency.Require(), reviewHandler.UpdateAnnotationStatus)
+	production.POST("/documents/:id/reviews", g.Contributor(), idempotency.Require(), reviewHandler.Submit)
+	production.GET("/reviews/:id", g.Contributor(), reviewHandler.Get)
+	production.POST("/reviews/:id/steps/:step_id/decision", g.Contributor(), idempotency.Require(), reviewHandler.Decide)
 }
 
 // RegisterChunkerDebugRoutes wires the read-only chunker preview endpoint

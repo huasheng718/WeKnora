@@ -13,9 +13,40 @@ import (
 
 type ProductionReviewService interface {
 	Submit(ctx context.Context, documentID, versionID string) (*types.ProductionReviewRequest, error)
+	Get(ctx context.Context, reviewID string) (*types.ProductionReviewRequest, error)
 	Decide(ctx context.Context, stepID string, decision types.ProductionReviewDecision, comment string) error
 	Reject(ctx context.Context, reviewID, reason string) error
 	Cancel(ctx context.Context, reviewID, reason string) error
+}
+
+func (s *productionReviewService) Get(
+	ctx context.Context,
+	reviewID string,
+) (*types.ProductionReviewRequest, error) {
+	tenantID, _, err := productionCaller(ctx)
+	if err != nil {
+		return nil, err
+	}
+	review, err := s.reviews.GetReview(ctx, tenantID, reviewID)
+	if err != nil {
+		return nil, err
+	}
+	if review == nil || review.TenantID != tenantID || review.ProjectID == "" {
+		return nil, types.ErrProductionReviewScopeInvalid
+	}
+	if s.projects == nil {
+		return nil, types.ErrProductionForbidden
+	}
+	if err := s.projects.RequireProjectRole(ctx, review.ProjectID,
+		types.ProductionRoleProjectOwner,
+		types.ProductionRoleAuthor,
+		types.ProductionRoleBusinessReviewer,
+		types.ProductionRoleEngineeringReviewer,
+		types.ProductionRoleComplianceReviewer,
+	); err != nil {
+		return nil, err
+	}
+	return review, nil
 }
 
 type productionReviewService struct {
@@ -230,7 +261,7 @@ func (s *productionReviewService) Decide(
 			return decideErr
 		}
 		if !changed {
-			return types.ErrProductionForbidden
+			return types.ErrProductionReviewLifecycle
 		}
 		return emitProductionReviewDecisionAudit(
 			txCtx, s.audit, tenantID, actorID, membership.Role, stepID, string(decision),

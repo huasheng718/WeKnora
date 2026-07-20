@@ -303,6 +303,36 @@ func TestProductionReviewSubmissionFreezesCanonicalPolicyAndMaterializesSteps(t 
 	require.Equal(t, productionReviewAuthorID, fixture.audit.entries[0].ActorUserID)
 }
 
+func TestProductionReviewGetRequiresTenantScopedProjectAccess(t *testing.T) {
+	fixture := newProductionReviewFixture(t)
+	request := fixture.submit(t)
+	authorizer := &productionDocumentAuthorizerStub{}
+	fixture.svc.projects = authorizer
+
+	loaded, err := fixture.svc.Get(
+		productionReviewServiceContext(productionReviewBusinessID, types.TenantRoleContributor),
+		request.ID,
+	)
+	require.NoError(t, err)
+	require.Equal(t, request.ID, loaded.ID)
+	require.Equal(t, productionReviewProjectID, authorizer.project)
+	require.ElementsMatch(t, []types.ProductionRole{
+		types.ProductionRoleProjectOwner,
+		types.ProductionRoleAuthor,
+		types.ProductionRoleBusinessReviewer,
+		types.ProductionRoleEngineeringReviewer,
+		types.ProductionRoleComplianceReviewer,
+	}, authorizer.roles)
+
+	authorizer.err = types.ErrProductionForbidden
+	loaded, err = fixture.svc.Get(
+		productionReviewServiceContext(productionReviewBusinessID, types.TenantRoleContributor),
+		request.ID,
+	)
+	require.Nil(t, loaded)
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
+}
+
 func TestProductionReviewSubmissionAuditFailureRollsBackAggregate(t *testing.T) {
 	fixture := newProductionReviewFixture(t)
 	fixture.audit.err = errors.New("review audit unavailable")
@@ -385,6 +415,21 @@ func TestWrongProjectRoleCannotApproveStep(t *testing.T) {
 	)
 	require.NoError(t, loadErr)
 	require.Equal(t, types.ProductionReviewDecision(types.ProductionReviewPending), loaded.Steps[1].Decision)
+}
+
+func TestProductionReviewDuplicateDecisionIsLifecycleConflict(t *testing.T) {
+	fixture := newProductionReviewFixture(t)
+	request := fixture.submit(t)
+	ctx := productionReviewServiceContext(productionReviewBusinessID, types.TenantRoleContributor)
+
+	require.NoError(t, fixture.svc.Decide(
+		ctx, request.Steps[0].ID, types.ProductionReviewApproved, "approved",
+	))
+	err := fixture.svc.Decide(
+		ctx, request.Steps[0].ID, types.ProductionReviewApproved, "approved again",
+	)
+
+	require.ErrorIs(t, err, types.ErrProductionReviewLifecycle)
 }
 
 func TestProductionReviewFinalRequiredApprovalAtomicallyApprovesDocument(t *testing.T) {
