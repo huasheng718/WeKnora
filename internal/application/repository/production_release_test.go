@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -16,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 const (
@@ -130,6 +132,150 @@ func TestProductionReleaseRepositoryCreatesReleaseAndTargetsAtomicallyWithTruste
 	require.NoError(t, db.Model(&types.ProductionReleaseTarget{}).Count(&targetCount).Error)
 	require.EqualValues(t, 1, releaseCount)
 	require.EqualValues(t, 2, targetCount)
+}
+
+func insertRawProductionReleaseTargetConfig(
+	t *testing.T,
+	db *gorm.DB,
+	targetID, kbID, knowledgeID, snapshot, digest string,
+) {
+	t.Helper()
+	require.NoError(t, db.Exec(`INSERT INTO production_release_targets
+		(id, release_id, tenant_id, project_id, document_id, version_id,
+		 target_knowledge_base_id, knowledge_id, release_digest, config_snapshot, config_digest)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		targetID, releaseIDOne, reviewTenantID, reviewProjectID, reviewDocumentID, reviewVersionOne,
+		kbID, knowledgeID, strings.Repeat("a", 64), snapshot, digest,
+	).Error)
+}
+
+func TestProductionReleaseTargetReadsCanonicalizeAndVerifyPersistedConfig(t *testing.T) {
+	repo, db := newProductionReleaseRepoFixture(t, nil)
+	release := productionRelease(releaseIDOne, reviewVersionOne, reviewID(700))
+	require.NoError(t, repo.CreateRelease(productionReleaseContext(reviewTenantID, reviewAuthorID), release,
+		[]*types.ProductionReleaseTarget{productionReleaseTarget(releaseTarget1, releaseKBOne, releaseKnowledge1)}))
+
+	raw := types.JSON(`{"z":1,"a":{"size":512}}`)
+	canonical, digest, err := types.CanonicalProductionReleaseTargetConfig(raw)
+	require.NoError(t, err)
+	require.NotEqual(t, raw, canonical)
+	insertRawProductionReleaseTargetConfig(t, db, releaseTarget2, releaseKBTwo, releaseKnowledge2, string(raw), digest)
+
+	target, err := repo.GetTarget(context.Background(), reviewTenantID, releaseTarget2)
+	require.NoError(t, err)
+	require.Equal(t, canonical, target.ConfigSnapshot)
+	require.Equal(t, digest, target.ConfigDigest)
+
+	history, err := repo.ListProjectionHistory(context.Background(), reviewTenantID, reviewDocumentID, releaseKBTwo)
+	require.NoError(t, err)
+	require.Len(t, history, 1)
+	require.Equal(t, canonical, history[0].ConfigSnapshot)
+	require.Equal(t, digest, history[0].ConfigDigest)
+}
+
+func TestProductionReleaseTargetReadsRejectPersistedConfigDigestMismatch(t *testing.T) {
+	repo, db := newProductionReleaseRepoFixture(t, nil)
+	release := productionRelease(releaseIDOne, reviewVersionOne, reviewID(700))
+	require.NoError(t, repo.CreateRelease(productionReleaseContext(reviewTenantID, reviewAuthorID), release,
+		[]*types.ProductionReleaseTarget{productionReleaseTarget(releaseTarget1, releaseKBOne, releaseKnowledge1)}))
+	insertRawProductionReleaseTargetConfig(t, db, releaseTarget2, releaseKBTwo, releaseKnowledge2, `{}`, strings.Repeat("f", 64))
+
+	target, err := repo.GetTarget(context.Background(), reviewTenantID, releaseTarget2)
+	require.ErrorIs(t, err, types.ErrProductionReleaseConfigInvalid)
+	require.Nil(t, target)
+
+	history, err := repo.ListProjectionHistory(context.Background(), reviewTenantID, reviewDocumentID, releaseKBTwo)
+	require.ErrorIs(t, err, types.ErrProductionReleaseConfigInvalid)
+	require.Nil(t, history)
+}
+
+func TestProductionReleaseGetTargetRejectsMalformedPostgresJSONBScan(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{})
+	require.NoError(t, err)
+	repo := NewProductionReleaseRepository(db)
+	mock.ExpectQuery(`SELECT \* FROM "production_release_targets"`).
+		WithArgs(reviewTenantID, releaseTarget1, 1).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "config_snapshot", "config_digest"}).
+			AddRow(releaseTarget1, reviewTenantID, []byte(`[]`), strings.Repeat("a", 64)))
+
+	target, err := repo.GetTarget(context.Background(), reviewTenantID, releaseTarget1)
+	require.ErrorIs(t, err, types.ErrProductionReleaseConfigInvalid)
+	require.Nil(t, target)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestProductionReleaseGetTargetCanonicalizesPostgresJSONBScan(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{})
+	require.NoError(t, err)
+	repo := NewProductionReleaseRepository(db)
+	raw := types.JSON(`{ "z": 1, "a": { "size": 512 } }`)
+	canonical, digest, err := types.CanonicalProductionReleaseTargetConfig(raw)
+	require.NoError(t, err)
+	mock.ExpectQuery(`SELECT \* FROM "production_release_targets"`).
+		WithArgs(reviewTenantID, releaseTarget1, 1).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "config_snapshot", "config_digest"}).
+			AddRow(releaseTarget1, reviewTenantID, []byte(raw), digest))
+
+	target, err := repo.GetTarget(context.Background(), reviewTenantID, releaseTarget1)
+	require.NoError(t, err)
+	require.Equal(t, canonical, target.ConfigSnapshot)
+	require.Equal(t, digest, target.ConfigDigest)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestProductionReleasePostgresLiveJSONBRoundTrip(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("WEKNORA_TEST_POSTGRES_DSN"))
+	if dsn == "" {
+		t.Skip("set WEKNORA_TEST_POSTGRES_DSN to run the isolated PostgreSQL JSONB round-trip test")
+	}
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+
+	schemaName := fmt.Sprintf("weknora_release_config_%d", time.Now().UnixNano())
+	require.NoError(t, db.Exec(`CREATE SCHEMA "`+schemaName+`"`).Error)
+	t.Cleanup(func() { _ = db.Exec(`DROP SCHEMA IF EXISTS "` + schemaName + `" CASCADE`).Error })
+	require.NoError(t, db.Exec(`SET search_path TO "`+schemaName+`"`).Error)
+	require.NoError(t, db.Exec(`CREATE TABLE production_release_targets (
+		id TEXT PRIMARY KEY, release_id TEXT NOT NULL, tenant_id BIGINT NOT NULL,
+		project_id TEXT NOT NULL, document_id TEXT NOT NULL, version_id TEXT NOT NULL,
+		target_knowledge_base_id TEXT NOT NULL, knowledge_id TEXT NOT NULL,
+		release_digest TEXT NOT NULL, config_snapshot JSONB NOT NULL, config_digest TEXT NOT NULL,
+		status TEXT NOT NULL, retention_days INTEGER NOT NULL,
+		retention_until TIMESTAMPTZ, activated_at TIMESTAMPTZ, failed_at TIMESTAMPTZ,
+		rolled_back_at TIMESTAMPTZ, cleanup_requested_at TIMESTAMPTZ, cleaned_at TIMESTAMPTZ,
+		created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL
+	)`).Error)
+
+	raw := types.JSON(`{ "z": 1, "a": { "size": 512 } }`)
+	canonical, digest, err := types.CanonicalProductionReleaseTargetConfig(raw)
+	require.NoError(t, err)
+	require.NoError(t, db.Exec(`INSERT INTO production_release_targets
+		(id, release_id, tenant_id, project_id, document_id, version_id,
+		 target_knowledge_base_id, knowledge_id, release_digest, config_snapshot, config_digest,
+		 status, retention_days, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSONB), ?, ?, 30, now(), now())`,
+		releaseTarget1, releaseIDOne, reviewTenantID, reviewProjectID, reviewDocumentID, reviewVersionOne,
+		releaseKBOne, releaseKnowledge1, strings.Repeat("a", 64), string(raw), digest, types.ReleaseTargetBuilding,
+	).Error)
+
+	repo := NewProductionReleaseRepository(db)
+	target, err := repo.GetTarget(context.Background(), reviewTenantID, releaseTarget1)
+	require.NoError(t, err)
+	require.Equal(t, canonical, target.ConfigSnapshot)
+	history, err := repo.ListProjectionHistory(context.Background(), reviewTenantID, reviewDocumentID, releaseKBOne)
+	require.NoError(t, err)
+	require.Len(t, history, 1)
+	require.Equal(t, canonical, history[0].ConfigSnapshot)
 }
 
 func TestProductionReleaseRepositoryRejectsTargetConfigDigestMismatchAndRollsBack(t *testing.T) {

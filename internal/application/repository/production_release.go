@@ -242,7 +242,27 @@ func (r *productionReleaseRepository) GetTarget(ctx context.Context, tenantID ui
 	if err != nil {
 		return nil, err
 	}
+	if err := normalizeProductionReleaseTargetConfig(&target); err != nil {
+		return nil, err
+	}
 	return &target, nil
+}
+
+// normalizeProductionReleaseTargetConfig authenticates driver-returned
+// JSONB/TEXT before a target crosses the repository boundary.
+func normalizeProductionReleaseTargetConfig(target *types.ProductionReleaseTarget) error {
+	if target == nil {
+		return fmt.Errorf("%w: persisted target is missing", types.ErrProductionReleaseConfigInvalid)
+	}
+	canonical, digest, err := types.CanonicalProductionReleaseTargetConfig(target.ConfigSnapshot)
+	if err != nil {
+		return err
+	}
+	if target.ConfigDigest != digest {
+		return fmt.Errorf("%w: persisted digest does not match canonical configuration", types.ErrProductionReleaseConfigInvalid)
+	}
+	target.ConfigSnapshot = canonical
+	return nil
 }
 
 func (r *productionReleaseRepository) TransitionTarget(
@@ -454,7 +474,15 @@ func (r *productionReleaseRepository) ListProjectionHistory(
 	err := database.DBFromContext(ctx, r.db).WithContext(ctx).
 		Where("tenant_id = ? AND document_id = ? AND target_knowledge_base_id = ?", tenantID, documentID, kbID).
 		Order("created_at DESC, id DESC").Find(&targets).Error
-	return targets, err
+	if err != nil {
+		return nil, err
+	}
+	for _, target := range targets {
+		if err := normalizeProductionReleaseTargetConfig(target); err != nil {
+			return nil, err
+		}
+	}
+	return targets, nil
 }
 
 func translateProductionReleaseError(err error) error {
