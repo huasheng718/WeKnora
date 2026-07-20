@@ -502,7 +502,7 @@ func TestProductionOrchestratorCancelTerminalizesPendingAndApprovedChildren(t *t
 	}
 }
 
-func TestProductionOrchestratorDecisionRetriesPendingWakeupAfterEnqueueFailure(t *testing.T) {
+func TestProductionOrchestratorDuplicateDecisionNeverRetriesPendingWakeupAfterEnqueueFailure(t *testing.T) {
 	f := newProductionOrchestratorFixture(t, 0)
 	f.executor.fn = func(*types.ProductionRun, []*types.ProductionToolCall) (ProductionStepResult, error) {
 		return ProductionStepResult{ToolCall: approvalRequiredCall()}, nil
@@ -523,6 +523,11 @@ func TestProductionOrchestratorDecisionRetriesPendingWakeupAfterEnqueueFailure(t
 	won, err = f.orchestrator.ResolveDecision(
 		context.Background(), 7, calls[0].ID, types.ProductionToolCallApproved, uuid.NewString(),
 	)
+	require.NoError(t, err)
+	require.False(t, won)
+	require.Equal(t, 0, f.enqueuer.count())
+
+	won, err = f.orchestrator.Resume(context.Background(), 7, f.run.ID, 1)
 	require.NoError(t, err)
 	require.True(t, won)
 	run = f.load(t)
@@ -624,7 +629,13 @@ func TestProductionOrchestratorEnqueueBeforeMarkRecoversThroughDeterministicConf
 		context.Background(), 7, calls[0].ID, types.ProductionToolCallApproved, uuid.NewString(),
 	)
 	require.NoError(t, err)
-	require.False(t, won, "deterministic conflict recovers the mark but does not own the enqueue")
+	require.False(t, won, "a duplicate decision must not touch the pending wakeup")
+	run = f.load(t)
+	require.Greater(t, run.WakeupVersion, run.WakeupEnqueuedVersion)
+
+	won, err = f.orchestrator.Resume(context.Background(), 7, f.run.ID, 1)
+	require.NoError(t, err)
+	require.False(t, won, "deterministic task conflict repairs the mark but does not own the enqueue")
 	run = f.load(t)
 	require.Equal(t, run.WakeupVersion, run.WakeupEnqueuedVersion)
 }

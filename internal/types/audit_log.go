@@ -137,6 +137,9 @@ const (
 	AuditActionProductionDocumentTypeActivated AuditAction = "production.document_type_activated"
 	AuditActionProductionSourceFrozen          AuditAction = "production.source_frozen"
 	AuditActionProductionVersionCreated        AuditAction = "production.version_created"
+	AuditActionProductionRunStarted            AuditAction = "production.run_started"
+	AuditActionProductionToolCallApproved      AuditAction = "production.tool_call_approved"
+	AuditActionProductionToolCallRejected      AuditAction = "production.tool_call_rejected"
 )
 
 // AuditOutcome distinguishes successful mutations from middleware-level

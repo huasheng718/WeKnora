@@ -50,6 +50,16 @@ func NewProductionDataSourceAdapter(
 	}
 }
 
+func NewProductionDataSourceAdapterFromServices(
+	dataSources interfaces.DataSourceService,
+	registry *datasource.ConnectorRegistry,
+	runs interfaces.ProductionRunRepository,
+	sources interfaces.ProductionSourceRepository,
+	evidence interfaces.ProductionSourceService,
+) *ProductionDataSourceAdapter {
+	return NewProductionDataSourceAdapter(dataSources, registry, runs, sources, evidence)
+}
+
 type productionDataSourceRequest struct {
 	SourceItemID   string   `json:"source_item_id"`
 	ResourceIDs    []string `json:"resource_ids,omitempty"`

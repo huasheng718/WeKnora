@@ -53,6 +53,25 @@ func NewProductionRunRepository(db *gorm.DB) interfaces.ProductionRunRepository 
 	return &productionRunRepository{db: db}
 }
 
+func NewProductionRunRecoveryRepository(db *gorm.DB) interfaces.ProductionRunRecoveryRepository {
+	return &productionRunRepository{db: db}
+}
+
+func (r *productionRunRepository) ListPendingWakeups(
+	ctx context.Context,
+	limit int,
+) ([]*types.ProductionRun, error) {
+	if limit < 1 || limit > 1000 {
+		limit = 1000
+	}
+	var runs []*types.ProductionRun
+	err := database.DBFromContext(ctx, r.db).WithContext(ctx).
+		Select("id", "tenant_id", "attempt", "created_at").
+		Where("status = ? AND wakeup_version > wakeup_enqueued_version", types.ProductionRunQueued).
+		Order("created_at ASC, id ASC").Limit(limit).Find(&runs).Error
+	return runs, err
+}
+
 func (r *productionRunRepository) Create(ctx context.Context, run *types.ProductionRun) error {
 	if run == nil {
 		return errors.New("production run is required")
@@ -606,3 +625,4 @@ func (r *productionRunRepository) hasActiveLease(
 }
 
 var _ interfaces.ProductionRunRepository = (*productionRunRepository)(nil)
+var _ interfaces.ProductionRunRecoveryRepository = (*productionRunRepository)(nil)

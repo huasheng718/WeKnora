@@ -73,6 +73,15 @@ func NewProductionOrchestrator(
 	}
 }
 
+func NewProductionOrchestratorRuntime(
+	repo interfaces.ProductionRunRepository,
+	uow interfaces.ProductionUnitOfWork,
+	executor *ProductionExecutor,
+	enqueuer interfaces.TaskEnqueuer,
+) *ProductionOrchestrator {
+	return NewProductionOrchestrator(repo, uow, executor, enqueuer)
+}
+
 // CreateRun persists and schedules a fresh run. A queue failure leaves the
 // queued row intact so Resume can reissue the deterministic wake-up.
 func (o *ProductionOrchestrator) CreateRun(ctx context.Context, run *types.ProductionRun) error {
@@ -350,10 +359,6 @@ func (o *ProductionOrchestrator) ResolveDecision(
 		return false, err
 	}
 	if call.Status != types.ProductionToolCallPendingApproval {
-		if call.Status == types.ProductionToolCallApproved && run.Status == types.ProductionRunQueued &&
-			run.Attempt == call.Attempt && run.CurrentStep == call.CurrentStep {
-			return o.enqueuePending(ctx, run)
-		}
 		return false, nil
 	}
 	if run.Status != types.ProductionRunWaitingApproval || run.Attempt != call.Attempt || run.CurrentStep != call.CurrentStep {
@@ -362,9 +367,6 @@ func (o *ProductionOrchestrator) ResolveDecision(
 			return false, latestErr
 		}
 		if latest.Status != types.ProductionToolCallPendingApproval {
-			if latest.Status == types.ProductionToolCallApproved && run.Status == types.ProductionRunQueued {
-				return o.enqueuePending(ctx, run)
-			}
 			return false, nil
 		}
 		return false, errors.New("production approval does not match the persisted waiting step")

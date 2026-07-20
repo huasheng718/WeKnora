@@ -95,6 +95,7 @@ type RouterParams struct {
 	ProductionDocTypeHandler     *handler.ProductionDocumentTypeHandler
 	ProductionSourceHandler      *handler.ProductionSourceHandler
 	ProductionDocumentHandler    *handler.ProductionDocumentHandler
+	ProductionRunHandler         *handler.ProductionRunHandler
 	ProductionIdempotency        *middleware.ProductionIdempotencyMiddleware
 }
 
@@ -272,6 +273,7 @@ func NewRouter(params RouterParams) *gin.Engine {
 			params.ProductionDocTypeHandler,
 			params.ProductionSourceHandler,
 			params.ProductionDocumentHandler,
+			params.ProductionRunHandler,
 			rbacGuards,
 			params.ProductionIdempotency,
 		)
@@ -306,6 +308,7 @@ func RegisterProductionRoutes(
 	documentTypeHandler *handler.ProductionDocumentTypeHandler,
 	sourceHandler *handler.ProductionSourceHandler,
 	documentHandler *handler.ProductionDocumentHandler,
+	runHandler *handler.ProductionRunHandler,
 	g *rbacGuards,
 	idempotency *middleware.ProductionIdempotencyMiddleware,
 ) {
@@ -323,6 +326,10 @@ func RegisterProductionRoutes(
 	production.POST("/projects/:id/documents", g.Contributor(), idempotency.Require(), documentHandler.Create)
 	production.GET("/documents/:id/versions", g.Viewer(), documentHandler.ListVersions)
 	production.POST("/documents/:id/versions", g.Contributor(), idempotency.Require(), documentHandler.AppendVersion)
+	production.POST("/documents/:id/runs", g.Contributor(), idempotency.Require(), runHandler.Start)
+	production.POST("/source-sets/:id/collect", g.Contributor(), idempotency.Require(), runHandler.StartCollection)
+	production.GET("/runs/:id", g.Viewer(), runHandler.Get)
+	production.POST("/tool-calls/:id/decision", g.Contributor(), idempotency.Require(), runHandler.DecideToolCall)
 }
 
 // RegisterChunkerDebugRoutes wires the read-only chunker preview endpoint

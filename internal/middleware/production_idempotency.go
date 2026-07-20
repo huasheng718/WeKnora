@@ -91,6 +91,7 @@ func (m *ProductionIdempotencyMiddleware) Require() gin.HandlerFunc {
 			return
 		}
 		digest := productionRequestDigest(body, c.GetHeader("If-Match"))
+		ctx, runAfterCommit := types.WithProductionAfterCommit(ctx)
 		route := c.Request.Method + " " + c.Request.URL.EscapedPath()
 		reservation := &types.ProductionIdempotencyKey{
 			ID:             uuid.NewString(),
@@ -176,6 +177,9 @@ func (m *ProductionIdempotencyMiddleware) Require() gin.HandlerFunc {
 		if !created {
 			m.replayOrReject(c, reserved, digest)
 			return
+		}
+		if err := runAfterCommit(ctx); err != nil {
+			logger.Errorf(ctx, "production post-commit wakeup failed: %v", err)
 		}
 		capture.flushTo(original)
 	}

@@ -31,6 +31,7 @@ type productionIdempotencyRepoStub struct {
 	normalizeOnComplete bool
 	releaseCalls        int
 	transactionErr      error
+	transactionActive   bool
 }
 
 func newProductionIdempotencyRepoStub() *productionIdempotencyRepoStub {
@@ -106,6 +107,14 @@ func (r *productionIdempotencyRepoStub) WithinTransaction(
 ) error {
 	r.txMu.Lock()
 	defer r.txMu.Unlock()
+	r.mu.Lock()
+	r.transactionActive = true
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		r.transactionActive = false
+		r.mu.Unlock()
+	}()
 
 	r.mu.Lock()
 	snapshot := make(map[string]*types.ProductionIdempotencyKey, len(r.records))
@@ -133,6 +142,28 @@ func (r *productionIdempotencyRepoStub) WithinTransaction(
 		committed = true
 	}
 	return err
+}
+
+func TestProductionIdempotencyRunsWakeupsOnlyAfterTransactionCommit(t *testing.T) {
+	repo := newProductionIdempotencyRepoStub()
+	callbackCalls := 0
+	callbackSawTransaction := false
+	engine := newProductionIdempotencyTestEngine(repo, func(c *gin.Context) {
+		require.True(t, types.RegisterProductionAfterCommit(c.Request.Context(), func(context.Context) error {
+			repo.mu.Lock()
+			callbackSawTransaction = repo.transactionActive
+			repo.mu.Unlock()
+			callbackCalls++
+			return nil
+		}))
+		c.JSON(http.StatusAccepted, gin.H{"success": true})
+	})
+
+	response := performProductionIdempotencyRequest(engine, "request-1", `{"name":"Baseline"}`)
+
+	require.Equal(t, http.StatusAccepted, response.Code)
+	require.Equal(t, 1, callbackCalls)
+	require.False(t, callbackSawTransaction)
 }
 
 type productionTransactionMarker struct{}

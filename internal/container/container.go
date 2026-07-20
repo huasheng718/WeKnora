@@ -180,6 +180,8 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(repository.NewProductionDocumentTypeRepository))
 	must(container.Provide(repository.NewProductionSourceRepository))
 	must(container.Provide(repository.NewProductionDocumentRepository))
+	must(container.Provide(repository.NewProductionRunRepository))
+	must(container.Provide(repository.NewProductionRunRecoveryRepository))
 	must(container.Provide(repository.NewProductionIdempotencyRepository))
 	must(container.Provide(repository.NewProductionUnitOfWork))
 
@@ -297,6 +299,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 		must(container.Provide(router.NewMaintenanceAsynqServer, dig.Name("maintenanceAsynqServer")))
 		must(container.Provide(router.NewSharedAsynqServer, dig.Name("sharedAsynqServer")))
 		must(container.Provide(router.NewWikiAsynqServer, dig.Name("wikiAsynqServer")))
+		must(container.Provide(router.NewProductionAsynqServer, dig.Name("productionAsynqServer")))
 		// Asynq inspector for cancel-by-knowledge-id (best-effort
 		// dequeue of pending/scheduled/retry tasks + active-task cancel).
 		must(container.Provide(router.NewAsynqInspector))
@@ -326,6 +329,20 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(initConnectorRegistry))
 	must(container.Provide(datasource.NewScheduler))
 	must(container.Provide(service.NewDataSourceService))
+	must(container.Provide(service.NewProductionSkillAdapterFromServices))
+	must(container.Provide(service.NewProductionDataSourceAdapterFromServices))
+	must(container.Provide(service.NewProductionMCPAdapterFromServices))
+	must(container.Provide(service.NewProductionWriter))
+	must(container.Provide(service.NewProductionStepExecutor))
+	must(container.Provide(service.NewProductionOrchestratorRuntime))
+	must(container.Provide(func(orchestrator *service.ProductionOrchestrator) interfaces.ProductionRunOrchestrator {
+		return orchestrator
+	}))
+	must(container.Provide(func(orchestrator *service.ProductionOrchestrator) interfaces.ProductionRunResumer {
+		return orchestrator
+	}))
+	must(container.Provide(router.NewProductionRunTaskHandler, dig.Name("productionRun"), dig.As(new(interfaces.TaskHandler))))
+	must(container.Provide(service.NewProductionRunService, dig.As(new(interfaces.ProductionRunService))))
 	must(container.Invoke(startDataSourceScheduler))
 	logger.Debugf(ctx, "[Container] Data source sync framework registered")
 	must(container.Invoke(startAuditLogRetention))
@@ -402,6 +419,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(handler.NewProductionDocumentTypeHandler))
 	must(container.Provide(handler.NewProductionSourceHandler))
 	must(container.Provide(handler.NewProductionDocumentHandler))
+	must(container.Provide(handler.NewProductionRunHandler))
 	logger.Debugf(ctx, "[Container] HTTP handlers registered")
 
 	// Wire the chat package's local image resolver so multimodal chat can read
@@ -417,6 +435,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	} else {
 		must(container.Invoke(router.RegisterSyncHandlers))
 	}
+	must(container.Invoke(recoverPendingProductionRuns))
 	// Wiki operation rows are durable, while their wake-up triggers may be
 	// lost across a process restart (always in Lite mode, and in Redis mode if
 	// persistence succeeded immediately before trigger enqueue failed). Re-arm

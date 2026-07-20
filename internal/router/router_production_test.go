@@ -105,6 +105,21 @@ type productionRouterDocumentService struct {
 	err       error
 }
 
+type productionRouterRunService struct{}
+
+func (s *productionRouterRunService) StartDocumentRun(context.Context, string, interfaces.StartProductionDocumentRunInput) (*types.ProductionRun, error) {
+	return &types.ProductionRun{}, nil
+}
+func (s *productionRouterRunService) StartSourceSetCollection(context.Context, string, interfaces.StartProductionSourceSetCollectionInput) (*types.ProductionRun, error) {
+	return &types.ProductionRun{}, nil
+}
+func (s *productionRouterRunService) GetRun(context.Context, string) (*types.ProductionRun, error) {
+	return &types.ProductionRun{}, nil
+}
+func (s *productionRouterRunService) DecideToolCall(context.Context, string, interfaces.ProductionToolDecision) (*types.ProductionToolCall, error) {
+	return &types.ProductionToolCall{}, nil
+}
+
 func (s *productionRouterDocumentService) CreateDocument(context.Context, interfaces.CreateProductionDocumentInput) (*types.ProductionDocument, error) {
 	return nil, s.err
 }
@@ -147,6 +162,7 @@ func newProductionRouteTestEngine(
 		projectHandler,
 		handler.NewProductionSourceHandler(&productionRouterSourceService{}),
 		handler.NewProductionDocumentHandler(&productionRouterDocumentService{}),
+		handler.NewProductionRunHandler(&productionRouterRunService{}),
 		repo,
 		types.TenantRoleAdmin,
 	)
@@ -156,6 +172,7 @@ func newProductionRouteTestEngineForRole(
 	projectHandler *handler.ProductionProjectHandler,
 	sourceHandler *handler.ProductionSourceHandler,
 	documentHandler *handler.ProductionDocumentHandler,
+	runHandler *handler.ProductionRunHandler,
 	repo interfaces.ProductionIdempotencyRepository,
 	role types.TenantRole,
 ) *gin.Engine {
@@ -178,6 +195,7 @@ func newProductionRouteTestEngineForRole(
 		&handler.ProductionDocumentTypeHandler{},
 		sourceHandler,
 		documentHandler,
+		runHandler,
 		guards,
 		middleware.NewProductionIdempotencyMiddleware(repo),
 	)
@@ -194,7 +212,7 @@ func TestProductionRouteRBACRunsBeforeIdempotencyAndServiceAuthorizationRemainsA
 		engine := newProductionRouteTestEngineForRole(
 			&handler.ProductionProjectHandler{},
 			handler.NewProductionSourceHandler(&productionRouterSourceService{}),
-			handler.NewProductionDocumentHandler(documents), repo, types.TenantRoleViewer,
+			handler.NewProductionDocumentHandler(documents), handler.NewProductionRunHandler(&productionRouterRunService{}), repo, types.TenantRoleViewer,
 		)
 		read := httptest.NewRecorder()
 		engine.ServeHTTP(read, httptest.NewRequest(http.MethodGet, "/api/v1/production/documents/"+documentID+"/versions", nil))
@@ -214,7 +232,7 @@ func TestProductionRouteRBACRunsBeforeIdempotencyAndServiceAuthorizationRemainsA
 		sources := &productionRouterSourceService{err: types.ErrProductionForbidden}
 		engine := newProductionRouteTestEngineForRole(
 			&handler.ProductionProjectHandler{}, handler.NewProductionSourceHandler(sources),
-			handler.NewProductionDocumentHandler(&productionRouterDocumentService{}), repo, types.TenantRoleContributor,
+			handler.NewProductionDocumentHandler(&productionRouterDocumentService{}), handler.NewProductionRunHandler(&productionRouterRunService{}), repo, types.TenantRoleContributor,
 		)
 		response := httptest.NewRecorder()
 		request := httptest.NewRequest(http.MethodPost, "/api/v1/production/source-sets/"+sourceSetID+"/freeze", nil)
@@ -276,6 +294,10 @@ func TestProductionFoundationRoutesAreRegistered(t *testing.T) {
 		{http.MethodPost, "/api/v1/production/projects/:id/documents"},
 		{http.MethodGet, "/api/v1/production/documents/:id/versions"},
 		{http.MethodPost, "/api/v1/production/documents/:id/versions"},
+		{http.MethodPost, "/api/v1/production/documents/:id/runs"},
+		{http.MethodPost, "/api/v1/production/source-sets/:id/collect"},
+		{http.MethodGet, "/api/v1/production/runs/:id"},
+		{http.MethodPost, "/api/v1/production/tool-calls/:id/decision"},
 	} {
 		assertProductionRoute(t, engine, route.method, route.path)
 	}
@@ -295,6 +317,9 @@ func TestEveryProductionWriteRouteRequiresIdempotencyKey(t *testing.T) {
 		{http.MethodPost, "/api/v1/production/source-sets/set-1/freeze", ""},
 		{http.MethodPost, "/api/v1/production/projects/project-1/documents", `{}`},
 		{http.MethodPost, "/api/v1/production/documents/document-1/versions", `{}`},
+		{http.MethodPost, "/api/v1/production/documents/document-1/runs", `{}`},
+		{http.MethodPost, "/api/v1/production/source-sets/set-1/collect", `{}`},
+		{http.MethodPost, "/api/v1/production/tool-calls/call-1/decision", `{}`},
 	} {
 		t.Run(request.method+" "+request.path, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
@@ -332,3 +357,4 @@ var _ interfaces.ProductionIdempotencyRepository = (*productionRouterIdempotency
 var _ interfaces.ProductionProjectService = (*productionRouterProjectService)(nil)
 var _ interfaces.ProductionSourceService = (*productionRouterSourceService)(nil)
 var _ interfaces.ProductionDocumentService = (*productionRouterDocumentService)(nil)
+var _ interfaces.ProductionRunService = (*productionRouterRunService)(nil)

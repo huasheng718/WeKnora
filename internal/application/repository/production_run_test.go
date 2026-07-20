@@ -143,6 +143,25 @@ func TestProductionRunRepositoryCreateCanonicalizesSnapshotsAndScopesReads(t *te
 	require.Nil(t, got)
 }
 
+func TestProductionRunRecoveryRepositoryListsOnlyQueuedWakeupLag(t *testing.T) {
+	repo, db := newProductionRunRepoTestDB(t)
+	pending := newTestProductionRun(7)
+	pending.IdempotencyKey = "pending-recovery"
+	require.NoError(t, repo.Create(context.Background(), pending))
+	marked := newTestProductionRun(7)
+	marked.IdempotencyKey = "marked-recovery"
+	marked.WakeupEnqueuedVersion = marked.WakeupVersion
+	require.NoError(t, repo.Create(context.Background(), marked))
+
+	recovery := NewProductionRunRecoveryRepository(db)
+	runs, err := recovery.ListPendingWakeups(context.Background(), 100)
+
+	require.NoError(t, err)
+	require.Len(t, runs, 1)
+	require.Equal(t, pending.ID, runs[0].ID)
+	require.Equal(t, uint64(7), runs[0].TenantID)
+}
+
 func TestProductionRunRepositoryPersistsExactRawModelResponseWithCAS(t *testing.T) {
 	repo, _ := newProductionRunRepoTestDB(t)
 	run := newTestProductionRun(7)

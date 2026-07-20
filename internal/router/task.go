@@ -34,6 +34,7 @@ type AsynqTaskParams struct {
 	MaintenanceServer    *asynq.Server `name:"maintenanceAsynqServer"`
 	SharedServer         *asynq.Server `name:"sharedAsynqServer"`
 	WikiServer           *asynq.Server `name:"wikiAsynqServer"`
+	ProductionServer     *asynq.Server `name:"productionAsynqServer"`
 	KnowledgeService     interfaces.KnowledgeService
 	KnowledgeBaseService interfaces.KnowledgeBaseService
 	TagService           interfaces.KnowledgeTagService
@@ -43,6 +44,7 @@ type AsynqTaskParams struct {
 	ImageMultimodal      interfaces.TaskHandler `name:"imageMultimodal"`
 	KnowledgePostProcess interfaces.TaskHandler `name:"knowledgePostProcess"`
 	WikiIngest           interfaces.TaskHandler `name:"wikiIngest"`
+	ProductionRun        interfaces.TaskHandler `name:"productionRun"`
 	DeadLetterRepo       interfaces.TaskDeadLetterRepository
 	SpanTracker          service.SpanTracker
 }
@@ -222,6 +224,19 @@ func NewWikiAsynqServer(svc interfaces.SystemSettingService) *asynq.Server {
 	return newAsynqServer(concurrency, types.QueueWeightsForPool(types.WorkerPoolWiki))
 }
 
+func productionWorkerPoolConfig(allocation types.WorkerPoolConcurrency) asynq.Config {
+	return asynq.Config{
+		Concurrency: allocation.Production, Queues: types.QueueWeightsForPool(types.WorkerPoolProduction),
+		RetryDelayFunc: asynqRetryDelayFunc,
+	}
+}
+
+func NewProductionAsynqServer(svc interfaces.SystemSettingService) *asynq.Server {
+	allocation := resolveWorkerPoolConcurrency(svc)
+	log.Printf("asynq production-pool server starting with concurrency=%d", allocation.Production)
+	return asynq.NewServer(getAsynqRedisClientOpt(), productionWorkerPoolConfig(allocation))
+}
+
 func RunAsynqServer(params AsynqTaskParams) *asynq.ServeMux {
 	// Create a new mux and register all handlers
 	mux := asynq.NewServeMux()
@@ -307,6 +322,9 @@ func RunAsynqServer(params AsynqTaskParams) *asynq.ServeMux {
 	// and both land on QueueWiki, so the dedicated wiki pool serves them.
 	mux.HandleFunc(types.TypeWikiIngest, params.WikiIngest.Handle)
 	mux.HandleFunc(types.TypeWikiFinalize, params.WikiIngest.Handle)
+	mux.HandleFunc(types.TypeProductionCollect, params.ProductionRun.Handle)
+	mux.HandleFunc(types.TypeProductionWrite, params.ProductionRun.Handle)
+	mux.HandleFunc(types.TypeProductionValidate, params.ProductionRun.Handle)
 
 	// Run the same mux on every pool. Shared and dedicated servers intentionally
 	// overlap, but Redis dequeue is atomic, so each task still executes once.
@@ -323,6 +341,7 @@ func RunAsynqServer(params AsynqTaskParams) *asynq.ServeMux {
 	runPool("maintenance-pool", params.MaintenanceServer)
 	runPool("shared-pool", params.SharedServer)
 	runPool("wiki-pool", params.WikiServer)
+	runPool("production-pool", params.ProductionServer)
 	return mux
 }
 

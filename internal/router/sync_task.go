@@ -127,6 +127,7 @@ type SyncTaskParams struct {
 	ImageMultimodal      interfaces.TaskHandler `name:"imageMultimodal"`
 	KnowledgePostProcess interfaces.TaskHandler `name:"knowledgePostProcess"`
 	WikiIngest           interfaces.TaskHandler `name:"wikiIngest"`
+	ProductionRun        interfaces.TaskHandler `name:"productionRun"`
 }
 
 // RegisterSyncHandlers registers all task handlers on the SyncTaskExecutor.
@@ -150,5 +151,8 @@ func RegisterSyncHandlers(params SyncTaskParams) {
 	params.Executor.RegisterHandler(types.TypeDataSourceSync, params.DataSourceService.ProcessSync)
 	params.Executor.RegisterHandler(types.TypeWikiIngest, params.WikiIngest.Handle)
 	params.Executor.RegisterHandler(types.TypeWikiFinalize, params.WikiIngest.Handle)
+	params.Executor.RegisterHandler(types.TypeProductionCollect, params.ProductionRun.Handle)
+	params.Executor.RegisterHandler(types.TypeProductionWrite, params.ProductionRun.Handle)
+	params.Executor.RegisterHandler(types.TypeProductionValidate, params.ProductionRun.Handle)
 	logger.Infof(context.Background(), "[SyncTask] All task handlers registered (Lite mode, no Redis)")
 }

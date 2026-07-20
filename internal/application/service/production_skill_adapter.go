@@ -42,15 +42,16 @@ type ProductionToolAdapter interface {
 // ProductionToolPlan is a canonical, side-effect-free description of one
 // durable invocation. Digest is SHA-256 over Canonical.
 type ProductionToolPlan struct {
-	ToolCallID      string
-	ProviderType    types.ProductionToolProviderType
-	ProviderID      string
-	ToolName        string
-	Canonical       types.JSON
-	Digest          string
-	ProviderDigest  string
-	RequestSnapshot types.JSON
-	RequestDigest   string
+	ToolCallID       string
+	ProviderType     types.ProductionToolProviderType
+	ProviderID       string
+	ToolName         string
+	Canonical        types.JSON
+	Digest           string
+	ProviderDigest   string
+	RequestSnapshot  types.JSON
+	RequestDigest    string
+	RequiresApproval bool
 }
 
 // ProductionToolResult contains only normalized provider output. Evidence has
@@ -86,6 +87,23 @@ type productionSkillRuntime interface {
 type productionSkillCatalog interface {
 	ListPreloadedSkills(ctx context.Context) ([]*skills.SkillMetadata, error)
 	GetSkillByName(ctx context.Context, name string) (*skills.Skill, error)
+}
+
+type productionSkillServiceRuntime struct{ catalog interfaces.SkillService }
+
+func (r productionSkillServiceRuntime) LoadSkill(ctx context.Context, skillName string) (*skills.Skill, error) {
+	return r.catalog.GetSkillByName(ctx, skillName)
+}
+
+func NewProductionSkillAdapterFromServices(
+	catalog interfaces.SkillService,
+	runs interfaces.ProductionRunRepository,
+	sources interfaces.ProductionSourceRepository,
+	evidence interfaces.ProductionSourceService,
+) *ProductionSkillAdapter {
+	return NewProductionSkillAdapter(
+		productionSkillServiceRuntime{catalog: catalog}, catalog, runs, sources, evidence,
+	)
 }
 
 type productionToolScope struct {

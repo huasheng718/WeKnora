@@ -67,8 +67,50 @@ type ProductionRunRepository interface {
 	TransitionToolCall(ctx context.Context, tenantID uint64, runID, callID string, expected ProductionToolCallCAS, to types.ProductionToolCallStatus, patch ProductionToolCallPatch) (bool, error)
 }
 
+// ProductionRunRecoveryRepository is the system-owned startup scan. It
+// returns the tenant identity needed to re-enter the normal tenant-scoped
+// Resume path and exposes no mutation surface of its own.
+type ProductionRunRecoveryRepository interface {
+	ListPendingWakeups(ctx context.Context, limit int) ([]*types.ProductionRun, error)
+}
+
 // ProductionRunOrchestrator processes a durable run wake-up. The payload is
 // the tenant-scoped queue contract and must be validated before any read.
 type ProductionRunOrchestrator interface {
 	HandleRun(ctx context.Context, payload types.ProductionRunPayload) error
+}
+
+type ProductionRunResumer interface {
+	Resume(ctx context.Context, tenantID uint64, runID string, attempt int) (bool, error)
+}
+
+type ProductionToolDecision string
+
+const (
+	ProductionToolDecisionApprove ProductionToolDecision = "approve"
+	ProductionToolDecisionReject  ProductionToolDecision = "reject"
+)
+
+func (d ProductionToolDecision) IsValid() bool {
+	return d == ProductionToolDecisionApprove || d == ProductionToolDecisionReject
+}
+
+type StartProductionDocumentRunInput struct {
+	RunType types.ProductionRunType
+	ModelID string
+}
+
+type StartProductionSourceSetCollectionInput struct {
+	DocumentID string
+	ModelID    string
+}
+
+// ProductionRunService is the HTTP-facing application boundary. It owns
+// authorization, authoritative aggregate checks, required audit writes, and
+// the post-commit durable wakeup handoff.
+type ProductionRunService interface {
+	StartDocumentRun(ctx context.Context, documentID string, input StartProductionDocumentRunInput) (*types.ProductionRun, error)
+	StartSourceSetCollection(ctx context.Context, sourceSetID string, input StartProductionSourceSetCollectionInput) (*types.ProductionRun, error)
+	GetRun(ctx context.Context, runID string) (*types.ProductionRun, error)
+	DecideToolCall(ctx context.Context, callID string, decision ProductionToolDecision) (*types.ProductionToolCall, error)
 }
