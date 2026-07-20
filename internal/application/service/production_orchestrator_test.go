@@ -735,6 +735,28 @@ func TestProductionOrchestratorRejectsRawStepResultBeforeOtherPersistenceBranche
 	}
 }
 
+func TestProductionOrchestratorRejectsRawStepResultBeforeExecutionFailurePersistence(t *testing.T) {
+	f := newProductionOrchestratorFixture(t, 0)
+	enqueueCalls := f.enqueuer.callCount()
+	f.executor.fn = func(*types.ProductionRun, []*types.ProductionToolCall) (ProductionStepResult, error) {
+		return ProductionStepResult{RawModelResponse: types.JSON(`"must be audited by the writer"`)}, errors.New("executor failed")
+	}
+
+	err := f.orchestrator.HandleRun(context.Background(), f.payload())
+
+	require.ErrorContains(t, err, "raw model response must be audited before returning a step result")
+	require.NotContains(t, err.Error(), "executor failed")
+	run := f.load(t)
+	require.Nil(t, run.RawModelResponse)
+	require.Nil(t, run.RawModelResponseDigest)
+	require.Equal(t, 0, run.CurrentStep)
+	require.Equal(t, types.ProductionRunRunning, run.Status)
+	calls, listErr := f.repo.ListToolCalls(context.Background(), 7, run.ID)
+	require.NoError(t, listErr)
+	require.Empty(t, calls)
+	require.Equal(t, enqueueCalls, f.enqueuer.callCount())
+}
+
 type failWaitingTransitionRepository struct {
 	interfaces.ProductionRunRepository
 }

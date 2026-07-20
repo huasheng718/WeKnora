@@ -151,11 +151,11 @@ func (o *ProductionOrchestrator) HandleRun(ctx context.Context, payload types.Pr
 	}
 	approved := approvedCallsForStep(calls, claimed.Attempt, claimed.CurrentStep)
 	result, executeErr := o.executor.ExecuteStep(ctx, claimed, approved)
-	if executeErr != nil {
-		return o.persistExecutionFailure(ctx, claimed, calls, executeErr)
-	}
 	if len(result.RawModelResponse) != 0 {
 		return errors.New("raw model response must be audited before returning a step result")
+	}
+	if executeErr != nil {
+		return o.persistExecutionFailure(ctx, claimed, calls, executeErr)
 	}
 	if result.ToolCall != nil {
 		if len(approved) > 0 || result.ToolCallResult != nil {
