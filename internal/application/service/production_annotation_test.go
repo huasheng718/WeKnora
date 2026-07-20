@@ -97,6 +97,10 @@ func (r *productionAnnotationReviewRepoStub) CreateCurrentReview(context.Context
 	return errors.New("unexpected CreateCurrentReview")
 }
 
+func (r *productionAnnotationReviewRepoStub) LockCurrentReviewVersion(context.Context, *types.ProductionReviewRequest) error {
+	return errors.New("unexpected LockCurrentReviewVersion")
+}
+
 func (r *productionAnnotationReviewRepoStub) GetReview(context.Context, uint64, string) (*types.ProductionReviewRequest, error) {
 	return nil, errors.New("unexpected GetReview")
 }

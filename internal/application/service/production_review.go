@@ -131,6 +131,9 @@ func (s *productionReviewService) Submit(
 			return types.ErrProductionReviewScopeInvalid
 		}
 		request.ProjectID = liveDocument.ProjectID
+		if lockErr := s.reviews.LockCurrentReviewVersion(txCtx, request); lockErr != nil {
+			return lockErr
+		}
 		version, loadErr := s.documents.GetVersion(txCtx, tenantID, versionID)
 		if loadErr != nil {
 			return loadErr
@@ -139,7 +142,9 @@ func (s *productionReviewService) Submit(
 			version.FrozenAt == nil {
 			return types.ErrProductionReviewScopeInvalid
 		}
-		documentType, loadErr := s.documentTypes.GetByID(txCtx, tenantID, liveDocument.DocumentTypeID)
+		documentType, loadErr := s.documentTypes.GetActiveByIDForReview(
+			txCtx, tenantID, liveDocument.DocumentTypeID, liveDocument.DocumentTypeSchemaVersion,
+		)
 		if loadErr != nil {
 			return loadErr
 		}

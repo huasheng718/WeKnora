@@ -8,6 +8,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type productionDocumentTypeRepository struct {
@@ -77,6 +78,46 @@ func (r *productionDocumentTypeRepository) GetByID(
 	err := database.DBFromContext(ctx, r.db).WithContext(ctx).
 		Where("tenant_id = ? AND id = ?", tenantID, documentTypeID).
 		First(&documentType).Error
+	if err != nil {
+		return nil, err
+	}
+	return &documentType, nil
+}
+
+func (r *productionDocumentTypeRepository) GetActiveByIDForReview(
+	ctx context.Context,
+	tenantID uint64,
+	documentTypeID string,
+	schemaVersion int,
+) (*types.ProductionDocumentType, error) {
+	var documentType types.ProductionDocumentType
+	err := database.WithTransactionContext(ctx, r.db, func(txCtx context.Context) error {
+		db := database.DBFromContext(txCtx, r.db).WithContext(txCtx)
+		where := db.Where(
+			"tenant_id = ? AND id = ? AND schema_version = ? AND status = ?",
+			tenantID, documentTypeID, schemaVersion, types.ProductionDocumentTypeActive,
+		)
+		if db.Dialector.Name() == "postgres" {
+			return where.Clauses(clause.Locking{Strength: "SHARE"}).First(&documentType).Error
+		}
+		// SQLite has no row locks. Reserve its single writer before the read so
+		// activation/retirement cannot interleave with policy materialization.
+		result := where.Model(&types.ProductionDocumentType{}).
+			UpdateColumn("status", gorm.Expr("status"))
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return gorm.ErrRecordNotFound
+		}
+		return db.Where(
+			"tenant_id = ? AND id = ? AND schema_version = ? AND status = ?",
+			tenantID, documentTypeID, schemaVersion, types.ProductionDocumentTypeActive,
+		).First(&documentType).Error
+	})
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, types.ErrProductionDocumentTypeInactive
+	}
 	if err != nil {
 		return nil, err
 	}

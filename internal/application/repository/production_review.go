@@ -544,8 +544,8 @@ func (r *productionReviewRepository) CreateCurrentReview(
 	}
 	return database.WithTransactionContext(ctx, r.db, func(txCtx context.Context) error {
 		db := database.DBFromContext(txCtx, r.db).WithContext(txCtx)
-		if err := lockCurrentProductionReviewVersion(db, request); err != nil {
-			return translateProductionReviewError(err)
+		if err := r.LockCurrentReviewVersion(txCtx, request); err != nil {
+			return err
 		}
 		if err := requireLiveProductionReviewSubmitter(db, request.ProjectID, request.SubmittedBy); err != nil {
 			return err
@@ -564,6 +564,23 @@ func (r *productionReviewRepository) CreateCurrentReview(
 			return types.ErrProductionReviewScopeInvalid
 		}
 		return nil
+	})
+}
+
+func (r *productionReviewRepository) LockCurrentReviewVersion(
+	ctx context.Context,
+	request *types.ProductionReviewRequest,
+) error {
+	if request == nil {
+		return types.ErrProductionReviewScopeInvalid
+	}
+	if _, err := trustedProductionReviewActor(ctx, request.TenantID, request.SubmittedBy); err != nil {
+		return err
+	}
+	return database.WithTransactionContext(ctx, r.db, func(txCtx context.Context) error {
+		return translateProductionReviewError(lockCurrentProductionReviewVersion(
+			database.DBFromContext(txCtx, r.db).WithContext(txCtx), request,
+		))
 	})
 }
 

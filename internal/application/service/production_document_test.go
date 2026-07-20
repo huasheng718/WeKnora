@@ -299,6 +299,8 @@ INSERT INTO production_review_steps
     (id, review_request_id, tenant_id, project_id, document_id, version_id, required_role, sequence)
 VALUES (?, ?, 7, ?, ?, ?, 'business_reviewer', 1)
 `, stepID, requestID, documentServiceProjectID, document.ID, reviewedVersion.ID).Error)
+	require.NoError(t, db.Model(&types.ProductionDocument{}).Where("id = ?", document.ID).
+		UpdateColumn("status", types.ProductionDocumentInReview).Error)
 
 	newVersion, err := svc.AppendVersion(productionDocumentContext(7), document.ID, interfaces.AppendProductionVersionInput{
 		ParentVersionID: reviewedVersion.ID, SourceSetID: documentServiceSetID,
@@ -310,6 +312,60 @@ VALUES (?, ?, 7, ?, ?, ?, 'business_reviewer', 1)
 	var review types.ProductionReviewRequest
 	require.NoError(t, db.First(&review, "id = ?", requestID).Error)
 	require.Equal(t, types.ProductionReviewStatus(types.ProductionReviewObsolete), review.Status)
+	var persisted types.ProductionDocument
+	require.NoError(t, db.First(&persisted, "id = ?", document.ID).Error)
+	require.Equal(t, types.ProductionDocumentDraft, persisted.Status)
+	require.Nil(t, persisted.LatestApprovedVersionID)
+}
+
+func TestNewVersionObsolescenceFailureRollsBackHeadAndStatusReset(t *testing.T) {
+	svc, _, db, _ := newProductionDocumentServiceFixture(t)
+	document := createServiceDocument(t, svc)
+	reviewedVersion, err := svc.AppendVersion(productionDocumentContext(7), document.ID, interfaces.AppendProductionVersionInput{
+		ParentVersionID: *document.CurrentVersionID, SourceSetID: documentServiceSetID,
+		Origin: types.ProductionDocumentOriginHuman,
+		Blocks: governedServiceBlocks(governedServiceParagraph("reviewed-rollback", `"reviewed"`)),
+	})
+	require.NoError(t, err)
+	requestID := "83000000-0000-4000-8000-000000000011"
+	stepID := "83000000-0000-4000-8000-000000000012"
+	require.NoError(t, db.Exec(`
+INSERT INTO production_review_requests
+    (id, tenant_id, project_id, document_id, version_id, policy_snapshot, policy_digest, submitted_by)
+VALUES (?, 7, ?, ?, ?, '{"steps":["business_reviewer"]}', ?, ?)
+`, requestID, documentServiceProjectID, document.ID, reviewedVersion.ID, strings.Repeat("b", 64), productionReviewAuthorID).Error)
+	require.NoError(t, db.Exec(`
+INSERT INTO production_review_steps
+    (id, review_request_id, tenant_id, project_id, document_id, version_id, required_role, sequence)
+VALUES (?, ?, 7, ?, ?, ?, 'business_reviewer', 1)
+`, stepID, requestID, documentServiceProjectID, document.ID, reviewedVersion.ID).Error)
+	require.NoError(t, db.Model(&types.ProductionDocument{}).Where("id = ?", document.ID).
+		UpdateColumn("status", types.ProductionDocumentInReview).Error)
+	require.NoError(t, db.Exec(`
+CREATE TRIGGER fail_service_review_obsolescence
+BEFORE UPDATE OF decision ON production_review_steps
+FOR EACH ROW
+WHEN NEW.decision = 'cancelled'
+BEGIN
+    SELECT RAISE(ABORT, 'forced service review obsolescence failure');
+END`).Error)
+
+	newVersion, err := svc.AppendVersion(productionDocumentContext(7), document.ID, interfaces.AppendProductionVersionInput{
+		ParentVersionID: reviewedVersion.ID, SourceSetID: documentServiceSetID,
+		Origin: types.ProductionDocumentOriginHuman,
+		Blocks: governedServiceBlocks(governedServiceParagraph("new-version-rollback", `"new version"`)),
+	})
+
+	require.Nil(t, newVersion)
+	require.ErrorContains(t, err, "forced service review obsolescence failure")
+	var persisted types.ProductionDocument
+	require.NoError(t, db.First(&persisted, "id = ?", document.ID).Error)
+	require.Equal(t, reviewedVersion.ID, *persisted.CurrentVersionID)
+	require.Equal(t, types.ProductionDocumentInReview, persisted.Status)
+	var review types.ProductionReviewRequest
+	require.NoError(t, db.First(&review, "id = ?", requestID).Error)
+	require.Equal(t, types.ProductionReviewStatus(types.ProductionReviewPending), review.Status)
+	require.Equal(t, int64(2), countServiceRows(t, db, &types.ProductionDocumentVersion{}))
 }
 
 func TestProductionDocumentServiceBindsInternalPrincipalToAIProvenance(t *testing.T) {
@@ -427,6 +483,10 @@ func TestProductionDocumentDirectServiceAuditFailureRollsBackBootstrapAndAppend(
 		svc.audit = NewAuditLogService(apprepository.NewAuditLogRepository(db))
 		document := createServiceDocument(t, svc)
 		bootstrapID := *document.CurrentVersionID
+		require.NoError(t, db.Model(&types.ProductionDocument{}).Where("id = ?", document.ID).
+			Updates(map[string]any{
+				"status": types.ProductionDocumentApproved, "latest_approved_version_id": bootstrapID,
+			}).Error)
 		require.NoError(t, installServiceAuditFailureTrigger(db))
 
 		version, err := svc.AppendVersion(productionDocumentContext(7), document.ID, interfaces.AppendProductionVersionInput{
@@ -443,6 +503,9 @@ func TestProductionDocumentDirectServiceAuditFailureRollsBackBootstrapAndAppend(
 		var persisted types.ProductionDocument
 		require.NoError(t, db.First(&persisted, "id = ?", document.ID).Error)
 		require.Equal(t, bootstrapID, *persisted.CurrentVersionID)
+		require.Equal(t, types.ProductionDocumentApproved, persisted.Status)
+		require.NotNil(t, persisted.LatestApprovedVersionID)
+		require.Equal(t, bootstrapID, *persisted.LatestApprovedVersionID)
 	})
 }
 

@@ -443,6 +443,72 @@ END`).Error)
 	require.Equal(t, bootstrap.ID, *document.CurrentVersionID)
 }
 
+func TestProductionDocumentRepositoryAppendResetsHeadGovernanceStatus(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		status         types.ProductionDocumentStatus
+		latestApproved bool
+	}{
+		{name: "in review", status: types.ProductionDocumentInReview},
+		{name: "approved", status: types.ProductionDocumentApproved, latestApproved: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			repo, _, db := newProductionDocumentRepoFixture(t)
+			first := createDocumentAndFirstVersion(t, repo)
+			updates := map[string]any{"status": test.status}
+			if test.latestApproved {
+				updates["latest_approved_version_id"] = first.ID
+			}
+			require.NoError(t, db.Model(&types.ProductionDocument{}).
+				Where("id = ?", documentID).Updates(updates).Error)
+			second := productionVersion(secondVersionID, stringPointer(first.ID), productionBlock("block-row-2", "block-a", `"second"`))
+
+			require.NoError(t, repo.AppendVersion(context.Background(), second, second.Blocks, nil))
+
+			document, err := repo.GetDocument(context.Background(), 7, documentID)
+			require.NoError(t, err)
+			require.Equal(t, second.ID, *document.CurrentVersionID)
+			require.Equal(t, types.ProductionDocumentDraft, document.Status)
+			if test.latestApproved {
+				require.NotNil(t, document.LatestApprovedVersionID)
+				require.Equal(t, first.ID, *document.LatestApprovedVersionID)
+			} else {
+				require.Nil(t, document.LatestApprovedVersionID)
+			}
+		})
+	}
+}
+
+func TestProductionDocumentRepositoryStatusResetFailureRollsBackNewHead(t *testing.T) {
+	repo, _, db := newProductionDocumentRepoFixture(t)
+	first := createDocumentAndFirstVersion(t, repo)
+	require.NoError(t, db.Model(&types.ProductionDocument{}).Where("id = ?", documentID).
+		Updates(map[string]any{
+			"status": types.ProductionDocumentApproved, "latest_approved_version_id": first.ID,
+		}).Error)
+	require.NoError(t, db.Exec(`
+CREATE TRIGGER fail_production_document_status_reset
+BEFORE UPDATE OF status ON production_documents
+FOR EACH ROW
+WHEN OLD.status = 'approved' AND NEW.status = 'draft'
+BEGIN
+    SELECT RAISE(ABORT, 'forced document status reset failure');
+END`).Error)
+	second := productionVersion(secondVersionID, stringPointer(first.ID), productionBlock("block-row-2", "block-a", `"second"`))
+
+	err := repo.AppendVersion(context.Background(), second, second.Blocks, nil)
+
+	require.ErrorContains(t, err, "forced document status reset failure")
+	document, loadErr := repo.GetDocument(context.Background(), 7, documentID)
+	require.NoError(t, loadErr)
+	require.Equal(t, first.ID, *document.CurrentVersionID)
+	require.Equal(t, types.ProductionDocumentApproved, document.Status)
+	require.Equal(t, first.ID, *document.LatestApprovedVersionID)
+	var count int64
+	require.NoError(t, db.Model(&types.ProductionDocumentVersion{}).Count(&count).Error)
+	require.Equal(t, int64(2), count)
+}
+
 func TestProductionDocumentRepositoryJoinsSharedTransactionContext(t *testing.T) {
 	repo, _, db := newProductionDocumentRepoFixture(t)
 	errRollback := context.Canceled
@@ -573,8 +639,8 @@ func TestProductionDocumentRepositoryPostgresRollsBackOnFinalHeadUpdateFailure(t
 		).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	forced := errors.New("forced final head update failure")
-	mock.ExpectExec(`UPDATE "production_documents" SET "current_version_id"=\$1 WHERE id = \$2 AND current_version_id IS NULL`).
-		WithArgs(firstVersionID, documentID).
+	mock.ExpectExec(`UPDATE "production_documents" SET "current_version_id"=\$1,"status"=\$2,"updated_at"=\$3 WHERE id = \$4 AND current_version_id IS NULL`).
+		WithArgs(firstVersionID, types.ProductionDocumentDraft, sqlmock.AnyArg(), documentID).
 		WillReturnError(forced)
 	mock.ExpectRollback()
 

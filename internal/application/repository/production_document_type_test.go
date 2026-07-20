@@ -4,10 +4,13 @@ import (
 	"context"
 	"testing"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 func newProductionDocumentTypeRepoTestDB(
@@ -131,4 +134,59 @@ func TestProductionDocumentTypeRepositoryDuplicateLiveVersionReturnsConflict(t *
 	err := repo.Create(context.Background(), productionDocumentType("type-2", 7, "baseline", 1))
 
 	require.ErrorIs(t, err, types.ErrProductionConflict)
+}
+
+func TestProductionDocumentTypeRepositoryPostgresLocksExactActiveReviewPolicy(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	mock.ExpectBegin()
+	query := `SELECT \* FROM "production_document_types" WHERE .*tenant_id = \$1 AND id = \$2 AND schema_version = \$3 AND status = \$4.*FOR SHARE`
+	mock.ExpectQuery(query).
+		WithArgs(uint64(7), "type-1", 3, types.ProductionDocumentTypeActive, 1).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "schema_version", "status", "review_policy"}).
+			AddRow("type-1", 7, 3, string(types.ProductionDocumentTypeActive), `{"steps":["business_reviewer"]}`))
+	mock.ExpectCommit()
+
+	got, err := NewProductionDocumentTypeRepository(db).GetActiveByIDForReview(
+		context.Background(), 7, "type-1", 3,
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, "type-1", got.ID)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestProductionDocumentTypeRepositorySQLiteReservesWriterBeforeReviewPolicyRead(t *testing.T) {
+	repo, db := newProductionDocumentTypeRepoTestDB(t)
+	active := productionDocumentType("type-review", 7, "review", 3)
+	active.Status = types.ProductionDocumentTypeActive
+	active.ReviewPolicy = types.JSON(`{"steps":["business_reviewer"]}`)
+	require.NoError(t, db.Create(active).Error)
+	require.NoError(t, db.Exec(`CREATE TABLE review_policy_lock_probe (count INTEGER NOT NULL)`).Error)
+	require.NoError(t, db.Exec(`INSERT INTO review_policy_lock_probe (count) VALUES (0)`).Error)
+	require.NoError(t, db.Exec(`
+CREATE TRIGGER capture_review_policy_writer_reservation
+BEFORE UPDATE OF status ON production_document_types
+FOR EACH ROW
+WHEN OLD.id = 'type-review' AND OLD.status = 'active' AND NEW.status = 'active'
+BEGIN
+    UPDATE review_policy_lock_probe SET count = count + 1;
+END`).Error)
+
+	got, err := repo.GetActiveByIDForReview(context.Background(), 7, active.ID, 3)
+
+	require.NoError(t, err)
+	require.Equal(t, active.ID, got.ID)
+	var reservations int
+	require.NoError(t, db.Raw(`SELECT count FROM review_policy_lock_probe`).Scan(&reservations).Error)
+	require.Equal(t, 1, reservations)
+
+	require.NoError(t, db.Model(&types.ProductionDocumentType{}).Where("id = ?", active.ID).
+		UpdateColumn("status", types.ProductionDocumentTypeRetired).Error)
+	got, err = repo.GetActiveByIDForReview(context.Background(), 7, active.ID, 3)
+	require.Nil(t, got)
+	require.ErrorIs(t, err, types.ErrProductionDocumentTypeInactive)
 }

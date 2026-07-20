@@ -14,6 +14,7 @@ import (
 	"time"
 
 	apprepository "github.com/Tencent/WeKnora/internal/application/repository"
+	"github.com/Tencent/WeKnora/internal/database"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/stretchr/testify/require"
@@ -46,6 +47,50 @@ type productionReviewFixture struct {
 	documents interfaces.ProductionDocumentRepository
 	members   *productionMemberServiceStub
 	audit     *productionAuditServiceStub
+}
+
+type retiringProductionDocumentTypeRepository struct {
+	interfaces.ProductionDocumentTypeRepository
+	db *gorm.DB
+}
+
+func (r *retiringProductionDocumentTypeRepository) GetByID(
+	ctx context.Context,
+	tenantID uint64,
+	documentTypeID string,
+) (*types.ProductionDocumentType, error) {
+	documentType, err := r.ProductionDocumentTypeRepository.GetByID(ctx, tenantID, documentTypeID)
+	if err != nil {
+		return nil, err
+	}
+	err = database.DBFromContext(ctx, r.db).WithContext(ctx).
+		Model(&types.ProductionDocumentType{}).
+		Where("tenant_id = ? AND id = ?", tenantID, documentTypeID).
+		UpdateColumn("status", types.ProductionDocumentTypeRetired).Error
+	return documentType, err
+}
+
+func (r *retiringProductionDocumentTypeRepository) GetActiveByIDForReview(
+	ctx context.Context,
+	tenantID uint64,
+	documentTypeID string,
+	schemaVersion int,
+) (*types.ProductionDocumentType, error) {
+	db := database.DBFromContext(ctx, r.db).WithContext(ctx)
+	if err := db.Model(&types.ProductionDocumentType{}).
+		Where("tenant_id = ? AND id = ?", tenantID, documentTypeID).
+		UpdateColumn("status", types.ProductionDocumentTypeRetired).Error; err != nil {
+		return nil, err
+	}
+	var documentType types.ProductionDocumentType
+	err := db.Where(
+		"tenant_id = ? AND id = ? AND schema_version = ? AND status = ?",
+		tenantID, documentTypeID, schemaVersion, types.ProductionDocumentTypeActive,
+	).First(&documentType).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, types.ErrProductionDocumentTypeInactive
+	}
+	return &documentType, err
 }
 
 func newProductionReviewFixture(t *testing.T) *productionReviewFixture {
@@ -284,6 +329,23 @@ func TestProductionReviewSubmissionRequiresExactCurrentVersion(t *testing.T) {
 	)
 	require.Nil(t, request)
 	require.ErrorIs(t, err, types.ErrProductionReviewScopeInvalid)
+}
+
+func TestProductionReviewSubmissionRejectsTypeRetiredAfterInitialRead(t *testing.T) {
+	fixture := newProductionReviewFixture(t)
+	fixture.svc.documentTypes = &retiringProductionDocumentTypeRepository{
+		ProductionDocumentTypeRepository: fixture.svc.documentTypes,
+		db:                               fixture.db,
+	}
+
+	request, err := fixture.svc.Submit(
+		productionReviewServiceContext(productionReviewAuthorID, types.TenantRoleContributor),
+		productionReviewDocumentID, productionReviewVersionID,
+	)
+
+	require.Nil(t, request)
+	require.ErrorIs(t, err, types.ErrProductionDocumentTypeInactive)
+	require.Zero(t, countServiceRows(t, fixture.db, &types.ProductionReviewRequest{}))
 }
 
 func TestProductionReviewRevokedSubmitterRoleAtMutationBoundaryCannotSubmit(t *testing.T) {

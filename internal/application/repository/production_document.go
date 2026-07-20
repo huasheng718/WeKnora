@@ -464,7 +464,11 @@ func (r *productionDocumentRepository) AppendVersion(
 		} else {
 			update = update.Where("current_version_id = ?", *document.CurrentVersionID)
 		}
-		result := update.UpdateColumn("current_version_id", version.ID)
+		result := update.Updates(map[string]any{
+			"current_version_id": version.ID,
+			"status":             types.ProductionDocumentDraft,
+			"updated_at":         now,
+		})
 		if result.Error != nil {
 			return translateProductionDocumentError(result.Error)
 		}

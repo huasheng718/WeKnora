@@ -72,6 +72,22 @@ func (r *productionDocumentTypeRepoStub) GetByID(_ context.Context, tenantID uin
 	return nil, gorm.ErrRecordNotFound
 }
 
+func (r *productionDocumentTypeRepoStub) GetActiveByIDForReview(
+	ctx context.Context,
+	tenantID uint64,
+	documentTypeID string,
+	schemaVersion int,
+) (*types.ProductionDocumentType, error) {
+	documentType, err := r.GetByID(ctx, tenantID, documentTypeID)
+	if err != nil {
+		return nil, err
+	}
+	if documentType.Status != types.ProductionDocumentTypeActive || documentType.SchemaVersion != schemaVersion {
+		return nil, types.ErrProductionDocumentTypeInactive
+	}
+	return documentType, nil
+}
+
 func (r *productionDocumentTypeRepoStub) GetActiveByCode(_ context.Context, tenantID uint64, code string) (*types.ProductionDocumentType, error) {
 	r.activeCalls++
 	if r.activeErr != nil {

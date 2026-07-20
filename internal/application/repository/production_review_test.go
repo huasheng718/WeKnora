@@ -298,7 +298,7 @@ func TestProductionReviewPostgresVersionLockScopesExactImmutableVersion(t *testi
 
 func TestProductionReviewRepositoryExactTaskFourSurface(t *testing.T) {
 	repositoryType := reflect.TypeOf((*interfaces.ProductionReviewRepository)(nil)).Elem()
-	require.Equal(t, 11, repositoryType.NumMethod())
+	require.Equal(t, 12, repositoryType.NumMethod())
 	methods := make([]string, 0, repositoryType.NumMethod())
 	for index := range repositoryType.NumMethod() {
 		methods = append(methods, repositoryType.Method(index).Name)
@@ -309,6 +309,7 @@ func TestProductionReviewRepositoryExactTaskFourSurface(t *testing.T) {
 		"ResolveAnnotation",
 		"CountOpenBlocking",
 		"CreateReview",
+		"LockCurrentReviewVersion",
 		"CreateCurrentReview",
 		"GetReview",
 		"DecideStep",
