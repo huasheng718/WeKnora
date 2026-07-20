@@ -4,16 +4,19 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	apprepository "github.com/Tencent/WeKnora/internal/application/repository"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/hibiken/asynq"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -34,6 +37,7 @@ const (
 
 type projectionBuilderReleaseRepo struct {
 	interfaces.ProductionReleaseRepository
+	mu          sync.Mutex
 	target      *types.ProductionReleaseTarget
 	release     *types.ProductionRelease
 	events      *[]string
@@ -41,6 +45,8 @@ type projectionBuilderReleaseRepo struct {
 }
 
 func (r *projectionBuilderReleaseRepo) GetTarget(context.Context, uint64, string) (*types.ProductionReleaseTarget, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	*r.events = append(*r.events, "target.persisted")
 	copyTarget := *r.target
 	return &copyTarget, nil
@@ -54,6 +60,8 @@ func (r *projectionBuilderReleaseRepo) GetRelease(context.Context, uint64, strin
 func (r *projectionBuilderReleaseRepo) TransitionTarget(
 	_ context.Context, _ string, _, to types.ProductionReleaseTargetStatus, _ types.JSONMap,
 ) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.transitions = append(r.transitions, to)
 	r.target.Status = to
 	return true, nil
@@ -116,6 +124,21 @@ type projectionBuilderKnowledgeService struct {
 	events   *[]string
 	existing *types.Knowledge
 	created  *types.ProductionProjectionKnowledgePayload
+}
+
+type projectionBuilderDelegatingKnowledgeService struct {
+	interfaces.KnowledgeService
+	delegate *knowledgeService
+}
+
+func (s *projectionBuilderDelegatingKnowledgeService) GetKnowledgeByID(context.Context, string) (*types.Knowledge, error) {
+	return nil, apprepository.ErrKnowledgeNotFound
+}
+
+func (s *projectionBuilderDelegatingKnowledgeService) CreateKnowledgeFromProductionProjection(
+	ctx context.Context, payload *types.ProductionProjectionKnowledgePayload,
+) (*types.Knowledge, error) {
+	return s.delegate.CreateKnowledgeFromProductionProjection(ctx, payload)
 }
 
 func (s *projectionBuilderKnowledgeService) GetKnowledgeByID(context.Context, string) (*types.Knowledge, error) {
@@ -320,6 +343,51 @@ func TestProjectionBuildRetryReturnsExistingOwnedKnowledgeWithoutDuplicateEnqueu
 	require.NoError(t, err)
 	require.Equal(t, first.ID, second.ID)
 	require.Nil(t, fixture.knowledge.created)
+}
+
+func TestProjectionBuildConcurrentPendingReplaysClaimOneEnqueueAttempt(t *testing.T) {
+	fixture := newProjectionBuilderFixture(t)
+	pending, err := fixture.builder.Build(projectionBuildContext(), projectionTargetID)
+	require.NoError(t, err)
+	tracker, spanDB := setupConcurrentSpanTrackerTest(t, pending.TenantID, pending.ID)
+	tasks := &manualAttemptRetryEnqueuer{accepted: make(map[string]*asynq.Task)}
+	realService := &knowledgeService{
+		repo: &initialPostProcessKnowledgeRepo{knowledge: pending}, task: tasks, spanTracker: tracker,
+	}
+	fixture.builder.knowledge = &projectionBuilderDelegatingKnowledgeService{delegate: realService}
+
+	const builders = 16
+	start := make(chan struct{})
+	errCh := make(chan error, builders)
+	var builds sync.WaitGroup
+	for range builders {
+		builds.Add(1)
+		go func() {
+			defer builds.Done()
+			<-start
+			_, buildErr := fixture.builder.Build(projectionBuildContext(), projectionTargetID)
+			errCh <- buildErr
+		}()
+	}
+	close(start)
+	builds.Wait()
+	close(errCh)
+	for buildErr := range errCh {
+		require.NoError(t, buildErr)
+	}
+
+	manualTaskID := productionProjectionTaskID(projectionTargetID, projectionKnowledgeID, "build")
+	manualTask := tasks.accepted[manualTaskID]
+	require.NotNil(t, manualTask)
+	var payload types.ManualProcessPayload
+	require.NoError(t, json.Unmarshal(manualTask.Payload(), &payload))
+	require.Equal(t, tracker.LatestAttempt(projectionBuildContext(), pending.ID), payload.Attempt)
+	var roots int64
+	require.NoError(t, spanDB.Model(&types.KnowledgeProcessingSpan{}).
+		Where("knowledge_id = ? AND kind = ?", pending.ID, types.SpanKindRoot).
+		Count(&roots).Error)
+	require.Equal(t, int64(1), roots)
+	require.Len(t, tasks.accepted, 1)
 }
 
 func TestProjectionBuildReplayRejectsTamperedPersistedManualContent(t *testing.T) {

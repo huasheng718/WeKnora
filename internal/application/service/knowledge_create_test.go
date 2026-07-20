@@ -177,7 +177,8 @@ func (s *createKnowledgeTaskEnqueuerStub) Enqueue(
 func TestCreateKnowledgeFromProductionProjectionUsesReservedIDAndImmutableMetadata(t *testing.T) {
 	repo := &createKnowledgeFileRepoStub{}
 	tasks := &createKnowledgeTaskEnqueuerStub{}
-	tracker, _ := setupSpanTrackerTest(t)
+	tracker, spanDB := setupSpanTrackerTest(t)
+	seedSpanTrackerKnowledgeTest(t, spanDB, 1, "93000000-0000-4000-8000-000000000007")
 	svc := &knowledgeService{
 		repo: repo,
 		kbService: &createKnowledgeFileKBServiceStub{kb: &types.KnowledgeBase{
@@ -288,7 +289,8 @@ func TestCreateKnowledgeFromProductionProjectionRetriesFailedOwnedKnowledgeOnce(
 	require.NoError(t, owned.SetManualMetadata(meta))
 	repo := &createKnowledgeFileRepoStub{existingKnowledge: owned}
 	tasks := &createKnowledgeTaskEnqueuerStub{}
-	tracker, _ := setupSpanTrackerTest(t)
+	tracker, spanDB := setupSpanTrackerTest(t)
+	seedSpanTrackerKnowledgeTest(t, spanDB, owned.TenantID, owned.ID)
 	svc := &knowledgeService{repo: repo, task: tasks, spanTracker: tracker}
 
 	got, err := svc.CreateKnowledgeFromProductionProjection(
@@ -322,7 +324,8 @@ func TestCreateKnowledgeFromProductionProjectionRearmsPendingWithDeterministicTa
 	require.NoError(t, owned.SetManualMetadata(meta))
 	repo := &createKnowledgeFileRepoStub{existingKnowledge: owned}
 	tasks := &createKnowledgeTaskEnqueuerStub{}
-	tracker, _ := setupSpanTrackerTest(t)
+	tracker, spanDB := setupSpanTrackerTest(t)
+	seedSpanTrackerKnowledgeTest(t, spanDB, owned.TenantID, owned.ID)
 	svc := &knowledgeService{repo: repo, task: tasks, spanTracker: tracker}
 	payload := &types.ProductionProjectionKnowledgePayload{
 		KnowledgeID: "knowledge-1", KnowledgeBaseID: "kb-1", Content: "# owned",
@@ -356,7 +359,8 @@ func TestCreateKnowledgeFromProductionProjectionTreatsRetryTaskConflictAsDurable
 	require.NoError(t, owned.SetManualMetadata(meta))
 	repo := &createKnowledgeFileRepoStub{existingKnowledge: owned}
 	tasks := &createKnowledgeTaskEnqueuerStub{enqueueErr: asynq.ErrTaskIDConflict}
-	tracker, _ := setupSpanTrackerTest(t)
+	tracker, spanDB := setupSpanTrackerTest(t)
+	seedSpanTrackerKnowledgeTest(t, spanDB, owned.TenantID, owned.ID)
 	svc := &knowledgeService{repo: repo, task: tasks, spanTracker: tracker}
 
 	_, err := svc.CreateKnowledgeFromProductionProjection(newCreateKnowledgeFileContext(), &types.ProductionProjectionKnowledgePayload{

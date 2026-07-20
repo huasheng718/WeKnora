@@ -11,6 +11,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/hibiken/asynq"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 type initialPostProcessKnowledgeRepo struct {
@@ -286,9 +287,10 @@ func TestOrdinaryMultimodalPostProcessEnqueueFailureRemainsBestEffort(t *testing
 
 func TestProductionProjectionManualRetryReusesPersistedAttempt(t *testing.T) {
 	t.Setenv("RETRIEVE_DRIVER", "")
-	tracker, _ := setupSpanTrackerTest(t)
+	tracker, spanDB := setupSpanTrackerTest(t)
 	queueErr := errors.New("post-process enqueue response lost")
 	knowledge := initialPostProcessProjectionKnowledge(t, types.ParseStatusPending)
+	seedSpanTrackerKnowledgeTest(t, spanDB, knowledge.TenantID, knowledge.ID)
 	repo := &initialPostProcessKnowledgeRepo{knowledge: knowledge}
 	tasks := &manualAttemptRetryEnqueuer{
 		accepted:                make(map[string]*asynq.Task),
@@ -329,8 +331,9 @@ func TestProductionProjectionManualRetryReusesPersistedAttempt(t *testing.T) {
 }
 
 func TestProductionProjectionFailedRetryAllocatesFreshPersistedAttempt(t *testing.T) {
-	tracker, _ := setupSpanTrackerTest(t)
+	tracker, spanDB := setupSpanTrackerTest(t)
 	knowledge := initialPostProcessProjectionKnowledge(t, types.ParseStatusPending)
+	seedSpanTrackerKnowledgeTest(t, spanDB, knowledge.TenantID, knowledge.ID)
 	tasks := &initialPostProcessEnqueuer{}
 	service := &knowledgeService{task: tasks, spanTracker: tracker}
 
@@ -380,4 +383,148 @@ func TestOrdinaryManualEnqueueReusesPresetReparseAttempt(t *testing.T) {
 	require.Equal(t, reparseAttempt, payload.Attempt)
 	require.Equal(t, reparseAttempt, tracker.LatestAttempt(context.Background(), knowledge.ID),
 		"enqueue must not allocate a second attempt after reparse already opened one")
+}
+
+func TestProductionProjectionConcurrentPendingBuildEnqueueClaimsOneAttempt(t *testing.T) {
+	t.Setenv("RETRIEVE_DRIVER", "")
+	knowledge := initialPostProcessProjectionKnowledge(t, types.ParseStatusPending)
+	tracker, spanDB := setupConcurrentSpanTrackerTest(t, knowledge.TenantID, knowledge.ID)
+	repo := &initialPostProcessKnowledgeRepo{knowledge: knowledge}
+	tasks := &manualAttemptRetryEnqueuer{accepted: make(map[string]*asynq.Task)}
+	service := &knowledgeService{
+		repo: repo,
+		kbService: &initialPostProcessKBService{kb: &types.KnowledgeBase{
+			ID: knowledge.KnowledgeBaseID, TenantID: knowledge.TenantID,
+		}},
+		tenantRepo:   &initialPostProcessTenantRepo{},
+		chunkService: &initialPostProcessChunkService{},
+		graphEngine:  &initialPostProcessGraphRepo{},
+		task:         tasks,
+		spanTracker:  tracker,
+	}
+	meta, err := knowledge.ManualMetadata()
+	require.NoError(t, err)
+	overrides, err := knowledge.ProcessOverrides()
+	require.NoError(t, err)
+	payload := &types.ProductionProjectionKnowledgePayload{
+		KnowledgeID: knowledge.ID, KnowledgeBaseID: knowledge.KnowledgeBaseID,
+		Title: "Projection", Content: meta.Content, SummaryModelID: meta.ProductionProjection.SummaryModelID,
+		IndexingStrategy: meta.ProductionProjection.IndexingStrategy, ProcessOverrides: overrides,
+		ProductionProjection: meta.ProductionProjection,
+	}
+	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, knowledge.TenantID)
+
+	const builders = 16
+	start := make(chan struct{})
+	errs := make(chan error, builders)
+	var builds sync.WaitGroup
+	for range builders {
+		builds.Add(1)
+		go func() {
+			defer builds.Done()
+			<-start
+			_, buildErr := service.CreateKnowledgeFromProductionProjection(ctx, payload)
+			errs <- buildErr
+		}()
+	}
+	close(start)
+	builds.Wait()
+	close(errs)
+	for buildErr := range errs {
+		require.NoError(t, buildErr)
+	}
+
+	manualTaskID := "production-projection-build-target-1-projection-knowledge-1"
+	manualTask := tasks.accepted[manualTaskID]
+	require.NotNil(t, manualTask)
+	var acceptedPayload types.ManualProcessPayload
+	require.NoError(t, json.Unmarshal(manualTask.Payload(), &acceptedPayload))
+	latestAttempt := tracker.LatestAttempt(ctx, knowledge.ID)
+	require.Equal(t, latestAttempt, acceptedPayload.Attempt)
+	require.False(t, attemptSuperseded(ctx, tracker, knowledge.ID, acceptedPayload.Attempt))
+
+	var rootCount int64
+	require.NoError(t, spanDB.Table("knowledge_processing_spans").
+		Where("knowledge_id = ? AND kind = ?", knowledge.ID, types.SpanKindRoot).
+		Count(&rootCount).Error)
+	require.Equal(t, int64(1), rootCount)
+	require.Len(t, tasks.accepted, 1, "only one deterministic manual task may be accepted")
+	require.NoError(t, service.ProcessManualUpdate(context.Background(), manualTask),
+		"the queue winner must remain on the latest attempt through finalization dispatch")
+	postProcessTaskID := "production-projection-post-process-attempt-1-target-1-projection-knowledge-1"
+	postProcessTask := tasks.accepted[postProcessTaskID]
+	require.NotNil(t, postProcessTask)
+	var postProcessPayload types.KnowledgePostProcessPayload
+	require.NoError(t, json.Unmarshal(postProcessTask.Payload(), &postProcessPayload))
+	require.Equal(t, acceptedPayload.Attempt, postProcessPayload.Attempt)
+	require.False(t, attemptSuperseded(ctx, tracker, knowledge.ID, postProcessPayload.Attempt))
+}
+
+func requireManualAttemptRootState(
+	t *testing.T, db *gorm.DB, knowledgeID string, attempt int, status, errorCode string,
+) {
+	t.Helper()
+	var root types.KnowledgeProcessingSpan
+	require.NoError(t, db.Table("knowledge_processing_spans").
+		Where("knowledge_id = ? AND attempt = ? AND kind = ?", knowledgeID, attempt, types.SpanKindRoot).
+		Take(&root).Error)
+	require.Equal(t, status, root.Status)
+	require.Equal(t, errorCode, root.ErrorCode)
+}
+
+func TestProductionProjectionManualMarshalFailureFinalizesClaimedAttempt(t *testing.T) {
+	knowledge := initialPostProcessProjectionKnowledge(t, types.ParseStatusPending)
+	tracker, spanDB := setupConcurrentSpanTrackerTest(t, knowledge.TenantID, knowledge.ID)
+	service := &knowledgeService{task: &initialPostProcessEnqueuer{}, spanTracker: tracker}
+	marshalErr := errors.New("manual payload cannot be encoded")
+
+	err := service.enqueueManualProcessingWithEncoder(
+		context.Background(), knowledge, "# governed projection", false,
+		func(types.ManualProcessPayload) ([]byte, error) { return nil, marshalErr },
+	)
+	require.ErrorIs(t, err, marshalErr)
+	requireManualAttemptRootState(t, spanDB, knowledge.ID, 1, types.SpanStatusFailed, "MANUAL_TASK_PAYLOAD_MARSHAL_FAILED")
+}
+
+func TestOrdinaryManualDefinitiveEnqueueFailureFinalizesNewAttempt(t *testing.T) {
+	tracker, spanDB := setupSpanTrackerTest(t)
+	knowledge := &types.Knowledge{
+		ID: "ordinary-enqueue-failure", TenantID: 1, KnowledgeBaseID: "kb-1", Type: types.KnowledgeTypeManual,
+	}
+	queueErr := errors.New("queue rejected task")
+	service := &knowledgeService{
+		task: &initialPostProcessEnqueuer{errors: []error{queueErr}}, spanTracker: tracker,
+	}
+
+	err := service.enqueueManualProcessing(context.Background(), knowledge, "# ordinary", false)
+	require.ErrorIs(t, err, queueErr)
+	requireManualAttemptRootState(t, spanDB, knowledge.ID, 1, types.SpanStatusFailed, "MANUAL_TASK_ENQUEUE_FAILED")
+}
+
+func TestOrdinaryManualReparseEnqueueFailureFinalizesPresetAttempt(t *testing.T) {
+	tracker, spanDB := setupSpanTrackerTest(t)
+	knowledge := &types.Knowledge{
+		ID: "ordinary-reparse-failure", TenantID: 1, KnowledgeBaseID: "kb-1", Type: types.KnowledgeTypeManual,
+	}
+	_, attempt, err := tracker.OpenAttempt(context.Background(), knowledge.ID, "")
+	require.NoError(t, err)
+	queueErr := errors.New("queue rejected reparse")
+	service := &knowledgeService{
+		task: &initialPostProcessEnqueuer{errors: []error{queueErr}}, spanTracker: tracker,
+	}
+
+	err = service.enqueueManualProcessing(context.Background(), knowledge, "# ordinary", true, attempt)
+	require.ErrorIs(t, err, queueErr)
+	requireManualAttemptRootState(t, spanDB, knowledge.ID, attempt, types.SpanStatusFailed, "MANUAL_TASK_ENQUEUE_FAILED")
+}
+
+func TestProductionProjectionTaskIDConflictPreservesClaimedAttempt(t *testing.T) {
+	knowledge := initialPostProcessProjectionKnowledge(t, types.ParseStatusPending)
+	tracker, spanDB := setupConcurrentSpanTrackerTest(t, knowledge.TenantID, knowledge.ID)
+	service := &knowledgeService{
+		task: &initialPostProcessEnqueuer{errors: []error{asynq.ErrTaskIDConflict}}, spanTracker: tracker,
+	}
+
+	require.NoError(t, service.enqueueManualProcessing(context.Background(), knowledge, "# governed projection", false))
+	requireManualAttemptRootState(t, spanDB, knowledge.ID, 1, types.SpanStatusRunning, "")
 }

@@ -86,6 +86,12 @@ type SpanTracker interface {
 	// nextAttempt) and returns its number plus the root *Span. Call
 	// at the start of a parse / reparse, before any other Begin*.
 	OpenAttempt(ctx context.Context, knowledgeID, langfuseTraceID string) (root *Span, attempt int, err error)
+	// ClaimPendingAttempt atomically reuses the running root for concurrent
+	// pending projection replays or creates the first root under a tenant-scoped
+	// Knowledge row lock.
+	ClaimPendingAttempt(ctx context.Context, tenantID uint64, knowledgeID, langfuseTraceID string) (
+		root *Span, attempt int, created bool, err error,
+	)
 
 	// LatestAttempt returns the highest attempt number recorded for
 	// the knowledge, or 0 if it's never been parsed. Used by the API
@@ -283,6 +289,46 @@ func (t *spanTracker) OpenAttempt(ctx context.Context, knowledgeID, langfuseTrac
 	}, attempt, nil
 }
 
+func (t *spanTracker) ClaimPendingAttempt(
+	ctx context.Context,
+	tenantID uint64,
+	knowledgeID, langfuseTraceID string,
+) (*Span, int, bool, error) {
+	now := time.Now()
+	meta := types.JSONMap{}
+	if langfuseTraceID != "" {
+		meta["langfuse_trace_id"] = langfuseTraceID
+	}
+	row, created, err := t.repo.ClaimPendingRoot(ctx, tenantID, knowledgeID, &types.KnowledgeProcessingSpan{
+		KnowledgeID: knowledgeID,
+		SpanID:      newSpanID(),
+		Name:        "knowledge_processing",
+		Kind:        types.SpanKindRoot,
+		Status:      types.SpanStatusRunning,
+		Metadata:    meta,
+		StartedAt:   &now,
+	})
+	if err != nil {
+		return nil, 0, false, err
+	}
+	startedAt := now
+	if row.StartedAt != nil {
+		startedAt = *row.StartedAt
+	}
+	if created {
+		t.recordStart(row.SpanID, startedAt)
+		t.touchKnowledgeHeartbeat(ctx, knowledgeID, types.SpanKindRoot)
+	}
+	return &Span{
+		KnowledgeID: knowledgeID,
+		Attempt:     row.Attempt,
+		SpanID:      row.SpanID,
+		Name:        row.Name,
+		Kind:        row.Kind,
+		StartedAt:   startedAt,
+	}, row.Attempt, created, nil
+}
+
 func (t *spanTracker) LatestAttempt(ctx context.Context, knowledgeID string) int {
 	n, err := t.repo.LatestAttempt(ctx, knowledgeID)
 	if err != nil {
@@ -309,8 +355,8 @@ func (t *spanTracker) BeginStage(ctx context.Context, knowledgeID string, attemp
 		return nil
 	}
 	var (
-		rootID    string
-		existing  *types.KnowledgeProcessingSpan
+		rootID   string
+		existing *types.KnowledgeProcessingSpan
 	)
 	for i := range rows {
 		r := rows[i]
@@ -852,6 +898,9 @@ type noopSpanTracker struct{}
 
 func (noopSpanTracker) OpenAttempt(_ context.Context, _, _ string) (*Span, int, error) {
 	return nil, 0, nil
+}
+func (noopSpanTracker) ClaimPendingAttempt(_ context.Context, _ uint64, _, _ string) (*Span, int, bool, error) {
+	return nil, 0, false, nil
 }
 func (noopSpanTracker) LatestAttempt(_ context.Context, _ string) int { return 0 }
 func (noopSpanTracker) BeginStage(_ context.Context, _ string, _ int, _ string, _ types.JSONMap) *Span {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -14,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
 )
 
 // span tracker tests use a real GORM-backed repo against an in-memory
@@ -51,17 +53,49 @@ CREATE TABLE IF NOT EXISTS knowledge_processing_spans (
 );
 `
 
+const spanTrackerKnowledgeTestDDL = `
+CREATE TABLE IF NOT EXISTS knowledges (
+    id VARCHAR(64) PRIMARY KEY,
+    tenant_id INTEGER NOT NULL,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    deleted_at DATETIME
+);
+`
+
 func setupSpanTrackerTest(t *testing.T) (SpanTracker, *gorm.DB) {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
 	require.NoError(t, db.Exec(spanTrackerTestDDL).Error)
+	require.NoError(t, db.Exec(spanTrackerKnowledgeTestDDL).Error)
 	// Pass nil for the heartbeat db: these tests don't exercise
 	// heartbeat side-effects (those are covered in the housekeeping
-	// suite). Keeping it nil also avoids needing the knowledges
-	// table just to validate span behaviour.
+	// suite). Claim tests still use the minimal Knowledge table above as
+	// the tenant-scoped serialization anchor.
 	repo := repository.NewKnowledgeSpanRepository(db)
 	return NewSpanTracker(repo, nil), db
+}
+
+func seedSpanTrackerKnowledgeTest(t *testing.T, db *gorm.DB, tenantID uint64, knowledgeID string) {
+	t.Helper()
+	require.NoError(t, db.Exec(
+		`INSERT INTO knowledges (id, tenant_id) VALUES (?, ?) ON CONFLICT(id) DO NOTHING`,
+		knowledgeID, tenantID,
+	).Error)
+}
+
+func setupConcurrentSpanTrackerTest(t *testing.T, tenantID uint64, knowledgeID string) (SpanTracker, *gorm.DB) {
+	t.Helper()
+	dsn := "file:" + filepath.Join(t.TempDir(), "span-tracker.db") + "?_busy_timeout=5000&_journal_mode=WAL"
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{Logger: gormlogger.Default.LogMode(gormlogger.Silent)})
+	require.NoError(t, err)
+	require.NoError(t, db.Exec(spanTrackerTestDDL).Error)
+	require.NoError(t, db.Exec(spanTrackerKnowledgeTestDDL).Error)
+	seedSpanTrackerKnowledgeTest(t, db, tenantID, knowledgeID)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(16)
+	return NewSpanTracker(repository.NewKnowledgeSpanRepository(db), nil), db
 }
 
 // TestSpanTracker_OpenAttempt_AllocatesFreshNumbers covers the contract

@@ -1220,9 +1220,27 @@ func (s *knowledgeService) UpdateManualKnowledge(ctx context.Context,
 func (s *knowledgeService) enqueueManualProcessing(ctx context.Context,
 	knowledge *types.Knowledge, content string, needCleanup bool, presetAttempt ...int,
 ) error {
+	return s.enqueueManualProcessingWithEncoder(
+		ctx, knowledge, content, needCleanup,
+		func(payload types.ManualProcessPayload) ([]byte, error) { return json.Marshal(payload) },
+		presetAttempt...,
+	)
+}
+
+func (s *knowledgeService) enqueueManualProcessingWithEncoder(
+	ctx context.Context,
+	knowledge *types.Knowledge,
+	content string,
+	needCleanup bool,
+	encode func(types.ManualProcessPayload) ([]byte, error),
+	presetAttempt ...int,
+) error {
 	projection, integrityErr := types.ValidateProductionProjectionIntegrity(knowledge)
 	if integrityErr != nil {
 		return integrityErr
+	}
+	if encode == nil {
+		return errors.New("manual process payload encoder is required")
 	}
 	requestID, _ := types.RequestIDFromContext(ctx)
 	payload := types.ManualProcessPayload{
@@ -1234,10 +1252,21 @@ func (s *knowledgeService) enqueueManualProcessing(ctx context.Context,
 		NeedCleanup:     needCleanup,
 	}
 	langfuse.InjectTracing(ctx, &payload)
+	finalizeAttemptOnFailure := false
 	if len(presetAttempt) > 0 && presetAttempt[0] > 0 {
 		payload.Attempt = presetAttempt[0]
+		finalizeAttemptOnFailure = true
 	} else if projection != nil && !needCleanup {
-		payload.Attempt = s.tracker().LatestAttempt(ctx, knowledge.ID)
+		root, attempt, created, attemptErr := s.tracker().ClaimPendingAttempt(
+			ctx, knowledge.TenantID, knowledge.ID, payload.LangfuseTraceID,
+		)
+		if attemptErr != nil {
+			return fmt.Errorf("failed to claim production projection parse attempt: %w", attemptErr)
+		}
+		if root != nil && attempt > 0 {
+			payload.Attempt = attempt
+			finalizeAttemptOnFailure = created
+		}
 	}
 	if payload.Attempt <= 0 {
 		root, attempt, attemptErr := s.tracker().OpenAttempt(ctx, knowledge.ID, payload.LangfuseTraceID)
@@ -1248,13 +1277,22 @@ func (s *knowledgeService) enqueueManualProcessing(ctx context.Context,
 			logger.Warnf(ctx, "Failed to persist manual processing attempt for %s: %v", knowledge.ID, attemptErr)
 		} else if root != nil && attempt > 0 {
 			payload.Attempt = attempt
+			finalizeAttemptOnFailure = true
 		}
 	}
 	if projection != nil && payload.Attempt <= 0 {
 		return fmt.Errorf("failed to persist production projection parse attempt")
 	}
-	payloadBytes, err := json.Marshal(payload)
+	finalizeFailedAttempt := func(errorCode, errorMessage string) {
+		if finalizeAttemptOnFailure && payload.Attempt > 0 {
+			s.tracker().FinalizeAttempt(
+				ctx, knowledge.ID, payload.Attempt, types.SpanStatusFailed, nil, errorCode, errorMessage,
+			)
+		}
+	}
+	payloadBytes, err := encode(payload)
 	if err != nil {
+		finalizeFailedAttempt("MANUAL_TASK_PAYLOAD_MARSHAL_FAILED", "failed to marshal manual process payload")
 		return fmt.Errorf("failed to marshal manual process payload: %w", err)
 	}
 
@@ -1275,6 +1313,7 @@ func (s *knowledgeService) enqueueManualProcessing(ctx context.Context,
 		if len(enqueueOptions) != 0 && errors.Is(err, asynq.ErrTaskIDConflict) {
 			return nil
 		}
+		finalizeFailedAttempt("MANUAL_TASK_ENQUEUE_FAILED", "failed to enqueue manual process task")
 		return fmt.Errorf("failed to enqueue manual process task: %w", err)
 	}
 	logger.Infof(ctx, "Enqueued manual process task: knowledge_id=%s, asynq_id=%s", knowledge.ID, info.ID)

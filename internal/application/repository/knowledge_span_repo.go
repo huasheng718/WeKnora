@@ -3,8 +3,10 @@ package repository
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/database"
 	"github.com/Tencent/WeKnora/internal/types"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -15,12 +17,16 @@ import (
 //
 //   - Upsert covers Begin/End/Fail/Skip — every state transition routes
 //     through the same write so the row stays internally consistent.
+//   - ClaimPendingRoot serializes pending projection replays on their
+//     tenant-scoped Knowledge row and returns one shared running root.
 //   - NextAttempt allocates a new attempt for re-parses without touching
 //     historical rows. Old attempts stay queryable for post-mortem.
 //   - ListByAttempt is the only read path; the handler builds the tree
 //     in memory rather than recursing through the DB.
 type KnowledgeSpanRepository interface {
 	Upsert(ctx context.Context, row *types.KnowledgeProcessingSpan) error
+	ClaimPendingRoot(ctx context.Context, tenantID uint64, knowledgeID string,
+		candidate *types.KnowledgeProcessingSpan) (root *types.KnowledgeProcessingSpan, created bool, err error)
 	NextAttempt(ctx context.Context, knowledgeID string) (int, error)
 	LatestAttempt(ctx context.Context, knowledgeID string) (int, error)
 	ListByAttempt(ctx context.Context, knowledgeID string, attempt int) ([]types.KnowledgeProcessingSpan, error)
@@ -43,6 +49,79 @@ type KnowledgeSpanRepository interface {
 	// after asynq retry or server restart so the trace tree does not
 	// accumulate duplicate postprocess.summary / question rows.
 	CancelOpenSpansByName(ctx context.Context, knowledgeID string, attempt int, name, errorCode, reason string) (int64, error)
+}
+
+func (r *knowledgeSpanRepository) ClaimPendingRoot(
+	ctx context.Context,
+	tenantID uint64,
+	knowledgeID string,
+	candidate *types.KnowledgeProcessingSpan,
+) (*types.KnowledgeProcessingSpan, bool, error) {
+	if tenantID == 0 || knowledgeID == "" || candidate == nil || candidate.KnowledgeID != knowledgeID ||
+		candidate.SpanID == "" || candidate.Kind != types.SpanKindRoot || candidate.Status != types.SpanStatusRunning {
+		return nil, false, errors.New("knowledgeSpanRepository.ClaimPendingRoot: valid tenant, knowledge, and running root required")
+	}
+
+	var claimed *types.KnowledgeProcessingSpan
+	created := false
+	err := database.WithTransactionContext(ctx, r.db, func(txCtx context.Context) error {
+		tx := database.DBFromContext(txCtx, r.db).WithContext(txCtx)
+		switch tx.Dialector.Name() {
+		case "postgres":
+			var knowledge types.Knowledge
+			if err := tx.Model(&types.Knowledge{}).Select("id").
+				Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("tenant_id = ? AND id = ?", tenantID, knowledgeID).
+				Take(&knowledge).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return ErrKnowledgeNotFound
+				}
+				return err
+			}
+		case "sqlite":
+			result := tx.Model(&types.Knowledge{}).
+				Where("tenant_id = ? AND id = ?", tenantID, knowledgeID).
+				UpdateColumn("updated_at", gorm.Expr("updated_at"))
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return ErrKnowledgeNotFound
+			}
+		default:
+			return fmt.Errorf("unsupported span attempt claim dialect %q", tx.Dialector.Name())
+		}
+
+		var existing types.KnowledgeProcessingSpan
+		err := tx.Where("knowledge_id = ? AND kind = ?", knowledgeID, types.SpanKindRoot).
+			Order("attempt DESC, id DESC").Take(&existing).Error
+		if err == nil && existing.Status == types.SpanStatusRunning {
+			claimed = &existing
+			return nil
+		}
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+
+		var maxAttempt int
+		if err := tx.Model(&types.KnowledgeProcessingSpan{}).
+			Where("knowledge_id = ?", knowledgeID).
+			Select("COALESCE(MAX(attempt), 0)").Row().Scan(&maxAttempt); err != nil {
+			return err
+		}
+		row := *candidate
+		row.Attempt = maxAttempt + 1
+		if err := tx.Create(&row).Error; err != nil {
+			return err
+		}
+		claimed = &row
+		created = true
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return claimed, created, nil
 }
 
 type knowledgeSpanRepository struct {
