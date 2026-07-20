@@ -119,8 +119,10 @@ BEGIN
         (OLD.status = 'building' AND NEW.status NOT IN ('building', 'ready', 'failed', 'rolled_back')) OR
         (OLD.status = 'ready' AND NEW.status NOT IN ('ready', 'active', 'failed', 'rolled_back')) OR
         (OLD.status = 'active' AND NEW.status NOT IN ('active', 'failed', 'rolled_back')) OR
-        (OLD.status = 'failed' AND NEW.status NOT IN ('failed', 'building', 'rolled_back')) OR
-        (OLD.status = 'rolled_back' AND NEW.status NOT IN ('rolled_back', 'building'))
+        (OLD.status = 'failed' AND NEW.status NOT IN ('failed', 'building', 'rolled_back', 'cleanup_pending')) OR
+        (OLD.status = 'rolled_back' AND NEW.status NOT IN ('rolled_back', 'building', 'cleanup_pending')) OR
+        (OLD.status = 'cleanup_pending' AND NEW.status NOT IN ('cleanup_pending', 'cleaned')) OR
+        (OLD.status = 'cleaned' AND NEW.status <> 'cleaned')
         THEN RAISE(ABORT, 'invalid production release status transition') END;
 END;
 
@@ -163,25 +165,37 @@ BEGIN
         (OLD.status = 'building' AND NEW.status NOT IN ('building', 'ready', 'failed', 'rolled_back')) OR
         (OLD.status = 'ready' AND NEW.status NOT IN ('ready', 'active', 'failed', 'rolled_back')) OR
         (OLD.status = 'active' AND NEW.status NOT IN ('active', 'rolled_back')) OR
-        (OLD.status = 'failed' AND NEW.status NOT IN ('failed', 'building', 'cleanup_pending')) OR
+        (OLD.status = 'failed' AND NEW.status NOT IN ('failed', 'building', 'rolled_back', 'cleanup_pending')) OR
         (OLD.status = 'rolled_back' AND NEW.status NOT IN ('rolled_back', 'building', 'cleanup_pending')) OR
         (OLD.status = 'cleanup_pending' AND NEW.status NOT IN ('cleanup_pending', 'cleaned')) OR
         (OLD.status = 'cleaned' AND NEW.status <> 'cleaned')
         THEN RAISE(ABORT, 'invalid production release target status transition') END;
     SELECT CASE WHEN NEW.status IN ('building', 'ready') AND (NEW.activated_at IS NOT NULL OR NEW.failed_at IS NOT NULL OR NEW.rolled_back_at IS NOT NULL OR NEW.cleanup_requested_at IS NOT NULL OR NEW.cleaned_at IS NOT NULL OR NEW.retention_until IS NOT NULL)
         THEN RAISE(ABORT, 'building and ready production release targets must not retain lifecycle timestamps') END;
-    SELECT CASE WHEN NEW.status = 'active' AND (NEW.activated_at IS NULL OR NEW.cleanup_requested_at IS NOT NULL OR NEW.cleaned_at IS NOT NULL OR NEW.retention_until IS NOT NULL)
+    SELECT CASE WHEN NEW.status = 'active' AND (NEW.activated_at IS NULL OR NEW.failed_at IS NOT NULL OR NEW.rolled_back_at IS NOT NULL OR NEW.cleanup_requested_at IS NOT NULL OR NEW.cleaned_at IS NOT NULL OR NEW.retention_until IS NOT NULL)
         THEN RAISE(ABORT, 'active production release targets cannot be cleaned') END;
-    SELECT CASE WHEN NEW.status = 'failed' AND (NEW.failed_at IS NULL OR NEW.retention_until IS NOT datetime(NEW.failed_at, '+' || NEW.retention_days || ' days'))
+    SELECT CASE WHEN NEW.status = 'active' AND NOT EXISTS (
+        SELECT 1 FROM production_projection_heads
+        WHERE tenant_id = NEW.tenant_id AND document_id = NEW.document_id
+          AND target_knowledge_base_id = NEW.target_knowledge_base_id
+          AND active_release_target_id = NEW.id
+    ) THEN RAISE(ABORT, 'active production release targets require projection head activation') END;
+    SELECT CASE WHEN NEW.status = 'failed' AND (NEW.activated_at IS NOT NULL OR NEW.failed_at IS NULL OR NEW.rolled_back_at IS NOT NULL OR NEW.cleanup_requested_at IS NOT NULL OR NEW.cleaned_at IS NOT NULL OR NEW.retention_until IS NOT datetime(NEW.failed_at, '+' || NEW.retention_days || ' days'))
         THEN RAISE(ABORT, 'failed production release targets require retention timestamps') END;
-    SELECT CASE WHEN NEW.status = 'rolled_back' AND (NEW.rolled_back_at IS NULL OR NEW.retention_until IS NOT datetime(NEW.rolled_back_at, '+' || NEW.retention_days || ' days'))
+    SELECT CASE WHEN NEW.status = 'rolled_back' AND (NEW.activated_at IS NOT NULL OR NEW.failed_at IS NOT NULL OR NEW.rolled_back_at IS NULL OR NEW.cleanup_requested_at IS NOT NULL OR NEW.cleaned_at IS NOT NULL OR NEW.retention_until IS NOT datetime(NEW.rolled_back_at, '+' || NEW.retention_days || ' days'))
         THEN RAISE(ABORT, 'rolled back production release targets require retention timestamps') END;
-    SELECT CASE WHEN NEW.status = 'cleanup_pending' AND NEW.cleanup_requested_at IS NULL
+    SELECT CASE WHEN NEW.status = 'cleanup_pending' AND (NEW.activated_at IS NOT NULL OR NEW.cleanup_requested_at IS NULL OR NEW.cleaned_at IS NOT NULL OR ((NEW.failed_at IS NULL) = (NEW.rolled_back_at IS NULL)))
         THEN RAISE(ABORT, 'cleanup pending production release targets require timestamps') END;
-    SELECT CASE WHEN NEW.status = 'cleaned' AND NEW.cleaned_at IS NULL
+    SELECT CASE WHEN NEW.status = 'cleaned' AND (NEW.activated_at IS NOT NULL OR NEW.cleanup_requested_at IS NULL OR NEW.cleaned_at IS NULL OR ((NEW.failed_at IS NULL) = (NEW.rolled_back_at IS NULL)))
         THEN RAISE(ABORT, 'cleaned production release targets require timestamps') END;
     SELECT CASE WHEN NEW.status IN ('cleanup_pending', 'cleaned') AND (NEW.retention_until IS NULL OR NEW.retention_until > CURRENT_TIMESTAMP)
         THEN RAISE(ABORT, 'production release target retention has not expired') END;
+    SELECT CASE WHEN OLD.status = 'active' AND NEW.status <> 'active' AND EXISTS (
+        SELECT 1 FROM production_projection_heads
+        WHERE tenant_id = OLD.tenant_id AND document_id = OLD.document_id
+          AND target_knowledge_base_id = OLD.target_knowledge_base_id
+          AND active_release_target_id = OLD.id
+    ) THEN RAISE(ABORT, 'active projection heads prevent independent target deactivation') END;
 END;
 
 CREATE TRIGGER IF NOT EXISTS trg_production_release_targets_prevent_delete
@@ -209,8 +223,8 @@ BEGIN
         SELECT 1 FROM production_release_targets
         WHERE id = NEW.active_release_target_id AND tenant_id = NEW.tenant_id
           AND document_id = NEW.document_id AND target_knowledge_base_id = NEW.target_knowledge_base_id
-          AND status = 'active'
-    ) THEN RAISE(ABORT, 'production projection heads require active targets') END;
+          AND status IN ('ready', 'active')
+    ) THEN RAISE(ABORT, 'production projection heads require ready or active targets') END;
 END;
 
 CREATE TRIGGER IF NOT EXISTS trg_production_projection_heads_guard
@@ -224,8 +238,55 @@ BEGIN
         THEN RAISE(ABORT, 'production projection head updates require CAS lock versions') END;
     SELECT CASE WHEN NOT EXISTS (
         SELECT 1 FROM production_release_targets
+        WHERE id = OLD.active_release_target_id AND tenant_id = OLD.tenant_id
+          AND document_id = OLD.document_id AND target_knowledge_base_id = OLD.target_knowledge_base_id
+          AND status = 'active'
+    ) THEN RAISE(ABORT, 'production projection heads must currently reference active targets') END;
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM production_release_targets
+        WHERE id = NEW.active_release_target_id AND tenant_id = NEW.tenant_id
+          AND document_id = NEW.document_id AND target_knowledge_base_id = NEW.target_knowledge_base_id
+          AND status IN ('ready', 'active')
+    ) THEN RAISE(ABORT, 'production projection heads require ready or active targets') END;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_production_projection_heads_activate_target_insert
+    AFTER INSERT ON production_projection_heads
+    FOR EACH ROW
+BEGIN
+    UPDATE production_release_targets
+    SET status = 'active', activated_at = CURRENT_TIMESTAMP, failed_at = NULL,
+        rolled_back_at = NULL, cleanup_requested_at = NULL, cleaned_at = NULL,
+        retention_until = NULL
+    WHERE id = NEW.active_release_target_id AND status = 'ready';
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM production_release_targets
         WHERE id = NEW.active_release_target_id AND tenant_id = NEW.tenant_id
           AND document_id = NEW.document_id AND target_knowledge_base_id = NEW.target_knowledge_base_id
           AND status = 'active'
-    ) THEN RAISE(ABORT, 'production projection heads require active targets') END;
+    ) THEN RAISE(ABORT, 'production projection heads must activate selected targets') END;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_production_projection_heads_activate_target
+    AFTER UPDATE ON production_projection_heads
+    FOR EACH ROW
+BEGIN
+    UPDATE production_release_targets
+    SET status = 'rolled_back', activated_at = NULL, failed_at = NULL,
+        rolled_back_at = CURRENT_TIMESTAMP, cleanup_requested_at = NULL,
+        cleaned_at = NULL,
+        retention_until = datetime(CURRENT_TIMESTAMP, '+' || retention_days || ' days')
+    WHERE OLD.active_release_target_id <> NEW.active_release_target_id
+      AND id = OLD.active_release_target_id AND status = 'active';
+    UPDATE production_release_targets
+    SET status = 'active', activated_at = CURRENT_TIMESTAMP, failed_at = NULL,
+        rolled_back_at = NULL, cleanup_requested_at = NULL, cleaned_at = NULL,
+        retention_until = NULL
+    WHERE id = NEW.active_release_target_id AND status = 'ready';
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM production_release_targets
+        WHERE id = NEW.active_release_target_id AND tenant_id = NEW.tenant_id
+          AND document_id = NEW.document_id AND target_knowledge_base_id = NEW.target_knowledge_base_id
+          AND status = 'active'
+    ) THEN RAISE(ABORT, 'production projection heads must activate selected targets') END;
 END;

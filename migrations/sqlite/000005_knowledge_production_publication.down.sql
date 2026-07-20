@@ -1,4 +1,6 @@
 DROP TRIGGER IF EXISTS trg_production_projection_heads_guard;
+DROP TRIGGER IF EXISTS trg_production_projection_heads_activate_target;
+DROP TRIGGER IF EXISTS trg_production_projection_heads_activate_target_insert;
 DROP TRIGGER IF EXISTS trg_production_projection_heads_validate_insert;
 DROP TRIGGER IF EXISTS trg_production_release_targets_prevent_replace;
 DROP TRIGGER IF EXISTS trg_production_release_targets_prevent_delete;
