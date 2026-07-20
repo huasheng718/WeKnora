@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS production_releases (
     CONSTRAINT chk_production_releases_status CHECK (status IN ('building', 'ready', 'active', 'failed', 'rolled_back', 'cleanup_pending', 'cleaned')),
     CONSTRAINT chk_production_releases_retention CHECK (retention_days >= 1 AND retention_days <= 3650),
     UNIQUE(id, tenant_id, project_id, document_id, version_id),
+    UNIQUE(id, tenant_id, project_id, document_id, version_id, release_digest),
     UNIQUE(tenant_id, project_id, document_id, version_id),
     CONSTRAINT fk_production_releases_document_context FOREIGN KEY (document_id, tenant_id, project_id)
         REFERENCES production_documents(id, tenant_id, project_id) ON DELETE RESTRICT,
@@ -42,6 +43,7 @@ CREATE TABLE IF NOT EXISTS production_release_targets (
     release_digest VARCHAR(64) NOT NULL,
     status VARCHAR(20) NOT NULL DEFAULT 'building',
     retention_days INTEGER NOT NULL DEFAULT 30,
+    retention_until TIMESTAMP NULL,
     activated_at TIMESTAMP NULL,
     failed_at TIMESTAMP NULL,
     rolled_back_at TIMESTAMP NULL,
@@ -54,14 +56,21 @@ CREATE TABLE IF NOT EXISTS production_release_targets (
     CONSTRAINT chk_production_release_targets_retention CHECK (retention_days >= 1 AND retention_days <= 3650),
     UNIQUE(release_id, target_knowledge_base_id),
     UNIQUE(id, tenant_id, document_id, target_knowledge_base_id),
-    CONSTRAINT fk_production_release_targets_release_context FOREIGN KEY (release_id, tenant_id, project_id, document_id, version_id)
-        REFERENCES production_releases(id, tenant_id, project_id, document_id, version_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_production_release_targets_release_context FOREIGN KEY (release_id, tenant_id, project_id, document_id, version_id, release_digest)
+        REFERENCES production_releases(id, tenant_id, project_id, document_id, version_id, release_digest) ON DELETE RESTRICT,
     CONSTRAINT fk_production_release_targets_knowledge_base_context FOREIGN KEY (target_knowledge_base_id, tenant_id)
         REFERENCES knowledge_bases(id, tenant_id) ON DELETE RESTRICT
 );
 
 CREATE INDEX IF NOT EXISTS idx_production_release_targets_document_status
     ON production_release_targets (tenant_id, document_id, target_knowledge_base_id, status);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_production_release_targets_active_projection
+    ON production_release_targets (tenant_id, document_id, target_knowledge_base_id)
+    WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_production_release_targets_scope_status
+    ON production_release_targets (tenant_id, target_knowledge_base_id, status);
+CREATE INDEX IF NOT EXISTS idx_production_release_targets_cleanup_eligibility
+    ON production_release_targets (status, retention_until);
 
 CREATE TABLE IF NOT EXISTS production_projection_heads (
     tenant_id BIGINT NOT NULL,
@@ -121,6 +130,24 @@ CREATE TRIGGER trg_production_releases_guard_identity
     BEFORE UPDATE ON production_releases
     FOR EACH ROW EXECUTE FUNCTION guard_production_release_identity();
 
+CREATE OR REPLACE FUNCTION guard_production_release_status()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF (OLD.status = 'building' AND NEW.status NOT IN ('building', 'ready', 'failed', 'rolled_back')) OR
+       (OLD.status = 'ready' AND NEW.status NOT IN ('ready', 'active', 'failed', 'rolled_back')) OR
+       (OLD.status = 'active' AND NEW.status NOT IN ('active', 'failed', 'rolled_back')) OR
+       (OLD.status = 'failed' AND NEW.status NOT IN ('failed', 'building', 'rolled_back')) OR
+       (OLD.status = 'rolled_back' AND NEW.status NOT IN ('rolled_back', 'building')) THEN
+        RAISE EXCEPTION 'invalid production release status transition';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_production_releases_guard_status
+    BEFORE UPDATE OF status ON production_releases
+    FOR EACH ROW EXECUTE FUNCTION guard_production_release_status();
+
 CREATE OR REPLACE FUNCTION prevent_production_release_delete()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -150,7 +177,7 @@ CREATE OR REPLACE FUNCTION validate_production_release_target_initial_state()
 RETURNS TRIGGER AS $$
 BEGIN
     IF NEW.status <> 'building' OR NEW.activated_at IS NOT NULL OR NEW.failed_at IS NOT NULL OR
-       NEW.rolled_back_at IS NOT NULL OR NEW.cleanup_requested_at IS NOT NULL OR NEW.cleaned_at IS NOT NULL THEN
+       NEW.rolled_back_at IS NOT NULL OR NEW.cleanup_requested_at IS NOT NULL OR NEW.cleaned_at IS NOT NULL OR NEW.retention_until IS NOT NULL THEN
         RAISE EXCEPTION 'production release targets must be created building';
     END IF;
     RETURN NEW;
@@ -180,17 +207,23 @@ BEGIN
     IF (OLD.status = 'building' AND NEW.status NOT IN ('building', 'ready', 'failed', 'rolled_back')) OR
        (OLD.status = 'ready' AND NEW.status NOT IN ('ready', 'active', 'failed', 'rolled_back')) OR
        (OLD.status = 'active' AND NEW.status NOT IN ('active', 'rolled_back')) OR
-       (OLD.status = 'failed' AND NEW.status NOT IN ('failed', 'cleanup_pending')) OR
-       (OLD.status = 'rolled_back' AND NEW.status NOT IN ('rolled_back', 'cleanup_pending')) OR
+       (OLD.status = 'failed' AND NEW.status NOT IN ('failed', 'building', 'cleanup_pending')) OR
+       (OLD.status = 'rolled_back' AND NEW.status NOT IN ('rolled_back', 'building', 'cleanup_pending')) OR
        (OLD.status = 'cleanup_pending' AND NEW.status NOT IN ('cleanup_pending', 'cleaned')) OR
        (OLD.status = 'cleaned' AND NEW.status <> 'cleaned') THEN
         RAISE EXCEPTION 'invalid production release target status transition';
     END IF;
-    IF NEW.status = 'active' AND (NEW.activated_at IS NULL OR NEW.cleanup_requested_at IS NOT NULL OR NEW.cleaned_at IS NOT NULL) THEN
+    IF NEW.status IN ('building', 'ready') AND (NEW.activated_at IS NOT NULL OR NEW.failed_at IS NOT NULL OR NEW.rolled_back_at IS NOT NULL OR NEW.cleanup_requested_at IS NOT NULL OR NEW.cleaned_at IS NOT NULL OR NEW.retention_until IS NOT NULL) THEN
+        RAISE EXCEPTION 'building and ready production release targets must not retain lifecycle timestamps';
+    END IF;
+    IF NEW.status = 'active' AND (NEW.activated_at IS NULL OR NEW.cleanup_requested_at IS NOT NULL OR NEW.cleaned_at IS NOT NULL OR NEW.retention_until IS NOT NULL) THEN
         RAISE EXCEPTION 'active production release targets cannot be cleaned';
     END IF;
-    IF NEW.status = 'rolled_back' AND NEW.rolled_back_at IS NULL THEN
-        RAISE EXCEPTION 'rolled back production release targets require timestamps';
+    IF NEW.status = 'failed' AND (NEW.failed_at IS NULL OR NEW.retention_until IS DISTINCT FROM NEW.failed_at + (NEW.retention_days * INTERVAL '1 day')) THEN
+        RAISE EXCEPTION 'failed production release targets require retention timestamps';
+    END IF;
+    IF NEW.status = 'rolled_back' AND (NEW.rolled_back_at IS NULL OR NEW.retention_until IS DISTINCT FROM NEW.rolled_back_at + (NEW.retention_days * INTERVAL '1 day')) THEN
+        RAISE EXCEPTION 'rolled back production release targets require retention timestamps';
     END IF;
     IF NEW.status = 'cleanup_pending' AND NEW.cleanup_requested_at IS NULL THEN
         RAISE EXCEPTION 'cleanup pending production release targets require timestamps';
@@ -198,13 +231,8 @@ BEGIN
     IF NEW.status = 'cleaned' AND NEW.cleaned_at IS NULL THEN
         RAISE EXCEPTION 'cleaned production release targets require timestamps';
     END IF;
-    IF OLD.status = 'active' AND NEW.status <> 'active' AND EXISTS (
-        SELECT 1 FROM production_projection_heads
-        WHERE tenant_id = OLD.tenant_id AND document_id = OLD.document_id
-          AND target_knowledge_base_id = OLD.target_knowledge_base_id
-          AND active_release_target_id = OLD.id
-    ) THEN
-        RAISE EXCEPTION 'active projection heads must move before release targets';
+    IF NEW.status IN ('cleanup_pending', 'cleaned') AND (NEW.retention_until IS NULL OR NEW.retention_until > CURRENT_TIMESTAMP) THEN
+        RAISE EXCEPTION 'production release target retention has not expired';
     END IF;
     RETURN NEW;
 END;

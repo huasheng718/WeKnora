@@ -2,6 +2,7 @@ package database
 
 import (
 	"database/sql"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -1347,8 +1348,14 @@ func TestProductionPublicationPostgreSQLMigrationDeclaresReleaseAndProjectionInt
 		"FOREIGN KEY (active_release_target_id, tenant_id, document_id, target_knowledge_base_id)",
 		"REFERENCES production_release_targets(id, tenant_id, document_id, target_knowledge_base_id)",
 		"CREATE TRIGGER trg_production_releases_validate_approved_review",
+		"CREATE TRIGGER trg_production_releases_guard_status",
 		"CREATE TRIGGER trg_production_release_targets_guard",
 		"CREATE TRIGGER trg_production_projection_heads_guard",
+		"CREATE UNIQUE INDEX IF NOT EXISTS uq_production_release_targets_active_projection",
+		"CREATE INDEX IF NOT EXISTS idx_production_release_targets_scope_status",
+		"CREATE INDEX IF NOT EXISTS idx_production_release_targets_cleanup_eligibility",
+		"retention_until TIMESTAMP NULL",
+		"FOREIGN KEY (release_id, tenant_id, project_id, document_id, version_id, release_digest)",
 		"production projection heads require active targets",
 		"production projection head updates require CAS lock versions",
 	} {
@@ -1360,6 +1367,13 @@ func TestProductionPublicationPostgreSQLMigrationDeclaresReleaseAndProjectionInt
 	require.NoError(t, err)
 	require.Less(t, strings.Index(down, "DROP TABLE IF EXISTS production_projection_heads"), strings.Index(down, "DROP TABLE IF EXISTS production_release_targets"))
 	require.Less(t, strings.Index(down, "DROP TABLE IF EXISTS production_release_targets"), strings.Index(down, "DROP TABLE IF EXISTS production_releases"))
+	for _, index := range []string{
+		"uq_production_release_targets_active_projection",
+		"idx_production_release_targets_scope_status",
+		"idx_production_release_targets_cleanup_eligibility",
+	} {
+		require.Contains(t, down, "DROP INDEX IF EXISTS "+index)
+	}
 }
 
 func TestProductionPublicationSQLiteMigrationEnforcesScopedTargetsAndCASHeads(t *testing.T) {
@@ -1391,8 +1405,6 @@ func TestProductionPublicationSQLiteMigrationEnforcesScopedTargetsAndCASHeads(t 
 
 	_, err = db.Exec(`UPDATE production_projection_heads SET lock_version = 3 WHERE tenant_id = 1 AND document_id = 'document-1' AND target_knowledge_base_id = 'kb-1'`)
 	require.ErrorContains(t, err, "require CAS lock versions")
-	_, err = db.Exec(`UPDATE production_release_targets SET status = 'rolled_back', rolled_back_at = CURRENT_TIMESTAMP WHERE id = 'target-1'`)
-	require.ErrorContains(t, err, "active projection heads")
 }
 
 func TestProductionPublicationSQLiteMigrationRollsBackPopulatedSchema(t *testing.T) {
@@ -1406,6 +1418,134 @@ func TestProductionPublicationSQLiteMigrationRollsBackPopulatedSchema(t *testing
 	require.NoError(t, err)
 	for _, table := range []string{"production_projection_heads", "production_release_targets", "production_releases"} {
 		require.Empty(t, sqliteMasterSQL(t, db, "table", table))
+	}
+}
+
+func TestProductionPublicationSQLiteMigrationGuardsAggregateLifecycleTargetsRetentionAndIndexes(t *testing.T) {
+	db := openProductionPublicationSQLite(t)
+	seedProductionReleaseScope(t, db)
+	insertProductionPublicationRelease(t, db, "release-1", "version-1", "review-pub-1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+
+	for _, status := range []string{"active", "cleaned"} {
+		_, err := db.Exec(`UPDATE production_releases SET status = ? WHERE id = 'release-1'`, status)
+		require.ErrorContains(t, err, "invalid production release status transition")
+	}
+	for _, status := range []string{"ready", "active", "failed", "building", "rolled_back", "building"} {
+		_, err := db.Exec(`UPDATE production_releases SET status = ? WHERE id = 'release-1'`, status)
+		require.NoErrorf(t, err, "release transition to %s", status)
+	}
+	_, err := db.Exec(`UPDATE production_releases SET status = 'active' WHERE id = 'release-1'`)
+	require.ErrorContains(t, err, "invalid production release status transition")
+
+	insertProductionPublicationTarget(t, db, "target-1", "release-1", "version-1", "kb-1", "knowledge-1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	_, err = db.Exec(`INSERT INTO production_release_targets (id, release_id, tenant_id, project_id, document_id, version_id, target_knowledge_base_id, knowledge_id, release_digest) VALUES ('target-digest-mismatch', 'release-1', 1, 'project-1', 'document-1', 'version-1', 'kb-2', 'knowledge-digest-mismatch', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')`)
+	require.Error(t, err, "target release digests are bound to their parent release")
+	_, err = db.Exec(`UPDATE production_release_targets SET status = 'ready' WHERE id = 'target-1'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_release_targets SET status = 'active', activated_at = CURRENT_TIMESTAMP WHERE id = 'target-1'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_release_targets SET cleanup_requested_at = CURRENT_TIMESTAMP WHERE id = 'target-1'`)
+	require.ErrorContains(t, err, "active production release targets cannot be cleaned")
+	_, err = db.Exec(`INSERT INTO production_projection_heads (tenant_id, document_id, target_knowledge_base_id, active_release_target_id) VALUES (1, 'document-1', 'kb-1', 'target-1')`)
+	require.NoError(t, err)
+
+	approveProductionPublicationReview(t, db, "review-pub-2", "version-pub-2", "step-pub-2")
+	insertProductionPublicationRelease(t, db, "release-2", "version-pub-2", "review-pub-2", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+	insertProductionPublicationTarget(t, db, "target-2", "release-2", "version-pub-2", "kb-1", "knowledge-2", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+
+	_, err = db.Exec("BEGIN")
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_release_targets SET status = 'rolled_back', rolled_back_at = '2020-01-01 00:00:00', retention_until = '2020-01-31 00:00:00' WHERE id = 'target-1'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_release_targets SET status = 'ready' WHERE id = 'target-2'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_release_targets SET status = 'active', activated_at = CURRENT_TIMESTAMP WHERE id = 'target-2'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_projection_heads SET active_release_target_id = 'target-2', lock_version = 2 WHERE tenant_id = 1 AND document_id = 'document-1' AND target_knowledge_base_id = 'kb-1'`)
+	require.NoError(t, err)
+	_, err = db.Exec("COMMIT")
+	require.NoError(t, err)
+	var activeTargets int
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM production_release_targets WHERE tenant_id = 1 AND document_id = 'document-1' AND target_knowledge_base_id = 'kb-1' AND status = 'active'`).Scan(&activeTargets))
+	require.Equal(t, 1, activeTargets)
+
+	_, err = db.Exec(`UPDATE production_release_targets SET status = 'building', activated_at = NULL, rolled_back_at = NULL, retention_until = NULL WHERE id = 'target-1'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_release_targets SET status = 'ready' WHERE id = 'target-1'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_release_targets SET status = 'active', activated_at = CURRENT_TIMESTAMP WHERE id = 'target-1'`)
+	require.Error(t, err, "only one target may be active for a projection scope")
+
+	insertProductionPublicationTarget(t, db, "target-retention", "release-1", "version-1", "kb-2", "knowledge-retention", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	_, err = db.Exec(`UPDATE production_release_targets SET status = 'failed', failed_at = '2099-01-01 00:00:00', retention_until = '2099-01-31 00:00:00' WHERE id = 'target-retention'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_release_targets SET status = 'cleanup_pending', cleanup_requested_at = CURRENT_TIMESTAMP WHERE id = 'target-retention'`)
+	require.ErrorContains(t, err, "retention has not expired")
+	_, err = db.Exec(`UPDATE production_release_targets SET failed_at = '2020-01-01 00:00:00', retention_until = '2020-01-31 00:00:00' WHERE id = 'target-retention'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_release_targets SET status = 'cleanup_pending', cleanup_requested_at = CURRENT_TIMESTAMP WHERE id = 'target-retention'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_release_targets SET status = 'cleaned', cleaned_at = CURRENT_TIMESTAMP WHERE id = 'target-retention'`)
+	require.NoError(t, err)
+
+	for _, query := range []string{
+		`EXPLAIN QUERY PLAN SELECT id FROM production_release_targets WHERE tenant_id = 1 AND target_knowledge_base_id = 'kb-1' AND status = 'active'`,
+		`EXPLAIN QUERY PLAN SELECT id FROM production_release_targets WHERE status = 'failed' AND retention_until <= CURRENT_TIMESTAMP`,
+	} {
+		rows, err := db.Query(query)
+		require.NoError(t, err)
+		var plan []string
+		for rows.Next() {
+			var id, parent, unused int
+			var detail string
+			require.NoError(t, rows.Scan(&id, &parent, &unused, &detail))
+			plan = append(plan, detail)
+		}
+		require.NoError(t, rows.Err())
+		require.NoError(t, rows.Close())
+		require.Contains(t, strings.Join(plan, "\n"), map[string]string{
+			`EXPLAIN QUERY PLAN SELECT id FROM production_release_targets WHERE tenant_id = 1 AND target_knowledge_base_id = 'kb-1' AND status = 'active'`: "idx_production_release_targets_scope_status",
+			`EXPLAIN QUERY PLAN SELECT id FROM production_release_targets WHERE status = 'failed' AND retention_until <= CURRENT_TIMESTAMP`:                "idx_production_release_targets_cleanup_eligibility",
+		}[query])
+	}
+}
+
+func TestProductionPublicationSQLiteMigrationEnumeratesReleaseStatusEdges(t *testing.T) {
+	db := openProductionPublicationSQLite(t)
+	seedProductionReleaseScope(t, db)
+
+	accepted := []struct{ from, to string }{
+		{"building", "ready"},
+		{"building", "failed"},
+		{"building", "rolled_back"},
+		{"ready", "active"},
+		{"ready", "failed"},
+		{"ready", "rolled_back"},
+		{"active", "failed"},
+		{"active", "rolled_back"},
+		{"failed", "building"},
+		{"failed", "rolled_back"},
+		{"rolled_back", "building"},
+	}
+	for index, edge := range accepted {
+		releaseID := insertProductionPublicationTransitionRelease(t, db, index)
+		setProductionReleaseStatus(t, db, releaseID, edge.from)
+		_, err := db.Exec(`UPDATE production_releases SET status = ? WHERE id = ?`, edge.to, releaseID)
+		require.NoErrorf(t, err, "accepted release edge %s -> %s", edge.from, edge.to)
+	}
+
+	rejected := []struct{ from, to string }{
+		{"building", "active"},
+		{"ready", "building"},
+		{"active", "ready"},
+		{"failed", "active"},
+		{"rolled_back", "active"},
+	}
+	for index, edge := range rejected {
+		releaseID := insertProductionPublicationTransitionRelease(t, db, index+len(accepted))
+		setProductionReleaseStatus(t, db, releaseID, edge.from)
+		_, err := db.Exec(`UPDATE production_releases SET status = ? WHERE id = ?`, edge.to, releaseID)
+		require.ErrorContainsf(t, err, "invalid production release status transition", "rejected release edge %s -> %s", edge.from, edge.to)
 	}
 }
 
@@ -1472,12 +1612,65 @@ func openProductionPublicationSQLite(t *testing.T) *sql.DB {
 	return db
 }
 
+func insertProductionPublicationRelease(t *testing.T, db *sql.DB, id, versionID, reviewID, digest string) {
+	t.Helper()
+
+	_, err := db.Exec(`INSERT INTO production_releases (id, tenant_id, project_id, document_id, version_id, review_request_id, release_digest, created_by) VALUES (?, 1, 'project-1', 'document-1', ?, ?, ?, 'owner-1')`, id, versionID, reviewID, digest)
+	require.NoError(t, err)
+}
+
+func insertProductionPublicationTransitionRelease(t *testing.T, db *sql.DB, sequence int) string {
+	t.Helper()
+
+	versionID := fmt.Sprintf("version-release-edge-%d", sequence)
+	reviewID := fmt.Sprintf("review-release-edge-%d", sequence)
+	releaseID := fmt.Sprintf("release-edge-%d", sequence)
+	insertProductionVersion(t, db, versionID, "document-1", 1, "project-1", 100+sequence, "source-set-1", "")
+	insertProductionReviewRequest(t, db, reviewID, versionID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "{}")
+	approveProductionPublicationReview(t, db, reviewID, versionID, fmt.Sprintf("step-release-edge-%d", sequence))
+	insertProductionPublicationRelease(t, db, releaseID, versionID, reviewID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	return releaseID
+}
+
+func setProductionReleaseStatus(t *testing.T, db *sql.DB, releaseID, status string) {
+	t.Helper()
+
+	for _, next := range map[string][]string{
+		"building":    nil,
+		"ready":       {"ready"},
+		"active":      {"ready", "active"},
+		"failed":      {"failed"},
+		"rolled_back": {"rolled_back"},
+	}[status] {
+		_, err := db.Exec(`UPDATE production_releases SET status = ? WHERE id = ?`, next, releaseID)
+		require.NoError(t, err)
+	}
+}
+
+func insertProductionPublicationTarget(t *testing.T, db *sql.DB, id, releaseID, versionID, knowledgeBaseID, knowledgeID, digest string) {
+	t.Helper()
+
+	_, err := db.Exec(`INSERT INTO production_release_targets (id, release_id, tenant_id, project_id, document_id, version_id, target_knowledge_base_id, knowledge_id, release_digest) VALUES (?, ?, 1, 'project-1', 'document-1', ?, ?, ?, ?)`, id, releaseID, versionID, knowledgeBaseID, knowledgeID, digest)
+	require.NoError(t, err)
+}
+
+func approveProductionPublicationReview(t *testing.T, db *sql.DB, reviewID, versionID, stepID string) {
+	t.Helper()
+
+	_, err := db.Exec(`INSERT INTO production_review_steps (id, review_request_id, tenant_id, project_id, document_id, version_id, required_role, sequence) VALUES (?, ?, 1, 'project-1', 'document-1', ?, 'business_reviewer', 1)`, stepID, reviewID, versionID)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_review_steps SET decision = 'approved', reviewer_user_id = 'business-1', comment = 'approved', decided_at = CURRENT_TIMESTAMP WHERE id = ?`, stepID)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_review_requests SET status = 'approved', terminal_by = 'owner-1', completed_at = CURRENT_TIMESTAMP WHERE id = ?`, reviewID)
+	require.NoError(t, err)
+}
+
 func seedProductionReleaseScope(t *testing.T, db *sql.DB) {
 	t.Helper()
 
 	seedProductionRunScopes(t, db)
 	insertProductionVersion(t, db, "version-pub-2", "document-1", 1, "project-1", 2, "source-set-1", "version-1")
-	_, err := db.Exec(`INSERT INTO knowledge_bases (id, tenant_id) VALUES ('kb-1', 1), ('kb-other-tenant', 2)`)
+	_, err := db.Exec(`INSERT INTO knowledge_bases (id, tenant_id) VALUES ('kb-1', 1), ('kb-2', 1), ('kb-other-tenant', 2)`)
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO production_project_members (project_id, user_id, role, assigned_by) VALUES ('project-1', 'business-1', 'business_reviewer', 'owner-1')`)
 	require.NoError(t, err)

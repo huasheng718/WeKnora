@@ -16,6 +16,8 @@ DROP TRIGGER IF EXISTS trg_production_releases_prevent_delete ON production_rele
 DROP FUNCTION IF EXISTS prevent_production_release_delete();
 DROP TRIGGER IF EXISTS trg_production_releases_guard_identity ON production_releases;
 DROP FUNCTION IF EXISTS guard_production_release_identity();
+DROP TRIGGER IF EXISTS trg_production_releases_guard_status ON production_releases;
+DROP FUNCTION IF EXISTS guard_production_release_status();
 DROP TRIGGER IF EXISTS trg_production_releases_validate_approved_review ON production_releases;
 DROP FUNCTION IF EXISTS validate_production_release_approved_review();
 
@@ -24,5 +26,8 @@ DROP TABLE IF EXISTS production_release_targets;
 DROP TABLE IF EXISTS production_releases;
 
 DROP INDEX IF EXISTS idx_production_release_targets_document_status;
+DROP INDEX IF EXISTS uq_production_release_targets_active_projection;
+DROP INDEX IF EXISTS idx_production_release_targets_scope_status;
+DROP INDEX IF EXISTS idx_production_release_targets_cleanup_eligibility;
 DROP INDEX IF EXISTS idx_production_releases_document_status;
 DROP INDEX IF EXISTS uq_knowledge_bases_id_tenant;
