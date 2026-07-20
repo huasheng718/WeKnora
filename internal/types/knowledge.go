@@ -196,11 +196,35 @@ func (k *Knowledge) BeforeCreate(tx *gorm.DB) (err error) {
 
 // ManualKnowledgeMetadata stores metadata for manual Markdown knowledge content.
 type ManualKnowledgeMetadata struct {
-	Content   string `json:"content"`
-	Format    string `json:"format"`
-	Status    string `json:"status"`
-	Version   int    `json:"version"`
-	UpdatedAt string `json:"updated_at"`
+	Content              string                        `json:"content"`
+	Format               string                        `json:"format"`
+	Status               string                        `json:"status"`
+	Version              int                           `json:"version"`
+	UpdatedAt            string                        `json:"updated_at"`
+	ProductionProjection *ProductionProjectionMetadata `json:"production_projection,omitempty"`
+}
+
+// ProductionProjectionMetadata immutably binds a manual Knowledge row to the
+// governed document version and pre-reserved release target that created it.
+type ProductionProjectionMetadata struct {
+	DocumentID      string `json:"document_id"`
+	VersionID       string `json:"version_id"`
+	ReleaseTargetID string `json:"release_target_id"`
+	ContentDigest   string `json:"content_digest"`
+	GraphModelID    string `json:"graph_model_id,omitempty"`
+}
+
+// ProductionProjectionKnowledgePayload is the server-owned creation input.
+// It is not exposed as a manual Knowledge API payload.
+type ProductionProjectionKnowledgePayload struct {
+	KnowledgeID          string
+	KnowledgeBaseID      string
+	Title                string
+	Content              string
+	EmbeddingModelID     string
+	GraphModelID         string
+	ProcessOverrides     *KnowledgeProcessOverrides
+	ProductionProjection *ProductionProjectionMetadata
 }
 
 // ManualKnowledgePayload represents the payload for manual knowledge operations.

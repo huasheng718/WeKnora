@@ -174,6 +174,7 @@ func (r *productionReleaseRepository) CreateRelease(
 			return types.ErrProductionReleaseLifecycle
 		}
 		if target.RetentionDays < 0 || target.RetentionDays > 3650 ||
+			target.FailureCode != "" || target.FailureReason != "" ||
 			target.RetentionUntil != nil || target.ActivatedAt != nil || target.FailedAt != nil ||
 			target.RolledBackAt != nil || target.CleanupRequestedAt != nil || target.CleanedAt != nil {
 			return fmt.Errorf("%w: target lifecycle fields are server-owned", types.ErrProductionReleaseInvalid)
@@ -194,6 +195,8 @@ func (r *productionReleaseRepository) CreateRelease(
 		target.ConfigSnapshot = canonicalConfig
 		target.ConfigDigest = configDigest
 		target.Status = types.ReleaseTargetBuilding
+		target.FailureCode = ""
+		target.FailureReason = ""
 		if target.RetentionDays == 0 {
 			target.RetentionDays = release.RetentionDays
 		}
@@ -217,6 +220,7 @@ func (r *productionReleaseRepository) CreateRelease(
 				"target_knowledge_base_id": target.TargetKnowledgeBaseID, "knowledge_id": target.KnowledgeID,
 				"release_digest": target.ReleaseDigest, "config_snapshot": configValue, "config_digest": target.ConfigDigest,
 				"status": target.Status, "retention_days": target.RetentionDays,
+				"failure_code": "", "failure_reason": "",
 				"retention_until": nil, "activated_at": nil, "failed_at": nil, "rolled_back_at": nil,
 				"cleanup_requested_at": nil, "cleaned_at": nil,
 				"created_at": target.CreatedAt, "updated_at": target.UpdatedAt,
@@ -247,6 +251,32 @@ func (r *productionReleaseRepository) GetTarget(ctx context.Context, tenantID ui
 		return nil, err
 	}
 	return &target, nil
+}
+
+func (r *productionReleaseRepository) GetRelease(
+	ctx context.Context, tenantID uint64, releaseID string,
+) (*types.ProductionRelease, error) {
+	if err := requireProductionReleaseTenantContext(ctx, tenantID); err != nil {
+		return nil, err
+	}
+	if err := requireProductionReleaseIdentity("release_id", releaseID); err != nil {
+		return nil, err
+	}
+	db := database.DBFromContext(ctx, r.db).WithContext(ctx)
+	var release types.ProductionRelease
+	if err := db.Where("tenant_id = ? AND id = ?", tenantID, releaseID).First(&release).Error; err != nil {
+		return nil, translateProductionReleaseTargetReadError(err)
+	}
+	if err := db.Where("tenant_id = ? AND release_id = ?", tenantID, releaseID).
+		Order("id ASC").Find(&release.Targets).Error; err != nil {
+		return nil, translateProductionReleaseTargetReadError(err)
+	}
+	for _, target := range release.Targets {
+		if err := normalizeProductionReleaseTargetConfig(target); err != nil {
+			return nil, err
+		}
+	}
+	return &release, nil
 }
 
 // normalizeProductionReleaseTargetConfig authenticates driver-returned
@@ -295,7 +325,22 @@ func (r *productionReleaseRepository) TransitionTarget(
 	if err := requireProductionReleaseIdentity("target_id", targetID); err != nil {
 		return false, err
 	}
-	if len(patch) != 0 {
+	failureCode := ""
+	failureReason := ""
+	if to == types.ReleaseTargetFailed {
+		failureCode = types.ProductionProjectionFailureBuildFailed
+		failureReason = types.ProductionProjectionFailureReasonBuildFailed
+		if len(patch) != 0 {
+			code, codeOK := patch["failure_code"].(string)
+			reason, reasonOK := patch["failure_reason"].(string)
+			if len(patch) != 2 || !codeOK || !reasonOK ||
+				code != types.ProductionProjectionFailureContentDigestMismatch ||
+				reason != types.ProductionProjectionFailureReasonContentDigestMismatch {
+				return false, types.ErrProductionReleasePatchInvalid
+			}
+			failureCode, failureReason = code, reason
+		}
+	} else if len(patch) != 0 {
 		return false, types.ErrProductionReleasePatchInvalid
 	}
 	if !types.CanTransitionReleaseTarget(from, to) || to == types.ReleaseTargetActive || from == types.ReleaseTargetActive {
@@ -315,8 +360,12 @@ func (r *productionReleaseRepository) TransitionTarget(
 	switch to {
 	case types.ReleaseTargetBuilding, types.ReleaseTargetReady:
 		clearLifecycle()
+		updates["failure_code"] = ""
+		updates["failure_reason"] = ""
 	case types.ReleaseTargetFailed:
 		clearLifecycle()
+		updates["failure_code"] = failureCode
+		updates["failure_reason"] = failureReason
 		updates["failed_at"] = now
 		updates["retention_until"] = r.retentionDeadlineExpression(now)
 	case types.ReleaseTargetRolledBack:

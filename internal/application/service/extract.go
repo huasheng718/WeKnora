@@ -167,7 +167,8 @@ type ChunkExtractService struct {
 	// spanTracker records this graph-extract task's subspan under the
 	// parent attempt's postprocess stage so the trace viewer shows real
 	// per-chunk graph extraction time rather than the upstream's enqueue.
-	spanTracker SpanTracker
+	spanTracker           SpanTracker
+	productionReleaseRepo interfaces.ProductionReleaseRepository
 }
 
 // NewChunkExtractService creates a new chunk extract service
@@ -179,15 +180,17 @@ func NewChunkExtractService(
 	chunkRepo interfaces.ChunkRepository,
 	graphEngine interfaces.RetrieveGraphRepository,
 	spanTracker SpanTracker,
+	productionReleaseRepo interfaces.ProductionReleaseRepository,
 ) interfaces.TaskHandler {
 	return &ChunkExtractService{
-		template:          config.ExtractManager.ExtractGraph,
-		modelService:      modelService,
-		knowledgeBaseRepo: knowledgeBaseRepo,
-		knowledgeRepo:     knowledgeRepo,
-		chunkRepo:         chunkRepo,
-		graphEngine:       graphEngine,
-		spanTracker:       spanTracker,
+		template:              config.ExtractManager.ExtractGraph,
+		modelService:          modelService,
+		knowledgeBaseRepo:     knowledgeBaseRepo,
+		knowledgeRepo:         knowledgeRepo,
+		chunkRepo:             chunkRepo,
+		graphEngine:           graphEngine,
+		spanTracker:           spanTracker,
+		productionReleaseRepo: productionReleaseRepo,
 	}
 }
 
@@ -199,7 +202,7 @@ func (s *ChunkExtractService) tracker() SpanTracker {
 }
 
 // Handle handles the chunk extraction task
-func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
+func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) (retErr error) {
 	var p types.ExtractChunkPayload
 	if err := json.Unmarshal(t.Payload(), &p); err != nil {
 		logger.Errorf(ctx, "failed to unmarshal task payload: %v", err)
@@ -244,9 +247,11 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
 		// completed (or terminally-failed) per-chunk extract releases its
 		// slot in pending_subtasks_count. KnowledgeID is the new (post-#? )
 		// payload field; legacy in-flight tasks without it are skipped.
-		finalizeSubtaskDetached(ctx, s.knowledgeRepo, p.KnowledgeID,
+		if err := finalizeSubtaskDetached(ctx, s.knowledgeRepo, s.productionReleaseRepo, p.KnowledgeID,
 			fmt.Sprintf("graph_chunk[%d]", p.ChunkIndex),
-			handleErr, false, isFinalAsynqAttempt(ctx))
+			handleErr, false, isFinalAsynqAttempt(ctx)); err != nil && retErr == nil {
+			retErr = err
+		}
 		if gSpan == nil {
 			return
 		}

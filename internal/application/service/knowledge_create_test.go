@@ -3,12 +3,16 @@ package service
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"mime/multipart"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/Tencent/WeKnora/internal/application/repository"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/hibiken/asynq"
@@ -18,9 +22,42 @@ import (
 type createKnowledgeFileRepoStub struct {
 	interfaces.KnowledgeRepository
 
-	createCalls      int
-	createErr        error
-	createdKnowledge *types.Knowledge
+	createCalls       int
+	createErr         error
+	createdKnowledge  *types.Knowledge
+	existingKnowledge *types.Knowledge
+	columnUpdates     map[string]interface{}
+}
+
+func (r *createKnowledgeFileRepoStub) UpdateKnowledgeColumns(
+	_ context.Context, _ string, values map[string]interface{},
+) error {
+	r.columnUpdates = values
+	if status, ok := values["parse_status"].(string); ok && r.existingKnowledge != nil {
+		r.existingKnowledge.ParseStatus = status
+	}
+	return nil
+}
+
+func (r *createKnowledgeFileRepoStub) ClaimFailedKnowledgeRetry(
+	_ context.Context, _ string,
+) (bool, error) {
+	if r.existingKnowledge == nil || r.existingKnowledge.ParseStatus != types.ParseStatusFailed {
+		return false, nil
+	}
+	return true, r.UpdateKnowledgeColumns(context.Background(), r.existingKnowledge.ID, map[string]interface{}{
+		"parse_status": types.ParseStatusPending, "error_message": "",
+	})
+}
+
+func (r *createKnowledgeFileRepoStub) GetKnowledgeByID(
+	_ context.Context, _ uint64, _ string,
+) (*types.Knowledge, error) {
+	if r.existingKnowledge == nil {
+		return nil, repository.ErrKnowledgeNotFound
+	}
+	copyKnowledge := *r.existingKnowledge
+	return &copyKnowledge, nil
 }
 
 func (r *createKnowledgeFileRepoStub) CheckKnowledgeExists(
@@ -125,6 +162,133 @@ func (s *createKnowledgeTaskEnqueuerStub) Enqueue(
 ) (*asynq.TaskInfo, error) {
 	s.calls++
 	return &asynq.TaskInfo{ID: "task-1", Queue: "default"}, nil
+}
+
+func TestCreateKnowledgeFromProductionProjectionUsesReservedIDAndImmutableMetadata(t *testing.T) {
+	repo := &createKnowledgeFileRepoStub{}
+	tasks := &createKnowledgeTaskEnqueuerStub{}
+	svc := &knowledgeService{
+		repo: repo,
+		kbService: &createKnowledgeFileKBServiceStub{kb: &types.KnowledgeBase{
+			ID: "kb-1", TenantID: 1, Type: types.KnowledgeBaseTypeDocument,
+			EmbeddingModelID: "live-model",
+		}},
+		fileSvc: &createKnowledgeFileServiceStub{}, task: tasks,
+	}
+	payload := &types.ProductionProjectionKnowledgePayload{
+		KnowledgeID:     "93000000-0000-4000-8000-000000000007",
+		KnowledgeBaseID: "kb-1", Title: "Approved baseline", Content: "# Approved\n",
+		EmbeddingModelID: "snapshot-model",
+		ProcessOverrides: &types.KnowledgeProcessOverrides{
+			ChunkingConfig: &types.ChunkingConfig{ChunkSize: 777},
+		},
+		ProductionProjection: &types.ProductionProjectionMetadata{
+			DocumentID: "doc-1", VersionID: "v3", ReleaseTargetID: "target-1",
+			ContentDigest: projectionKnowledgeContentDigest("# Approved\n"),
+		},
+	}
+
+	knowledge, err := svc.CreateKnowledgeFromProductionProjection(newCreateKnowledgeFileContext(), payload)
+	require.NoError(t, err)
+	require.Equal(t, payload.KnowledgeID, knowledge.ID)
+	require.Equal(t, "snapshot-model", knowledge.EmbeddingModelID)
+	require.Equal(t, types.ParseStatusPending, knowledge.ParseStatus)
+	require.Equal(t, 1, repo.createCalls)
+	require.Equal(t, 1, tasks.calls)
+	meta, err := knowledge.ManualMetadata()
+	require.NoError(t, err)
+	require.Equal(t, payload.ProductionProjection, meta.ProductionProjection)
+	overrides, err := knowledge.ProcessOverrides()
+	require.NoError(t, err)
+	require.Equal(t, 777, overrides.ChunkingConfig.ChunkSize)
+}
+
+func TestCreateKnowledgeFromProductionProjectionIsIdempotentAndRejectsForeignOwnership(t *testing.T) {
+	owned := &types.Knowledge{
+		ID: "knowledge-1", TenantID: 1, KnowledgeBaseID: "kb-1", Type: types.KnowledgeTypeManual,
+	}
+	ownedMeta := types.NewManualKnowledgeMetadata("# owned", types.ManualKnowledgeStatusPublish, 1)
+	ownedMeta.ProductionProjection = &types.ProductionProjectionMetadata{
+		DocumentID: "doc-1", VersionID: "v3", ReleaseTargetID: "target-1",
+		ContentDigest: projectionKnowledgeContentDigest("# owned"),
+	}
+	require.NoError(t, owned.SetManualMetadata(ownedMeta))
+	repo := &createKnowledgeFileRepoStub{existingKnowledge: owned}
+	tasks := &createKnowledgeTaskEnqueuerStub{}
+	svc := &knowledgeService{repo: repo, task: tasks}
+	payload := &types.ProductionProjectionKnowledgePayload{
+		KnowledgeID: "knowledge-1", KnowledgeBaseID: "kb-1",
+		Content:              "# owned",
+		ProductionProjection: ownedMeta.ProductionProjection,
+	}
+
+	got, err := svc.CreateKnowledgeFromProductionProjection(newCreateKnowledgeFileContext(), payload)
+	require.NoError(t, err)
+	require.Equal(t, owned.ID, got.ID)
+	require.Zero(t, repo.createCalls)
+	require.Zero(t, tasks.calls)
+
+	foreign := *owned
+	foreignMeta := *ownedMeta
+	foreignProjection := *ownedMeta.ProductionProjection
+	foreignProjection.ReleaseTargetID = "target-other"
+	foreignMeta.ProductionProjection = &foreignProjection
+	require.NoError(t, foreign.SetManualMetadata(&foreignMeta))
+	repo.existingKnowledge = &foreign
+	_, err = svc.CreateKnowledgeFromProductionProjection(newCreateKnowledgeFileContext(), payload)
+	require.ErrorIs(t, err, types.ErrProductionProjectionConflict)
+	require.Zero(t, tasks.calls)
+}
+
+func TestCreateKnowledgeFromProductionProjectionRejectsContentDigestMismatchBeforeCreate(t *testing.T) {
+	repo := &createKnowledgeFileRepoStub{}
+	svc := &knowledgeService{repo: repo}
+	_, err := svc.CreateKnowledgeFromProductionProjection(
+		newCreateKnowledgeFileContext(),
+		&types.ProductionProjectionKnowledgePayload{
+			KnowledgeID: "knowledge-1", KnowledgeBaseID: "kb-1", Content: "# tampered",
+			ProductionProjection: &types.ProductionProjectionMetadata{
+				DocumentID: "doc-1", VersionID: "v3", ReleaseTargetID: "target-1",
+				ContentDigest: strings.Repeat("a", 64),
+			},
+		},
+	)
+	require.ErrorIs(t, err, types.ErrProductionContentDigestMismatch)
+	require.Zero(t, repo.createCalls)
+}
+
+func TestCreateKnowledgeFromProductionProjectionRetriesFailedOwnedKnowledgeOnce(t *testing.T) {
+	owned := &types.Knowledge{
+		ID: "knowledge-1", TenantID: 1, KnowledgeBaseID: "kb-1", Type: types.KnowledgeTypeManual,
+		ParseStatus: types.ParseStatusFailed, ErrorMessage: "old internal failure",
+	}
+	meta := types.NewManualKnowledgeMetadata("# owned", types.ManualKnowledgeStatusPublish, 1)
+	meta.ProductionProjection = &types.ProductionProjectionMetadata{
+		DocumentID: "doc-1", VersionID: "v3", ReleaseTargetID: "target-1",
+		ContentDigest: projectionKnowledgeContentDigest("# owned"),
+	}
+	require.NoError(t, owned.SetManualMetadata(meta))
+	repo := &createKnowledgeFileRepoStub{existingKnowledge: owned}
+	tasks := &createKnowledgeTaskEnqueuerStub{}
+	svc := &knowledgeService{repo: repo, task: tasks}
+
+	got, err := svc.CreateKnowledgeFromProductionProjection(
+		newCreateKnowledgeFileContext(),
+		&types.ProductionProjectionKnowledgePayload{
+			KnowledgeID: "knowledge-1", KnowledgeBaseID: "kb-1",
+			Content: "# owned", ProductionProjection: meta.ProductionProjection,
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, types.ParseStatusPending, got.ParseStatus)
+	require.Equal(t, types.ParseStatusPending, repo.columnUpdates["parse_status"])
+	require.Empty(t, repo.columnUpdates["error_message"])
+	require.Equal(t, 1, tasks.calls)
+}
+
+func projectionKnowledgeContentDigest(content string) string {
+	digest := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(digest[:])
 }
 
 func TestCreateKnowledgeFromFileDoesNotPersistWhenStorageSaveFails(t *testing.T) {

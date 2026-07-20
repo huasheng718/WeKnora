@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS production_release_targets (
     config_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
     config_digest VARCHAR(64) NOT NULL DEFAULT '44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a',
     status VARCHAR(20) NOT NULL DEFAULT 'building',
+    failure_code VARCHAR(64) NOT NULL DEFAULT '',
+    failure_reason VARCHAR(256) NOT NULL DEFAULT '',
     retention_days INTEGER NOT NULL DEFAULT 30,
     retention_until TIMESTAMP NULL,
     activated_at TIMESTAMP NULL,
@@ -59,6 +61,10 @@ CREATE TABLE IF NOT EXISTS production_release_targets (
     ),
     CONSTRAINT chk_production_release_targets_config_digest CHECK (config_digest ~ '^[0-9a-f]{64}$'),
     CONSTRAINT chk_production_release_targets_status CHECK (status IN ('building', 'ready', 'active', 'failed', 'rolled_back', 'cleanup_pending', 'cleaned')),
+    CONSTRAINT chk_production_release_targets_failure CHECK (
+        failure_code ~ '^[A-Z0-9_]*$' AND
+        ((status = 'failed' AND failure_code <> '' AND failure_reason <> '') OR status <> 'failed')
+    ),
     CONSTRAINT chk_production_release_targets_retention CHECK (retention_days >= 1 AND retention_days <= 3650),
     UNIQUE(release_id, target_knowledge_base_id),
     UNIQUE(id, tenant_id, document_id, target_knowledge_base_id),
@@ -184,7 +190,8 @@ CREATE TRIGGER trg_production_releases_prevent_replace
 CREATE OR REPLACE FUNCTION validate_production_release_target_initial_state()
 RETURNS TRIGGER AS $$
 BEGIN
-    IF NEW.status <> 'building' OR NEW.activated_at IS NOT NULL OR NEW.failed_at IS NOT NULL OR
+    IF NEW.status <> 'building' OR NEW.failure_code <> '' OR NEW.failure_reason <> '' OR
+       NEW.activated_at IS NOT NULL OR NEW.failed_at IS NOT NULL OR
        NEW.rolled_back_at IS NOT NULL OR NEW.cleanup_requested_at IS NOT NULL OR NEW.cleaned_at IS NOT NULL OR NEW.retention_until IS NOT NULL THEN
         RAISE EXCEPTION 'production release targets must be created building';
     END IF;
@@ -214,6 +221,11 @@ BEGIN
        NEW.created_at IS DISTINCT FROM OLD.created_at THEN
         RAISE EXCEPTION 'production release target identity is immutable';
     END IF;
+    IF (NEW.failure_code IS DISTINCT FROM OLD.failure_code OR NEW.failure_reason IS DISTINCT FROM OLD.failure_reason) AND
+       NOT ((NEW.status = 'failed' AND OLD.status <> 'failed') OR
+            (NEW.status = 'building' AND OLD.status IN ('failed', 'rolled_back') AND NEW.failure_code = '' AND NEW.failure_reason = '')) THEN
+        RAISE EXCEPTION 'production release target failure metadata is lifecycle-owned';
+    END IF;
     IF (OLD.status = 'building' AND NEW.status NOT IN ('building', 'ready', 'failed', 'rolled_back')) OR
        (OLD.status = 'ready' AND NEW.status NOT IN ('ready', 'active', 'failed', 'rolled_back')) OR
        (OLD.status = 'active' AND NEW.status NOT IN ('active', 'rolled_back')) OR
@@ -225,6 +237,9 @@ BEGIN
     END IF;
     IF NEW.status IN ('building', 'ready') AND (NEW.activated_at IS NOT NULL OR NEW.failed_at IS NOT NULL OR NEW.rolled_back_at IS NOT NULL OR NEW.cleanup_requested_at IS NOT NULL OR NEW.cleaned_at IS NOT NULL OR NEW.retention_until IS NOT NULL) THEN
         RAISE EXCEPTION 'building and ready production release targets must not retain lifecycle timestamps';
+    END IF;
+    IF NEW.status IN ('building', 'ready', 'active') AND (NEW.failure_code <> '' OR NEW.failure_reason <> '') THEN
+        RAISE EXCEPTION 'non-failed production release targets must not retain failure metadata';
     END IF;
     IF NEW.status = 'active' AND (NEW.activated_at IS NULL OR NEW.failed_at IS NOT NULL OR NEW.rolled_back_at IS NOT NULL OR NEW.cleanup_requested_at IS NOT NULL OR NEW.cleaned_at IS NOT NULL OR NEW.retention_until IS NOT NULL) THEN
         RAISE EXCEPTION 'active production release targets cannot be cleaned';

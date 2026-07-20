@@ -2,7 +2,10 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"mime/multipart"
 	"net/url"
@@ -12,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/application/repository"
 	werrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/infrastructure/chunker"
 	"github.com/Tencent/WeKnora/internal/infrastructure/docparser"
@@ -826,6 +830,140 @@ func (s *knowledgeService) CreateKnowledgeFromManual(ctx context.Context,
 		}
 	}
 
+	return knowledge, nil
+}
+
+func (s *knowledgeService) CreateKnowledgeFromProductionProjection(
+	ctx context.Context,
+	payload *types.ProductionProjectionKnowledgePayload,
+) (*types.Knowledge, error) {
+	if payload == nil || payload.ProductionProjection == nil ||
+		strings.TrimSpace(payload.KnowledgeID) == "" || strings.TrimSpace(payload.KnowledgeBaseID) == "" {
+		return nil, types.ErrProductionReleaseInvalid
+	}
+	projection := payload.ProductionProjection
+	_, validContentDigest := normalizedSHA256(projection.ContentDigest)
+	if strings.TrimSpace(projection.DocumentID) == "" || strings.TrimSpace(projection.VersionID) == "" ||
+		strings.TrimSpace(projection.ReleaseTargetID) == "" || !validContentDigest {
+		return nil, types.ErrProductionReleaseInvalid
+	}
+	contentDigest := sha256.Sum256([]byte(payload.Content))
+	if hex.EncodeToString(contentDigest[:]) != projection.ContentDigest {
+		return nil, types.ErrProductionContentDigestMismatch
+	}
+
+	tenantID, ok := types.TenantIDFromContext(ctx)
+	if !ok || tenantID == 0 {
+		return nil, types.ErrProductionForbidden
+	}
+	ownedExisting := func(existing *types.Knowledge) (*types.Knowledge, error) {
+		if existing == nil || existing.ID != payload.KnowledgeID || existing.TenantID != tenantID ||
+			existing.KnowledgeBaseID != payload.KnowledgeBaseID || existing.Type != types.KnowledgeTypeManual {
+			return nil, types.ErrProductionProjectionConflict
+		}
+		meta, err := existing.ManualMetadata()
+		if err != nil || meta == nil || meta.ProductionProjection == nil ||
+			*meta.ProductionProjection != *projection {
+			return nil, types.ErrProductionProjectionConflict
+		}
+		return existing, nil
+	}
+
+	existing, err := s.repo.GetKnowledgeByID(ctx, tenantID, payload.KnowledgeID)
+	if err == nil {
+		owned, ownershipErr := ownedExisting(existing)
+		if ownershipErr != nil {
+			return nil, ownershipErr
+		}
+		if owned.ParseStatus != types.ParseStatusFailed {
+			return owned, nil
+		}
+		claimed, claimErr := s.repo.ClaimFailedKnowledgeRetry(ctx, owned.ID)
+		if claimErr != nil {
+			return nil, claimErr
+		}
+		if !claimed {
+			current, readErr := s.repo.GetKnowledgeByID(ctx, tenantID, owned.ID)
+			if readErr != nil {
+				return nil, readErr
+			}
+			return ownedExisting(current)
+		}
+		owned.ParseStatus = types.ParseStatusPending
+		owned.ErrorMessage = ""
+		meta, metaErr := owned.ManualMetadata()
+		if metaErr != nil || meta == nil {
+			return nil, types.ErrProductionProjectionConflict
+		}
+		if enqueueErr := s.enqueueManualProcessing(ctx, owned, meta.Content, true); enqueueErr != nil {
+			_ = s.repo.UpdateKnowledgeColumns(ctx, owned.ID, map[string]interface{}{
+				"parse_status":  types.ParseStatusFailed,
+				"error_message": "Failed to enqueue projection processing task",
+				"updated_at":    time.Now(),
+			})
+			return nil, enqueueErr
+		}
+		return owned, nil
+	}
+	if !errors.Is(err, repository.ErrKnowledgeNotFound) {
+		return nil, err
+	}
+
+	kb, err := s.kbService.GetKnowledgeBaseByID(ctx, payload.KnowledgeBaseID)
+	if err != nil {
+		return nil, err
+	}
+	if kb == nil || kb.ID != payload.KnowledgeBaseID || kb.TenantID != tenantID || kb.Type != types.KnowledgeBaseTypeDocument {
+		return nil, types.ErrProductionForbidden
+	}
+	if err := s.checkStorageEngineConfigured(ctx, kb); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(payload.Content) == "" || len([]rune(payload.Content)) > manualContentMaxLength {
+		return nil, types.ErrProductionReleaseInvalid
+	}
+	title, valid := secutils.ValidateInput(payload.Title)
+	if !valid || strings.TrimSpace(title) == "" {
+		return nil, types.ErrProductionReleaseInvalid
+	}
+
+	now := time.Now()
+	knowledge := &types.Knowledge{
+		ID: payload.KnowledgeID, TenantID: tenantID, KnowledgeBaseID: payload.KnowledgeBaseID,
+		Type: types.KnowledgeTypeManual, Channel: types.ChannelAPI,
+		Title: title, Source: types.KnowledgeTypeManual,
+		ParseStatus: types.ParseStatusPending, EnableStatus: "disabled",
+		CreatedAt: now, UpdatedAt: now, EmbeddingModelID: payload.EmbeddingModelID,
+		FileName: ensureManualFileName(title), FileType: types.KnowledgeTypeManual,
+	}
+	if knowledge.EmbeddingModelID == "" {
+		knowledge.EmbeddingModelID = kb.EmbeddingModelID
+	}
+	meta := types.NewManualKnowledgeMetadata(payload.Content, types.ManualKnowledgeStatusPublish, 1)
+	projectionCopy := *projection
+	projectionCopy.GraphModelID = payload.GraphModelID
+	meta.ProductionProjection = &projectionCopy
+	if err := knowledge.SetManualMetadata(meta); err != nil {
+		return nil, err
+	}
+	if _, err := ApplyKnowledgeProcessOverrides(ctx, kb, knowledge, payload.ProcessOverrides, nil, nil); err != nil {
+		return nil, err
+	}
+	knowledge.EnsureManualDefaults()
+
+	if err := s.repo.CreateKnowledge(ctx, knowledge); err != nil {
+		raced, readErr := s.repo.GetKnowledgeByID(ctx, tenantID, payload.KnowledgeID)
+		if readErr == nil {
+			return ownedExisting(raced)
+		}
+		return nil, err
+	}
+	if err := s.enqueueManualProcessing(ctx, knowledge, payload.Content, false); err != nil {
+		knowledge.ParseStatus = types.ParseStatusFailed
+		knowledge.ErrorMessage = "Failed to enqueue projection processing task"
+		_ = s.repo.UpdateKnowledge(ctx, knowledge)
+		return nil, err
+	}
 	return knowledge, nil
 }
 

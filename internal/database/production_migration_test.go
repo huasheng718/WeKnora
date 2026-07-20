@@ -1364,6 +1364,9 @@ func TestProductionPublicationPostgreSQLMigrationDeclaresReleaseAndProjectionInt
 		"production projection head updates require CAS lock versions",
 		"config_snapshot JSONB NOT NULL",
 		"config_digest VARCHAR(64) NOT NULL",
+		"failure_code VARCHAR(64) NOT NULL DEFAULT ''",
+		"failure_reason VARCHAR(256) NOT NULL DEFAULT ''",
+		"production release target failure metadata is lifecycle-owned",
 		"chk_production_release_targets_config_digest",
 		"octet_length(config_snapshot::text)",
 	} {
@@ -1533,7 +1536,10 @@ func TestProductionPublicationSQLiteMigrationGuardsAggregateLifecycleTargetsRete
 	require.Equal(t, "target-2", activeHead)
 
 	insertProductionPublicationTarget(t, db, "target-retention", "release-1", "version-1", "kb-2", "knowledge-retention", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-	_, err = db.Exec(`UPDATE production_release_targets SET status = 'failed', failed_at = '2099-01-01 00:00:00', retention_until = '2099-01-31 00:00:00' WHERE id = 'target-retention'`)
+	_, err = db.Exec(`UPDATE production_release_targets
+		SET status = 'failed', failure_code = 'PROJECTION_BUILD_FAILED', failure_reason = 'projection build failed',
+		    failed_at = '2099-01-01 00:00:00', retention_until = '2099-01-31 00:00:00'
+		WHERE id = 'target-retention'`)
 	require.NoError(t, err)
 	_, err = db.Exec(`UPDATE production_release_targets SET status = 'cleanup_pending', cleanup_requested_at = CURRENT_TIMESTAMP WHERE id = 'target-retention'`)
 	require.ErrorContains(t, err, "retention has not expired")

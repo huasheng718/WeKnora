@@ -48,3 +48,19 @@ func TestSetProcessOverridesPreservesOtherMetadata(t *testing.T) {
 	require.NotNil(t, gotOverrides)
 	require.False(t, *gotOverrides.EnableMultimodel)
 }
+
+func TestProductionProjectionMetadataRoundTripsWithManualMetadata(t *testing.T) {
+	meta := NewManualKnowledgeMetadata("# Baseline", ManualKnowledgeStatusPublish, 1)
+	meta.ProductionProjection = &ProductionProjectionMetadata{
+		DocumentID:      "doc-1",
+		VersionID:       "v3",
+		ReleaseTargetID: "target-1",
+		ContentDigest:   "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+	}
+	knowledge := &Knowledge{}
+	require.NoError(t, knowledge.SetManualMetadata(meta))
+
+	got, err := knowledge.ManualMetadata()
+	require.NoError(t, err)
+	require.Equal(t, meta.ProductionProjection, got.ProductionProjection)
+}

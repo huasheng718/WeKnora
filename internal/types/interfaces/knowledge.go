@@ -53,6 +53,12 @@ type KnowledgeService interface {
 		payload *types.ManualKnowledgePayload,
 		channel string,
 	) (*types.Knowledge, error)
+	// CreateKnowledgeFromProductionProjection creates or resumes a governed
+	// manual Knowledge row using the release target's preassigned ID.
+	CreateKnowledgeFromProductionProjection(
+		ctx context.Context,
+		payload *types.ProductionProjectionKnowledgePayload,
+	) (*types.Knowledge, error)
 	// GetKnowledgeByID retrieves knowledge by ID (uses tenant from context).
 	GetKnowledgeByID(ctx context.Context, id string) (*types.Knowledge, error)
 	// GetKnowledgeByIDOnly retrieves knowledge by ID without tenant filter (for permission resolution).
@@ -239,6 +245,9 @@ type KnowledgeRepository interface {
 	// statement so callers that flip several related fields (e.g. parse_status +
 	// error_message) cannot leave the row in a half-updated state.
 	UpdateKnowledgeColumns(ctx context.Context, id string, values map[string]interface{}) error
+	// ClaimFailedKnowledgeRetry atomically moves one failed row back to pending.
+	// Exactly one concurrent retry caller may enqueue the replacement task.
+	ClaimFailedKnowledgeRetry(ctx context.Context, id string) (bool, error)
 	// UpdateActiveDeletingKnowledgeColumns updates an active, non-deleted knowledge row
 	// only when it is still in the transient deleting state.
 	UpdateActiveDeletingKnowledgeColumns(ctx context.Context, id string, values map[string]interface{}) (bool, error)

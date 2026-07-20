@@ -276,9 +276,13 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 
 	// Get embedding model for vectorization — only needed when vector/keyword indexing is enabled
 	var embeddingModel embedding.Embedder
+	embeddingModelID := knowledge.EmbeddingModelID
+	if embeddingModelID == "" {
+		embeddingModelID = kb.EmbeddingModelID
+	}
 	if kb.NeedsEmbeddingModel() {
 		var err error
-		embeddingModel, err = s.modelService.GetEmbeddingModel(ctx, kb.EmbeddingModelID)
+		embeddingModel, err = s.modelService.GetEmbeddingModel(ctx, embeddingModelID)
 		if err != nil {
 			logger.GetLogger(ctx).WithField("error", err).Errorf("processChunks get embedding model failed")
 			return
@@ -518,7 +522,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 	if kb.NeedsEmbeddingModel() && embeddingModel != nil {
 		embedInput := types.JSONMap{
 			"chunks_to_embed": len(textChunks),
-			"model_id":        kb.EmbeddingModelID,
+			"model_id":        embeddingModelID,
 		}
 		if dim := embeddingModel.GetDimensions(); dim > 0 {
 			embedInput["dim"] = dim
@@ -942,8 +946,10 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 		// summaryErr would skip them and leave the row stuck in
 		// "finalizing". When we DO return an error asynq will retry, so
 		// we only drain on the final attempt.
-		finalizeSubtaskDetached(ctx, s.repo, payload.KnowledgeID, "summary",
-			retErr, false, isFinalAsynqAttempt(ctx))
+		if err := finalizeSubtaskDetached(ctx, s.repo, s.productionReleaseRepo, payload.KnowledgeID, "summary",
+			retErr, false, isFinalAsynqAttempt(ctx)); err != nil && retErr == nil {
+			retErr = err
+		}
 		if span == nil {
 			return
 		}
@@ -1259,8 +1265,10 @@ func (s *knowledgeService) processQuestionGenerationForKnowledge(ctx context.Con
 	// final attempt. Runs AFTER the stats-log defer below — defers
 	// unwind LIFO, so this one declared first executes last.
 	defer func() {
-		finalizeSubtaskDetached(ctx, s.repo, payload.KnowledgeID, "question_legacy",
-			retErr, superseded, isFinalAsynqAttempt(ctx))
+		if err := finalizeSubtaskDetached(ctx, s.repo, s.productionReleaseRepo, payload.KnowledgeID, "question_legacy",
+			retErr, superseded, isFinalAsynqAttempt(ctx)); err != nil && retErr == nil {
+			retErr = err
+		}
 	}()
 	defer func() {
 		logger.Infof(
@@ -1620,9 +1628,11 @@ func (s *knowledgeService) processQuestionGenerationForChunks(ctx context.Contex
 	// span failure yet `return nil` (terminal, must drain). Declared first
 	// so it runs LAST (after the stats/span defer below).
 	defer func() {
-		finalizeSubtaskDetached(ctx, s.repo, payload.KnowledgeID,
+		if err := finalizeSubtaskDetached(ctx, s.repo, s.productionReleaseRepo, payload.KnowledgeID,
 			fmt.Sprintf("question_batch[%d]", payload.BatchIndex),
-			retErr, superseded, isFinalAsynqAttempt(ctx))
+			retErr, superseded, isFinalAsynqAttempt(ctx)); err != nil && retErr == nil {
+			retErr = err
+		}
 	}()
 	defer func() {
 		logger.Infof(ctx,

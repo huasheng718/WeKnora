@@ -3,8 +3,10 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/logger"
@@ -18,13 +20,14 @@ import (
 // KnowledgePostProcessService acts as an orchestrator for all post-processing tasks
 // after a document has been parsed and split into chunks (including multimodal OCR/Caption).
 type KnowledgePostProcessService struct {
-	knowledgeRepo interfaces.KnowledgeRepository
-	kbService     interfaces.KnowledgeBaseService
-	chunkService  interfaces.ChunkService
-	taskEnqueuer  interfaces.TaskEnqueuer
-	pendingRepo   interfaces.TaskPendingOpsRepository
-	redisClient   *redis.Client
-	spanTracker   SpanTracker
+	knowledgeRepo         interfaces.KnowledgeRepository
+	kbService             interfaces.KnowledgeBaseService
+	chunkService          interfaces.ChunkService
+	taskEnqueuer          interfaces.TaskEnqueuer
+	pendingRepo           interfaces.TaskPendingOpsRepository
+	redisClient           *redis.Client
+	spanTracker           SpanTracker
+	productionReleaseRepo interfaces.ProductionReleaseRepository
 }
 
 func NewKnowledgePostProcessService(
@@ -35,15 +38,17 @@ func NewKnowledgePostProcessService(
 	pendingRepo interfaces.TaskPendingOpsRepository,
 	redisClient *redis.Client,
 	spanTracker SpanTracker,
+	productionReleaseRepo interfaces.ProductionReleaseRepository,
 ) interfaces.TaskHandler {
 	return &KnowledgePostProcessService{
-		knowledgeRepo: knowledgeRepo,
-		kbService:     kbService,
-		chunkService:  chunkService,
-		taskEnqueuer:  taskEnqueuer,
-		pendingRepo:   pendingRepo,
-		redisClient:   redisClient,
-		spanTracker:   spanTracker,
+		knowledgeRepo:         knowledgeRepo,
+		kbService:             kbService,
+		chunkService:          chunkService,
+		taskEnqueuer:          taskEnqueuer,
+		pendingRepo:           pendingRepo,
+		redisClient:           redisClient,
+		spanTracker:           spanTracker,
+		productionReleaseRepo: productionReleaseRepo,
 	}
 }
 
@@ -52,6 +57,75 @@ func (s *KnowledgePostProcessService) tracker() SpanTracker {
 		return noopSpanTracker{}
 	}
 	return s.spanTracker
+}
+
+func productionProjectionMetadata(knowledge *types.Knowledge) (*types.ProductionProjectionMetadata, error) {
+	if knowledge == nil || len(knowledge.Metadata) == 0 {
+		return nil, nil
+	}
+	metadata, err := knowledge.ManualMetadata()
+	if err != nil {
+		return nil, err
+	}
+	if metadata == nil || metadata.ProductionProjection == nil {
+		return nil, nil
+	}
+	copyProjection := *metadata.ProductionProjection
+	return &copyProjection, nil
+}
+
+func markProductionProjectionReady(
+	ctx context.Context,
+	knowledgeRepo interfaces.KnowledgeRepository,
+	releaseRepo interfaces.ProductionReleaseRepository,
+	knowledgeID string,
+) error {
+	if knowledgeRepo == nil || releaseRepo == nil || strings.TrimSpace(knowledgeID) == "" {
+		return errors.New("production projection completion dependencies are unavailable")
+	}
+	knowledge, err := knowledgeRepo.GetKnowledgeByIDOnly(ctx, knowledgeID)
+	if err != nil {
+		return err
+	}
+	projection, err := productionProjectionMetadata(knowledge)
+	if err != nil || projection == nil {
+		return err
+	}
+	if knowledge.ParseStatus != types.ParseStatusCompleted {
+		return nil
+	}
+	target, err := releaseRepo.GetTarget(ctx, knowledge.TenantID, projection.ReleaseTargetID)
+	if err != nil {
+		return err
+	}
+	if target == nil || target.KnowledgeID != knowledge.ID ||
+		target.TargetKnowledgeBaseID != knowledge.KnowledgeBaseID ||
+		target.DocumentID != projection.DocumentID || target.VersionID != projection.VersionID {
+		return types.ErrProductionProjectionConflict
+	}
+	if target.Status == types.ReleaseTargetReady || target.Status == types.ReleaseTargetActive {
+		return nil
+	}
+	if target.Status != types.ReleaseTargetBuilding {
+		return types.ErrProductionReleaseLifecycle
+	}
+	changed, err := releaseRepo.TransitionTarget(
+		ctx, target.ID, types.ReleaseTargetBuilding, types.ReleaseTargetReady, nil,
+	)
+	if err != nil {
+		return err
+	}
+	if changed {
+		return nil
+	}
+	current, err := releaseRepo.GetTarget(ctx, knowledge.TenantID, target.ID)
+	if err != nil {
+		return err
+	}
+	if current != nil && (current.Status == types.ReleaseTargetReady || current.Status == types.ReleaseTargetActive) {
+		return nil
+	}
+	return types.ErrProductionProjectionConflict
 }
 
 // Handle implements asynq handler for TypeKnowledgePostProcess.
@@ -99,6 +173,17 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 	if knowledge == nil {
 		logger.Warnf(ctx, "[KnowledgePostProcess] Knowledge %s not found, aborting.", payload.KnowledgeID)
 		return nil
+	}
+	projection, projectionErr := productionProjectionMetadata(knowledge)
+	if projectionErr != nil {
+		return fmt.Errorf("read production projection metadata for %s: %w", payload.KnowledgeID, projectionErr)
+	}
+	if projection != nil && knowledge.ParseStatus == types.ParseStatusCompleted {
+		if err := markProductionProjectionReady(
+			ctx, s.knowledgeRepo, s.productionReleaseRepo, payload.KnowledgeID,
+		); err != nil {
+			return err
+		}
 	}
 
 	// Skip post-processing entirely when the knowledge has been cancelled
@@ -159,7 +244,7 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 	willSpawnSummary := len(textChunks) > 0
 	willSpawnQuestion := willSpawnSummary && kb.NeedsEmbeddingModel() &&
 		eff.QuestionGenerationConfig.Enabled
-	willSpawnWiki := kb.IndexingStrategy.WikiEnabled && len(textChunks) > 0
+	willSpawnWiki := projection == nil && kb.IndexingStrategy.WikiEnabled && len(textChunks) > 0
 
 	// Question generation now fans out one subtask per plain text chunk
 	// (mirroring the graph-extract per-chunk pattern) so each chunk's LLM
@@ -237,9 +322,19 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 		if err := s.knowledgeRepo.UpdateKnowledgeColumns(ctx, payload.KnowledgeID, updates); err != nil {
 			logger.Warnf(ctx, "[KnowledgePostProcess] Failed to mark %s completed (no subtasks): %v",
 				payload.KnowledgeID, err)
+			if projection != nil {
+				return fmt.Errorf("complete production projection knowledge %s: %w", payload.KnowledgeID, err)
+			}
 		} else {
 			logger.Infof(ctx, "[KnowledgePostProcess] Knowledge %s marked completed (no enrichment subtasks).",
 				payload.KnowledgeID)
+		}
+		if projection != nil {
+			if err := markProductionProjectionReady(
+				ctx, s.knowledgeRepo, s.productionReleaseRepo, payload.KnowledgeID,
+			); err != nil {
+				return err
+			}
 		}
 	default:
 		// Flip processing → finalizing in one statement so a parallel
@@ -312,9 +407,13 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 	// 5. Spawn Graph RAG Tasks — only when graph indexing is enabled in IndexingStrategy
 	enqueuedGraphCount := 0
 	if graphChunkCount > 0 {
+		graphModelID := kb.SummaryModelID
+		if projection != nil && projection.GraphModelID != "" {
+			graphModelID = projection.GraphModelID
+		}
 		logger.Infof(ctx, "[KnowledgePostProcess] Spawning Graph RAG extract tasks for %d text-like chunks", len(textChunks))
 		for i, chunk := range textChunks {
-			ok, err := NewChunkExtractTask(ctx, s.taskEnqueuer, payload.TenantID, chunk.ID, kb.SummaryModelID,
+			ok, err := NewChunkExtractTask(ctx, s.taskEnqueuer, payload.TenantID, chunk.ID, graphModelID,
 				payload.KnowledgeID, attempt, i)
 			if err != nil {
 				logger.Errorf(ctx, "[KnowledgePostProcess] Failed to create chunk extract task for %s: %v", chunk.ID, err)
@@ -364,6 +463,7 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 	// cancelled ctx would silently abort the releases and strand the row in
 	// "finalizing". The bound is per-call (matches the helper) so a wedged
 	// connection can't pin the goroutine for the whole serial loop.
+	var reconciliationErr error
 	if enteredFinalizing {
 		plannedOwned := questionBatchCount + graphChunkCount
 		if willSpawnSummary {
@@ -380,15 +480,24 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 			for i := 0; i < shortfall; i++ {
 				rctx, cancel := context.WithTimeout(
 					context.WithoutCancel(ctx), finalizeSubtaskDetachedTimeout)
-				_, _, err := s.knowledgeRepo.FinalizeSubtask(rctx, payload.KnowledgeID)
+				_, promoted, err := s.knowledgeRepo.FinalizeSubtask(rctx, payload.KnowledgeID)
+				if err == nil && promoted && s.productionReleaseRepo != nil {
+					err = markProductionProjectionReady(
+						rctx, s.knowledgeRepo, s.productionReleaseRepo, payload.KnowledgeID,
+					)
+				}
 				cancel()
 				if err != nil {
 					logger.Warnf(ctx, "[KnowledgePostProcess] Failed to release subtask slot for %s: %v",
 						payload.KnowledgeID, err)
+					reconciliationErr = err
 					break
 				}
 			}
 		}
+	}
+	if reconciliationErr != nil && projection != nil {
+		return fmt.Errorf("finalize production projection knowledge %s: %w", payload.KnowledgeID, reconciliationErr)
 	}
 
 	postOutput := types.JSONMap{

@@ -945,7 +945,7 @@ func (s *wikiIngestService) finalizeWikiSubtask(ctx context.Context, knowledgeID
 	// always an intended drain (retErr=nil, final=true). Detached context: the
 	// wiki batch worker may be mid-shutdown or have a cancelled ctx when this
 	// runs; a swallowed failure would strand the parent in "finalizing".
-	finalizeSubtaskDetached(ctx, s.knowledgeRepo, knowledgeID, "wiki", nil, false, true)
+	_ = finalizeSubtaskDetached(ctx, s.knowledgeRepo, nil, knowledgeID, "wiki", nil, false, true)
 }
 
 // requeueFailedOps records in-batch failures.

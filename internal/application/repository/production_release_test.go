@@ -135,6 +135,79 @@ func TestProductionReleaseRepositoryCreatesReleaseAndTargetsAtomicallyWithTruste
 	require.EqualValues(t, 2, targetCount)
 }
 
+func TestProductionReleaseRepositoryGetsReleaseByTenantAndHydratesTargets(t *testing.T) {
+	repo, _ := newProductionReleaseRepoFixture(t, nil)
+	release := productionRelease(releaseIDOne, reviewVersionOne, reviewID(700))
+	targets := []*types.ProductionReleaseTarget{
+		productionReleaseTarget(releaseTarget2, releaseKBTwo, releaseKnowledge2),
+		productionReleaseTarget(releaseTarget1, releaseKBOne, releaseKnowledge1),
+	}
+	require.NoError(t, repo.CreateRelease(productionReleaseContext(reviewTenantID, reviewAuthorID), release, targets))
+
+	got, err := repo.GetRelease(context.Background(), reviewTenantID, releaseIDOne)
+	require.NoError(t, err)
+	require.Equal(t, releaseIDOne, got.ID)
+	require.Len(t, got.Targets, 2)
+	require.Equal(t, releaseTarget1, got.Targets[0].ID)
+	require.Equal(t, releaseTarget2, got.Targets[1].ID)
+	_, err = repo.GetRelease(productionReleaseContext(8, reviewAuthorID), reviewTenantID, releaseIDOne)
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
+}
+
+func TestProductionReleaseTargetFailureReasonIsBoundedSanitizedAndClearedOnRetry(t *testing.T) {
+	repo, _ := newProductionReleaseRepoFixture(t, nil)
+	require.NoError(t, repo.CreateRelease(
+		productionReleaseContext(reviewTenantID, reviewAuthorID),
+		productionRelease(releaseIDOne, reviewVersionOne, reviewID(700)),
+		[]*types.ProductionReleaseTarget{productionReleaseTarget(releaseTarget1, releaseKBOne, releaseKnowledge1)},
+	))
+
+	changed, err := repo.TransitionTarget(
+		productionReleaseContext(reviewTenantID, reviewAuthorID), releaseTarget1,
+		types.ReleaseTargetBuilding, types.ReleaseTargetFailed,
+		types.JSONMap{"failure_code": types.ProductionProjectionFailureContentDigestMismatch,
+			"failure_reason": types.ProductionProjectionFailureReasonContentDigestMismatch},
+	)
+	require.NoError(t, err)
+	require.True(t, changed)
+	failed, err := repo.GetTarget(context.Background(), reviewTenantID, releaseTarget1)
+	require.NoError(t, err)
+	require.Equal(t, types.ProductionProjectionFailureContentDigestMismatch, failed.FailureCode)
+	require.Equal(t, types.ProductionProjectionFailureReasonContentDigestMismatch, failed.FailureReason)
+
+	changed, err = repo.TransitionTarget(
+		productionReleaseContext(reviewTenantID, reviewAuthorID), releaseTarget1,
+		types.ReleaseTargetFailed, types.ReleaseTargetBuilding, nil,
+	)
+	require.NoError(t, err)
+	require.True(t, changed)
+	retried, err := repo.GetTarget(context.Background(), reviewTenantID, releaseTarget1)
+	require.NoError(t, err)
+	require.Empty(t, retried.FailureCode)
+	require.Empty(t, retried.FailureReason)
+
+	_, err = repo.TransitionTarget(
+		productionReleaseContext(reviewTenantID, reviewAuthorID), releaseTarget1,
+		types.ReleaseTargetBuilding, types.ReleaseTargetFailed,
+		types.JSONMap{"failure_code": "RAW_PROVIDER_ERROR", "failure_reason": "token=secret"},
+	)
+	require.ErrorIs(t, err, types.ErrProductionReleasePatchInvalid)
+}
+
+func TestProductionReleaseCreateRejectsCallerSuppliedFailureMetadata(t *testing.T) {
+	repo, _ := newProductionReleaseRepoFixture(t, nil)
+	target := productionReleaseTarget(releaseTarget1, releaseKBOne, releaseKnowledge1)
+	target.FailureCode = "RAW_PROVIDER_ERROR"
+	target.FailureReason = "token=secret"
+
+	err := repo.CreateRelease(
+		productionReleaseContext(reviewTenantID, reviewAuthorID),
+		productionRelease(releaseIDOne, reviewVersionOne, reviewID(700)),
+		[]*types.ProductionReleaseTarget{target},
+	)
+	require.ErrorIs(t, err, types.ErrProductionReleaseInvalid)
+}
+
 func insertRawProductionReleaseTargetConfig(
 	t *testing.T,
 	db *gorm.DB,

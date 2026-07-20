@@ -152,6 +152,43 @@ func TestFinalizeSubtask_Concurrent_ExactlyOnePromote(t *testing.T) {
 	assert.Equal(t, 0, count)
 }
 
+func TestClaimFailedKnowledgeRetryConcurrentExactlyOneWinner(t *testing.T) {
+	db := setupKnowledgeTestDB(t)
+	repo := NewKnowledgeRepository(db).(*knowledgeRepository)
+	id := insertKnowledgeWithStatus(t, db, types.ParseStatusFailed, false)
+	require.NoError(t, db.Model(&types.Knowledge{}).Where("id = ?", id).
+		UpdateColumn("error_message", "old internal failure").Error)
+
+	const callers = 20
+	var wins atomic.Int32
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			claimed, err := repo.ClaimFailedKnowledgeRetry(context.Background(), id)
+			if err != nil {
+				t.Errorf("ClaimFailedKnowledgeRetry: %v", err)
+				return
+			}
+			if claimed {
+				wins.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	require.Equal(t, int32(1), wins.Load())
+
+	var row struct {
+		ParseStatus  string
+		ErrorMessage string
+	}
+	require.NoError(t, db.Model(&types.Knowledge{}).
+		Select("parse_status", "error_message").Where("id = ?", id).Take(&row).Error)
+	require.Equal(t, types.ParseStatusPending, row.ParseStatus)
+	require.Empty(t, row.ErrorMessage)
+}
+
 // TestFinalizeSubtask_PartialDecrement_StaysFinalizing verifies the row
 // remains in "finalizing" with the expected residual count when fewer
 // callers decrement than were seeded — the promote guard must not fire

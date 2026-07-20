@@ -10,9 +10,19 @@ import (
 )
 
 const (
-	ProductionReleaseTargetConfigMaxBytes = 256 * 1024
-	ProductionReleaseTargetConfigMaxDepth = 32
-	ProductionReleaseDefaultRetentionDays = 30
+	ProductionReleaseTargetConfigMaxBytes      = 256 * 1024
+	ProductionReleaseTargetConfigMaxDepth      = 32
+	ProductionReleaseDefaultRetentionDays      = 30
+	ProductionProjectionFailureCodeMaxLength   = 64
+	ProductionProjectionFailureReasonMaxLength = 256
+)
+
+const (
+	ProductionProjectionFailureBuildFailed           = "PROJECTION_BUILD_FAILED"
+	ProductionProjectionFailureContentDigestMismatch = "CONTENT_DIGEST_MISMATCH"
+
+	ProductionProjectionFailureReasonBuildFailed           = "projection build failed"
+	ProductionProjectionFailureReasonContentDigestMismatch = "approved content digest verification failed"
 )
 
 var (
@@ -104,18 +114,19 @@ func CanTransitionReleaseTarget(from, to ProductionReleaseTargetStatus) bool {
 }
 
 type ProductionRelease struct {
-	ID              string                  `json:"id" gorm:"type:varchar(36);primaryKey"`
-	TenantID        uint64                  `json:"tenant_id" gorm:"not null;index"`
-	ProjectID       string                  `json:"project_id" gorm:"type:varchar(36);not null;index"`
-	DocumentID      string                  `json:"document_id" gorm:"type:varchar(36);not null;index"`
-	VersionID       string                  `json:"version_id" gorm:"type:varchar(36);not null;index"`
-	ReviewRequestID string                  `json:"review_request_id" gorm:"type:varchar(36);not null"`
-	ReleaseDigest   string                  `json:"release_digest" gorm:"type:varchar(64);not null"`
-	Status          ProductionReleaseStatus `json:"status" gorm:"type:varchar(20);not null;default:'building'"`
-	RetentionDays   int                     `json:"retention_days" gorm:"not null;default:30"`
-	CreatedBy       string                  `json:"created_by" gorm:"type:varchar(36);not null"`
-	CreatedAt       time.Time               `json:"created_at"`
-	UpdatedAt       time.Time               `json:"updated_at"`
+	ID              string                     `json:"id" gorm:"type:varchar(36);primaryKey"`
+	TenantID        uint64                     `json:"tenant_id" gorm:"not null;index"`
+	ProjectID       string                     `json:"project_id" gorm:"type:varchar(36);not null;index"`
+	DocumentID      string                     `json:"document_id" gorm:"type:varchar(36);not null;index"`
+	VersionID       string                     `json:"version_id" gorm:"type:varchar(36);not null;index"`
+	ReviewRequestID string                     `json:"review_request_id" gorm:"type:varchar(36);not null"`
+	ReleaseDigest   string                     `json:"release_digest" gorm:"type:varchar(64);not null"`
+	Status          ProductionReleaseStatus    `json:"status" gorm:"type:varchar(20);not null;default:'building'"`
+	RetentionDays   int                        `json:"retention_days" gorm:"not null;default:30"`
+	CreatedBy       string                     `json:"created_by" gorm:"type:varchar(36);not null"`
+	CreatedAt       time.Time                  `json:"created_at"`
+	UpdatedAt       time.Time                  `json:"updated_at"`
+	Targets         []*ProductionReleaseTarget `json:"targets,omitempty" gorm:"-"`
 }
 
 func (ProductionRelease) TableName() string { return "production_releases" }
@@ -133,6 +144,8 @@ type ProductionReleaseTarget struct {
 	ConfigSnapshot        JSON                          `json:"config_snapshot" gorm:"type:jsonb;not null"`
 	ConfigDigest          string                        `json:"config_digest" gorm:"type:varchar(64);not null"`
 	Status                ProductionReleaseTargetStatus `json:"status" gorm:"type:varchar(20);not null;default:'building'"`
+	FailureCode           string                        `json:"failure_code,omitempty" gorm:"type:varchar(64);not null;default:''"`
+	FailureReason         string                        `json:"failure_reason,omitempty" gorm:"type:varchar(256);not null;default:''"`
 	RetentionDays         int                           `json:"retention_days" gorm:"not null;default:30"`
 	RetentionUntil        *time.Time                    `json:"retention_until,omitempty"`
 	ActivatedAt           *time.Time                    `json:"activated_at,omitempty"`
@@ -156,6 +169,37 @@ type ProductionProjectionHead struct {
 }
 
 func (ProductionProjectionHead) TableName() string { return "production_projection_heads" }
+
+// ComputeProductionReleaseDigest binds publication to one exact approved
+// version and its immutable review policy without including mutable target
+// lifecycle state or credentials.
+func ComputeProductionReleaseDigest(
+	release *ProductionRelease,
+	version *ProductionDocumentVersion,
+	review *ProductionReviewRequest,
+) string {
+	if release == nil || version == nil || review == nil {
+		return ""
+	}
+	payload := struct {
+		TenantID             uint64 `json:"tenant_id"`
+		ProjectID            string `json:"project_id"`
+		DocumentID           string `json:"document_id"`
+		VersionID            string `json:"version_id"`
+		ReviewRequestID      string `json:"review_request_id"`
+		VersionContentDigest string `json:"version_content_digest"`
+		ReviewPolicyDigest   string `json:"review_policy_digest"`
+	}{
+		TenantID: release.TenantID, ProjectID: release.ProjectID,
+		DocumentID: release.DocumentID, VersionID: release.VersionID,
+		ReviewRequestID:      release.ReviewRequestID,
+		VersionContentDigest: version.ContentDigest,
+		ReviewPolicyDigest:   review.PolicyDigest,
+	}
+	encoded, _ := json.Marshal(payload)
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:])
+}
 
 type ProductionKnowledgeScope struct {
 	ActiveKnowledgeIDs        []string `json:"active_knowledge_ids"`
