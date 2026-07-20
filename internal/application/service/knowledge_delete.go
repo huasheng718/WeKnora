@@ -62,6 +62,9 @@ func (s *knowledgeService) DeleteKnowledge(ctx context.Context, id string) error
 	if err != nil {
 		return err
 	}
+	if err := types.RejectProductionProjectionMutation(knowledge); err != nil {
+		return err
+	}
 
 	// Mark as deleting first to prevent async task conflicts
 	// This ensures that any running async tasks will detect the deletion and abort
@@ -435,6 +438,11 @@ func (s *knowledgeService) DeleteKnowledgeList(ctx context.Context, ids []string
 	knowledgeList, err := s.repo.GetKnowledgeBatch(ctx, tenantInfo.ID, ids)
 	if err != nil {
 		return err
+	}
+	for _, knowledge := range knowledgeList {
+		if err := types.RejectProductionProjectionMutation(knowledge); err != nil {
+			return err
+		}
 	}
 
 	// Mark all as deleting first to prevent async task conflicts.

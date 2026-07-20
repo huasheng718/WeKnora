@@ -277,10 +277,17 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 	// Get embedding model for vectorization — only needed when vector/keyword indexing is enabled
 	var embeddingModel embedding.Embedder
 	embeddingModelID := knowledge.EmbeddingModelID
+	indexingStrategy := kb.IndexingStrategy
+	if projection, projectionErr := types.ValidateProductionProjectionIntegrity(knowledge); projectionErr != nil {
+		logger.Errorf(ctx, "Production projection integrity verification failed: %v", projectionErr)
+		return
+	} else if projection != nil {
+		indexingStrategy = projection.IndexingStrategy
+	}
 	if embeddingModelID == "" {
 		embeddingModelID = kb.EmbeddingModelID
 	}
-	if kb.NeedsEmbeddingModel() {
+	if indexingStrategy.NeedsEmbedding() {
 		var err error
 		embeddingModel, err = s.modelService.GetEmbeddingModel(ctx, embeddingModelID)
 		if err != nil {
@@ -519,7 +526,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 	// Create index information and perform vector indexing — only when vector/keyword is enabled.
 	// Chunks are ALWAYS saved to DB (above) because wiki and graph need them even without vector indexing.
 	var totalStorageSize int64
-	if kb.NeedsEmbeddingModel() && embeddingModel != nil {
+	if indexingStrategy.NeedsEmbedding() && embeddingModel != nil {
 		embedInput := types.JSONMap{
 			"chunks_to_embed": len(textChunks),
 			"model_id":        embeddingModelID,
@@ -971,9 +978,17 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 	// know it — debugging "summary stage took 60s" benefits hugely from
 	// seeing WHICH chat model was actually used (kb config drift, fall-
 	// throughs to a slow upstream, etc.).
-	summaryOut["model_id"] = kb.SummaryModelID
+	summaryModelID := kb.SummaryModelID
+	embeddingModelID := kb.EmbeddingModelID
+	if payload.SummaryModelID != "" {
+		summaryModelID = payload.SummaryModelID
+	}
+	if payload.EmbeddingModelID != "" {
+		embeddingModelID = payload.EmbeddingModelID
+	}
+	summaryOut["model_id"] = summaryModelID
 
-	if kb.SummaryModelID == "" {
+	if summaryModelID == "" {
 		logger.Warn(ctx, "Knowledge base summary model ID is empty, skipping summary generation")
 		summaryOut["skipped"] = "no_summary_model"
 		return nil
@@ -1047,7 +1062,7 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 	})
 
 	// Initialize chat model for summary
-	chatModel, err := s.modelService.GetChatModel(ctx, kb.SummaryModelID)
+	chatModel, err := s.modelService.GetChatModel(ctx, summaryModelID)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to get chat model: %v", err)
 		markSummaryFailed()
@@ -1114,7 +1129,14 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 
 	// Create summary chunk and index it — only when RAG indexing is enabled.
 	// Wiki-only KBs don't need summary chunks in the vector index.
-	if strings.TrimSpace(summary) != "" && kb.NeedsEmbeddingModel() {
+	indexingStrategy := kb.IndexingStrategy
+	if projection, projectionErr := types.ValidateProductionProjectionIntegrity(knowledge); projectionErr != nil {
+		summaryErr = projectionErr
+		return projectionErr
+	} else if projection != nil {
+		indexingStrategy = projection.IndexingStrategy
+	}
+	if strings.TrimSpace(summary) != "" && indexingStrategy.NeedsEmbedding() {
 		// Get max chunk index
 		maxChunkIndex := 0
 		for _, chunk := range chunks {
@@ -1168,7 +1190,7 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 			return fmt.Errorf("failed to init retrieve engine: %w", err)
 		}
 
-		embeddingModel, err := s.modelService.GetEmbeddingModel(ctx, kb.EmbeddingModelID)
+		embeddingModel, err := s.modelService.GetEmbeddingModel(ctx, embeddingModelID)
 		if err != nil {
 			logger.Errorf(ctx, "Failed to get embedding model: %v", err)
 			summaryErr = err
@@ -1431,16 +1453,24 @@ func (s *knowledgeService) processQuestionGenerationForKnowledge(ctx context.Con
 	})
 
 	// Initialize chat model
-	chatModel, err := s.modelService.GetChatModel(ctx, kb.SummaryModelID)
+	summaryModelID := kb.SummaryModelID
+	embeddingModelID := kb.EmbeddingModelID
+	if payload.SummaryModelID != "" {
+		summaryModelID = payload.SummaryModelID
+	}
+	if payload.EmbeddingModelID != "" {
+		embeddingModelID = payload.EmbeddingModelID
+	}
+	chatModel, err := s.modelService.GetChatModel(ctx, summaryModelID)
 	if err != nil {
 		exitStatus = "get_chat_model_failed"
 		logger.Errorf(ctx, "Failed to get chat model: %v", err)
 		return fmt.Errorf("failed to get chat model: %w", err)
 	}
-	resolvedModelID = kb.SummaryModelID
+	resolvedModelID = summaryModelID
 
 	// Initialize embedding model and retrieval engine
-	embeddingModel, err := s.modelService.GetEmbeddingModel(ctx, kb.EmbeddingModelID)
+	embeddingModel, err := s.modelService.GetEmbeddingModel(ctx, embeddingModelID)
 	if err != nil {
 		exitStatus = "get_embedding_model_failed"
 		logger.Errorf(ctx, "Failed to get embedding model: %v", err)
@@ -1472,7 +1502,13 @@ func (s *knowledgeService) processQuestionGenerationForKnowledge(ctx context.Con
 	}
 
 	processOverrides, _ := knowledge.ProcessOverrides()
-	questionGenCfg := ResolveProcessConfig(kb, processOverrides).QuestionGenerationConfig
+	questionConfig := ResolveProcessConfig(kb, processOverrides)
+	if projection, projectionErr := types.ValidateProductionProjectionIntegrity(knowledge); projectionErr != nil {
+		return projectionErr
+	} else if projection != nil {
+		questionConfig = ResolveProductionProjectionProcessConfig(processOverrides)
+	}
+	questionGenCfg := questionConfig.QuestionGenerationConfig
 	customInstructions := questionGenCfg.CustomInstructions
 
 	// Collect image info for all text chunks so question generation can
@@ -1735,15 +1771,23 @@ func (s *knowledgeService) processQuestionGenerationForChunks(ctx context.Contex
 		}
 	}
 
-	chatModel, err := s.modelService.GetChatModel(ctx, kb.SummaryModelID)
+	summaryModelID := kb.SummaryModelID
+	embeddingModelID := kb.EmbeddingModelID
+	if payload.SummaryModelID != "" {
+		summaryModelID = payload.SummaryModelID
+	}
+	if payload.EmbeddingModelID != "" {
+		embeddingModelID = payload.EmbeddingModelID
+	}
+	chatModel, err := s.modelService.GetChatModel(ctx, summaryModelID)
 	if err != nil {
 		exitStatus = "get_chat_model_failed"
 		logger.Errorf(ctx, "Failed to get chat model: %v", err)
 		return fmt.Errorf("failed to get chat model: %w", err)
 	}
-	resolvedModelID = kb.SummaryModelID
+	resolvedModelID = summaryModelID
 
-	embeddingModel, err := s.modelService.GetEmbeddingModel(ctx, kb.EmbeddingModelID)
+	embeddingModel, err := s.modelService.GetEmbeddingModel(ctx, embeddingModelID)
 	if err != nil {
 		exitStatus = "get_embedding_model_failed"
 		logger.Errorf(ctx, "Failed to get embedding model: %v", err)
@@ -1775,7 +1819,13 @@ func (s *knowledgeService) processQuestionGenerationForChunks(ctx context.Contex
 	}
 
 	processOverrides, _ := knowledge.ProcessOverrides()
-	questionGenCfg := ResolveProcessConfig(kb, processOverrides).QuestionGenerationConfig
+	questionConfig := ResolveProcessConfig(kb, processOverrides)
+	if projection, projectionErr := types.ValidateProductionProjectionIntegrity(knowledge); projectionErr != nil {
+		return projectionErr
+	} else if projection != nil {
+		questionConfig = ResolveProductionProjectionProcessConfig(processOverrides)
+	}
+	questionGenCfg := questionConfig.QuestionGenerationConfig
 	customInstructions := questionGenCfg.CustomInstructions
 
 	// Fetch the batch chunks (in payload order) plus the two boundary
@@ -1987,6 +2037,9 @@ func (s *knowledgeService) ReparseKnowledge(
 	existing, err := s.repo.GetKnowledgeByID(ctx, tenantID, knowledgeID)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to load knowledge: %v", err)
+		return nil, err
+	}
+	if err := types.RejectProductionProjectionMutation(existing); err != nil {
 		return nil, err
 	}
 
@@ -2294,6 +2347,9 @@ func (s *knowledgeService) CancelKnowledgeParse(
 	}
 	if existing == nil {
 		return nil, werrors.NewNotFoundError("knowledge not found")
+	}
+	if err := types.RejectProductionProjectionMutation(existing); err != nil {
+		return nil, err
 	}
 
 	switch existing.ParseStatus {
@@ -2685,8 +2741,7 @@ func (s *knowledgeService) ProcessManualUpdate(ctx context.Context, t *asynq.Tas
 	}
 
 	// Run manual processing (image resolution + chunking + embedding) synchronously within the worker
-	s.triggerManualProcessing(ctx, kb, knowledge, payload.Content, true)
-	return nil
+	return s.triggerManualProcessing(ctx, kb, knowledge, payload.Content, true)
 }
 
 // ProcessDocument handles Asynq document processing tasks

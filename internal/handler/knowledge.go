@@ -2202,6 +2202,10 @@ func (h *KnowledgeHandler) MoveKnowledge(c *gin.Context) {
 			c.Error(errors.NewBadRequestError(fmt.Sprintf("Knowledge item %s does not belong to the source knowledge base", kID)))
 			return
 		}
+		if err := types.RejectProductionProjectionMutation(knowledge); err != nil {
+			c.Error(err)
+			return
+		}
 		if knowledge.ParseStatus != types.ParseStatusCompleted {
 			c.Error(errors.NewBadRequestError(fmt.Sprintf("Knowledge item %s is not in completed status (current: %s)", kID, knowledge.ParseStatus)))
 			return

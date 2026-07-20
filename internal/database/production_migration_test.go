@@ -1334,8 +1334,58 @@ func TestProductionPublicationMigrationsDeclareRequiredTables(t *testing.T) {
 	}
 }
 
+func TestProductionProjectionIntegrityMigrationsAreAdditiveAndParse(t *testing.T) {
+	postgresUp := mustReadMigration(t, "../../migrations/versioned/000075_knowledge_production_projection_integrity.up.sql")
+	postgresDown := mustReadMigration(t, "../../migrations/versioned/000075_knowledge_production_projection_integrity.down.sql")
+	_, err := pg_query.Parse(postgresUp)
+	require.NoError(t, err)
+	_, err = pg_query.Parse(postgresDown)
+	require.NoError(t, err)
+
+	for _, migration := range []string{
+		postgresUp,
+		mustReadMigration(t, "../../migrations/sqlite/000006_knowledge_production_projection_integrity.up.sql"),
+	} {
+		require.Contains(t, migration, "release_digest_version")
+		require.Contains(t, migration, "failure_code")
+		require.Contains(t, migration, "failure_reason")
+	}
+}
+
+func TestProductionProjectionIntegritySQLiteUpgradesAndDowngradesPopulatedPublication(t *testing.T) {
+	db := openProductionPublicationSQLite(t)
+	seedProductionReleaseScope(t, db)
+	insertProductionPublicationRelease(t, db, "release-upgrade", "version-1", "review-pub-1", strings.Repeat("a", 64))
+	insertProductionPublicationTarget(t, db, "target-upgrade", "release-upgrade", "version-1", "kb-1", "knowledge-upgrade", strings.Repeat("a", 64))
+
+	_, err := db.Exec(mustReadMigration(t, "../../migrations/sqlite/000006_knowledge_production_projection_integrity.up.sql"))
+	require.NoError(t, err)
+	var digestVersion int
+	var failureCode, failureReason string
+	require.NoError(t, db.QueryRow(`SELECT release_digest_version FROM production_releases WHERE id = 'release-upgrade'`).Scan(&digestVersion))
+	require.Zero(t, digestVersion, "legacy digests must remain explicitly unverifiable")
+	require.NoError(t, db.QueryRow(`SELECT failure_code, failure_reason FROM production_release_targets WHERE id = 'target-upgrade'`).Scan(&failureCode, &failureReason))
+	require.Empty(t, failureCode)
+	require.Empty(t, failureReason)
+	_, err = db.Exec(`UPDATE production_releases SET release_digest_version = 1 WHERE id = 'release-upgrade'`)
+	require.ErrorContains(t, err, "release identity is immutable")
+	_, err = db.Exec(`UPDATE production_release_targets
+		SET status = 'failed', failed_at = CURRENT_TIMESTAMP, retention_until = datetime(CURRENT_TIMESTAMP, '+30 days')
+		WHERE id = 'target-upgrade'`)
+	require.Error(t, err, "failed targets require bounded failure metadata")
+
+	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000006_knowledge_production_projection_integrity.down.sql"))
+	require.NoError(t, err)
+	require.Empty(t, sqliteColumnTypeIfPresent(t, db, "production_releases", "release_digest_version"))
+	require.Empty(t, sqliteColumnTypeIfPresent(t, db, "production_release_targets", "failure_code"))
+	var targetCount int
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM production_release_targets WHERE id = 'target-upgrade'`).Scan(&targetCount))
+	require.Equal(t, 1, targetCount)
+}
+
 func TestProductionPublicationPostgreSQLMigrationDeclaresReleaseAndProjectionIntegrity(t *testing.T) {
 	up := mustReadMigration(t, "../../migrations/versioned/000074_knowledge_production_publication.up.sql")
+	integrityUp := mustReadMigration(t, "../../migrations/versioned/000075_knowledge_production_projection_integrity.up.sql")
 	_, err := pg_query.Parse(up)
 	require.NoError(t, err)
 
@@ -1364,13 +1414,18 @@ func TestProductionPublicationPostgreSQLMigrationDeclaresReleaseAndProjectionInt
 		"production projection head updates require CAS lock versions",
 		"config_snapshot JSONB NOT NULL",
 		"config_digest VARCHAR(64) NOT NULL",
-		"failure_code VARCHAR(64) NOT NULL DEFAULT ''",
-		"failure_reason VARCHAR(256) NOT NULL DEFAULT ''",
-		"production release target failure metadata is lifecycle-owned",
 		"chk_production_release_targets_config_digest",
 		"octet_length(config_snapshot::text)",
 	} {
 		require.Contains(t, up, declaration)
+	}
+	for _, declaration := range []string{
+		"release_digest_version INTEGER NOT NULL DEFAULT 0",
+		"failure_code VARCHAR(64) NOT NULL DEFAULT ''",
+		"failure_reason VARCHAR(256) NOT NULL DEFAULT ''",
+		"production release target failure metadata is lifecycle-owned",
+	} {
+		require.Contains(t, integrityUp, declaration)
 	}
 
 	down := mustReadMigration(t, "../../migrations/versioned/000074_knowledge_production_publication.down.sql")
@@ -1465,7 +1520,7 @@ func TestProductionPublicationSQLiteMigrationRollsBackPopulatedSchema(t *testing
 }
 
 func TestProductionPublicationSQLiteMigrationGuardsAggregateLifecycleTargetsRetentionAndIndexes(t *testing.T) {
-	db := openProductionPublicationSQLite(t)
+	db := openProductionProjectionIntegritySQLite(t)
 	seedProductionReleaseScope(t, db)
 	insertProductionPublicationRelease(t, db, "release-1", "version-1", "review-pub-1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 
@@ -1675,6 +1730,15 @@ func openProductionPublicationSQLite(t *testing.T) *sql.DB {
     )`)
 	require.NoError(t, err)
 	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000005_knowledge_production_publication.up.sql"))
+	require.NoError(t, err)
+	return db
+}
+
+func openProductionProjectionIntegritySQLite(t *testing.T) *sql.DB {
+	t.Helper()
+
+	db := openProductionPublicationSQLite(t)
+	_, err := db.Exec(mustReadMigration(t, "../../migrations/sqlite/000006_knowledge_production_projection_integrity.up.sql"))
 	require.NoError(t, err)
 	return db
 }
@@ -1925,6 +1989,25 @@ func sqliteColumnType(t *testing.T, db *sql.DB, table, column string) string {
 	}
 	require.NoError(t, rows.Err())
 	t.Fatalf("column %s not found on table %s", column, table)
+	return ""
+}
+
+func sqliteColumnTypeIfPresent(t *testing.T, db *sql.DB, table, column string) string {
+	t.Helper()
+
+	rows, err := db.Query("PRAGMA table_info(" + table + ")")
+	require.NoError(t, err)
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		require.NoError(t, rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey))
+		if name == column {
+			return strings.ToLower(columnType)
+		}
+	}
+	require.NoError(t, rows.Err())
 	return ""
 }
 

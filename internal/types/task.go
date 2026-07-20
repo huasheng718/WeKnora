@@ -312,10 +312,12 @@ type FAQImportPayload struct {
 // QuestionGenerationPayload represents the question generation task payload
 type QuestionGenerationPayload struct {
 	TracingContext
-	TenantID        uint64 `json:"tenant_id"`
-	KnowledgeBaseID string `json:"knowledge_base_id"`
-	KnowledgeID     string `json:"knowledge_id"`
-	QuestionCount   int    `json:"question_count"`
+	TenantID         uint64 `json:"tenant_id"`
+	KnowledgeBaseID  string `json:"knowledge_base_id"`
+	KnowledgeID      string `json:"knowledge_id"`
+	QuestionCount    int    `json:"question_count"`
+	SummaryModelID   string `json:"summary_model_id,omitempty"`
+	EmbeddingModelID string `json:"embedding_model_id,omitempty"`
 	// Language is the request locale (e.g. zh-CN, en-US) when the task was enqueued, used for {{language}} / {{lang}} in templates.
 	Language string `json:"language,omitempty"`
 	// Attempt links this task to the parent parse attempt so the worker
@@ -356,10 +358,12 @@ type QuestionGenerationPayload struct {
 // SummaryGenerationPayload represents the summary generation task payload
 type SummaryGenerationPayload struct {
 	TracingContext
-	TenantID        uint64 `json:"tenant_id"`
-	KnowledgeBaseID string `json:"knowledge_base_id"`
-	KnowledgeID     string `json:"knowledge_id"`
-	Language        string `json:"language,omitempty"`
+	TenantID         uint64 `json:"tenant_id"`
+	KnowledgeBaseID  string `json:"knowledge_base_id"`
+	KnowledgeID      string `json:"knowledge_id"`
+	SummaryModelID   string `json:"summary_model_id,omitempty"`
+	EmbeddingModelID string `json:"embedding_model_id,omitempty"`
+	Language         string `json:"language,omitempty"`
 	// Attempt links this task to the parent parse attempt so the worker
 	// can record a postprocess.summary subspan under the right attempt's
 	// postprocess stage. See QuestionGenerationPayload.Attempt notes.

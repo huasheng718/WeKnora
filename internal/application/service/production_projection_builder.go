@@ -113,6 +113,9 @@ func (b *ProductionProjectionBuilder) Build(ctx context.Context, targetID string
 		return nil, err
 	}
 	if err := verifyProductionProjectionDigests(target, release, version, review, evidenceByID); err != nil {
+		if errors.Is(err, types.ErrProductionReleaseReprepareRequired) {
+			return nil, err
+		}
 		return nil, b.failDigestMismatch(ctx, target, err)
 	}
 
@@ -121,7 +124,7 @@ func (b *ProductionProjectionBuilder) Build(ctx context.Context, targetID string
 		return nil, err
 	}
 	contentSum := sha256.Sum256([]byte(markdown))
-	processOverrides, embeddingModelID, graphModelID, err := productionProjectionProcessSnapshot(target.ConfigSnapshot)
+	processOverrides, embeddingModelID, summaryModelID, graphModelID, indexingStrategy, err := productionProjectionProcessSnapshot(target.ConfigSnapshot)
 	if err != nil {
 		return nil, err
 	}
@@ -137,12 +140,12 @@ func (b *ProductionProjectionBuilder) Build(ctx context.Context, targetID string
 	payload := &types.ProductionProjectionKnowledgePayload{
 		KnowledgeID: target.KnowledgeID, KnowledgeBaseID: target.TargetKnowledgeBaseID,
 		Title: document.Title, Content: markdown, EmbeddingModelID: embeddingModelID,
-		GraphModelID:     graphModelID,
+		SummaryModelID: summaryModelID, GraphModelID: graphModelID, IndexingStrategy: indexingStrategy,
 		ProcessOverrides: processOverrides,
 		ProductionProjection: &types.ProductionProjectionMetadata{
 			DocumentID: target.DocumentID, VersionID: target.VersionID,
 			ReleaseTargetID: target.ID, ContentDigest: hex.EncodeToString(contentSum[:]),
-			GraphModelID: graphModelID,
+			GraphModelID: graphModelID, SummaryModelID: summaryModelID, IndexingStrategy: indexingStrategy,
 		},
 	}
 	if existing, loadErr := b.knowledge.GetKnowledgeByID(ctx, target.KnowledgeID); loadErr == nil {
@@ -178,15 +181,36 @@ func validateProductionProjectionScope(
 		version.ProjectID != target.ProjectID || review.ID != release.ReviewRequestID ||
 		review.TenantID != target.TenantID || review.ProjectID != target.ProjectID ||
 		review.DocumentID != target.DocumentID || review.VersionID != target.VersionID ||
-		review.Status != types.ProductionReviewApproved || version.FrozenAt == nil {
+		review.Status != types.ProductionReviewApproved || version.FrozenAt == nil ||
+		document.LatestApprovedVersionID == nil || *document.LatestApprovedVersionID != target.VersionID {
 		return types.ErrProductionReviewScopeInvalid
 	}
-	for _, step := range review.Steps {
+	var policyObject map[string]json.RawMessage
+	if err := json.Unmarshal(review.PolicySnapshot, &policyObject); err != nil || len(policyObject) != 1 {
+		return types.ErrProductionReviewScopeInvalid
+	}
+	var policyRoles []types.ProductionRole
+	stepsJSON, ok := policyObject["steps"]
+	if !ok || json.Unmarshal(stepsJSON, &policyRoles) != nil || len(policyRoles) == 0 || len(policyRoles) != len(review.Steps) {
+		return types.ErrProductionReviewScopeInvalid
+	}
+	seenStepIDs := make(map[string]struct{}, len(review.Steps))
+	seenSequences := make(map[int]struct{}, len(review.Steps))
+	for index, step := range review.Steps {
 		if step == nil || step.ReviewRequestID != review.ID || step.TenantID != target.TenantID ||
 			step.ProjectID != target.ProjectID || step.DocumentID != target.DocumentID ||
-			step.VersionID != target.VersionID || step.Decision != types.ProductionReviewApproved {
+			step.VersionID != target.VersionID || step.Decision != types.ProductionReviewApproved ||
+			step.Sequence != index+1 || !step.RequiredRole.IsValid() || step.RequiredRole != policyRoles[index] {
 			return types.ErrProductionReviewScopeInvalid
 		}
+		if _, duplicate := seenStepIDs[step.ID]; duplicate {
+			return types.ErrProductionReviewScopeInvalid
+		}
+		if _, duplicate := seenSequences[step.Sequence]; duplicate {
+			return types.ErrProductionReviewScopeInvalid
+		}
+		seenStepIDs[step.ID] = struct{}{}
+		seenSequences[step.Sequence] = struct{}{}
 	}
 	return nil
 }
@@ -209,7 +233,14 @@ func verifyProductionProjectionDigests(
 	if err := VerifyProductionVersionDigests(version, evidenceByID); err != nil {
 		return errors.Join(types.ErrProductionContentDigestMismatch, err)
 	}
-	if expected := types.ComputeProductionReleaseDigest(release, version, review); expected == "" || expected != release.ReleaseDigest || target.ReleaseDigest != expected {
+	if release.ReleaseDigestVersion != types.ProductionReleaseDigestVersionCurrent {
+		return types.ErrProductionReleaseReprepareRequired
+	}
+	expected, err := types.ComputeProductionReleaseDigestForVersion(release.ReleaseDigestVersion, release, version, review)
+	if err != nil {
+		return err
+	}
+	if expected != release.ReleaseDigest || target.ReleaseDigest != expected {
 		return errors.Join(types.ErrProductionContentDigestMismatch, errors.New("release digest mismatch"))
 	}
 	return nil
@@ -269,46 +300,55 @@ func validateProductionProjectionKnowledge(
 	return nil
 }
 
-func productionProjectionProcessSnapshot(raw types.JSON) (*types.KnowledgeProcessOverrides, string, string, error) {
+func productionProjectionProcessSnapshot(raw types.JSON) (*types.KnowledgeProcessOverrides, string, string, string, types.IndexingStrategy, error) {
 	var snapshot struct {
-		EmbeddingModelID         string                           `json:"embedding_model_id"`
-		Chunking                 *types.ChunkingConfig            `json:"chunking"`
-		ChunkingConfig           *types.ChunkingConfig            `json:"chunking_config"`
-		ParserEngineRules        []types.ParserEngineRule         `json:"parser_engine_rules"`
-		EnableMultimodel         *bool                            `json:"enable_multimodel"`
-		VLMConfig                *types.VLMConfig                 `json:"vlm_config"`
-		ASRConfig                *types.ASRConfig                 `json:"asr_config"`
-		QuestionGenerationConfig *types.QuestionGenerationConfig  `json:"question_generation_config"`
-		ExtractConfig            *types.ExtractConfig             `json:"extract_config"`
-		Graph                    json.RawMessage                  `json:"graph"`
-		GraphEnabled             *bool                            `json:"graph_enabled"`
-		ProcessOverrides         *types.KnowledgeProcessOverrides `json:"process_overrides"`
+		Version                  int                             `json:"version"`
+		IndexingStrategy         *types.IndexingStrategy         `json:"indexing_strategy"`
+		EmbeddingModelID         string                          `json:"embedding_model_id"`
+		SummaryModelID           string                          `json:"summary_model_id"`
+		Chunking                 *types.ChunkingConfig           `json:"chunking"`
+		ChunkingConfig           *types.ChunkingConfig           `json:"chunking_config"`
+		ParserEngineRules        []types.ParserEngineRule        `json:"parser_engine_rules"`
+		EnableMultimodel         *bool                           `json:"enable_multimodel"`
+		VLMConfig                *types.VLMConfig                `json:"vlm_config"`
+		ASRConfig                *types.ASRConfig                `json:"asr_config"`
+		QuestionGenerationConfig *types.QuestionGenerationConfig `json:"question_generation_config"`
+		ExtractConfig            *types.ExtractConfig            `json:"extract_config"`
+		Graph                    *struct {
+			Enabled       *bool                `json:"enabled"`
+			ModelID       string               `json:"model_id"`
+			ExtractConfig *types.ExtractConfig `json:"extract_config"`
+		} `json:"graph"`
+		GraphEnabled     *bool                            `json:"graph_enabled"`
+		ProcessOverrides *types.KnowledgeProcessOverrides `json:"process_overrides"`
 	}
 	decoder := json.NewDecoder(strings.NewReader(string(raw)))
 	decoder.UseNumber()
 	var decoded any
 	if err := decoder.Decode(&decoded); err != nil {
-		return nil, "", "", fmt.Errorf("%w: decode processing snapshot: %v", types.ErrProductionReleaseConfigInvalid, err)
+		return nil, "", "", "", types.IndexingStrategy{}, fmt.Errorf("%w: decode processing snapshot: %v", types.ErrProductionReleaseConfigInvalid, err)
 	}
 	normalized, err := json.Marshal(normalizeProductionProjectionJSONNumbers(decoded))
 	if err != nil {
-		return nil, "", "", fmt.Errorf("%w: normalize processing snapshot: %v", types.ErrProductionReleaseConfigInvalid, err)
+		return nil, "", "", "", types.IndexingStrategy{}, fmt.Errorf("%w: normalize processing snapshot: %v", types.ErrProductionReleaseConfigInvalid, err)
 	}
 	if err := json.Unmarshal(normalized, &snapshot); err != nil {
-		return nil, "", "", fmt.Errorf("%w: decode processing snapshot: %v", types.ErrProductionReleaseConfigInvalid, err)
+		return nil, "", "", "", types.IndexingStrategy{}, fmt.Errorf("%w: decode processing snapshot: %v", types.ErrProductionReleaseConfigInvalid, err)
+	}
+	if snapshot.Version != 1 || snapshot.IndexingStrategy == nil || !snapshot.IndexingStrategy.HasAnyIndexing() ||
+		snapshot.Chunking == nil || snapshot.Chunking.ChunkSize <= 0 || strings.TrimSpace(snapshot.Chunking.Strategy) == "" ||
+		strings.TrimSpace(snapshot.SummaryModelID) == "" || snapshot.Graph == nil || snapshot.Graph.Enabled == nil ||
+		*snapshot.Graph.Enabled != snapshot.IndexingStrategy.GraphEnabled ||
+		(snapshot.IndexingStrategy.NeedsEmbedding() && strings.TrimSpace(snapshot.EmbeddingModelID) == "") ||
+		(snapshot.IndexingStrategy.GraphEnabled && (strings.TrimSpace(snapshot.Graph.ModelID) == "" || snapshot.Graph.ExtractConfig == nil || !snapshot.Graph.ExtractConfig.Enabled)) {
+		return nil, "", "", "", types.IndexingStrategy{}, fmt.Errorf("%w: processing snapshot is incomplete", types.ErrProductionReleaseConfigInvalid)
 	}
 	overrides := snapshot.ProcessOverrides
 	if overrides == nil {
 		overrides = &types.KnowledgeProcessOverrides{}
 	}
-	chunking := snapshot.ChunkingConfig
-	if chunking == nil {
-		chunking = snapshot.Chunking
-	}
-	if chunking != nil {
-		copyChunking := *chunking
-		overrides.ChunkingConfig = &copyChunking
-	}
+	copyChunking := *snapshot.Chunking
+	overrides.ChunkingConfig = &copyChunking
 	if len(snapshot.ParserEngineRules) != 0 {
 		overrides.ParserEngineRules = append([]types.ParserEngineRule(nil), snapshot.ParserEngineRules...)
 	}
@@ -316,31 +356,14 @@ func productionProjectionProcessSnapshot(raw types.JSON) (*types.KnowledgeProces
 	overrides.VLMConfig = snapshot.VLMConfig
 	overrides.ASRConfig = snapshot.ASRConfig
 	overrides.QuestionGenerationConfig = snapshot.QuestionGenerationConfig
-	overrides.ExtractConfig = snapshot.ExtractConfig
-	if snapshot.GraphEnabled != nil {
-		value := *snapshot.GraphEnabled
-		overrides.GraphEnabled = &value
-	} else if len(snapshot.Graph) != 0 {
-		var enabled bool
-		if err := json.Unmarshal(snapshot.Graph, &enabled); err == nil {
-			overrides.GraphEnabled = &enabled
-		} else {
-			var graph struct {
-				Enabled       bool                 `json:"enabled"`
-				ModelID       string               `json:"model_id"`
-				ExtractConfig *types.ExtractConfig `json:"extract_config"`
-			}
-			if err := json.Unmarshal(snapshot.Graph, &graph); err != nil {
-				return nil, "", "", fmt.Errorf("%w: decode graph snapshot: %v", types.ErrProductionReleaseConfigInvalid, err)
-			}
-			overrides.GraphEnabled = &graph.Enabled
-			if graph.ExtractConfig != nil {
-				overrides.ExtractConfig = graph.ExtractConfig
-			}
-			return overrides, strings.TrimSpace(snapshot.EmbeddingModelID), strings.TrimSpace(graph.ModelID), nil
-		}
+	graphEnabled := *snapshot.Graph.Enabled
+	overrides.GraphEnabled = &graphEnabled
+	if snapshot.Graph.ExtractConfig != nil {
+		overrides.ExtractConfig = snapshot.Graph.ExtractConfig
+	} else {
+		overrides.ExtractConfig = snapshot.ExtractConfig
 	}
-	return overrides, strings.TrimSpace(snapshot.EmbeddingModelID), "", nil
+	return overrides, strings.TrimSpace(snapshot.EmbeddingModelID), strings.TrimSpace(snapshot.SummaryModelID), strings.TrimSpace(snapshot.Graph.ModelID), *snapshot.IndexingStrategy, nil
 }
 
 func normalizeProductionProjectionJSONNumbers(value any) any {

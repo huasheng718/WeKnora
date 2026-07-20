@@ -60,18 +60,7 @@ func (s *KnowledgePostProcessService) tracker() SpanTracker {
 }
 
 func productionProjectionMetadata(knowledge *types.Knowledge) (*types.ProductionProjectionMetadata, error) {
-	if knowledge == nil || len(knowledge.Metadata) == 0 {
-		return nil, nil
-	}
-	metadata, err := knowledge.ManualMetadata()
-	if err != nil {
-		return nil, err
-	}
-	if metadata == nil || metadata.ProductionProjection == nil {
-		return nil, nil
-	}
-	copyProjection := *metadata.ProductionProjection
-	return &copyProjection, nil
+	return types.ValidateProductionProjectionIntegrity(knowledge)
 }
 
 func markProductionProjectionReady(
@@ -211,6 +200,11 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 
 	processOverrides, _ := knowledge.ProcessOverrides()
 	eff := ResolveProcessConfig(kb, processOverrides)
+	indexingStrategy := kb.IndexingStrategy
+	if projection != nil {
+		eff = ResolveProductionProjectionProcessConfig(processOverrides)
+		indexingStrategy = projection.IndexingStrategy
+	}
 
 	// 2. Fetch all chunks
 	chunks, err := s.chunkService.ListChunksByKnowledgeID(ctx, payload.KnowledgeID)
@@ -242,7 +236,7 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 	//    completed while wiki runs minutes later. A wiki op that never
 	//    drains is bounded by the housekeeping finalizing sweep.
 	willSpawnSummary := len(textChunks) > 0
-	willSpawnQuestion := willSpawnSummary && kb.NeedsEmbeddingModel() &&
+	willSpawnQuestion := willSpawnSummary && indexingStrategy.NeedsEmbedding() &&
 		eff.QuestionGenerationConfig.Enabled
 	willSpawnWiki := projection == nil && kb.IndexingStrategy.WikiEnabled && len(textChunks) > 0
 
@@ -292,6 +286,8 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 	enteredFinalizing := false
 
 	switch {
+	case projection != nil && knowledge.ParseStatus == types.ParseStatusFinalizing:
+		enteredFinalizing = true
 	case knowledge.ParseStatus != types.ParseStatusProcessing:
 		// The row was already in some other state (deleting / cancelled /
 		// failed / completed) when we arrived. Don't touch parse_status
@@ -381,8 +377,12 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 	// 4. Spawn Summary and Question Tasks
 	enqueuedSummary := false
 	enqueuedQuestionCount := 0
+	var projectionEnqueueErr error
 	if willSpawnSummary {
-		enqueuedSummary = s.enqueueSummaryGenerationTask(ctx, payload, attempt)
+		enqueuedSummary, err = s.enqueueSummaryGenerationTask(ctx, payload, attempt, knowledge, projection)
+		if err != nil {
+			projectionEnqueueErr = errors.Join(projectionEnqueueErr, err)
+		}
 		if willSpawnQuestion {
 			// Create the postprocess.question grouping span up front so the
 			// per-batch subspans (enqueued just below, run later in their own
@@ -400,7 +400,10 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 					"chunk_count": len(questionChunks),
 				})
 			}
-			enqueuedQuestionCount = s.enqueueQuestionGenerationTasks(ctx, payload, eff.QuestionGenerationConfig, attempt, questionChunks)
+			enqueuedQuestionCount, err = s.enqueueQuestionGenerationTasks(ctx, payload, eff.QuestionGenerationConfig, attempt, questionChunks, knowledge, projection)
+			if err != nil {
+				projectionEnqueueErr = errors.Join(projectionEnqueueErr, err)
+			}
 		}
 	}
 
@@ -413,13 +416,22 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 		}
 		logger.Infof(ctx, "[KnowledgePostProcess] Spawning Graph RAG extract tasks for %d text-like chunks", len(textChunks))
 		for i, chunk := range textChunks {
+			var taskID string
+			if projection != nil {
+				taskID = productionProjectionTaskID(projection.ReleaseTargetID, payload.KnowledgeID, fmt.Sprintf("graph-%d", i))
+			}
 			ok, err := NewChunkExtractTask(ctx, s.taskEnqueuer, payload.TenantID, chunk.ID, graphModelID,
-				payload.KnowledgeID, attempt, i)
+				payload.KnowledgeID, attempt, i, taskID)
 			if err != nil {
 				logger.Errorf(ctx, "[KnowledgePostProcess] Failed to create chunk extract task for %s: %v", chunk.ID, err)
+				if projection != nil {
+					projectionEnqueueErr = errors.Join(projectionEnqueueErr, err)
+				}
 			}
 			if ok {
 				enqueuedGraphCount++
+			} else if projection != nil && err == nil {
+				projectionEnqueueErr = errors.Join(projectionEnqueueErr, errors.New("production graph task was not enqueued"))
 			}
 		}
 	}
@@ -473,7 +485,7 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 		if enqueuedSummary {
 			actualOwned++
 		}
-		if shortfall := plannedOwned - actualOwned; shortfall > 0 {
+		if shortfall := plannedOwned - actualOwned; shortfall > 0 && (projection == nil || projectionEnqueueErr == nil) {
 			logger.Warnf(ctx,
 				"[KnowledgePostProcess] Releasing %d un-enqueued subtask slot(s) for %s (planned=%d actual=%d)",
 				shortfall, payload.KnowledgeID, plannedOwned, actualOwned)
@@ -499,6 +511,9 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 	if reconciliationErr != nil && projection != nil {
 		return fmt.Errorf("finalize production projection knowledge %s: %w", payload.KnowledgeID, reconciliationErr)
 	}
+	if projectionEnqueueErr != nil && projection != nil {
+		return fmt.Errorf("enqueue production projection post-process tasks for %s: %w", payload.KnowledgeID, projectionEnqueueErr)
+	}
 
 	postOutput := types.JSONMap{
 		"chunks_total":            len(textChunks),
@@ -523,9 +538,12 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 // enqueueSummaryGenerationTask enqueues the summary task. Returns true only
 // when a task was actually placed on the queue, so the caller can release the
 // seeded pending-subtask slot when enqueue is skipped or fails.
-func (s *KnowledgePostProcessService) enqueueSummaryGenerationTask(ctx context.Context, payload types.KnowledgePostProcessPayload, attempt int) bool {
+func (s *KnowledgePostProcessService) enqueueSummaryGenerationTask(
+	ctx context.Context, payload types.KnowledgePostProcessPayload, attempt int,
+	knowledge *types.Knowledge, projection *types.ProductionProjectionMetadata,
+) (bool, error) {
 	if s.taskEnqueuer == nil {
-		return false
+		return false, nil
 	}
 
 	taskPayload := types.SummaryGenerationPayload{
@@ -535,21 +553,33 @@ func (s *KnowledgePostProcessService) enqueueSummaryGenerationTask(ctx context.C
 		Language:        payload.Language,
 		Attempt:         attempt,
 	}
+	var enqueueOptions []asynq.Option
+	if projection != nil {
+		taskPayload.SummaryModelID = projection.SummaryModelID
+		taskPayload.EmbeddingModelID = knowledge.EmbeddingModelID
+		enqueueOptions = append(enqueueOptions,
+			asynq.TaskID(productionProjectionTaskID(projection.ReleaseTargetID, payload.KnowledgeID, "summary")),
+			asynq.Retention(24*time.Hour),
+		)
+	}
 	langfuse.InjectTracing(ctx, &taskPayload)
 	payloadBytes, err := json.Marshal(taskPayload)
 	if err != nil {
 		logger.Warnf(ctx, "[KnowledgePostProcess] Failed to marshal summary generation payload: %v", err)
-		return false
+		return false, err
 	}
 
 	task := asynq.NewTask(types.TypeSummaryGeneration, payloadBytes,
 		asynq.Queue(types.QueueSummary), asynq.MaxRetry(3), asynq.Timeout(30*time.Minute))
-	if _, err := s.taskEnqueuer.Enqueue(task); err != nil {
+	if _, err := s.taskEnqueuer.Enqueue(task, enqueueOptions...); err != nil {
+		if projection != nil && errors.Is(err, asynq.ErrTaskIDConflict) {
+			return true, nil
+		}
 		logger.Warnf(ctx, "[KnowledgePostProcess] Failed to enqueue summary generation for %s: %v", payload.KnowledgeID, err)
-		return false
+		return false, err
 	}
 	logger.Infof(ctx, "[KnowledgePostProcess] Enqueued summary generation task for %s", payload.KnowledgeID)
-	return true
+	return true, nil
 }
 
 // questionGenChunkBatchSize is the number of text chunks handled by a single
@@ -582,12 +612,14 @@ func (s *KnowledgePostProcessService) enqueueQuestionGenerationTasks(
 	qg types.QuestionGenerationConfig,
 	attempt int,
 	questionChunks []*types.Chunk,
-) int {
+	knowledge *types.Knowledge,
+	projection *types.ProductionProjectionMetadata,
+) (int, error) {
 	if s.taskEnqueuer == nil || len(questionChunks) == 0 {
-		return 0
+		return 0, nil
 	}
 	if !qg.Enabled {
-		return 0
+		return 0, nil
 	}
 
 	questionCount := qg.QuestionCount
@@ -600,6 +632,7 @@ func (s *KnowledgePostProcessService) enqueueQuestionGenerationTasks(
 
 	total := len(questionChunks)
 	enqueued := 0
+	var enqueueErr error
 	batchIndex := 0
 	for start := 0; start < total; start += questionGenChunkBatchSize {
 		end := start + questionGenChunkBatchSize
@@ -622,6 +655,15 @@ func (s *KnowledgePostProcessService) enqueueQuestionGenerationTasks(
 			ChunkIDs:        chunkIDs,
 			BatchIndex:      batchIndex,
 		}
+		var enqueueOptions []asynq.Option
+		if projection != nil {
+			taskPayload.SummaryModelID = projection.SummaryModelID
+			taskPayload.EmbeddingModelID = knowledge.EmbeddingModelID
+			enqueueOptions = append(enqueueOptions,
+				asynq.TaskID(productionProjectionTaskID(projection.ReleaseTargetID, payload.KnowledgeID, fmt.Sprintf("question-%d", batchIndex))),
+				asynq.Retention(24*time.Hour),
+			)
+		}
 		// Boundary context: the text chunk just before / after this window.
 		if start > 0 {
 			taskPayload.PrevChunkID = questionChunks[start-1].ID
@@ -635,18 +677,24 @@ func (s *KnowledgePostProcessService) enqueueQuestionGenerationTasks(
 		payloadBytes, err := json.Marshal(taskPayload)
 		if err != nil {
 			logger.Warnf(ctx, "[KnowledgePostProcess] Failed to marshal question generation payload for batch %d: %v", batchIndex-1, err)
+			enqueueErr = errors.Join(enqueueErr, err)
 			continue
 		}
 
 		task := asynq.NewTask(types.TypeQuestionGeneration, payloadBytes,
 			asynq.Queue(types.QueueQuestion), asynq.MaxRetry(3), asynq.Timeout(30*time.Minute))
-		if _, err := s.taskEnqueuer.Enqueue(task); err != nil {
+		if _, err := s.taskEnqueuer.Enqueue(task, enqueueOptions...); err != nil {
+			if projection != nil && errors.Is(err, asynq.ErrTaskIDConflict) {
+				enqueued++
+				continue
+			}
 			logger.Warnf(ctx, "[KnowledgePostProcess] Failed to enqueue question generation batch %d for %s: %v", batchIndex-1, payload.KnowledgeID, err)
+			enqueueErr = errors.Join(enqueueErr, err)
 			continue
 		}
 		enqueued++
 	}
 	logger.Infof(ctx, "[KnowledgePostProcess] Enqueued %d question generation batch tasks (%d chunks, batch_size=%d) for %s (count=%d)",
 		enqueued, total, questionGenChunkBatchSize, payload.KnowledgeID, questionCount)
-	return enqueued
+	return enqueued, enqueueErr
 }

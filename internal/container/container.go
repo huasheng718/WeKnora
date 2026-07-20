@@ -184,6 +184,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(repository.NewProductionRunRepository))
 	must(container.Provide(repository.NewProductionRunRecoveryRepository))
 	must(container.Provide(repository.NewProductionIdempotencyRepository))
+	must(container.Provide(repository.NewProductionReleaseRepository))
 	must(container.Provide(repository.NewProductionUnitOfWork))
 
 	// MCP manager for managing MCP client connections

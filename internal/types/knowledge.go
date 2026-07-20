@@ -1,8 +1,12 @@
 package types
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -207,11 +211,13 @@ type ManualKnowledgeMetadata struct {
 // ProductionProjectionMetadata immutably binds a manual Knowledge row to the
 // governed document version and pre-reserved release target that created it.
 type ProductionProjectionMetadata struct {
-	DocumentID      string `json:"document_id"`
-	VersionID       string `json:"version_id"`
-	ReleaseTargetID string `json:"release_target_id"`
-	ContentDigest   string `json:"content_digest"`
-	GraphModelID    string `json:"graph_model_id,omitempty"`
+	DocumentID       string           `json:"document_id"`
+	VersionID        string           `json:"version_id"`
+	ReleaseTargetID  string           `json:"release_target_id"`
+	ContentDigest    string           `json:"content_digest"`
+	GraphModelID     string           `json:"graph_model_id,omitempty"`
+	SummaryModelID   string           `json:"summary_model_id"`
+	IndexingStrategy IndexingStrategy `json:"indexing_strategy"`
 }
 
 // ProductionProjectionKnowledgePayload is the server-owned creation input.
@@ -222,7 +228,9 @@ type ProductionProjectionKnowledgePayload struct {
 	Title                string
 	Content              string
 	EmbeddingModelID     string
+	SummaryModelID       string
 	GraphModelID         string
+	IndexingStrategy     IndexingStrategy
 	ProcessOverrides     *KnowledgeProcessOverrides
 	ProductionProjection *ProductionProjectionMetadata
 }
@@ -297,6 +305,50 @@ func (k *Knowledge) ManualMetadata() (*ManualKnowledgeMetadata, error) {
 		metadata.Version = 1
 	}
 	return &metadata, nil
+}
+
+// ValidateProductionProjectionIntegrity verifies persisted projection metadata
+// and its content digest. A nil metadata result means ordinary Knowledge.
+func ValidateProductionProjectionIntegrity(k *Knowledge) (*ProductionProjectionMetadata, error) {
+	if k == nil || len(k.Metadata) == 0 {
+		return nil, nil
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(k.Metadata, &envelope); err != nil {
+		if bytes.Contains(k.Metadata, []byte(`"production_projection"`)) {
+			return nil, ErrProductionContentDigestMismatch
+		}
+		return nil, nil
+	}
+	raw, exists := envelope["production_projection"]
+	if !exists || len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	meta, err := k.ManualMetadata()
+	if err != nil || meta == nil || meta.ProductionProjection == nil {
+		return nil, ErrProductionContentDigestMismatch
+	}
+	projection := meta.ProductionProjection
+	digest := sha256.Sum256([]byte(meta.Content))
+	if strings.TrimSpace(projection.DocumentID) == "" || strings.TrimSpace(projection.VersionID) == "" ||
+		strings.TrimSpace(projection.ReleaseTargetID) == "" || fmt.Sprintf("%x", digest[:]) != projection.ContentDigest {
+		return nil, ErrProductionContentDigestMismatch
+	}
+	copyProjection := *projection
+	return &copyProjection, nil
+}
+
+// RejectProductionProjectionMutation rejects public mutation of governed
+// Knowledge and verifies the persisted content binding on every guard read.
+func RejectProductionProjectionMutation(k *Knowledge) error {
+	projection, err := ValidateProductionProjectionIntegrity(k)
+	if err != nil {
+		return errors.Join(ErrProductionProjectionImmutable, err)
+	}
+	if projection != nil {
+		return ErrProductionProjectionImmutable
+	}
+	return nil
 }
 
 // SetManualMetadata sets manual knowledge metadata onto the knowledge instance.

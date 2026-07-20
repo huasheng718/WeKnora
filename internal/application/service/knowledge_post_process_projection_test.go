@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"sync"
 	"testing"
 
 	"github.com/Tencent/WeKnora/internal/types"
@@ -74,10 +76,26 @@ func (s *projectionPostProcessChunkService) ListChunksByKnowledgeID(context.Cont
 	return s.chunks, nil
 }
 
-type projectionPostProcessEnqueuer struct{ taskTypes []string }
+type projectionPostProcessEnqueuer struct {
+	taskTypes  []string
+	taskIDs    []string
+	tasks      []*asynq.Task
+	enqueueErr error
+}
 
-func (e *projectionPostProcessEnqueuer) Enqueue(task *asynq.Task, _ ...asynq.Option) (*asynq.TaskInfo, error) {
+func (e *projectionPostProcessEnqueuer) Enqueue(task *asynq.Task, opts ...asynq.Option) (*asynq.TaskInfo, error) {
 	e.taskTypes = append(e.taskTypes, task.Type())
+	e.tasks = append(e.tasks, task)
+	for _, opt := range opts {
+		if opt.Type() == asynq.TaskIDOpt {
+			e.taskIDs = append(e.taskIDs, opt.Value().(string))
+		}
+	}
+	if e.enqueueErr != nil {
+		err := e.enqueueErr
+		e.enqueueErr = nil
+		return nil, err
+	}
 	return &asynq.TaskInfo{ID: "task-1"}, nil
 }
 
@@ -85,11 +103,15 @@ type projectionPostProcessReleaseRepo struct {
 	interfaces.ProductionReleaseRepository
 	readyTransitions int
 	status           types.ProductionReleaseTargetStatus
+	mu               sync.Mutex
+	transitionErr    error
 }
 
 func (r *projectionPostProcessReleaseRepo) GetTarget(
 	_ context.Context, _ uint64, targetID string,
 ) (*types.ProductionReleaseTarget, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	status := r.status
 	if status == "" {
 		status = types.ReleaseTargetBuilding
@@ -104,8 +126,16 @@ func (r *projectionPostProcessReleaseRepo) GetTarget(
 func (r *projectionPostProcessReleaseRepo) TransitionTarget(
 	_ context.Context, targetID string, from, to types.ProductionReleaseTargetStatus, patch types.JSONMap,
 ) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.transitionErr != nil {
+		err := r.transitionErr
+		r.transitionErr = nil
+		return false, err
+	}
 	if targetID == projectionTargetID && from == types.ReleaseTargetBuilding &&
-		to == types.ReleaseTargetReady && len(patch) == 0 {
+		to == types.ReleaseTargetReady && len(patch) == 0 &&
+		(r.status == "" || r.status == types.ReleaseTargetBuilding) {
 		r.readyTransitions++
 		r.status = types.ReleaseTargetReady
 		return true, nil
@@ -118,12 +148,14 @@ func productionProjectionKnowledgeForPostProcess(t *testing.T) *types.Knowledge 
 	knowledge := &types.Knowledge{
 		ID: projectionKnowledgeID, TenantID: projectionTenantID,
 		KnowledgeBaseID: projectionKBID, Type: types.KnowledgeTypeManual,
-		ParseStatus: types.ParseStatusProcessing,
+		ParseStatus: types.ParseStatusProcessing, EmbeddingModelID: "snapshot-embedding",
 	}
 	meta := types.NewManualKnowledgeMetadata("# baseline", types.ManualKnowledgeStatusPublish, 1)
 	meta.ProductionProjection = &types.ProductionProjectionMetadata{
 		DocumentID: projectionDocumentID, VersionID: projectionVersionID,
-		ReleaseTargetID: projectionTargetID, ContentDigest: stringsOfA(64),
+		ReleaseTargetID: projectionTargetID, ContentDigest: projectionKnowledgeContentDigest("# baseline"),
+		SummaryModelID:   "snapshot-summary",
+		IndexingStrategy: types.IndexingStrategy{VectorEnabled: true, KeywordEnabled: true},
 	}
 	require.NoError(t, knowledge.SetManualMetadata(meta))
 	return knowledge
@@ -211,10 +243,77 @@ func TestProductionProjectionFinalGraphDrainMarksTargetReady(t *testing.T) {
 	require.Equal(t, 1, releases.readyTransitions)
 }
 
-func stringsOfA(count int) string {
-	result := make([]byte, count)
-	for index := range result {
-		result[index] = 'a'
+func TestProductionProjectionReadinessFailureRetriesAfterKnowledgeAlreadyCompleted(t *testing.T) {
+	knowledgeRepo := &projectionPostProcessKnowledgeRepo{
+		knowledge: productionProjectionKnowledgeForPostProcess(t), updates: map[string]interface{}{},
 	}
-	return string(result)
+	knowledgeRepo.knowledge.ParseStatus = types.ParseStatusFinalizing
+	knowledgeRepo.knowledge.PendingSubtasksCount = 1
+	releases := &projectionPostProcessReleaseRepo{transitionErr: errors.New("ready CAS unavailable")}
+	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, projectionTenantID)
+
+	err := finalizeSubtaskDetached(ctx, knowledgeRepo, releases, projectionKnowledgeID, "summary", nil, false, true)
+	require.ErrorContains(t, err, "ready CAS unavailable")
+	require.Equal(t, types.ParseStatusCompleted, knowledgeRepo.knowledge.ParseStatus)
+
+	require.NoError(t, finalizeSubtaskDetached(ctx, knowledgeRepo, releases, projectionKnowledgeID, "summary", nil, false, true))
+	require.Equal(t, 1, releases.readyTransitions)
+}
+
+func TestProductionProjectionConcurrentReadinessReconciliationIsIdempotent(t *testing.T) {
+	knowledgeRepo := &projectionPostProcessKnowledgeRepo{
+		knowledge: productionProjectionKnowledgeForPostProcess(t), updates: map[string]interface{}{},
+	}
+	knowledgeRepo.knowledge.ParseStatus = types.ParseStatusCompleted
+	releases := &projectionPostProcessReleaseRepo{}
+	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, projectionTenantID)
+
+	var wg sync.WaitGroup
+	errorsSeen := make(chan error, 8)
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errorsSeen <- finalizeSubtaskDetached(ctx, knowledgeRepo, releases, projectionKnowledgeID, "replay", nil, false, true)
+		}()
+	}
+	wg.Wait()
+	close(errorsSeen)
+	for err := range errorsSeen {
+		require.NoError(t, err)
+	}
+	require.Equal(t, 1, releases.readyTransitions)
+}
+
+func TestProductionProjectionPostProcessEnqueueFailureRetriesDeterministically(t *testing.T) {
+	knowledgeRepo := &projectionPostProcessKnowledgeRepo{
+		knowledge: productionProjectionKnowledgeForPostProcess(t), updates: map[string]interface{}{},
+	}
+	enqueuer := &projectionPostProcessEnqueuer{enqueueErr: errors.New("queue unavailable")}
+	handler := NewKnowledgePostProcessService(
+		knowledgeRepo,
+		&projectionPostProcessKBService{kb: &types.KnowledgeBase{
+			ID: projectionKBID, TenantID: projectionTenantID,
+			SummaryModelID: "live-summary", EmbeddingModelID: "live-embedding",
+		}},
+		&projectionPostProcessChunkService{chunks: []*types.Chunk{{
+			ID: "chunk-1", KnowledgeID: projectionKnowledgeID, ChunkType: types.ChunkTypeText,
+		}}},
+		enqueuer, nil, nil, nil, &projectionPostProcessReleaseRepo{},
+	)
+
+	err := handler.Handle(context.Background(), projectionPostProcessTask(t))
+	require.ErrorContains(t, err, "queue unavailable")
+	require.Equal(t, types.ParseStatusFinalizing, knowledgeRepo.knowledge.ParseStatus)
+	require.Equal(t, 1, knowledgeRepo.knowledge.PendingSubtasksCount)
+	require.Equal(t, []string{
+		"production-projection-summary-" + projectionTargetID + "-" + projectionKnowledgeID,
+	}, enqueuer.taskIDs)
+
+	require.NoError(t, handler.Handle(context.Background(), projectionPostProcessTask(t)))
+	require.Len(t, enqueuer.taskIDs, 2)
+	var payload types.SummaryGenerationPayload
+	require.NoError(t, json.Unmarshal(enqueuer.tasks[1].Payload(), &payload))
+	require.Equal(t, "snapshot-summary", payload.SummaryModelID)
+	require.Equal(t, "snapshot-embedding", payload.EmbeddingModelID)
 }

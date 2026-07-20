@@ -524,12 +524,20 @@ func (s *ImageMultimodalService) resolveVLM(ctx context.Context, kbID, knowledge
 	}
 
 	var processOverrides *types.KnowledgeProcessOverrides
+	var projection *types.ProductionProjectionMetadata
 	if knowledgeID != "" && s.knowledgeRepo != nil {
 		if k, kerr := s.knowledgeRepo.GetKnowledgeByIDOnly(ctx, knowledgeID); kerr == nil && k != nil {
 			processOverrides, _ = k.ProcessOverrides()
+			projection, kerr = types.ValidateProductionProjectionIntegrity(k)
+			if kerr != nil {
+				return nil, types.VLMConfig{}, kerr
+			}
 		}
 	}
 	vlmCfg := ResolveProcessConfig(kb, processOverrides).VLMConfig
+	if projection != nil {
+		vlmCfg = ResolveProductionProjectionProcessConfig(processOverrides).VLMConfig
+	}
 	if !vlmCfg.IsEnabled() {
 		return nil, types.VLMConfig{}, fmt.Errorf("VLM is not enabled for knowledge base %s", kbID)
 	}

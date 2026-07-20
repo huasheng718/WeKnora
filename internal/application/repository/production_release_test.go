@@ -55,6 +55,9 @@ func newProductionReleaseRepoFixture(t *testing.T, clock ProductionReleaseClock)
 	migration, err := os.ReadFile(filepath.Join(filepath.Dir(filename), "../../../migrations/sqlite/000005_knowledge_production_publication.up.sql"))
 	require.NoError(t, err)
 	require.NoError(t, db.Exec(string(migration)).Error)
+	integrityMigration, err := os.ReadFile(filepath.Join(filepath.Dir(filename), "../../../migrations/sqlite/000006_knowledge_production_projection_integrity.up.sql"))
+	require.NoError(t, err)
+	require.NoError(t, db.Exec(string(integrityMigration)).Error)
 	require.NoError(t, db.Exec(`INSERT INTO knowledge_bases (id, tenant_id) VALUES (?, ?), (?, ?), (?, 8)`, releaseKBOne, reviewTenantID, releaseKBTwo, reviewTenantID, releaseKBTwo+"-other", 8).Error)
 
 	approveProductionReleaseReview(t, db, reviewRepo, reviewID(700), reviewVersionOne, 700)
@@ -85,7 +88,7 @@ func approveProductionReleaseReview(t *testing.T, db *gorm.DB, repo interfaces.P
 func productionRelease(id, versionID, reviewRequestID string) *types.ProductionRelease {
 	return &types.ProductionRelease{
 		ID: id, TenantID: reviewTenantID, ProjectID: reviewProjectID, DocumentID: reviewDocumentID,
-		VersionID: versionID, ReviewRequestID: reviewRequestID, ReleaseDigest: strings.Repeat("a", 64),
+		VersionID: versionID, ReviewRequestID: reviewRequestID,
 		Status: types.ProductionReleaseBuilding, RetentionDays: 30,
 	}
 }
@@ -133,6 +136,40 @@ func TestProductionReleaseRepositoryCreatesReleaseAndTargetsAtomicallyWithTruste
 	require.NoError(t, db.Model(&types.ProductionReleaseTarget{}).Count(&targetCount).Error)
 	require.EqualValues(t, 1, releaseCount)
 	require.EqualValues(t, 2, targetCount)
+}
+
+func TestProductionReleaseRepositoryComputesAuthoritativeDigest(t *testing.T) {
+	repo, db := newProductionReleaseRepoFixture(t, nil)
+	release := productionRelease(releaseIDOne, reviewVersionOne, reviewID(700))
+	release.ReleaseDigest = ""
+
+	require.NoError(t, repo.CreateRelease(
+		productionReleaseContext(reviewTenantID, reviewAuthorID), release,
+		[]*types.ProductionReleaseTarget{productionReleaseTarget(releaseTarget1, releaseKBOne, releaseKnowledge1)},
+	))
+
+	var version types.ProductionDocumentVersion
+	require.NoError(t, db.First(&version, "id = ?", reviewVersionOne).Error)
+	var review types.ProductionReviewRequest
+	require.NoError(t, db.First(&review, "id = ?", reviewID(700)).Error)
+	require.Equal(t, types.ComputeProductionReleaseDigest(release, &version, &review), release.ReleaseDigest)
+	require.Equal(t, types.ProductionReleaseDigestVersionCurrent, release.ReleaseDigestVersion)
+	require.NotEqual(t, strings.Repeat("a", 64), release.ReleaseDigest)
+}
+
+func TestProductionReleaseRepositoryRejectsCallerDigestMismatch(t *testing.T) {
+	repo, db := newProductionReleaseRepoFixture(t, nil)
+	release := productionRelease(releaseIDOne, reviewVersionOne, reviewID(700))
+	release.ReleaseDigest = strings.Repeat("f", 64)
+
+	err := repo.CreateRelease(
+		productionReleaseContext(reviewTenantID, reviewAuthorID), release,
+		[]*types.ProductionReleaseTarget{productionReleaseTarget(releaseTarget1, releaseKBOne, releaseKnowledge1)},
+	)
+	require.ErrorIs(t, err, types.ErrProductionContentDigestMismatch)
+	var count int64
+	require.NoError(t, db.Model(&types.ProductionRelease{}).Count(&count).Error)
+	require.Zero(t, count)
 }
 
 func TestProductionReleaseRepositoryGetsReleaseByTenantAndHydratesTargets(t *testing.T) {
@@ -214,12 +251,14 @@ func insertRawProductionReleaseTargetConfig(
 	targetID, kbID, knowledgeID, snapshot, digest string,
 ) {
 	t.Helper()
+	var releaseDigest string
+	require.NoError(t, db.Raw(`SELECT release_digest FROM production_releases WHERE id = ?`, releaseIDOne).Scan(&releaseDigest).Error)
 	require.NoError(t, db.Exec(`INSERT INTO production_release_targets
 		(id, release_id, tenant_id, project_id, document_id, version_id,
 		 target_knowledge_base_id, knowledge_id, release_digest, config_snapshot, config_digest)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		targetID, releaseIDOne, reviewTenantID, reviewProjectID, reviewDocumentID, reviewVersionOne,
-		kbID, knowledgeID, strings.Repeat("a", 64), snapshot, digest,
+		kbID, knowledgeID, releaseDigest, snapshot, digest,
 	).Error)
 }
 

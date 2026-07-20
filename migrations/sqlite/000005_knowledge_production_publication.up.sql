@@ -44,8 +44,6 @@ CREATE TABLE IF NOT EXISTS production_release_targets (
     config_snapshot TEXT NOT NULL DEFAULT '{}',
     config_digest VARCHAR(64) NOT NULL DEFAULT '44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a',
     status VARCHAR(20) NOT NULL DEFAULT 'building',
-    failure_code VARCHAR(64) NOT NULL DEFAULT '',
-    failure_reason VARCHAR(256) NOT NULL DEFAULT '',
     retention_days INTEGER NOT NULL DEFAULT 30,
     retention_until DATETIME NULL,
     activated_at DATETIME NULL,
@@ -64,11 +62,6 @@ CREATE TABLE IF NOT EXISTS production_release_targets (
         length(config_digest) = 64 AND config_digest NOT GLOB '*[^0-9a-f]*'
     ),
     CONSTRAINT chk_production_release_targets_status CHECK (status IN ('building', 'ready', 'active', 'failed', 'rolled_back', 'cleanup_pending', 'cleaned')),
-    CONSTRAINT chk_production_release_targets_failure CHECK (
-        length(failure_code) <= 64 AND length(failure_reason) <= 256 AND
-        failure_code NOT GLOB '*[^A-Z0-9_]*' AND
-        ((status = 'failed' AND failure_code <> '' AND failure_reason <> '') OR status <> 'failed')
-    ),
     CONSTRAINT chk_production_release_targets_retention CHECK (retention_days >= 1 AND retention_days <= 3650),
     UNIQUE(release_id, target_knowledge_base_id),
     UNIQUE(id, tenant_id, document_id, target_knowledge_base_id),
@@ -161,8 +154,7 @@ CREATE TRIGGER IF NOT EXISTS trg_production_release_targets_validate_initial_sta
     BEFORE INSERT ON production_release_targets
     FOR EACH ROW
 BEGIN
-    SELECT CASE WHEN NEW.status <> 'building' OR NEW.failure_code <> '' OR NEW.failure_reason <> '' OR
-                          NEW.activated_at IS NOT NULL OR NEW.failed_at IS NOT NULL OR
+    SELECT CASE WHEN NEW.status <> 'building' OR NEW.activated_at IS NOT NULL OR NEW.failed_at IS NOT NULL OR
                           NEW.rolled_back_at IS NOT NULL OR NEW.cleanup_requested_at IS NOT NULL OR NEW.cleaned_at IS NOT NULL OR NEW.retention_until IS NOT NULL
         THEN RAISE(ABORT, 'production release targets must be created building') END;
 END;
@@ -179,10 +171,6 @@ BEGIN
                           NEW.config_snapshot IS NOT OLD.config_snapshot OR NEW.config_digest IS NOT OLD.config_digest OR
                           NEW.retention_days IS NOT OLD.retention_days OR NEW.created_at IS NOT OLD.created_at
         THEN RAISE(ABORT, 'production release target identity is immutable') END;
-    SELECT CASE WHEN (NEW.failure_code IS NOT OLD.failure_code OR NEW.failure_reason IS NOT OLD.failure_reason) AND
-                          NOT ((NEW.status = 'failed' AND OLD.status <> 'failed') OR
-                               (NEW.status = 'building' AND OLD.status IN ('failed', 'rolled_back') AND NEW.failure_code = '' AND NEW.failure_reason = ''))
-        THEN RAISE(ABORT, 'production release target failure metadata is lifecycle-owned') END;
     SELECT CASE WHEN
         (OLD.status = 'building' AND NEW.status NOT IN ('building', 'ready', 'failed', 'rolled_back')) OR
         (OLD.status = 'ready' AND NEW.status NOT IN ('ready', 'active', 'failed', 'rolled_back')) OR
@@ -194,8 +182,6 @@ BEGIN
         THEN RAISE(ABORT, 'invalid production release target status transition') END;
     SELECT CASE WHEN NEW.status IN ('building', 'ready') AND (NEW.activated_at IS NOT NULL OR NEW.failed_at IS NOT NULL OR NEW.rolled_back_at IS NOT NULL OR NEW.cleanup_requested_at IS NOT NULL OR NEW.cleaned_at IS NOT NULL OR NEW.retention_until IS NOT NULL)
         THEN RAISE(ABORT, 'building and ready production release targets must not retain lifecycle timestamps') END;
-    SELECT CASE WHEN NEW.status IN ('building', 'ready', 'active') AND (NEW.failure_code <> '' OR NEW.failure_reason <> '')
-        THEN RAISE(ABORT, 'non-failed production release targets must not retain failure metadata') END;
     SELECT CASE WHEN NEW.status = 'active' AND (NEW.activated_at IS NULL OR NEW.failed_at IS NOT NULL OR NEW.rolled_back_at IS NOT NULL OR NEW.cleanup_requested_at IS NOT NULL OR NEW.cleaned_at IS NOT NULL OR NEW.retention_until IS NOT NULL)
         THEN RAISE(ABORT, 'active production release targets cannot be cleaned') END;
     SELECT CASE WHEN NEW.status = 'active' AND NOT EXISTS (

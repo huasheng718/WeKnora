@@ -989,6 +989,9 @@ func (s *knowledgeService) moveOneKnowledge(
 	if err != nil {
 		return fmt.Errorf("failed to get knowledge %s: %w", knowledgeID, err)
 	}
+	if err := types.RejectProductionProjectionMutation(knowledge); err != nil {
+		return err
+	}
 
 	// Only move completed items
 	if knowledge.ParseStatus != types.ParseStatusCompleted {
@@ -1147,8 +1150,7 @@ func (s *knowledgeService) moveKnowledgeReparse(
 		if err != nil || meta == nil {
 			return fmt.Errorf("failed to get manual metadata for reparse: %w", err)
 		}
-		s.triggerManualProcessing(ctx, targetKB, knowledge, meta.Content, false)
-		return nil
+		return s.triggerManualProcessing(ctx, targetKB, knowledge, meta.Content, false)
 	}
 
 	if knowledge.FilePath != "" {

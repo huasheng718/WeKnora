@@ -66,6 +66,41 @@ func ResolveProcessConfig(kb *types.KnowledgeBase, overrides *types.KnowledgePro
 	return eff
 }
 
+// ResolveProductionProjectionProcessConfig treats the persisted projection
+// snapshot as complete and never merges mutable KnowledgeBase defaults.
+func ResolveProductionProjectionProcessConfig(overrides *types.KnowledgeProcessOverrides) types.EffectiveProcessConfig {
+	var eff types.EffectiveProcessConfig
+	if overrides == nil {
+		return eff
+	}
+	if overrides.ChunkingConfig != nil {
+		eff.ChunkingConfig = *overrides.ChunkingConfig
+	}
+	if len(overrides.ParserEngineRules) != 0 {
+		eff.ChunkingConfig.ParserEngineRules = append([]types.ParserEngineRule(nil), overrides.ParserEngineRules...)
+	}
+	if overrides.EnableMultimodel != nil {
+		eff.EnableMultimodel = *overrides.EnableMultimodel
+	}
+	if overrides.VLMConfig != nil {
+		eff.VLMConfig = *overrides.VLMConfig
+	}
+	if overrides.ASRConfig != nil {
+		eff.ASRConfig = *overrides.ASRConfig
+	}
+	if overrides.QuestionGenerationConfig != nil {
+		eff.QuestionGenerationConfig = *overrides.QuestionGenerationConfig
+	}
+	if overrides.GraphEnabled != nil {
+		eff.GraphEnabled = *overrides.GraphEnabled
+	}
+	if overrides.ExtractConfig != nil {
+		eff.ExtractConfig = *overrides.ExtractConfig
+	}
+	eff.GraphEnabled = eff.GraphEnabled && eff.ExtractConfig.Enabled
+	return eff
+}
+
 // ValidateProcessOverrides validates batch overrides against file types in the upload.
 func ValidateProcessOverrides(
 	ctx context.Context,

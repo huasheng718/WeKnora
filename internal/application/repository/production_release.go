@@ -101,8 +101,11 @@ func validateProductionReleaseForCreate(release *types.ProductionRelease, target
 			return err
 		}
 	}
-	if release.TenantID == 0 || !productionReleaseDigestPattern.MatchString(release.ReleaseDigest) {
+	if release.TenantID == 0 || (release.ReleaseDigest != "" && !productionReleaseDigestPattern.MatchString(release.ReleaseDigest)) {
 		return fmt.Errorf("%w: tenant and lowercase SHA-256 release digest are required", types.ErrProductionReleaseInvalid)
+	}
+	if release.ReleaseDigestVersion != 0 && release.ReleaseDigestVersion != types.ProductionReleaseDigestVersionCurrent {
+		return types.ErrProductionReleaseReprepareRequired
 	}
 	if release.Status != "" && release.Status != types.ProductionReleaseBuilding {
 		return types.ErrProductionReleaseLifecycle
@@ -125,6 +128,34 @@ func (r *productionReleaseRepository) CreateRelease(
 	if err != nil {
 		return err
 	}
+	db := database.DBFromContext(ctx, r.db).WithContext(ctx)
+	var version types.ProductionDocumentVersion
+	if err := db.Where(
+		"id = ? AND document_id = ? AND tenant_id = ? AND project_id = ?",
+		release.VersionID, release.DocumentID, release.TenantID, release.ProjectID,
+	).First(&version).Error; err != nil {
+		return translateProductionReleaseError(err)
+	}
+	var review types.ProductionReviewRequest
+	if err := db.Where(
+		"id = ? AND tenant_id = ? AND project_id = ? AND document_id = ? AND version_id = ? AND status = ?",
+		release.ReviewRequestID, release.TenantID, release.ProjectID, release.DocumentID,
+		release.VersionID, types.ProductionReviewApproved,
+	).First(&review).Error; err != nil {
+		return translateProductionReleaseError(err)
+	}
+	authoritativeDigest, err := types.ComputeProductionReleaseDigestForVersion(
+		types.ProductionReleaseDigestVersionCurrent, release, &version, &review,
+	)
+	if err != nil {
+		return err
+	}
+	if release.ReleaseDigest != "" && release.ReleaseDigest != authoritativeDigest {
+		return types.ErrProductionContentDigestMismatch
+	}
+	release.ReleaseDigestVersion = types.ProductionReleaseDigestVersionCurrent
+	release.ReleaseDigest = authoritativeDigest
+
 	now := r.nowUTC()
 	if release.RetentionDays == 0 {
 		release.RetentionDays = types.ProductionReleaseDefaultRetentionDays

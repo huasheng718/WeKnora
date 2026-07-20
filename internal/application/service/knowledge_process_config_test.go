@@ -36,6 +36,33 @@ func TestResolveProcessConfig_OverridesChunkSize(t *testing.T) {
 	require.Equal(t, 50, eff.ChunkingConfig.ChunkOverlap)
 }
 
+func TestResolveProductionProjectionProcessConfigNeverFallsBackToLiveKnowledgeBase(t *testing.T) {
+	t.Parallel()
+	live := &types.KnowledgeBase{
+		ChunkingConfig:           types.ChunkingConfig{ChunkSize: 99, ChunkOverlap: 10, Strategy: "heading"},
+		QuestionGenerationConfig: &types.QuestionGenerationConfig{Enabled: true, CustomInstructions: "live"},
+		ExtractConfig:            &types.ExtractConfig{Enabled: true, CustomInstructions: "live"},
+		IndexingStrategy:         types.IndexingStrategy{GraphEnabled: true},
+	}
+	snapshot := &types.KnowledgeProcessOverrides{
+		ChunkingConfig:           &types.ChunkingConfig{ChunkSize: 777, Strategy: "recursive"},
+		QuestionGenerationConfig: &types.QuestionGenerationConfig{Enabled: false},
+		GraphEnabled:             processConfigBoolPtr(false),
+		ExtractConfig:            &types.ExtractConfig{Enabled: false},
+	}
+
+	regular := ResolveProcessConfig(live, snapshot)
+	require.Equal(t, 10, regular.ChunkingConfig.ChunkOverlap, "ordinary uploads inherit live defaults")
+	projection := ResolveProductionProjectionProcessConfig(snapshot)
+	require.Equal(t, 777, projection.ChunkingConfig.ChunkSize)
+	require.Zero(t, projection.ChunkingConfig.ChunkOverlap)
+	require.Equal(t, "recursive", projection.ChunkingConfig.Strategy)
+	require.False(t, projection.QuestionGenerationConfig.Enabled)
+	require.Empty(t, projection.QuestionGenerationConfig.CustomInstructions)
+	require.False(t, projection.GraphEnabled)
+	require.Empty(t, projection.ExtractConfig.CustomInstructions)
+}
+
 func TestResolveProcessConfig_OverrideTogglesParentChild(t *testing.T) {
 	t.Parallel()
 

@@ -197,6 +197,10 @@ func attemptSuperseded(ctx context.Context, tracker SpanTracker, knowledgeID str
 // connection can't hang a worker goroutine forever in its terminal defer.
 const finalizeSubtaskDetachedTimeout = 10 * time.Second
 
+func productionProjectionTaskID(targetID, knowledgeID, phase string) string {
+	return fmt.Sprintf("production-projection-%s-%s-%s", phase, targetID, knowledgeID)
+}
+
 // finalizeSubtaskDetached evaluates the drain decision for a subtask's
 // terminal exit and — when the subtask should drain — decrements
 // pending_subtasks_count using a context DETACHED from the caller's
@@ -233,13 +237,13 @@ func finalizeSubtaskDetached(
 	}
 	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalizeSubtaskDetachedTimeout)
 	defer cancel()
-	_, promoted, err := repo.FinalizeSubtask(dctx, knowledgeID)
+	_, _, err := repo.FinalizeSubtask(dctx, knowledgeID)
 	if err != nil {
 		logger.Warnf(ctx, "finalize subtask decrement failed source=%s knowledge=%s err=%v",
 			source, knowledgeID, err)
 		return err
 	}
-	if promoted && releaseRepo != nil {
+	if releaseRepo != nil {
 		if err := markProductionProjectionReady(dctx, repo, releaseRepo, knowledgeID); err != nil {
 			logger.Warnf(ctx, "projection readiness failed source=%s knowledge=%s err=%v",
 				source, knowledgeID, err)
@@ -608,6 +612,9 @@ func (s *knowledgeService) UpdateKnowledge(ctx context.Context, knowledge *types
 	record, err := s.repo.GetKnowledgeByID(ctx, ctx.Value(types.TenantIDContextKey).(uint64), knowledge.ID)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to get knowledge record: %v", err)
+		return err
+	}
+	if err := types.RejectProductionProjectionMutation(record); err != nil {
 		return err
 	}
 	// if need other fields update, please add here

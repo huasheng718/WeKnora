@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -95,6 +96,7 @@ func NewChunkExtractTask(
 	knowledgeID string,
 	attempt int,
 	chunkIndex int,
+	taskID ...string,
 ) (bool, error) {
 	if strings.ToLower(os.Getenv("NEO4J_ENABLE")) != "true" {
 		logger.Warn(ctx, "NEO4J is not enabled, skip chunk extract task")
@@ -115,8 +117,15 @@ func NewChunkExtractTask(
 	}
 	task := asynq.NewTask(types.TypeChunkExtract, payload,
 		asynq.Queue(types.QueueGraph), asynq.MaxRetry(3), asynq.Timeout(30*time.Minute))
-	info, err := client.Enqueue(task)
+	var enqueueOptions []asynq.Option
+	if len(taskID) != 0 && taskID[0] != "" {
+		enqueueOptions = append(enqueueOptions, asynq.TaskID(taskID[0]), asynq.Retention(24*time.Hour))
+	}
+	info, err := client.Enqueue(task, enqueueOptions...)
 	if err != nil {
+		if len(enqueueOptions) != 0 && errors.Is(err, asynq.ErrTaskIDConflict) {
+			return true, nil
+		}
 		logger.Errorf(ctx, "failed to enqueue task: %v", err)
 		return false, fmt.Errorf("failed to enqueue task: %v", err)
 	}
@@ -299,6 +308,7 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) (retErr
 	}
 
 	var processOverrides *types.KnowledgeProcessOverrides
+	var projection *types.ProductionProjectionMetadata
 	knowledgeID := p.KnowledgeID
 	if knowledgeID == "" {
 		knowledgeID = chunk.KnowledgeID
@@ -306,9 +316,17 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) (retErr
 	if knowledgeID != "" && s.knowledgeRepo != nil {
 		if k, kerr := s.knowledgeRepo.GetKnowledgeByIDOnly(ctx, knowledgeID); kerr == nil && k != nil {
 			processOverrides, _ = k.ProcessOverrides()
+			projection, kerr = types.ValidateProductionProjectionIntegrity(k)
+			if kerr != nil {
+				handleErr = kerr
+				return kerr
+			}
 		}
 	}
 	extractCfg := ResolveProcessConfig(kb, processOverrides).ExtractConfig
+	if projection != nil {
+		extractCfg = ResolveProductionProjectionProcessConfig(processOverrides).ExtractConfig
+	}
 	if !extractCfg.Enabled {
 		logger.Warnf(ctx, "extract config not enabled")
 		graphOut["skipped"] = "extract_disabled"

@@ -10,6 +10,9 @@ import (
 )
 
 const (
+	ProductionReleaseDigestVersionV1      = 1
+	ProductionReleaseDigestVersionCurrent = ProductionReleaseDigestVersionV1
+
 	ProductionReleaseTargetConfigMaxBytes      = 256 * 1024
 	ProductionReleaseTargetConfigMaxDepth      = 32
 	ProductionReleaseDefaultRetentionDays      = 30
@@ -26,12 +29,14 @@ const (
 )
 
 var (
-	ErrProductionReleaseInvalid       = errors.New("production release is invalid")
-	ErrProductionReleaseConfigInvalid = errors.New("production release target configuration is invalid")
-	ErrProductionReleaseLifecycle     = errors.New("production release lifecycle transition is invalid")
-	ErrProductionReleasePatchInvalid  = errors.New("production release target patch is invalid")
-	ErrProductionProjectionConflict   = errors.New("production projection head conflict")
-	ErrProductionProjectionInactive   = errors.New("production projection is inactive")
+	ErrProductionReleaseInvalid           = errors.New("production release is invalid")
+	ErrProductionReleaseConfigInvalid     = errors.New("production release target configuration is invalid")
+	ErrProductionReleaseLifecycle         = errors.New("production release lifecycle transition is invalid")
+	ErrProductionReleasePatchInvalid      = errors.New("production release target patch is invalid")
+	ErrProductionProjectionConflict       = errors.New("production projection head conflict")
+	ErrProductionProjectionInactive       = errors.New("production projection is inactive")
+	ErrProductionReleaseReprepareRequired = errors.New("production release must be prepared again")
+	ErrProductionProjectionImmutable      = errors.New("production projection knowledge is immutable")
 )
 
 type ProductionReleaseStatus string
@@ -114,19 +119,20 @@ func CanTransitionReleaseTarget(from, to ProductionReleaseTargetStatus) bool {
 }
 
 type ProductionRelease struct {
-	ID              string                     `json:"id" gorm:"type:varchar(36);primaryKey"`
-	TenantID        uint64                     `json:"tenant_id" gorm:"not null;index"`
-	ProjectID       string                     `json:"project_id" gorm:"type:varchar(36);not null;index"`
-	DocumentID      string                     `json:"document_id" gorm:"type:varchar(36);not null;index"`
-	VersionID       string                     `json:"version_id" gorm:"type:varchar(36);not null;index"`
-	ReviewRequestID string                     `json:"review_request_id" gorm:"type:varchar(36);not null"`
-	ReleaseDigest   string                     `json:"release_digest" gorm:"type:varchar(64);not null"`
-	Status          ProductionReleaseStatus    `json:"status" gorm:"type:varchar(20);not null;default:'building'"`
-	RetentionDays   int                        `json:"retention_days" gorm:"not null;default:30"`
-	CreatedBy       string                     `json:"created_by" gorm:"type:varchar(36);not null"`
-	CreatedAt       time.Time                  `json:"created_at"`
-	UpdatedAt       time.Time                  `json:"updated_at"`
-	Targets         []*ProductionReleaseTarget `json:"targets,omitempty" gorm:"-"`
+	ID                   string                     `json:"id" gorm:"type:varchar(36);primaryKey"`
+	TenantID             uint64                     `json:"tenant_id" gorm:"not null;index"`
+	ProjectID            string                     `json:"project_id" gorm:"type:varchar(36);not null;index"`
+	DocumentID           string                     `json:"document_id" gorm:"type:varchar(36);not null;index"`
+	VersionID            string                     `json:"version_id" gorm:"type:varchar(36);not null;index"`
+	ReviewRequestID      string                     `json:"review_request_id" gorm:"type:varchar(36);not null"`
+	ReleaseDigest        string                     `json:"release_digest" gorm:"type:varchar(64);not null"`
+	ReleaseDigestVersion int                        `json:"release_digest_version" gorm:"not null;default:0"`
+	Status               ProductionReleaseStatus    `json:"status" gorm:"type:varchar(20);not null;default:'building'"`
+	RetentionDays        int                        `json:"retention_days" gorm:"not null;default:30"`
+	CreatedBy            string                     `json:"created_by" gorm:"type:varchar(36);not null"`
+	CreatedAt            time.Time                  `json:"created_at"`
+	UpdatedAt            time.Time                  `json:"updated_at"`
+	Targets              []*ProductionReleaseTarget `json:"targets,omitempty" gorm:"-"`
 }
 
 func (ProductionRelease) TableName() string { return "production_releases" }
@@ -178,10 +184,26 @@ func ComputeProductionReleaseDigest(
 	version *ProductionDocumentVersion,
 	review *ProductionReviewRequest,
 ) string {
+	digest, _ := ComputeProductionReleaseDigestForVersion(
+		ProductionReleaseDigestVersionCurrent, release, version, review,
+	)
+	return digest
+}
+
+func ComputeProductionReleaseDigestForVersion(
+	digestVersion int,
+	release *ProductionRelease,
+	version *ProductionDocumentVersion,
+	review *ProductionReviewRequest,
+) (string, error) {
+	if digestVersion != ProductionReleaseDigestVersionV1 {
+		return "", ErrProductionReleaseReprepareRequired
+	}
 	if release == nil || version == nil || review == nil {
-		return ""
+		return "", ErrProductionReleaseInvalid
 	}
 	payload := struct {
+		DigestVersion        int    `json:"digest_version"`
 		TenantID             uint64 `json:"tenant_id"`
 		ProjectID            string `json:"project_id"`
 		DocumentID           string `json:"document_id"`
@@ -190,7 +212,8 @@ func ComputeProductionReleaseDigest(
 		VersionContentDigest string `json:"version_content_digest"`
 		ReviewPolicyDigest   string `json:"review_policy_digest"`
 	}{
-		TenantID: release.TenantID, ProjectID: release.ProjectID,
+		DigestVersion: digestVersion,
+		TenantID:      release.TenantID, ProjectID: release.ProjectID,
 		DocumentID: release.DocumentID, VersionID: release.VersionID,
 		ReviewRequestID:      release.ReviewRequestID,
 		VersionContentDigest: version.ContentDigest,
@@ -198,7 +221,7 @@ func ComputeProductionReleaseDigest(
 	}
 	encoded, _ := json.Marshal(payload)
 	digest := sha256.Sum256(encoded)
-	return hex.EncodeToString(digest[:])
+	return hex.EncodeToString(digest[:]), nil
 }
 
 type ProductionKnowledgeScope struct {

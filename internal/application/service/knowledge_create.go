@@ -851,6 +851,14 @@ func (s *knowledgeService) CreateKnowledgeFromProductionProjection(
 	if hex.EncodeToString(contentDigest[:]) != projection.ContentDigest {
 		return nil, types.ErrProductionContentDigestMismatch
 	}
+	if !payload.IndexingStrategy.HasAnyIndexing() || payload.ProcessOverrides == nil ||
+		payload.ProcessOverrides.ChunkingConfig == nil || payload.ProcessOverrides.ChunkingConfig.ChunkSize <= 0 ||
+		strings.TrimSpace(payload.SummaryModelID) == "" ||
+		(payload.IndexingStrategy.NeedsEmbedding() && strings.TrimSpace(payload.EmbeddingModelID) == "") ||
+		projection.SummaryModelID != payload.SummaryModelID || projection.GraphModelID != payload.GraphModelID ||
+		projection.IndexingStrategy != payload.IndexingStrategy {
+		return nil, types.ErrProductionReleaseConfigInvalid
+	}
 
 	tenantID, ok := types.TenantIDFromContext(ctx)
 	if !ok || tenantID == 0 {
@@ -866,6 +874,10 @@ func (s *knowledgeService) CreateKnowledgeFromProductionProjection(
 			*meta.ProductionProjection != *projection {
 			return nil, types.ErrProductionProjectionConflict
 		}
+		if persistedProjection, integrityErr := types.ValidateProductionProjectionIntegrity(existing); integrityErr != nil ||
+			persistedProjection == nil || *persistedProjection != *projection {
+			return nil, errors.Join(types.ErrProductionProjectionConflict, integrityErr)
+		}
 		return existing, nil
 	}
 
@@ -874,6 +886,16 @@ func (s *knowledgeService) CreateKnowledgeFromProductionProjection(
 		owned, ownershipErr := ownedExisting(existing)
 		if ownershipErr != nil {
 			return nil, ownershipErr
+		}
+		if owned.ParseStatus == types.ParseStatusPending {
+			meta, metaErr := owned.ManualMetadata()
+			if metaErr != nil || meta == nil {
+				return nil, types.ErrProductionProjectionConflict
+			}
+			if enqueueErr := s.enqueueManualProcessing(ctx, owned, meta.Content, false); enqueueErr != nil {
+				return nil, enqueueErr
+			}
+			return owned, nil
 		}
 		if owned.ParseStatus != types.ParseStatusFailed {
 			return owned, nil
@@ -936,12 +958,11 @@ func (s *knowledgeService) CreateKnowledgeFromProductionProjection(
 		CreatedAt: now, UpdatedAt: now, EmbeddingModelID: payload.EmbeddingModelID,
 		FileName: ensureManualFileName(title), FileType: types.KnowledgeTypeManual,
 	}
-	if knowledge.EmbeddingModelID == "" {
-		knowledge.EmbeddingModelID = kb.EmbeddingModelID
-	}
 	meta := types.NewManualKnowledgeMetadata(payload.Content, types.ManualKnowledgeStatusPublish, 1)
 	projectionCopy := *projection
 	projectionCopy.GraphModelID = payload.GraphModelID
+	projectionCopy.SummaryModelID = payload.SummaryModelID
+	projectionCopy.IndexingStrategy = payload.IndexingStrategy
 	meta.ProductionProjection = &projectionCopy
 	if err := knowledge.SetManualMetadata(meta); err != nil {
 		return nil, err
@@ -1121,6 +1142,9 @@ func (s *knowledgeService) UpdateManualKnowledge(ctx context.Context,
 	if !existing.IsManual() {
 		return nil, werrors.NewBadRequestError("仅支持手工知识的在线编辑")
 	}
+	if err := types.RejectProductionProjectionMutation(existing); err != nil {
+		return nil, err
+	}
 
 	kb, err := s.kbService.GetKnowledgeBaseByID(ctx, existing.KnowledgeBaseID)
 	if err != nil {
@@ -1213,8 +1237,23 @@ func (s *knowledgeService) enqueueManualProcessing(ctx context.Context,
 
 	task := asynq.NewTask(types.TypeManualProcess, payloadBytes,
 		asynq.Queue(types.QueueDefault), asynq.MaxRetry(3), asynq.Timeout(30*time.Minute))
-	info, err := s.task.Enqueue(task)
+	var enqueueOptions []asynq.Option
+	if projection, integrityErr := types.ValidateProductionProjectionIntegrity(knowledge); integrityErr != nil {
+		return integrityErr
+	} else if projection != nil {
+		phase := "build"
+		if needCleanup {
+			phase = "retry"
+		}
+		enqueueOptions = append(enqueueOptions, asynq.TaskID(productionProjectionTaskID(
+			projection.ReleaseTargetID, knowledge.ID, phase,
+		)))
+	}
+	info, err := s.task.Enqueue(task, enqueueOptions...)
 	if err != nil {
+		if len(enqueueOptions) != 0 && errors.Is(err, asynq.ErrTaskIDConflict) {
+			return nil
+		}
 		return fmt.Errorf("failed to enqueue manual process task: %w", err)
 	}
 	logger.Infof(ctx, "Enqueued manual process task: knowledge_id=%s, asynq_id=%s", knowledge.ID, info.ID)
@@ -1251,10 +1290,10 @@ func sanitizeManualDownloadFilename(title string) string {
 
 func (s *knowledgeService) triggerManualProcessing(ctx context.Context,
 	kb *types.KnowledgeBase, knowledge *types.Knowledge, content string, doSync bool,
-) {
+) error {
 	clean := strings.TrimSpace(content)
 	if clean == "" {
-		return
+		return nil
 	}
 
 	// Resolve embedded data:base64 images and remote http(s) images → storage, replace URLs.
@@ -1281,6 +1320,12 @@ func (s *knowledgeService) triggerManualProcessing(ctx context.Context,
 
 	processOverrides, _ := knowledge.ProcessOverrides()
 	eff := ResolveProcessConfig(kb, processOverrides)
+	if projection, projectionErr := types.ValidateProductionProjectionIntegrity(knowledge); projectionErr != nil {
+		logger.Errorf(ctx, "Production projection integrity verification failed: %v", projectionErr)
+		return projectionErr
+	} else if projection != nil {
+		eff = ResolveProductionProjectionProcessConfig(processOverrides)
+	}
 
 	// Manual content is markdown - chunk directly with Go chunker
 	chunkCfg := buildSplitterConfigFromChunking(eff.ChunkingConfig)
@@ -1333,9 +1378,10 @@ func (s *knowledgeService) triggerManualProcessing(ctx context.Context,
 
 	if doSync {
 		s.processChunks(ctx, kb, knowledge, parsed, opts)
-		return
+		return nil
 	}
 
 	newCtx := logger.CloneContext(ctx)
 	go s.processChunks(newCtx, kb, knowledge, parsed, opts)
+	return nil
 }

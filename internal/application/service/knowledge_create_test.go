@@ -153,7 +153,9 @@ func (s *createKnowledgeFileServiceStub) CopyFile(ctx context.Context, srcPath s
 }
 
 type createKnowledgeTaskEnqueuerStub struct {
-	calls int
+	calls      int
+	enqueueErr error
+	taskIDs    []string
 }
 
 func (s *createKnowledgeTaskEnqueuerStub) Enqueue(
@@ -161,6 +163,14 @@ func (s *createKnowledgeTaskEnqueuerStub) Enqueue(
 	opts ...asynq.Option,
 ) (*asynq.TaskInfo, error) {
 	s.calls++
+	for _, opt := range opts {
+		if opt.Type() == asynq.TaskIDOpt {
+			s.taskIDs = append(s.taskIDs, opt.Value().(string))
+		}
+	}
+	if s.enqueueErr != nil {
+		return nil, s.enqueueErr
+	}
 	return &asynq.TaskInfo{ID: "task-1", Queue: "default"}, nil
 }
 
@@ -178,13 +188,16 @@ func TestCreateKnowledgeFromProductionProjectionUsesReservedIDAndImmutableMetada
 	payload := &types.ProductionProjectionKnowledgePayload{
 		KnowledgeID:     "93000000-0000-4000-8000-000000000007",
 		KnowledgeBaseID: "kb-1", Title: "Approved baseline", Content: "# Approved\n",
-		EmbeddingModelID: "snapshot-model",
+		EmbeddingModelID: "snapshot-model", SummaryModelID: "snapshot-summary",
+		IndexingStrategy: types.IndexingStrategy{VectorEnabled: true, KeywordEnabled: true},
 		ProcessOverrides: &types.KnowledgeProcessOverrides{
 			ChunkingConfig: &types.ChunkingConfig{ChunkSize: 777},
 		},
 		ProductionProjection: &types.ProductionProjectionMetadata{
 			DocumentID: "doc-1", VersionID: "v3", ReleaseTargetID: "target-1",
-			ContentDigest: projectionKnowledgeContentDigest("# Approved\n"),
+			ContentDigest:    projectionKnowledgeContentDigest("# Approved\n"),
+			SummaryModelID:   "snapshot-summary",
+			IndexingStrategy: types.IndexingStrategy{VectorEnabled: true, KeywordEnabled: true},
 		},
 	}
 
@@ -210,7 +223,8 @@ func TestCreateKnowledgeFromProductionProjectionIsIdempotentAndRejectsForeignOwn
 	ownedMeta := types.NewManualKnowledgeMetadata("# owned", types.ManualKnowledgeStatusPublish, 1)
 	ownedMeta.ProductionProjection = &types.ProductionProjectionMetadata{
 		DocumentID: "doc-1", VersionID: "v3", ReleaseTargetID: "target-1",
-		ContentDigest: projectionKnowledgeContentDigest("# owned"),
+		ContentDigest:  projectionKnowledgeContentDigest("# owned"),
+		SummaryModelID: "snapshot-summary", IndexingStrategy: types.IndexingStrategy{VectorEnabled: true},
 	}
 	require.NoError(t, owned.SetManualMetadata(ownedMeta))
 	repo := &createKnowledgeFileRepoStub{existingKnowledge: owned}
@@ -218,7 +232,9 @@ func TestCreateKnowledgeFromProductionProjectionIsIdempotentAndRejectsForeignOwn
 	svc := &knowledgeService{repo: repo, task: tasks}
 	payload := &types.ProductionProjectionKnowledgePayload{
 		KnowledgeID: "knowledge-1", KnowledgeBaseID: "kb-1",
-		Content:              "# owned",
+		Content: "# owned", EmbeddingModelID: "snapshot-embedding", SummaryModelID: "snapshot-summary",
+		IndexingStrategy:     types.IndexingStrategy{VectorEnabled: true},
+		ProcessOverrides:     &types.KnowledgeProcessOverrides{ChunkingConfig: &types.ChunkingConfig{ChunkSize: 512}},
 		ProductionProjection: ownedMeta.ProductionProjection,
 	}
 
@@ -265,7 +281,8 @@ func TestCreateKnowledgeFromProductionProjectionRetriesFailedOwnedKnowledgeOnce(
 	meta := types.NewManualKnowledgeMetadata("# owned", types.ManualKnowledgeStatusPublish, 1)
 	meta.ProductionProjection = &types.ProductionProjectionMetadata{
 		DocumentID: "doc-1", VersionID: "v3", ReleaseTargetID: "target-1",
-		ContentDigest: projectionKnowledgeContentDigest("# owned"),
+		ContentDigest:  projectionKnowledgeContentDigest("# owned"),
+		SummaryModelID: "snapshot-summary", IndexingStrategy: types.IndexingStrategy{VectorEnabled: true},
 	}
 	require.NoError(t, owned.SetManualMetadata(meta))
 	repo := &createKnowledgeFileRepoStub{existingKnowledge: owned}
@@ -276,7 +293,10 @@ func TestCreateKnowledgeFromProductionProjectionRetriesFailedOwnedKnowledgeOnce(
 		newCreateKnowledgeFileContext(),
 		&types.ProductionProjectionKnowledgePayload{
 			KnowledgeID: "knowledge-1", KnowledgeBaseID: "kb-1",
-			Content: "# owned", ProductionProjection: meta.ProductionProjection,
+			Content: "# owned", EmbeddingModelID: "snapshot-embedding", SummaryModelID: "snapshot-summary",
+			IndexingStrategy:     types.IndexingStrategy{VectorEnabled: true},
+			ProcessOverrides:     &types.KnowledgeProcessOverrides{ChunkingConfig: &types.ChunkingConfig{ChunkSize: 512}},
+			ProductionProjection: meta.ProductionProjection,
 		},
 	)
 	require.NoError(t, err)
@@ -284,6 +304,67 @@ func TestCreateKnowledgeFromProductionProjectionRetriesFailedOwnedKnowledgeOnce(
 	require.Equal(t, types.ParseStatusPending, repo.columnUpdates["parse_status"])
 	require.Empty(t, repo.columnUpdates["error_message"])
 	require.Equal(t, 1, tasks.calls)
+}
+
+func TestCreateKnowledgeFromProductionProjectionRearmsPendingWithDeterministicTaskID(t *testing.T) {
+	owned := &types.Knowledge{
+		ID: "knowledge-1", TenantID: 1, KnowledgeBaseID: "kb-1", Type: types.KnowledgeTypeManual,
+		ParseStatus: types.ParseStatusPending,
+	}
+	meta := types.NewManualKnowledgeMetadata("# owned", types.ManualKnowledgeStatusPublish, 1)
+	meta.ProductionProjection = &types.ProductionProjectionMetadata{
+		DocumentID: "doc-1", VersionID: "v3", ReleaseTargetID: "target-1",
+		ContentDigest:  projectionKnowledgeContentDigest("# owned"),
+		SummaryModelID: "snapshot-summary", IndexingStrategy: types.IndexingStrategy{VectorEnabled: true},
+	}
+	require.NoError(t, owned.SetManualMetadata(meta))
+	repo := &createKnowledgeFileRepoStub{existingKnowledge: owned}
+	tasks := &createKnowledgeTaskEnqueuerStub{}
+	svc := &knowledgeService{repo: repo, task: tasks}
+	payload := &types.ProductionProjectionKnowledgePayload{
+		KnowledgeID: "knowledge-1", KnowledgeBaseID: "kb-1", Content: "# owned",
+		EmbeddingModelID: "snapshot-embedding", SummaryModelID: "snapshot-summary",
+		IndexingStrategy:     types.IndexingStrategy{VectorEnabled: true},
+		ProcessOverrides:     &types.KnowledgeProcessOverrides{ChunkingConfig: &types.ChunkingConfig{ChunkSize: 512}},
+		ProductionProjection: meta.ProductionProjection,
+	}
+
+	_, err := svc.CreateKnowledgeFromProductionProjection(newCreateKnowledgeFileContext(), payload)
+	require.NoError(t, err)
+	require.Equal(t, []string{"production-projection-build-target-1-knowledge-1"}, tasks.taskIDs)
+
+	tasks.enqueueErr = asynq.ErrTaskIDConflict
+	_, err = svc.CreateKnowledgeFromProductionProjection(newCreateKnowledgeFileContext(), payload)
+	require.NoError(t, err, "an ambiguous first enqueue replays as a successful duplicate")
+	require.Equal(t, 2, tasks.calls)
+}
+
+func TestCreateKnowledgeFromProductionProjectionTreatsRetryTaskConflictAsDurableSuccess(t *testing.T) {
+	owned := &types.Knowledge{
+		ID: "knowledge-1", TenantID: 1, KnowledgeBaseID: "kb-1", Type: types.KnowledgeTypeManual,
+		ParseStatus: types.ParseStatusFailed,
+	}
+	meta := types.NewManualKnowledgeMetadata("# owned", types.ManualKnowledgeStatusPublish, 1)
+	meta.ProductionProjection = &types.ProductionProjectionMetadata{
+		DocumentID: "doc-1", VersionID: "v3", ReleaseTargetID: "target-1",
+		ContentDigest:  projectionKnowledgeContentDigest("# owned"),
+		SummaryModelID: "snapshot-summary", IndexingStrategy: types.IndexingStrategy{VectorEnabled: true},
+	}
+	require.NoError(t, owned.SetManualMetadata(meta))
+	repo := &createKnowledgeFileRepoStub{existingKnowledge: owned}
+	tasks := &createKnowledgeTaskEnqueuerStub{enqueueErr: asynq.ErrTaskIDConflict}
+	svc := &knowledgeService{repo: repo, task: tasks}
+
+	_, err := svc.CreateKnowledgeFromProductionProjection(newCreateKnowledgeFileContext(), &types.ProductionProjectionKnowledgePayload{
+		KnowledgeID: "knowledge-1", KnowledgeBaseID: "kb-1", Content: "# owned",
+		EmbeddingModelID: "snapshot-embedding", SummaryModelID: "snapshot-summary",
+		IndexingStrategy:     types.IndexingStrategy{VectorEnabled: true},
+		ProcessOverrides:     &types.KnowledgeProcessOverrides{ChunkingConfig: &types.ChunkingConfig{ChunkSize: 512}},
+		ProductionProjection: meta.ProductionProjection,
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"production-projection-retry-target-1-knowledge-1"}, tasks.taskIDs)
+	require.Equal(t, types.ParseStatusPending, repo.columnUpdates["parse_status"])
 }
 
 func projectionKnowledgeContentDigest(content string) string {
