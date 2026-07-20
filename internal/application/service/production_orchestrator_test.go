@@ -679,6 +679,21 @@ func TestProductionOrchestratorStaleParentRollsBackToolTerminalization(t *testin
 	require.Equal(t, types.ProductionRunRunning, f.load(t).Status)
 }
 
+func TestProductionOrchestratorRejectsStepResultRawModelResponse(t *testing.T) {
+	f := newProductionOrchestratorFixture(t, 0)
+	f.executor.fn = func(*types.ProductionRun, []*types.ProductionToolCall) (ProductionStepResult, error) {
+		return ProductionStepResult{RawModelResponse: types.JSON(`"must be audited by the writer"`)}, nil
+	}
+
+	err := f.orchestrator.HandleRun(context.Background(), f.payload())
+
+	require.ErrorContains(t, err, "raw model response must be audited before returning a step result")
+	run := f.load(t)
+	require.Nil(t, run.RawModelResponse)
+	require.Nil(t, run.RawModelResponseDigest)
+	require.Equal(t, types.ProductionRunRunning, run.Status)
+}
+
 type failWaitingTransitionRepository struct {
 	interfaces.ProductionRunRepository
 }

@@ -21,7 +21,10 @@ const (
 // Concrete Skill, MCP, writer and validator executors are registered by later
 // tasks; this state machine only owns their persistence boundary.
 type ProductionStepResult struct {
-	StatePayload     types.JSON
+	StatePayload types.JSON
+	// RawModelResponse must be persisted by the dedicated running-to-running
+	// audit transition before a step result is returned. Nonempty values are
+	// rejected here so ordinary run transitions cannot write audit state.
 	RawModelResponse types.JSON
 	OutputVersionID  *string
 	ToolCall         *types.ProductionToolCall
@@ -172,10 +175,13 @@ func (o *ProductionOrchestrator) persistStepResult(
 	calls []*types.ProductionToolCall,
 	result ProductionStepResult,
 ) error {
+	if len(result.RawModelResponse) != 0 {
+		return errors.New("raw model response must be audited before returning a step result")
+	}
 	nextStep := run.CurrentStep + 1
 	patch := interfaces.ProductionRunPatch{
 		CurrentStep: &nextStep, StatePayload: result.StatePayload,
-		RawModelResponse: result.RawModelResponse, OutputVersionID: result.OutputVersionID,
+		OutputVersionID: result.OutputVersionID,
 	}
 	to := types.ProductionRunQueued
 	patch.IncrementWakeup = true

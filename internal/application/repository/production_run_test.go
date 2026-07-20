@@ -196,6 +196,58 @@ func TestProductionRunRepositoryPersistsExactRawModelResponseWithCAS(t *testing.
 	require.False(t, changed)
 }
 
+func TestProductionRunRepositoryRejectsRawAuditPatchOutsideReservedSelfTransition(t *testing.T) {
+	repo, _ := newProductionRunRepoTestDB(t)
+	run := newTestProductionRun(7)
+	require.NoError(t, repo.Create(context.Background(), run))
+	running, changed, err := repo.Transition(
+		context.Background(), 7, run.ID, runCAS(run), types.ProductionRunRunning, interfaces.ProductionRunPatch{},
+	)
+	require.NoError(t, err)
+	require.True(t, changed)
+	firstSnapshot := types.JSON(`"first audit"`)
+	firstSum := sha256.Sum256(firstSnapshot)
+	firstDigest := hex.EncodeToString(firstSum[:])
+	audited, changed, err := repo.Transition(
+		context.Background(), 7, run.ID, runCAS(running), types.ProductionRunRunning,
+		interfaces.ProductionRunPatch{RawModelResponse: firstSnapshot, RawModelResponseDigest: &firstDigest},
+	)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	nextStep := audited.CurrentStep + 1
+	completedAt := time.Now().UTC()
+	for _, test := range []struct {
+		name  string
+		to    types.ProductionRunStatus
+		patch interfaces.ProductionRunPatch
+	}{
+		{
+			name: "queued", to: types.ProductionRunQueued,
+			patch: interfaces.ProductionRunPatch{
+				CurrentStep: &nextStep, IncrementWakeup: true,
+				RawModelResponse: types.JSON(`"replacement"`), RawModelResponseDigest: &firstDigest,
+			},
+		},
+		{
+			name: "completed", to: types.ProductionRunCompleted,
+			patch: interfaces.ProductionRunPatch{
+				CompletedAt: &completedAt, RawModelResponse: types.JSON(`"replacement"`), RawModelResponseDigest: &firstDigest,
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, changed, err := repo.Transition(context.Background(), 7, run.ID, runCAS(audited), test.to, test.patch)
+			require.ErrorContains(t, err, "raw model response must be persisted through the reserved running self-transition")
+			require.False(t, changed)
+			stored, getErr := repo.Get(context.Background(), 7, run.ID)
+			require.NoError(t, getErr)
+			require.Equal(t, audited.RawModelResponse, stored.RawModelResponse)
+			require.Equal(t, audited.RawModelResponseDigest, stored.RawModelResponseDigest)
+		})
+	}
+}
+
 func TestProductionRunRepositoryRejectsCredentialSnapshots(t *testing.T) {
 	for _, key := range []string{
 		"access_token", "Access-Token", "refreshToken", "client_secret", "API-KEY", "apikey",

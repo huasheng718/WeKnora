@@ -190,8 +190,13 @@ func (r *productionRunRepository) Transition(
 			patch.CompletedAt != nil || patch.IncrementWakeup {
 			return nil, false, errors.New("running self-transition is reserved for raw model response audit persistence")
 		}
-	} else if err := validateProductionRunTransition(expected.Status, to); err != nil {
-		return nil, false, err
+	} else {
+		if len(patch.RawModelResponse) != 0 || patch.RawModelResponseDigest != nil {
+			return nil, false, errors.New("raw model response must be persisted through the reserved running self-transition")
+		}
+		if err := validateProductionRunTransition(expected.Status, to); err != nil {
+			return nil, false, err
+		}
 	}
 	if expected.Attempt < 1 || expected.CurrentStep < 0 || expected.WakeupVersion < 1 {
 		return nil, false, errors.New("invalid production run transition fence")
@@ -216,7 +221,7 @@ func (r *productionRunRepository) Transition(
 		}
 		updates["state_payload"] = canonical
 	}
-	if len(patch.RawModelResponse) > 0 {
+	if rawAuditTransition {
 		canonical, err := canonicalProductionSnapshot(patch.RawModelResponse, "")
 		if err != nil {
 			return nil, false, fmt.Errorf("canonicalize raw model response: %w", err)
@@ -227,8 +232,6 @@ func (r *productionRunRepository) Transition(
 		}
 		updates["raw_model_response"] = canonical
 		updates["raw_model_response_digest"] = digest
-	} else if patch.RawModelResponseDigest != nil {
-		return nil, false, errors.New("raw model response digest requires a response snapshot")
 	}
 	if patch.OutputVersionID != nil {
 		if err := requireCanonicalProductionUUID("output_version_id", *patch.OutputVersionID); err != nil {
