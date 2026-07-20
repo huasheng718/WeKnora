@@ -154,6 +154,9 @@ func (o *ProductionOrchestrator) HandleRun(ctx context.Context, payload types.Pr
 	if executeErr != nil {
 		return o.persistExecutionFailure(ctx, claimed, calls, executeErr)
 	}
+	if len(result.RawModelResponse) != 0 {
+		return errors.New("raw model response must be audited before returning a step result")
+	}
 	if result.ToolCall != nil {
 		if len(approved) > 0 || result.ToolCallResult != nil {
 			return o.persistExecutionFailure(ctx, claimed, calls, errors.New("approved tool execution cannot request another tool call"))
@@ -175,9 +178,6 @@ func (o *ProductionOrchestrator) persistStepResult(
 	calls []*types.ProductionToolCall,
 	result ProductionStepResult,
 ) error {
-	if len(result.RawModelResponse) != 0 {
-		return errors.New("raw model response must be audited before returning a step result")
-	}
 	nextStep := run.CurrentStep + 1
 	patch := interfaces.ProductionRunPatch{
 		CurrentStep: &nextStep, StatePayload: result.StatePayload,

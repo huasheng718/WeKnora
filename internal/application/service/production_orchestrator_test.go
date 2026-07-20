@@ -694,6 +694,47 @@ func TestProductionOrchestratorRejectsStepResultRawModelResponse(t *testing.T) {
 	require.Equal(t, types.ProductionRunRunning, run.Status)
 }
 
+func TestProductionOrchestratorRejectsRawStepResultBeforeOtherPersistenceBranches(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		result ProductionStepResult
+	}{
+		{
+			name: "tool call request",
+			result: ProductionStepResult{
+				RawModelResponse: types.JSON(`"must be audited by the writer"`), ToolCall: approvalRequiredCall(),
+			},
+		},
+		{
+			name: "invalid tool result",
+			result: ProductionStepResult{
+				RawModelResponse: types.JSON(`"must be audited by the writer"`), ToolCallResult: &ProductionToolCallResult{},
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newProductionOrchestratorFixture(t, 0)
+			enqueueCalls := f.enqueuer.callCount()
+			f.executor.fn = func(*types.ProductionRun, []*types.ProductionToolCall) (ProductionStepResult, error) {
+				return test.result, nil
+			}
+
+			err := f.orchestrator.HandleRun(context.Background(), f.payload())
+
+			require.ErrorContains(t, err, "raw model response must be audited before returning a step result")
+			run := f.load(t)
+			require.Nil(t, run.RawModelResponse)
+			require.Nil(t, run.RawModelResponseDigest)
+			require.Equal(t, 0, run.CurrentStep)
+			require.Equal(t, types.ProductionRunRunning, run.Status)
+			calls, listErr := f.repo.ListToolCalls(context.Background(), 7, run.ID)
+			require.NoError(t, listErr)
+			require.Empty(t, calls)
+			require.Equal(t, enqueueCalls, f.enqueuer.callCount())
+		})
+	}
+}
+
 type failWaitingTransitionRepository struct {
 	interfaces.ProductionRunRepository
 }
