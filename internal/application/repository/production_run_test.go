@@ -2,6 +2,9 @@ package repository
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -138,6 +141,44 @@ func TestProductionRunRepositoryCreateCanonicalizesSnapshotsAndScopesReads(t *te
 	got, err = repo.Get(context.Background(), 8, run.ID)
 	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
 	require.Nil(t, got)
+}
+
+func TestProductionRunRepositoryPersistsExactRawModelResponseWithCAS(t *testing.T) {
+	repo, _ := newProductionRunRepoTestDB(t)
+	run := newTestProductionRun(7)
+	require.NoError(t, repo.Create(context.Background(), run))
+	running, changed, err := repo.Transition(
+		context.Background(), 7, run.ID, runCAS(run), types.ProductionRunRunning, interfaces.ProductionRunPatch{},
+	)
+	require.NoError(t, err)
+	require.True(t, changed)
+	raw := []byte(`{"blocks":[`) // Deliberately invalid JSON must remain auditable.
+	snapshot, err := json.Marshal(string(raw))
+	require.NoError(t, err)
+	sum := sha256.Sum256(snapshot)
+	digest := hex.EncodeToString(sum[:])
+
+	persistedRun, changed, err := repo.Transition(
+		context.Background(), 7, run.ID, runCAS(running), types.ProductionRunRunning,
+		interfaces.ProductionRunPatch{RawModelResponse: snapshot, RawModelResponseDigest: &digest},
+	)
+
+	require.NoError(t, err)
+	require.True(t, changed)
+	var persisted string
+	require.NoError(t, json.Unmarshal(persistedRun.RawModelResponse, &persisted))
+	require.Equal(t, string(raw), persisted)
+	require.Equal(t, digest, *persistedRun.RawModelResponseDigest)
+	require.Nil(t, persistedRun.OutputVersionID)
+
+	_, changed, err = repo.Transition(
+		context.Background(), 7, run.ID,
+		interfaces.ProductionRunCAS{Status: running.Status, Attempt: running.Attempt + 1, CurrentStep: running.CurrentStep, WakeupVersion: running.WakeupVersion},
+		types.ProductionRunRunning,
+		interfaces.ProductionRunPatch{RawModelResponse: snapshot, RawModelResponseDigest: &digest},
+	)
+	require.NoError(t, err)
+	require.False(t, changed)
 }
 
 func TestProductionRunRepositoryRejectsCredentialSnapshots(t *testing.T) {

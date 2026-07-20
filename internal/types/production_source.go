@@ -6,12 +6,13 @@ import (
 )
 
 var (
-	ErrProductionSourceSetFrozen         = errors.New("production source set is frozen")
-	ErrProductionEvidenceMissing         = errors.New("accepted production source item is missing evidence")
-	ErrProductionEvidenceImmutable       = errors.New("production evidence snapshots are immutable")
-	ErrProductionEvidenceDigestMismatch  = errors.New("production evidence digest does not match content")
-	ErrProductionEvidenceResourceInvalid = errors.New("production evidence resource is invalid")
-	ErrProductionEvidenceConflict        = errors.New("production evidence identity conflicts with immutable content")
+	ErrProductionSourceSetFrozen          = errors.New("production source set is frozen")
+	ErrProductionEvidenceMissing          = errors.New("accepted production source item is missing evidence")
+	ErrProductionEvidenceImmutable        = errors.New("production evidence snapshots are immutable")
+	ErrProductionEvidenceDigestMismatch   = errors.New("production evidence digest does not match content")
+	ErrProductionEvidenceResourceInvalid  = errors.New("production evidence resource is invalid")
+	ErrProductionEvidenceConflict         = errors.New("production evidence identity conflicts with immutable content")
+	ErrProductionEvidenceReferenceInvalid = errors.New("production evidence reference is not accepted in the frozen source set")
 )
 
 type ProductionSourceSetStatus string

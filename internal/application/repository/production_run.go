@@ -182,7 +182,15 @@ func (r *productionRunRepository) Transition(
 	to types.ProductionRunStatus,
 	patch interfaces.ProductionRunPatch,
 ) (*types.ProductionRun, bool, error) {
-	if err := validateProductionRunTransition(expected.Status, to); err != nil {
+	rawAuditTransition := expected.Status == types.ProductionRunRunning && to == types.ProductionRunRunning
+	if rawAuditTransition {
+		if len(patch.RawModelResponse) == 0 || patch.RawModelResponseDigest == nil ||
+			patch.CurrentStep != nil || len(patch.StatePayload) != 0 || patch.OutputVersionID != nil ||
+			patch.ErrorCode != nil || patch.ErrorMessage != nil || patch.StartedAt != nil ||
+			patch.CompletedAt != nil || patch.IncrementWakeup {
+			return nil, false, errors.New("running self-transition is reserved for raw model response audit persistence")
+		}
+	} else if err := validateProductionRunTransition(expected.Status, to); err != nil {
 		return nil, false, err
 	}
 	if expected.Attempt < 1 || expected.CurrentStep < 0 || expected.WakeupVersion < 1 {
