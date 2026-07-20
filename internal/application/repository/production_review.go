@@ -598,6 +598,23 @@ func (r *productionReviewRepository) ListAnnotations(
 	return annotations, total, nil
 }
 
+func reserveSQLiteProductionAnnotationDocument(db *gorm.DB, tenantID uint64, annotationID string) error {
+	result := db.Model(&types.ProductionDocument{}).
+		Where(`tenant_id = ? AND id = (
+SELECT document_id
+FROM production_annotations
+WHERE tenant_id = ? AND id = ?
+)`, tenantID, tenantID, annotationID).
+		UpdateColumn("updated_at", gorm.Expr("updated_at"))
+	if result.Error != nil {
+		return translateProductionReviewError(result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
 func (r *productionReviewRepository) ResolveAnnotation(
 	ctx context.Context,
 	tenantID uint64,
@@ -620,6 +637,14 @@ func (r *productionReviewRepository) ResolveAnnotation(
 	changed := false
 	err = database.WithTransactionContext(ctx, r.db, func(txCtx context.Context) error {
 		db := database.DBFromContext(txCtx, r.db).WithContext(txCtx)
+		if db.Dialector.Name() != "postgres" {
+			if reserveErr := reserveSQLiteProductionAnnotationDocument(db, tenantID, annotationID); reserveErr != nil {
+				if errors.Is(reserveErr, gorm.ErrRecordNotFound) {
+					return nil
+				}
+				return reserveErr
+			}
+		}
 		var annotation types.ProductionAnnotation
 		loadErr := db.Select(
 			"id", "tenant_id", "project_id", "document_id", "version_id", "created_by",

@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -271,24 +272,45 @@ func TestProductionReviewRepositoryConcurrentAnnotationResolutionsSerialize(t *t
 	for _, annotation := range annotations {
 		require.NoError(t, repo.CreateAnnotation(productionReviewContext(reviewTenantID, reviewAuthorID), annotation))
 	}
+	annotationReads := make(chan struct{}, 2)
+	releaseReads := make(chan struct{})
+	var readCount int64
+	require.NoError(t, db.Callback().Query().After("gorm:query").Register(
+		"test:production_annotation_resolution_read_barrier",
+		func(tx *gorm.DB) {
+			if tx.Statement.Table != "production_annotations" || atomic.AddInt64(&readCount, 1) > 2 {
+				return
+			}
+			annotationReads <- struct{}{}
+			<-releaseReads
+		},
+	))
 
 	type resolutionResult struct {
 		changed bool
 		err     error
 	}
-	results := make(chan resolutionResult, 2)
-	var wg sync.WaitGroup
-	for _, attempt := range []struct {
+	attempts := []struct {
 		annotationID string
 		actor        string
 		resolution   types.ProductionAnnotationStatus
 	}{
 		{annotationID: annotations[0].ID, actor: reviewAuthorID, resolution: types.ProductionAnnotationResolved},
 		{annotationID: annotations[1].ID, actor: reviewBusinessActor, resolution: types.ProductionAnnotationDismissed},
-	} {
+	}
+	results := make(chan resolutionResult, len(attempts))
+	var wg sync.WaitGroup
+	resolve := func(attempt struct {
+		annotationID string
+		actor        string
+		resolution   types.ProductionAnnotationStatus
+	}, started chan<- struct{}) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			if started != nil {
+				close(started)
+			}
 			changed, err := repo.ResolveAnnotation(
 				productionReviewContext(reviewTenantID, attempt.actor), reviewTenantID,
 				attempt.annotationID, attempt.actor, attempt.resolution,
@@ -296,8 +318,21 @@ func TestProductionReviewRepositoryConcurrentAnnotationResolutionsSerialize(t *t
 			results <- resolutionResult{changed: changed, err: err}
 		}()
 	}
+	resolve(attempts[0], nil)
+	<-annotationReads
+	secondStarted := make(chan struct{})
+	resolve(attempts[1], secondStarted)
+	<-secondStarted
+	secondReadBeforeRelease := false
+	select {
+	case <-annotationReads:
+		secondReadBeforeRelease = true
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseReads)
 	wg.Wait()
 	close(results)
+	require.False(t, secondReadBeforeRelease, "second annotation scope read must wait for the document writer reservation")
 	changedCount := 0
 	for result := range results {
 		require.NoError(t, result.err)
