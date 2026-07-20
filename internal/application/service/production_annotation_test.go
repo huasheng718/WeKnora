@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	apprepository "github.com/Tencent/WeKnora/internal/application/repository"
+	"github.com/Tencent/WeKnora/internal/database"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/stretchr/testify/require"
@@ -66,6 +67,43 @@ type productionAnnotationReviewRepoStub struct {
 	resolveOK  bool
 	listOffset int
 	listLimit  int
+}
+
+type revokingAnnotationMutationRepository struct {
+	interfaces.ProductionReviewRepository
+	db              *gorm.DB
+	actorID         string
+	suspendOnCreate bool
+	removeOnResolve bool
+}
+
+func (r *revokingAnnotationMutationRepository) CreateAnnotation(
+	ctx context.Context, annotation *types.ProductionAnnotation,
+) error {
+	if r.suspendOnCreate {
+		if err := database.DBFromContext(ctx, r.db).WithContext(ctx).Model(&types.TenantMember{}).
+			Where("tenant_id = ? AND user_id = ?", annotationTenantID, r.actorID).
+			UpdateColumn("status", types.TenantMemberStatusSuspended).Error; err != nil {
+			return err
+		}
+	}
+	return r.ProductionReviewRepository.CreateAnnotation(ctx, annotation)
+}
+
+func (r *revokingAnnotationMutationRepository) ResolveAnnotation(
+	ctx context.Context, tenantID uint64, annotationID, actorID string,
+	resolution types.ProductionAnnotationStatus,
+) (bool, error) {
+	if r.removeOnResolve {
+		if err := database.DBFromContext(ctx, r.db).WithContext(ctx).
+			Where("tenant_id = ? AND user_id = ?", tenantID, r.actorID).
+			Delete(&types.TenantMember{}).Error; err != nil {
+			return false, err
+		}
+	}
+	return r.ProductionReviewRepository.ResolveAnnotation(
+		ctx, tenantID, annotationID, actorID, resolution,
+	)
 }
 
 func (r *productionAnnotationReviewRepoStub) ListAnnotations(
@@ -475,6 +513,48 @@ func TestProductionAnnotationCreateConcurrentRoleRevocationIsRejected(t *testing
 	require.Zero(t, count)
 }
 
+func TestProductionAnnotationCreateSuspendedTenantAtWriteBoundaryIsRejected(t *testing.T) {
+	svc, repo, db, _ := newProductionAnnotationWriteBoundaryFixture(t)
+	svc.reviews = &revokingAnnotationMutationRepository{
+		ProductionReviewRepository: repo, db: db,
+		actorID: "11111111-1111-4111-8111-111111111111", suspendOnCreate: true,
+	}
+
+	annotation, err := svc.Create(productionAnnotationContext(), CreateProductionAnnotationInput{
+		DocumentID: annotationDocumentID, VersionID: annotationVersionOne, BlockID: annotationBlockOne,
+		AnnotationType: types.ProductionAnnotationComment, Severity: types.ProductionAnnotationWarning,
+		Anchor: types.JSON(`{}`), Body: "suspended before insert",
+	})
+	require.Nil(t, annotation)
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
+	var count int64
+	require.NoError(t, db.Model(&types.ProductionAnnotation{}).Count(&count).Error)
+	require.Zero(t, count)
+}
+
+func TestProductionAnnotationCreatorRemovalAtResolveBoundaryIsRejected(t *testing.T) {
+	svc, repo, db, _ := newProductionAnnotationWriteBoundaryFixture(t)
+	annotation := &types.ProductionAnnotation{
+		ID: "99999999-9999-4999-8999-999999999999", TenantID: annotationTenantID, ProjectID: annotationProjectID,
+		DocumentID: annotationDocumentID, VersionID: annotationVersionOne, BlockID: annotationBlockOne,
+		AnnotationType: types.ProductionAnnotationComment, Severity: types.ProductionAnnotationWarning,
+		Anchor: types.JSON(`{}`), Body: "creator tenant removal", Status: types.ProductionAnnotationOpen,
+		CreatedBy: "11111111-1111-4111-8111-111111111111",
+	}
+	require.NoError(t, repo.CreateAnnotation(productionAnnotationContext(), annotation))
+	svc.reviews = &revokingAnnotationMutationRepository{
+		ProductionReviewRepository: repo, db: db,
+		actorID: "11111111-1111-4111-8111-111111111111", removeOnResolve: true,
+	}
+
+	err := svc.Resolve(productionAnnotationContext(), annotation.ID, types.ProductionAnnotationResolved)
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
+	var persisted types.ProductionAnnotation
+	require.NoError(t, db.First(&persisted, "id = ?", annotation.ID).Error)
+	require.Equal(t, types.ProductionAnnotationOpen, persisted.Status)
+	require.Nil(t, persisted.ResolvedBy)
+}
+
 func annotationRoleSet(roles []types.ProductionRole, first, second types.ProductionRole) bool {
 	return len(roles) == 2 && roles[0] == first && roles[1] == second
 }
@@ -498,6 +578,7 @@ func newProductionAnnotationWriteBoundaryFixture(t *testing.T) (*productionAnnot
 		require.NoError(t, readErr)
 		require.NoError(t, db.Exec(string(migration)).Error)
 	}
+	require.NoError(t, db.AutoMigrate(&types.TenantMember{}))
 	statements := []string{
 		`INSERT INTO production_projects (id, tenant_id, name, owner_user_id) VALUES (?, ?, 'Annotations', ?)`,
 		`INSERT INTO production_document_types (id, tenant_id, code, name, schema_version, status, created_by) VALUES (?, ?, 'annotation', 'Annotation', 1, 'active', ?)`,
@@ -522,6 +603,15 @@ func newProductionAnnotationWriteBoundaryFixture(t *testing.T) (*productionAnnot
 	}
 	for index := range statements {
 		require.NoError(t, db.Exec(statements[index], args[index]...).Error)
+	}
+	for _, actorID := range []string{
+		"11111111-1111-4111-8111-111111111111",
+		"22222222-2222-4222-8222-222222222222",
+	} {
+		require.NoError(t, db.Create(&types.TenantMember{
+			UserID: actorID, TenantID: annotationTenantID, Role: types.TenantRoleContributor,
+			Status: types.TenantMemberStatusActive,
+		}).Error)
 	}
 	authorizer := &productionAnnotationAuthorizerStub{}
 	repo := apprepository.NewProductionReviewRepository(db)

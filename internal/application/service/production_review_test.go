@@ -56,6 +56,43 @@ type revokingTerminalReplayRepository struct {
 	actorID  string
 }
 
+type revokingProfessionalMutationRepository struct {
+	interfaces.ProductionReviewRepository
+	db              *gorm.DB
+	actorID         string
+	suspendOnSubmit bool
+	removeOnDecide  bool
+}
+
+func (r *revokingProfessionalMutationRepository) LockCurrentReviewVersion(
+	ctx context.Context, request *types.ProductionReviewRequest,
+) error {
+	if r.suspendOnSubmit {
+		if err := database.DBFromContext(ctx, r.db).WithContext(ctx).Model(&types.TenantMember{}).
+			Where("tenant_id = ? AND user_id = ?", request.TenantID, r.actorID).
+			UpdateColumn("status", types.TenantMemberStatusSuspended).Error; err != nil {
+			return err
+		}
+	}
+	return r.ProductionReviewRepository.LockCurrentReviewVersion(ctx, request)
+}
+
+func (r *revokingProfessionalMutationRepository) DecideStep(
+	ctx context.Context, tenantID uint64, stepID string,
+	from, to types.ProductionReviewDecision, actorID, comment string,
+) (bool, error) {
+	if r.removeOnDecide {
+		if err := database.DBFromContext(ctx, r.db).WithContext(ctx).
+			Where("tenant_id = ? AND user_id = ?", tenantID, r.actorID).
+			Delete(&types.TenantMember{}).Error; err != nil {
+			return false, err
+		}
+	}
+	return r.ProductionReviewRepository.DecideStep(
+		ctx, tenantID, stepID, from, to, actorID, comment,
+	)
+}
+
 func (r *revokingTerminalReplayRepository) RejectReviewByTenantAuthority(
 	ctx context.Context, tenantID uint64, reviewID, actorID, reason string,
 ) (bool, error) {
@@ -453,6 +490,22 @@ func TestProductionReviewRevokedSubmitterRoleAtMutationBoundaryCannotSubmit(t *t
 	require.Zero(t, countServiceRows(t, fixture.db, &types.ProductionReviewRequest{}))
 }
 
+func TestProductionReviewSuspendedTenantAtSubmissionBoundaryCannotSubmit(t *testing.T) {
+	fixture := newProductionReviewFixture(t)
+	fixture.svc.reviews = &revokingProfessionalMutationRepository{
+		ProductionReviewRepository: fixture.reviews, db: fixture.db,
+		actorID: productionReviewAuthorID, suspendOnSubmit: true,
+	}
+
+	request, err := fixture.svc.Submit(
+		productionReviewServiceContext(productionReviewAuthorID, types.TenantRoleContributor),
+		productionReviewDocumentID, productionReviewVersionID,
+	)
+	require.Nil(t, request)
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
+	require.Zero(t, countServiceRows(t, fixture.db, &types.ProductionReviewRequest{}))
+}
+
 func TestWrongProjectRoleCannotApproveStep(t *testing.T) {
 	fixture := newProductionReviewFixture(t)
 	request := fixture.submit(t)
@@ -698,6 +751,27 @@ func TestProductionReviewRevokedRoleAtMutationBoundaryCannotDecide(t *testing.T)
 		request.Steps[0].ID, types.ProductionReviewApproved, "stale role",
 	)
 	require.ErrorIs(t, err, types.ErrProductionForbidden)
+}
+
+func TestProductionReviewRemovedTenantAtProfessionalDecisionBoundaryCannotDecide(t *testing.T) {
+	fixture := newProductionReviewFixture(t)
+	request := fixture.submit(t)
+	fixture.svc.reviews = &revokingProfessionalMutationRepository{
+		ProductionReviewRepository: fixture.reviews, db: fixture.db,
+		actorID: productionReviewBusinessID, removeOnDecide: true,
+	}
+
+	err := fixture.svc.Decide(
+		productionReviewServiceContext(productionReviewBusinessID, types.TenantRoleContributor),
+		request.Steps[0].ID, types.ProductionReviewApproved, "removed tenant member",
+	)
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
+	loaded, loadErr := fixture.reviews.GetReview(
+		productionReviewServiceContext(productionReviewBusinessID, types.TenantRoleContributor),
+		productionReviewTenantID, request.ID,
+	)
+	require.NoError(t, loadErr)
+	require.Equal(t, types.ProductionReviewDecision(types.ProductionReviewPending), loaded.Steps[0].Decision)
 }
 
 func productionCategory(value types.ProductionAnnotationCategory) *types.ProductionAnnotationCategory {

@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"os"
@@ -102,6 +103,7 @@ func newProductionReviewRepoFixture(t *testing.T) (interfaces.ProductionReviewRe
 		require.NoError(t, readErr)
 		require.NoError(t, db.Exec(string(migration)).Error)
 	}
+	require.NoError(t, db.AutoMigrate(&types.TenantMember{}))
 	seedProductionReviewScope(t, db)
 	return NewProductionReviewRepository(db), db
 }
@@ -152,6 +154,12 @@ func seedProductionReviewScope(t *testing.T, db *gorm.DB) {
 	}
 	for index := range statements {
 		require.NoError(t, db.Exec(statements[index], args[index]...).Error)
+	}
+	for _, actorID := range []string{reviewAuthorID, reviewBusinessActor, reviewEngineeringActor} {
+		require.NoError(t, db.Create(&types.TenantMember{
+			UserID: actorID, TenantID: reviewTenantID, Role: types.TenantRoleContributor,
+			Status: types.TenantMemberStatusActive,
+		}).Error)
 	}
 }
 
@@ -236,6 +244,68 @@ func TestProductionReviewRepositoryRejectsRevokedAnnotationResolverAtWriteBounda
 	var persisted types.ProductionAnnotation
 	require.NoError(t, db.First(&persisted, "id = ?", annotation.ID).Error)
 	require.Equal(t, types.ProductionAnnotationOpen, persisted.Status)
+}
+
+func TestProductionReviewRepositoryConcurrentAnnotationResolutionsSerialize(t *testing.T) {
+	repo, db := newProductionReviewRepoFixture(t)
+	require.NoError(t, db.Create(&types.ProductionProjectMember{
+		ProjectID: reviewProjectID, UserID: reviewBusinessActor,
+		Role: types.ProductionRoleAuthor, AssignedBy: reviewAuthorID,
+	}).Error)
+	annotations := []*types.ProductionAnnotation{
+		{
+			ID: reviewID(4), TenantID: reviewTenantID, ProjectID: reviewProjectID,
+			DocumentID: reviewDocumentID, VersionID: reviewVersionOne, BlockID: reviewBlockOne,
+			AnnotationType: types.ProductionAnnotationComment, Severity: types.ProductionAnnotationWarning,
+			Anchor: types.JSON(`{}`), Body: "first resolution race", Status: types.ProductionAnnotationOpen,
+			CreatedBy: reviewAuthorID,
+		},
+		{
+			ID: reviewID(5), TenantID: reviewTenantID, ProjectID: reviewProjectID,
+			DocumentID: reviewDocumentID, VersionID: reviewVersionOne, BlockID: reviewBlockOne,
+			AnnotationType: types.ProductionAnnotationComment, Severity: types.ProductionAnnotationWarning,
+			Anchor: types.JSON(`{}`), Body: "second resolution race", Status: types.ProductionAnnotationOpen,
+			CreatedBy: reviewAuthorID,
+		},
+	}
+	for _, annotation := range annotations {
+		require.NoError(t, repo.CreateAnnotation(productionReviewContext(reviewTenantID, reviewAuthorID), annotation))
+	}
+
+	type resolutionResult struct {
+		changed bool
+		err     error
+	}
+	results := make(chan resolutionResult, 2)
+	var wg sync.WaitGroup
+	for _, attempt := range []struct {
+		annotationID string
+		actor        string
+		resolution   types.ProductionAnnotationStatus
+	}{
+		{annotationID: annotations[0].ID, actor: reviewAuthorID, resolution: types.ProductionAnnotationResolved},
+		{annotationID: annotations[1].ID, actor: reviewBusinessActor, resolution: types.ProductionAnnotationDismissed},
+	} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			changed, err := repo.ResolveAnnotation(
+				productionReviewContext(reviewTenantID, attempt.actor), reviewTenantID,
+				attempt.annotationID, attempt.actor, attempt.resolution,
+			)
+			results <- resolutionResult{changed: changed, err: err}
+		}()
+	}
+	wg.Wait()
+	close(results)
+	changedCount := 0
+	for result := range results {
+		require.NoError(t, result.err)
+		if result.changed {
+			changedCount++
+		}
+	}
+	require.Equal(t, 2, changedCount)
 }
 
 func TestProductionReviewRepositoryResolveComplianceRiskRoleMatrix(t *testing.T) {
@@ -380,50 +450,239 @@ func TestProductionReviewRepositoryRejectsUnboundedAnnotationList(t *testing.T) 
 	require.Zero(t, total)
 }
 
-func TestProductionReviewPostgresVersionLockScopesExactImmutableVersion(t *testing.T) {
-	upper := strings.ToUpper(postgresProductionReviewLockSQL)
-	for _, fragment := range []string{"FROM PRODUCTION_DOCUMENT_VERSIONS", "ID = ?", "DOCUMENT_ID = ?", "TENANT_ID = ?", "PROJECT_ID = ?", "FOR UPDATE"} {
-		require.Contains(t, upper, fragment)
-	}
-}
-
-func TestProductionReviewPostgresAnnotationCreateLocksLiveAllowedMembership(t *testing.T) {
-	upper := strings.ToUpper(postgresProductionAnnotationCreateRoleLockSQL)
-	for _, fragment := range []string{
-		"FROM PRODUCTION_PROJECT_MEMBERS", "JOIN PRODUCTION_PROJECTS", "PROJECT.TENANT_ID = ?",
-		"MEMBER.PROJECT_ID = ?", "MEMBER.USER_ID = ?", "MEMBER.DELETED_AT IS NULL",
-		"MEMBER.ROLE IN (?, ?, ?, ?)", "FOR UPDATE OF MEMBER",
-	} {
-		require.Contains(t, upper, fragment)
-	}
-}
-
-func TestProductionReviewPostgresDecisionLocksDocumentBeforeReviewAggregate(t *testing.T) {
+func newProductionReviewPostgresMock(t *testing.T) (*gorm.DB, sqlmock.Sqlmock) {
+	t.Helper()
 	sqlDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = sqlDB.Close() })
 	db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
 	require.NoError(t, err)
+	return db, mock
+}
 
-	mock.ExpectQuery(`SELECT request\.document_id.*FROM production_review_requests AS request.*JOIN production_review_steps AS step`).
-		WithArgs(reviewTenantID, reviewTenantID, reviewID(301)).
-		WillReturnRows(sqlmock.NewRows([]string{"document_id"}).AddRow(reviewDocumentID))
-	mock.ExpectQuery(`SELECT id, current_version_id, status.*FROM production_documents.*FOR UPDATE`).
-		WithArgs(reviewDocumentID, reviewTenantID).
+func expectProductionMutationScopeLocks(
+	mock sqlmock.Sqlmock,
+	tenantID uint64,
+	projectID, documentID, versionID string,
+	documentStatus types.ProductionDocumentStatus,
+) {
+	mock.ExpectQuery(`SELECT id, current_version_id, status FROM production_documents .* FOR UPDATE`).
+		WithArgs(documentID, tenantID, projectID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "current_version_id", "status"}).
-			AddRow(reviewDocumentID, reviewVersionOne, string(types.ProductionDocumentInReview)))
+			AddRow(documentID, versionID, string(documentStatus)))
+	mock.ExpectQuery(`SELECT id FROM production_document_versions .* FOR UPDATE`).
+		WithArgs(versionID, documentID, tenantID, projectID).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(versionID))
+}
+
+func expectProductionTenantMembershipLock(mock sqlmock.Sqlmock, tenantID uint64, actorID string) {
+	mock.ExpectQuery(`SELECT id FROM tenant_members .* FOR UPDATE`).
+		WithArgs(tenantID, actorID, types.TenantMemberStatusActive).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(uint64(1)))
+}
+
+func expectProductionProjectMembershipLock(
+	mock sqlmock.Sqlmock,
+	tenantID uint64,
+	projectID, actorID string,
+	roles ...types.ProductionRole,
+) {
+	args := []driver.Value{tenantID, projectID, actorID}
+	for _, role := range roles {
+		args = append(args, string(role))
+	}
+	mock.ExpectQuery(`SELECT member.project_id FROM production_project_members AS member .* FOR UPDATE OF member`).
+		WithArgs(args...).
+		WillReturnRows(sqlmock.NewRows([]string{"project_id"}).AddRow(projectID))
+}
+
+func TestProductionReviewPostgresAnnotationCreateUsesUniversalMutationLockOrder(t *testing.T) {
+	db, mock := newProductionReviewPostgresMock(t)
+	repo := NewProductionReviewRepository(db)
+	annotation := &types.ProductionAnnotation{
+		ID: reviewID(300), TenantID: reviewTenantID, ProjectID: reviewProjectID,
+		DocumentID: reviewDocumentID, VersionID: reviewVersionOne, BlockID: reviewBlockOne,
+		AnnotationType: types.ProductionAnnotationComment, Severity: types.ProductionAnnotationWarning,
+		Anchor: types.JSON(`{}`), Body: "ordered create", Status: types.ProductionAnnotationOpen,
+		CreatedBy: reviewAuthorID,
+	}
+
+	mock.ExpectBegin()
+	expectProductionMutationScopeLocks(mock, reviewTenantID, reviewProjectID, reviewDocumentID, reviewVersionOne, types.ProductionDocumentDraft)
+	expectProductionTenantMembershipLock(mock, reviewTenantID, reviewAuthorID)
+	expectProductionProjectMembershipLock(
+		mock, reviewTenantID, reviewProjectID, reviewAuthorID,
+		types.ProductionRoleAuthor,
+		types.ProductionRoleBusinessReviewer,
+		types.ProductionRoleEngineeringReviewer,
+		types.ProductionRoleComplianceReviewer,
+	)
+	mock.ExpectQuery(`INSERT INTO "production_annotations" .* RETURNING "anchor"`).
+		WillReturnRows(sqlmock.NewRows([]string{"anchor"}).AddRow(`{}`))
+	mock.ExpectCommit()
+
+	require.NoError(t, repo.CreateAnnotation(productionReviewContext(reviewTenantID, reviewAuthorID), annotation))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestProductionReviewPostgresAnnotationResolveUsesUniversalMutationLockOrder(t *testing.T) {
+	db, mock := newProductionReviewPostgresMock(t)
+	repo := NewProductionReviewRepository(db)
+	annotationID := reviewID(301)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT .* FROM "production_annotations"`).
+		WithArgs(reviewTenantID, annotationID, 1).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "tenant_id", "project_id", "document_id", "version_id", "created_by",
+			"severity", "quality_tag", "status",
+		}).AddRow(
+			annotationID, reviewTenantID, reviewProjectID, reviewDocumentID, reviewVersionOne, reviewAuthorID,
+			string(types.ProductionAnnotationWarning), nil, string(types.ProductionAnnotationOpen),
+		))
+	expectProductionMutationScopeLocks(mock, reviewTenantID, reviewProjectID, reviewDocumentID, reviewVersionOne, types.ProductionDocumentDraft)
+	expectProductionTenantMembershipLock(mock, reviewTenantID, reviewBusinessActor)
+	expectProductionProjectMembershipLock(
+		mock, reviewTenantID, reviewProjectID, reviewBusinessActor,
+		types.ProductionRoleProjectOwner, types.ProductionRoleAuthor,
+	)
+	mock.ExpectExec(`UPDATE "production_annotations"`).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	changed, err := repo.ResolveAnnotation(
+		productionReviewContext(reviewTenantID, reviewBusinessActor), reviewTenantID,
+		annotationID, reviewBusinessActor, types.ProductionAnnotationResolved,
+	)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestProductionReviewPostgresSubmissionUsesUniversalMutationLockOrder(t *testing.T) {
+	db, mock := newProductionReviewPostgresMock(t)
+	repo := NewProductionReviewRepository(db)
+	request := productionReviewRequest(reviewID(310), reviewVersionOne)
+	steps := productionReviewSteps(request.ID, 310)
+
+	mock.ExpectBegin()
+	expectProductionMutationScopeLocks(mock, reviewTenantID, reviewProjectID, reviewDocumentID, reviewVersionOne, types.ProductionDocumentDraft)
+	expectProductionTenantMembershipLock(mock, reviewTenantID, reviewAuthorID)
+	expectProductionProjectMembershipLock(
+		mock, reviewTenantID, reviewProjectID, reviewAuthorID,
+		types.ProductionRoleProjectOwner, types.ProductionRoleAuthor,
+	)
+	mock.ExpectExec(`INSERT INTO "production_review_requests"`).WillReturnResult(sqlmock.NewResult(1, 1))
+	for range steps {
+		mock.ExpectExec(`INSERT INTO "production_review_steps"`).WillReturnResult(sqlmock.NewResult(1, 1))
+	}
+	mock.ExpectExec(`UPDATE "production_documents"`).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	require.NoError(t, repo.CreateCurrentReview(productionReviewContext(reviewTenantID, reviewAuthorID), request, steps))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestProductionReviewPostgresDecisionUsesUniversalMutationLockOrder(t *testing.T) {
+	db, mock := newProductionReviewPostgresMock(t)
+	repo := NewProductionReviewRepository(db)
+	stepID := reviewID(321)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT request\.project_id, request\.document_id, request\.version_id, step\.required_role`).
+		WithArgs(reviewTenantID, reviewTenantID, stepID).
+		WillReturnRows(sqlmock.NewRows([]string{"project_id", "document_id", "version_id", "required_role"}).
+			AddRow(reviewProjectID, reviewDocumentID, reviewVersionOne, string(types.ProductionRoleBusinessReviewer)))
+	expectProductionMutationScopeLocks(mock, reviewTenantID, reviewProjectID, reviewDocumentID, reviewVersionOne, types.ProductionDocumentInReview)
+	expectProductionTenantMembershipLock(mock, reviewTenantID, reviewBusinessActor)
+	expectProductionProjectMembershipLock(
+		mock, reviewTenantID, reviewProjectID, reviewBusinessActor, types.ProductionRoleBusinessReviewer,
+	)
 	mock.ExpectQuery(`SELECT request\.id AS review_id.*FOR UPDATE OF request, step`).
-		WithArgs(reviewTenantID, reviewTenantID, reviewID(301)).
+		WithArgs(reviewTenantID, reviewTenantID, stepID).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"review_id", "project_id", "document_id", "version_id", "status",
-		}).AddRow(reviewID(300), reviewProjectID, reviewDocumentID, reviewVersionOne, string(types.ProductionReviewPending)))
+		}).AddRow(reviewID(320), reviewProjectID, reviewDocumentID, reviewVersionOne, string(types.ProductionReviewPending)))
+	mock.ExpectExec(`UPDATE "production_review_steps"`).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`SELECT count\(\*\) FROM "production_review_steps"`).
+		WithArgs(reviewID(320), types.ProductionReviewApproved).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectCommit()
 
-	scope, err := lockProductionReviewDecisionScope(db, reviewTenantID, reviewID(301))
+	changed, err := repo.DecideStep(
+		productionReviewContext(reviewTenantID, reviewBusinessActor), reviewTenantID, stepID,
+		types.ProductionReviewPending, types.ProductionReviewApproved, reviewBusinessActor, "ordered decision",
+	)
 	require.NoError(t, err)
-	require.Equal(t, reviewDocumentID, scope.DocumentID)
-	require.Equal(t, reviewVersionOne, scope.CurrentVersionID)
-	require.Equal(t, types.ProductionDocumentInReview, scope.DocumentStatus)
+	require.True(t, changed)
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestProductionReviewPostgresLiveMutationLockSmoke(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("WEKNORA_TEST_POSTGRES_DSN"))
+	if dsn == "" {
+		t.Skip("set WEKNORA_TEST_POSTGRES_DSN to run the isolated PostgreSQL lock smoke test")
+	}
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+
+	schemaName := fmt.Sprintf("weknora_review_lock_%d", time.Now().UnixNano())
+	require.NoError(t, db.Exec(`CREATE SCHEMA "`+schemaName+`"`).Error)
+	t.Cleanup(func() { _ = db.Exec(`DROP SCHEMA IF EXISTS "` + schemaName + `" CASCADE`).Error })
+	require.NoError(t, db.Exec(`SET search_path TO "`+schemaName+`"`).Error)
+
+	for _, statement := range []string{
+		`CREATE TABLE production_documents (
+			id TEXT PRIMARY KEY, tenant_id BIGINT NOT NULL, project_id TEXT NOT NULL,
+			current_version_id TEXT, status TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE TABLE production_document_versions (
+			id TEXT PRIMARY KEY, document_id TEXT NOT NULL, tenant_id BIGINT NOT NULL, project_id TEXT NOT NULL
+		)`,
+		`CREATE TABLE tenant_members (
+			id BIGSERIAL PRIMARY KEY, tenant_id BIGINT NOT NULL, user_id TEXT NOT NULL,
+			status TEXT NOT NULL, deleted_at TIMESTAMPTZ
+		)`,
+		`CREATE TABLE production_projects (
+			id TEXT PRIMARY KEY, tenant_id BIGINT NOT NULL, deleted_at TIMESTAMPTZ
+		)`,
+		`CREATE TABLE production_project_members (
+			project_id TEXT NOT NULL, user_id TEXT NOT NULL, role TEXT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(), deleted_at TIMESTAMPTZ
+		)`,
+	} {
+		require.NoError(t, db.Exec(statement).Error)
+	}
+	require.NoError(t, db.Exec(
+		`INSERT INTO production_documents (id, tenant_id, project_id, current_version_id, status) VALUES (?, ?, ?, ?, ?)`,
+		reviewDocumentID, reviewTenantID, reviewProjectID, reviewVersionOne, types.ProductionDocumentDraft,
+	).Error)
+	require.NoError(t, db.Exec(
+		`INSERT INTO production_document_versions (id, document_id, tenant_id, project_id) VALUES (?, ?, ?, ?)`,
+		reviewVersionOne, reviewDocumentID, reviewTenantID, reviewProjectID,
+	).Error)
+	require.NoError(t, db.Exec(
+		`INSERT INTO tenant_members (tenant_id, user_id, status) VALUES (?, ?, ?)`,
+		reviewTenantID, reviewAuthorID, types.TenantMemberStatusActive,
+	).Error)
+	require.NoError(t, db.Exec(
+		`INSERT INTO production_projects (id, tenant_id) VALUES (?, ?)`, reviewProjectID, reviewTenantID,
+	).Error)
+	require.NoError(t, db.Exec(
+		`INSERT INTO production_project_members (project_id, user_id, role) VALUES (?, ?, ?)`,
+		reviewProjectID, reviewAuthorID, types.ProductionRoleAuthor,
+	).Error)
+
+	annotation := &types.ProductionAnnotation{
+		TenantID: reviewTenantID, ProjectID: reviewProjectID,
+		DocumentID: reviewDocumentID, VersionID: reviewVersionOne,
+	}
+	require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+		return lockProductionAnnotationCreateAuthority(tx, annotation, reviewAuthorID)
+	}))
 }
 
 func TestProductionReviewRepositoryExactGovernedSurface(t *testing.T) {

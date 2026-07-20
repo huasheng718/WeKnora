@@ -177,14 +177,6 @@ func (s *productionAnnotationService) Create(
 		return nil, types.ErrProductionForbidden
 	}
 	err = s.uow.WithinTransaction(ctx, func(txCtx context.Context) error {
-		if err := s.projects.RequireProjectRole(txCtx, document.ProjectID,
-			types.ProductionRoleAuthor,
-			types.ProductionRoleBusinessReviewer,
-			types.ProductionRoleEngineeringReviewer,
-			types.ProductionRoleComplianceReviewer,
-		); err != nil {
-			return err
-		}
 		return s.reviews.CreateAnnotation(txCtx, annotation)
 	})
 	if err != nil {
