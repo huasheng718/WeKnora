@@ -25,11 +25,31 @@ FOR UPDATE`
 
 const productionReviewObsoleteReason = "superseded by a newer document version"
 
-type productionReviewRepository struct{ db *gorm.DB }
+type ProductionReviewClock interface {
+	Now() time.Time
+}
+
+type productionReviewSystemClock struct{}
+
+func (productionReviewSystemClock) Now() time.Time { return time.Now() }
+
+type productionReviewRepository struct {
+	db    *gorm.DB
+	clock ProductionReviewClock
+}
 
 func NewProductionReviewRepository(db *gorm.DB) interfaces.ProductionReviewRepository {
-	return &productionReviewRepository{db: db}
+	return NewProductionReviewRepositoryWithClock(db, productionReviewSystemClock{})
 }
+
+func NewProductionReviewRepositoryWithClock(db *gorm.DB, clock ProductionReviewClock) interfaces.ProductionReviewRepository {
+	if clock == nil {
+		clock = productionReviewSystemClock{}
+	}
+	return &productionReviewRepository{db: db, clock: clock}
+}
+
+func (r *productionReviewRepository) nowUTC() time.Time { return r.clock.Now().UTC() }
 
 func requireProductionReviewUUID(name, value string) error {
 	parsed, err := uuid.Parse(value)
@@ -39,9 +59,40 @@ func requireProductionReviewUUID(name, value string) error {
 	return nil
 }
 
-func canonicalProductionReviewObject(raw types.JSON, fallback string) (types.JSON, error) {
+func requireProductionReviewTenantContext(ctx context.Context, tenantID uint64) error {
+	if ctx == nil {
+		return types.ErrProductionForbidden
+	}
+	contextTenantID, ok := types.TenantIDFromContext(ctx)
+	if !ok || contextTenantID == 0 || contextTenantID != tenantID {
+		return types.ErrProductionForbidden
+	}
+	return nil
+}
+
+func trustedProductionReviewActor(ctx context.Context, tenantID uint64, suppliedActorID string) (string, error) {
+	if err := requireProductionReviewTenantContext(ctx, tenantID); err != nil {
+		return "", err
+	}
+	actorID, ok := types.UserIDFromContext(ctx)
+	if !ok || actorID == types.ProductionSystemActorID {
+		return "", types.ErrProductionForbidden
+	}
+	if err := requireProductionReviewUUID("context actor", actorID); err != nil {
+		return "", types.ErrProductionForbidden
+	}
+	if suppliedActorID != "" && suppliedActorID != actorID {
+		return "", types.ErrProductionForbidden
+	}
+	return actorID, nil
+}
+
+func canonicalProductionReviewObject(raw types.JSON, fallback string, maxBytes, maxDepth int) (types.JSON, error) {
 	if len(raw) == 0 {
 		raw = types.JSON(fallback)
+	}
+	if err := types.ValidateProductionJSONResource(raw, maxBytes, maxDepth); err != nil {
+		return nil, err
 	}
 	canonical, err := types.CanonicalProductionJSON(raw)
 	if err != nil {
@@ -138,7 +189,12 @@ func validateProductionAnnotation(annotation *types.ProductionAnnotation) error 
 	if annotation.SuggestedContent != nil && utf8.RuneCountInString(*annotation.SuggestedContent) > 20000 {
 		return errors.New("production annotation suggested content exceeds 20000 characters")
 	}
-	anchor, err := canonicalProductionReviewObject(annotation.Anchor, "{}")
+	anchor, err := canonicalProductionReviewObject(
+		annotation.Anchor,
+		"{}",
+		types.ProductionAnnotationAnchorMaxBytes,
+		types.ProductionAnnotationAnchorMaxDepth,
+	)
 	if err != nil {
 		return errors.Join(types.ErrProductionAnnotationAnchorInvalid, err)
 	}
@@ -150,11 +206,19 @@ func validateProductionAnnotation(annotation *types.ProductionAnnotation) error 
 }
 
 func (r *productionReviewRepository) CreateAnnotation(ctx context.Context, annotation *types.ProductionAnnotation) error {
+	if annotation == nil {
+		return types.ErrProductionReviewScopeInvalid
+	}
+	actorID, err := trustedProductionReviewActor(ctx, annotation.TenantID, annotation.CreatedBy)
+	if err != nil {
+		return err
+	}
+	annotation.CreatedBy = actorID
 	if err := validateProductionAnnotation(annotation); err != nil {
 		return err
 	}
 	db := database.DBFromContext(ctx, r.db).WithContext(ctx)
-	now := time.Now().UTC()
+	now := r.nowUTC()
 	annotation.CreatedAt = now
 	annotation.UpdatedAt = now
 	anchorValue := any(string(annotation.Anchor))
@@ -176,7 +240,7 @@ func (r *productionReviewRepository) CreateAnnotation(ctx context.Context, annot
 		"status": annotation.Status, "created_by": annotation.CreatedBy,
 		"resolved_by": nil, "resolved_at": nil, "created_at": annotation.CreatedAt, "updated_at": annotation.UpdatedAt,
 	}
-	err := db.Model(&types.ProductionAnnotation{}).Create(values).Error
+	err = db.Model(&types.ProductionAnnotation{}).Create(values).Error
 	if isProductionForeignKeyError(err) {
 		return errors.Join(types.ErrProductionAnnotationAnchorInvalid, err)
 	}
@@ -192,21 +256,22 @@ func (r *productionReviewRepository) ResolveAnnotation(
 	if tenantID == 0 {
 		return false, types.ErrProductionReviewScopeInvalid
 	}
-	if err := requireProductionReviewUUID("annotation id", annotationID); err != nil {
+	trustedActorID, err := trustedProductionReviewActor(ctx, tenantID, actorID)
+	if err != nil {
 		return false, err
 	}
-	if err := requireProductionReviewUUID("resolution actor", actorID); err != nil {
+	if err := requireProductionReviewUUID("annotation id", annotationID); err != nil {
 		return false, err
 	}
 	if resolution != types.ProductionAnnotationResolved && resolution != types.ProductionAnnotationDismissed {
 		return false, types.ErrProductionAnnotationLifecycle
 	}
-	now := time.Now().UTC()
+	now := r.nowUTC()
 	result := database.DBFromContext(ctx, r.db).WithContext(ctx).
 		Model(&types.ProductionAnnotation{}).
 		Where("tenant_id = ? AND id = ? AND status = ?", tenantID, annotationID, types.ProductionAnnotationOpen).
 		Updates(map[string]any{
-			"status": resolution, "resolved_by": actorID, "resolved_at": now, "updated_at": now,
+			"status": resolution, "resolved_by": trustedActorID, "resolved_at": now, "updated_at": now,
 		})
 	if result.Error != nil {
 		return false, translateProductionReviewError(result.Error)
@@ -348,6 +413,14 @@ func (r *productionReviewRepository) CreateReview(
 	request *types.ProductionReviewRequest,
 	steps []*types.ProductionReviewStep,
 ) error {
+	if request == nil {
+		return types.ErrProductionReviewScopeInvalid
+	}
+	actorID, err := trustedProductionReviewActor(ctx, request.TenantID, request.SubmittedBy)
+	if err != nil {
+		return err
+	}
+	request.SubmittedBy = actorID
 	if err := validateProductionReviewRequest(request, steps); err != nil {
 		return err
 	}
@@ -356,14 +429,14 @@ func (r *productionReviewRepository) CreateReview(
 		if err := lockProductionReviewVersion(db, request); err != nil {
 			return translateProductionReviewError(err)
 		}
-		now := time.Now().UTC()
-		if request.SubmittedAt.IsZero() {
-			request.SubmittedAt = now
-		}
-		if request.CreatedAt.IsZero() {
-			request.CreatedAt = now
-		}
+		now := r.nowUTC()
+		request.SubmittedAt = now
+		request.CreatedAt = now
 		request.UpdatedAt = now
+		for _, step := range steps {
+			step.CreatedAt = now
+			step.UpdatedAt = now
+		}
 		policyValue := any(string(request.PolicySnapshot))
 		if db.Dialector.Name() == "postgres" {
 			policyValue = gorm.Expr("CAST(? AS JSONB)", string(request.PolicySnapshot))
@@ -435,10 +508,11 @@ func (r *productionReviewRepository) DecideStep(
 	if tenantID == 0 {
 		return false, types.ErrProductionReviewScopeInvalid
 	}
-	if err := requireProductionReviewUUID("review step id", stepID); err != nil {
+	trustedActorID, err := trustedProductionReviewActor(ctx, tenantID, actorID)
+	if err != nil {
 		return false, err
 	}
-	if err := requireProductionReviewUUID("review actor", actorID); err != nil {
+	if err := requireProductionReviewUUID("review step id", stepID); err != nil {
 		return false, err
 	}
 	if !types.CanTransitionReviewStep(from, to) {
@@ -448,12 +522,12 @@ func (r *productionReviewRepository) DecideStep(
 	if utf8.RuneCountInString(comment) > 5000 {
 		return false, errors.New("production review comment exceeds 5000 characters")
 	}
-	now := time.Now().UTC()
+	now := r.nowUTC()
 	result := database.DBFromContext(ctx, r.db).WithContext(ctx).
 		Model(&types.ProductionReviewStep{}).
 		Where("tenant_id = ? AND id = ? AND decision = ?", tenantID, stepID, from).
 		Updates(map[string]any{
-			"decision": to, "reviewer_user_id": actorID, "comment": comment,
+			"decision": to, "reviewer_user_id": trustedActorID, "comment": comment,
 			"decided_at": now, "updated_at": now,
 		})
 	if result.Error != nil {
@@ -472,10 +546,11 @@ func (r *productionReviewRepository) TransitionReview(
 	if tenantID == 0 {
 		return false, types.ErrProductionReviewScopeInvalid
 	}
-	if err := requireProductionReviewUUID("review id", reviewID); err != nil {
+	trustedActorID, err := trustedProductionReviewActor(ctx, tenantID, actorID)
+	if err != nil {
 		return false, err
 	}
-	if err := requireProductionReviewUUID("terminal actor", actorID); err != nil {
+	if err := requireProductionReviewUUID("review id", reviewID); err != nil {
 		return false, err
 	}
 	if !types.CanTransitionReviewRequest(from, to) {
@@ -489,9 +564,9 @@ func (r *productionReviewRepository) TransitionReview(
 	} else if length := utf8.RuneCountInString(reason); length < 1 || length > 5000 {
 		return false, errors.New("terminal production review reason must contain between 1 and 5000 characters")
 	}
-	now := time.Now().UTC()
+	now := r.nowUTC()
 	updates := map[string]any{
-		"status": to, "terminal_by": actorID, "completed_at": now, "updated_at": now,
+		"status": to, "terminal_by": trustedActorID, "completed_at": now, "updated_at": now,
 	}
 	if to == types.ProductionReviewApproved {
 		updates["terminal_reason"] = nil
@@ -516,25 +591,39 @@ func (r *productionReviewRepository) ObsoletePendingByDocument(
 	if tenantID == 0 {
 		return types.ErrProductionReviewScopeInvalid
 	}
+	if err := requireProductionReviewTenantContext(ctx, tenantID); err != nil {
+		return err
+	}
 	if err := requireProductionReviewUUID("document id", documentID); err != nil {
 		return err
 	}
 	if err := requireProductionReviewUUID("except version id", exceptVersionID); err != nil {
 		return err
 	}
-	now := time.Now().UTC()
-	result := database.DBFromContext(ctx, r.db).WithContext(ctx).
-		Model(&types.ProductionReviewRequest{}).
-		Where("tenant_id = ? AND document_id = ? AND version_id <> ? AND status = ?",
-			tenantID, documentID, exceptVersionID, types.ProductionReviewPending).
-		Updates(map[string]any{
-			"status":          types.ProductionReviewObsolete,
-			"terminal_by":     types.ProductionSystemActorID,
-			"terminal_reason": productionReviewObsoleteReason,
-			"completed_at":    now,
-			"updated_at":      now,
-		})
-	return translateProductionReviewError(result.Error)
+	return database.WithTransactionContext(ctx, r.db, func(txCtx context.Context) error {
+		db := database.DBFromContext(txCtx, r.db).WithContext(txCtx)
+		var exactVersionID string
+		if err := db.Raw(`SELECT id FROM production_document_versions
+WHERE tenant_id = ? AND document_id = ? AND id = ?`, tenantID, documentID, exceptVersionID).
+			Scan(&exactVersionID).Error; err != nil {
+			return err
+		}
+		if exactVersionID == "" {
+			return types.ErrProductionReviewScopeInvalid
+		}
+		now := r.nowUTC()
+		result := db.Model(&types.ProductionReviewRequest{}).
+			Where("tenant_id = ? AND document_id = ? AND version_id <> ? AND status = ?",
+				tenantID, documentID, exceptVersionID, types.ProductionReviewPending).
+			Updates(map[string]any{
+				"status":          types.ProductionReviewObsolete,
+				"terminal_by":     types.ProductionSystemActorID,
+				"terminal_reason": productionReviewObsoleteReason,
+				"completed_at":    now,
+				"updated_at":      now,
+			})
+		return translateProductionReviewError(result.Error)
+	})
 }
 
 var _ interfaces.ProductionReviewRepository = (*productionReviewRepository)(nil)

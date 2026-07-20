@@ -1,6 +1,7 @@
 package types
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -13,6 +14,29 @@ func TestProductionReviewDecisionTransitions(t *testing.T) {
 	require.False(t, CanTransitionReviewStep(ProductionReviewPending, ProductionReviewCancelled))
 	require.False(t, CanTransitionReviewStep(ProductionReviewApproved, ProductionReviewPending))
 	require.False(t, CanTransitionReviewStep(ProductionReviewApproved, ProductionReviewRejected))
+	require.False(t, CanTransitionReviewRequest(ProductionReviewPending, ProductionReviewObsolete))
+	require.True(t, CanTransitionReviewRequest(ProductionReviewPending, ProductionReviewCancelled))
+}
+
+func productionReviewNestedObject(depth int) JSON {
+	value := "0"
+	for range depth {
+		value = `{"x":` + value + `}`
+	}
+	return JSON(value)
+}
+
+func TestProductionReviewPolicyResourceBounds(t *testing.T) {
+	exactBytes := JSON(`{"x":"` + strings.Repeat("a", ProductionReviewPolicyMaxBytes-8) + `"}`)
+	_, _, err := CanonicalProductionReviewPolicy(exactBytes)
+	require.NoError(t, err)
+	_, _, err = CanonicalProductionReviewPolicy(append(exactBytes[:len(exactBytes)-2], []byte(`a"}`)...))
+	require.ErrorIs(t, err, ErrProductionJSONResourceLimit)
+
+	_, _, err = CanonicalProductionReviewPolicy(productionReviewNestedObject(ProductionReviewPolicyMaxDepth))
+	require.NoError(t, err)
+	_, _, err = CanonicalProductionReviewPolicy(productionReviewNestedObject(ProductionReviewPolicyMaxDepth + 1))
+	require.ErrorIs(t, err, ErrProductionJSONResourceLimit)
 }
 
 func TestProductionReviewEnumsMirrorSchema(t *testing.T) {

@@ -5,7 +5,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
+)
+
+const (
+	ProductionAnnotationAnchorMaxBytes = 32 * 1024
+	ProductionAnnotationAnchorMaxDepth = 16
+	ProductionReviewPolicyMaxBytes     = 256 * 1024
+	ProductionReviewPolicyMaxDepth     = 32
 )
 
 var (
@@ -17,6 +25,7 @@ var (
 	ErrProductionReviewScopeInvalid      = errors.New("production review scope is invalid")
 	ErrProductionReviewPolicyInvalid     = errors.New("production review policy is invalid")
 	ErrProductionBlockingAnnotations     = errors.New("open blocking annotations prevent review submission")
+	ErrProductionJSONResourceLimit       = errors.New("production JSON resource limit exceeded")
 )
 
 type ProductionAnnotationType string
@@ -127,7 +136,7 @@ func CanTransitionReviewRequest(from, to ProductionReviewStatus) bool {
 		return false
 	}
 	switch to {
-	case ProductionReviewApproved, ProductionReviewRejected, ProductionReviewObsolete,
+	case ProductionReviewApproved, ProductionReviewRejected,
 		ProductionReviewCancelled, ProductionReviewChangesRequested:
 		return true
 	default:
@@ -198,7 +207,49 @@ type ProductionReviewStep struct {
 
 func (ProductionReviewStep) TableName() string { return "production_review_steps" }
 
+// ValidateProductionJSONResource enforces allocation-free limits before JSON
+// parsing or canonicalization. Structural characters inside strings do not
+// contribute to nesting depth.
+func ValidateProductionJSONResource(raw JSON, maxBytes, maxDepth int) error {
+	if maxBytes < 1 || maxDepth < 1 || len(raw) > maxBytes {
+		return fmt.Errorf("%w: maximum %d bytes", ErrProductionJSONResourceLimit, maxBytes)
+	}
+	depth := 0
+	inString := false
+	escaped := false
+	for _, character := range raw {
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			switch character {
+			case '\\':
+				escaped = true
+			case '"':
+				inString = false
+			}
+			continue
+		}
+		switch character {
+		case '"':
+			inString = true
+		case '{', '[':
+			depth++
+			if depth > maxDepth {
+				return fmt.Errorf("%w: maximum nesting depth %d", ErrProductionJSONResourceLimit, maxDepth)
+			}
+		case '}', ']':
+			depth--
+		}
+	}
+	return nil
+}
+
 func CanonicalProductionReviewPolicy(raw JSON) (JSON, string, error) {
+	if err := ValidateProductionJSONResource(raw, ProductionReviewPolicyMaxBytes, ProductionReviewPolicyMaxDepth); err != nil {
+		return nil, "", errors.Join(ErrProductionReviewPolicyInvalid, err)
+	}
 	canonical, err := CanonicalProductionJSON(raw)
 	if err != nil {
 		return nil, "", errors.Join(ErrProductionReviewPolicyInvalid, err)
