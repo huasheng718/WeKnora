@@ -128,6 +128,30 @@ func TestProductionEvidenceValidatorAcceptsGovernedEvidenceOrExplicitConfirmatio
 	require.Empty(t, result.Errors)
 }
 
+func TestProductionEvidenceValidatorUsesRendererSafeImageURLPolicy(t *testing.T) {
+	for _, imageURL := range []string{
+		"javascript:alert(1)",
+		"https://user:secret@example.com/a.png",
+		"https://example.com/a.png?token=secret",
+		"https://example.com/a.png#fragment",
+	} {
+		t.Run(imageURL, func(t *testing.T) {
+			version := productionBaselineVersion()
+			version.Blocks = append(version.Blocks, productionValidationBlock(
+				"image", "image", len(version.Blocks), `{"alt":"x","url":"`+imageURL+`"}`, `{}`, `[]`,
+			))
+
+			require.Contains(t, productionIssueCodes(ValidateProductionVersion(version, nil).Errors), "invalid_block_content")
+		})
+	}
+
+	valid := productionBaselineVersion()
+	valid.Blocks = append(valid.Blocks, productionValidationBlock(
+		"image", "image", len(valid.Blocks), `{"alt":"x","url":"https://example.com/a.png"}`, `{}`, `[]`,
+	))
+	require.Empty(t, ValidateProductionVersion(valid, nil).Errors)
+}
+
 func TestProductionEvidenceValidatorRejectsMalformedAndUnsupportedBlocksInStableOrder(t *testing.T) {
 	version := productionBaselineVersion()
 	position := len(version.Blocks)

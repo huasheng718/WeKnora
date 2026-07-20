@@ -96,6 +96,9 @@ func (s *productionWriterRunRepoStub) Transition(
 		expected != productionRunCAS(s.run) || to != s.run.Status {
 		return nil, false, nil
 	}
+	if s.run.RawModelResponseDigest != nil {
+		return nil, false, nil
+	}
 	canonical, err := types.CanonicalProductionJSON(patch.RawModelResponse)
 	if err != nil {
 		return nil, false, err
@@ -394,6 +397,16 @@ func TestProductionWriterStrictlyRejectsInvalidStructuredOutputBeforeAppend(t *t
 		{name: "unknown block field", raw: strings.Replace(valid, `"needs_confirmation":false`, `"needs_confirmation":false,"tenant_id":999`, 1)},
 		{name: "trailing json", raw: valid + `{}`},
 		{name: "empty blocks", raw: `{"blocks":[]}`},
+		{name: "unknown table content field", raw: productionWriterOutput(t, map[string]any{
+			"logical_block_id": "table-a", "block_type": "table",
+			"content":       map[string]any{"headers": []string{"A"}, "rows": [][]string{}, "ignored": true},
+			"evidence_refs": []string{}, "needs_confirmation": true,
+		})},
+		{name: "unknown image content field", raw: productionWriterOutput(t, map[string]any{
+			"logical_block_id": "image-a", "block_type": "image",
+			"content":       map[string]any{"alt": "diagram", "url": "https://example.com/a.png", "ignored": true},
+			"evidence_refs": []string{}, "needs_confirmation": false,
+		})},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newProductionWriterFixture(t, test.raw)
@@ -410,6 +423,39 @@ func TestProductionWriterStrictlyRejectsInvalidStructuredOutputBeforeAppend(t *t
 			require.Nil(t, fixture.run.OutputVersionID)
 		})
 	}
+}
+
+func TestProductionWriterRejectsUnsafeImageURLBeforeAppend(t *testing.T) {
+	fixture := newProductionWriterFixture(t, productionWriterOutput(t, map[string]any{
+		"logical_block_id": "image-a", "block_type": "image",
+		"content":       map[string]any{"alt": "diagram", "url": "https://user:secret@example.com/a.png"},
+		"evidence_refs": []string{}, "needs_confirmation": false,
+	}))
+
+	_, err := fixture.writer.Write(context.Background(), fixture.run)
+
+	require.ErrorIs(t, err, types.ErrProductionDocumentValidation)
+	require.Equal(t, 0, fixture.service.calls)
+	require.Equal(t, []string{"persist"}, *fixture.events)
+}
+
+func TestProductionWriterCannotReplaceAnAuditedRawResponse(t *testing.T) {
+	firstRaw := productionWriterOutput(t, writerFact("block-a", "first", []string{writerEvidenceID}, false))
+	fixture := newProductionWriterFixture(t, firstRaw)
+
+	_, err := fixture.writer.Write(context.Background(), fixture.run)
+	require.NoError(t, err)
+	firstDigest := fixture.runs.digest
+	fixture.chat.response.Content = productionWriterOutput(t, writerFact("block-a", "replacement", []string{writerEvidenceID}, false))
+
+	_, err = fixture.writer.Write(context.Background(), fixture.run)
+
+	require.ErrorIs(t, err, errProductionWriterAuditConflict)
+	require.Equal(t, 1, fixture.service.calls)
+	require.Equal(t, firstDigest, fixture.runs.digest)
+	var persisted string
+	require.NoError(t, json.Unmarshal(fixture.runs.persisted, &persisted))
+	require.Equal(t, firstRaw, persisted)
 }
 
 func TestProductionWriterValidatesCompleteCandidateBeforeAppend(t *testing.T) {

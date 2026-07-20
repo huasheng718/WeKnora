@@ -171,6 +171,21 @@ func TestProductionRunRepositoryPersistsExactRawModelResponseWithCAS(t *testing.
 	require.Equal(t, digest, *persistedRun.RawModelResponseDigest)
 	require.Nil(t, persistedRun.OutputVersionID)
 
+	replacement, err := json.Marshal("replacement")
+	require.NoError(t, err)
+	replacementSum := sha256.Sum256(replacement)
+	replacementDigest := hex.EncodeToString(replacementSum[:])
+	_, changed, err = repo.Transition(
+		context.Background(), 7, run.ID, runCAS(running), types.ProductionRunRunning,
+		interfaces.ProductionRunPatch{RawModelResponse: replacement, RawModelResponseDigest: &replacementDigest},
+	)
+	require.NoError(t, err)
+	require.False(t, changed)
+	stored, err := repo.Get(context.Background(), 7, run.ID)
+	require.NoError(t, err)
+	require.Equal(t, persistedRun.RawModelResponse, stored.RawModelResponse)
+	require.Equal(t, persistedRun.RawModelResponseDigest, stored.RawModelResponseDigest)
+
 	_, changed, err = repo.Transition(
 		context.Background(), 7, run.ID,
 		interfaces.ProductionRunCAS{Status: running.Status, Attempt: running.Attempt + 1, CurrentStep: running.CurrentStep, WakeupVersion: running.WakeupVersion},

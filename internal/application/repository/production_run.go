@@ -255,12 +255,15 @@ func (r *productionRunRepository) Transition(
 		return nil, false, errors.New("nonterminal production run transition cannot set completed_at")
 	}
 	var transitioned types.ProductionRun
-	result := database.DBFromContext(ctx, r.db).WithContext(ctx).
+	query := database.DBFromContext(ctx, r.db).WithContext(ctx).
 		Model(&transitioned).Clauses(clause.Returning{}).
 		Where("tenant_id = ? AND id = ?", tenantID, runID).
 		Where("status = ? AND attempt = ? AND current_step = ? AND wakeup_version = ?",
-			expected.Status, expected.Attempt, expected.CurrentStep, expected.WakeupVersion).
-		Updates(updates)
+			expected.Status, expected.Attempt, expected.CurrentStep, expected.WakeupVersion)
+	if rawAuditTransition {
+		query = query.Where("raw_model_response IS NULL AND raw_model_response_digest IS NULL")
+	}
+	result := query.Updates(updates)
 	if result.Error != nil {
 		return nil, false, result.Error
 	}

@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"html"
-	"net/url"
 	"regexp"
 	"strings"
 
@@ -104,9 +103,8 @@ func productionRenderBlock(block *types.ProductionDocumentBlock) (string, []stri
 			URL string `json:"url"`
 		}
 		_ = productionDecodeJSON(block.Content, "", &image)
-		parsed, parseErr := url.Parse(image.URL)
-		if parseErr != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" ||
-			parsed.User != nil || strings.ContainsAny(image.URL, "?#") {
+		parsed, err := productionSafeImageURL(image.URL)
+		if err != nil {
 			return "", nil, fmt.Errorf("cannot render block %s: unsafe image URL", block.LogicalBlockID)
 		}
 		safeURL := strings.NewReplacer("(", "%28", ")", "%29", "<", "%3C", ">", "%3E").Replace(parsed.String())

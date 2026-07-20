@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
@@ -138,12 +139,12 @@ func productionValidateBlockContent(block *types.ProductionDocumentBlock) error 
 	switch block.BlockType {
 	case "heading", "paragraph", "code", "callout":
 		var text string
-		if err := productionDecodeJSON(block.Content, "", &text); err != nil {
+		if err := decodeProductionJSON(block.Content, &text, true); err != nil {
 			return errors.New("content must be a JSON string")
 		}
 	case "list":
 		var items []string
-		if err := productionDecodeJSON(block.Content, "", &items); err != nil || items == nil {
+		if err := decodeProductionJSON(block.Content, &items, true); err != nil || items == nil {
 			return errors.New("content must be an array of strings")
 		}
 	case "table":
@@ -151,7 +152,7 @@ func productionValidateBlockContent(block *types.ProductionDocumentBlock) error 
 			Headers []string   `json:"headers"`
 			Rows    [][]string `json:"rows"`
 		}
-		if err := productionDecodeJSON(block.Content, "", &table); err != nil || len(table.Headers) == 0 {
+		if err := decodeProductionJSON(block.Content, &table, true); err != nil || len(table.Headers) == 0 {
 			return errors.New("content must contain non-empty string headers and rows")
 		}
 		for _, row := range table.Rows {
@@ -164,13 +165,25 @@ func productionValidateBlockContent(block *types.ProductionDocumentBlock) error 
 			Alt string `json:"alt"`
 			URL string `json:"url"`
 		}
-		if err := productionDecodeJSON(block.Content, "", &image); err != nil || strings.TrimSpace(image.URL) == "" {
+		if err := decodeProductionJSON(block.Content, &image, true); err != nil || strings.TrimSpace(image.URL) == "" {
 			return errors.New("content must contain image alt and URL strings")
+		}
+		if _, err := productionSafeImageURL(image.URL); err != nil {
+			return errors.New("content must contain a render-safe image URL")
 		}
 	default:
 		return fmt.Errorf("unsupported block type %q", block.BlockType)
 	}
 	return nil
+}
+
+func productionSafeImageURL(value string) (*url.URL, error) {
+	parsed, err := url.Parse(value)
+	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" ||
+		parsed.User != nil || strings.ContainsAny(value, "?#") {
+		return nil, errors.New("unsafe image URL")
+	}
+	return parsed, nil
 }
 
 func productionIssue(code, message string, block *types.ProductionDocumentBlock) ProductionValidationIssue {
