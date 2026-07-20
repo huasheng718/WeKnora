@@ -284,6 +284,7 @@ func newProductionDocumentsHTTPFixture(t *testing.T) *productionDocumentsHTTPFix
 	for _, name := range []string{
 		"../../migrations/sqlite/000001_knowledge_production_foundation.up.sql",
 		"../../migrations/sqlite/000002_knowledge_production_documents.up.sql",
+		"../../migrations/sqlite/000004_knowledge_production_reviews.up.sql",
 	} {
 		migration, readErr := os.ReadFile(name)
 		require.NoError(t, readErr)
@@ -324,6 +325,7 @@ func newProductionDocumentsHTTPFixture(t *testing.T) *productionDocumentsHTTPFix
 	sourceService := appservice.NewProductionSourceService(fixture.sources, authorizer, nil, fixture.audit, uow)
 	documentService := appservice.NewProductionDocumentService(
 		fixture.documents, fixture.sources, apprepository.NewProductionDocumentTypeRepository(db), authorizer, nil, fixture.audit, uow,
+		apprepository.NewProductionReviewRepository(db),
 	)
 	idempotency := apprepository.NewProductionIdempotencyRepository(db)
 	fixture.completion = &productionCompletionFailingRepo{ProductionIdempotencyRepository: idempotency}

@@ -96,6 +96,7 @@ func openProductionWorkflowE2EDB(t *testing.T, path string, migrate bool) *gorm.
 		"000001_knowledge_production_foundation.up.sql",
 		"000002_knowledge_production_documents.up.sql",
 		"000003_knowledge_production_runs.up.sql",
+		"000004_knowledge_production_reviews.up.sql",
 	} {
 		migration, readErr := os.ReadFile(filepath.Join(migrationRoot, name))
 		require.NoError(t, readErr)
@@ -149,7 +150,10 @@ func newProductionWorkflowGraph(
 	uow := repository.NewProductionUnitOfWork(db)
 	audit := NewAuditLogService(repository.NewAuditLogRepository(db))
 	authorizer := &productionDocumentAuthorizerStub{}
-	documentService := NewProductionDocumentService(documents, sources, documentTypes, authorizer, nil, audit, uow)
+	documentService := NewProductionDocumentService(
+		documents, sources, documentTypes, authorizer, nil, audit, uow,
+		repository.NewProductionReviewRepository(db),
+	)
 	mcpService := &types.MCPService{
 		ID: workflowE2EMCPServiceID, TenantID: 7, Name: "workflow-mcp", Enabled: true,
 		TransportType: types.MCPTransportHTTPStreamable,

@@ -140,6 +140,9 @@ const (
 	AuditActionProductionRunStarted            AuditAction = "production.run_started"
 	AuditActionProductionToolCallApproved      AuditAction = "production.tool_call_approved"
 	AuditActionProductionToolCallRejected      AuditAction = "production.tool_call_rejected"
+	AuditActionProductionReviewSubmitted       AuditAction = "production.review_submitted"
+	AuditActionProductionReviewDecided         AuditAction = "production.review_decided"
+	AuditActionProductionContentDigestMismatch AuditAction = "production.content_digest_mismatch"
 )
 
 // AuditOutcome distinguishes successful mutations from middleware-level

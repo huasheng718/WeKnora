@@ -180,6 +180,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(repository.NewProductionDocumentTypeRepository))
 	must(container.Provide(repository.NewProductionSourceRepository))
 	must(container.Provide(repository.NewProductionDocumentRepository))
+	must(container.Provide(repository.NewProductionReviewRepository))
 	must(container.Provide(repository.NewProductionRunRepository))
 	must(container.Provide(repository.NewProductionRunRecoveryRepository))
 	must(container.Provide(repository.NewProductionIdempotencyRepository))

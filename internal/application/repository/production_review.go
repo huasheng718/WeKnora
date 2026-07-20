@@ -25,6 +25,15 @@ FOR UPDATE`
 
 const productionReviewObsoleteReason = "superseded by a newer document version"
 
+const productionTenantReviewAuthoritySQL = `EXISTS (
+    SELECT 1 FROM tenant_members AS member
+    WHERE member.tenant_id = production_review_requests.tenant_id
+      AND member.user_id = ?
+      AND member.status = ?
+      AND member.deleted_at IS NULL
+      AND member.role IN (?, ?)
+)`
+
 const productionAnnotationResolutionAuthorizationSQL = `
 (
     created_by = ? OR EXISTS (
@@ -525,6 +534,84 @@ func (r *productionReviewRepository) CreateReview(
 	})
 }
 
+func (r *productionReviewRepository) CreateCurrentReview(
+	ctx context.Context,
+	request *types.ProductionReviewRequest,
+	steps []*types.ProductionReviewStep,
+) error {
+	if request == nil {
+		return types.ErrProductionReviewScopeInvalid
+	}
+	return database.WithTransactionContext(ctx, r.db, func(txCtx context.Context) error {
+		db := database.DBFromContext(txCtx, r.db).WithContext(txCtx)
+		if err := lockCurrentProductionReviewVersion(db, request); err != nil {
+			return translateProductionReviewError(err)
+		}
+		if err := requireLiveProductionReviewSubmitter(db, request.ProjectID, request.SubmittedBy); err != nil {
+			return err
+		}
+		if err := r.CreateReview(txCtx, request, steps); err != nil {
+			return err
+		}
+		result := db.Model(&types.ProductionDocument{}).
+			Where("id = ? AND tenant_id = ? AND project_id = ? AND current_version_id = ?",
+				request.DocumentID, request.TenantID, request.ProjectID, request.VersionID).
+			Update("status", types.ProductionDocumentInReview)
+		if result.Error != nil {
+			return translateProductionReviewError(result.Error)
+		}
+		if result.RowsAffected != 1 {
+			return types.ErrProductionReviewScopeInvalid
+		}
+		return nil
+	})
+}
+
+func requireLiveProductionReviewSubmitter(db *gorm.DB, projectID, actorID string) error {
+	query := `SELECT role FROM production_project_members
+WHERE project_id = ? AND user_id = ? AND deleted_at IS NULL AND role IN (?, ?)`
+	if db.Dialector.Name() == "postgres" {
+		query += " FOR SHARE"
+	}
+	var roles []types.ProductionRole
+	if err := db.Raw(query, projectID, actorID,
+		types.ProductionRoleProjectOwner, types.ProductionRoleAuthor,
+	).Scan(&roles).Error; err != nil {
+		return err
+	}
+	if len(roles) == 0 {
+		return types.ErrProductionForbidden
+	}
+	return nil
+}
+
+func lockCurrentProductionReviewVersion(db *gorm.DB, request *types.ProductionReviewRequest) error {
+	if db.Dialector.Name() == "postgres" {
+		var currentVersionID *string
+		if err := db.Raw(`SELECT current_version_id FROM production_documents
+WHERE id = ? AND tenant_id = ? AND project_id = ? FOR UPDATE`,
+			request.DocumentID, request.TenantID, request.ProjectID,
+		).Scan(&currentVersionID).Error; err != nil {
+			return err
+		}
+		if currentVersionID == nil || *currentVersionID != request.VersionID {
+			return types.ErrProductionReviewScopeInvalid
+		}
+		return nil
+	}
+	result := db.Model(&types.ProductionDocument{}).
+		Where("id = ? AND tenant_id = ? AND project_id = ? AND current_version_id = ?",
+			request.DocumentID, request.TenantID, request.ProjectID, request.VersionID).
+		UpdateColumn("updated_at", gorm.Expr("updated_at"))
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return types.ErrProductionReviewScopeInvalid
+	}
+	return nil
+}
+
 func (r *productionReviewRepository) GetReview(ctx context.Context, tenantID uint64, reviewID string) (*types.ProductionReviewRequest, error) {
 	if tenantID == 0 {
 		return nil, types.ErrProductionReviewScopeInvalid
@@ -567,13 +654,170 @@ func (r *productionReviewRepository) DecideStep(
 	if utf8.RuneCountInString(comment) > 5000 {
 		return false, errors.New("production review comment exceeds 5000 characters")
 	}
+	if to != types.ProductionReviewApproved && comment == "" {
+		return false, errors.New("non-approval production review decision requires a comment")
+	}
+	changed := false
+	err = database.WithTransactionContext(ctx, r.db, func(txCtx context.Context) error {
+		db := database.DBFromContext(txCtx, r.db).WithContext(txCtx)
+		scope, lockErr := lockProductionReviewDecisionScope(db, tenantID, stepID)
+		if errors.Is(lockErr, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		if lockErr != nil {
+			return lockErr
+		}
+		if scope.Status != types.ProductionReviewPending {
+			return nil
+		}
+		now := r.nowUTC()
+		result := db.Model(&types.ProductionReviewStep{}).
+			Where("tenant_id = ? AND id = ? AND decision = ?", tenantID, stepID, from).
+			Updates(map[string]any{
+				"decision": to, "reviewer_user_id": trustedActorID, "comment": comment,
+				"decided_at": now, "updated_at": now,
+			})
+		if result.Error != nil {
+			return translateProductionReviewError(result.Error)
+		}
+		if result.RowsAffected != 1 {
+			return nil
+		}
+		changed = true
+		if scope.DocumentStatus != types.ProductionDocumentInReview || scope.CurrentVersionID != scope.VersionID {
+			return nil
+		}
+		if to == types.ProductionReviewChangesRequested || to == types.ProductionReviewRejected {
+			terminal := db.Model(&types.ProductionReviewRequest{}).
+				Where("tenant_id = ? AND id = ? AND status = ?", tenantID, scope.ReviewID, types.ProductionReviewPending).
+				Updates(map[string]any{
+					"status": types.ProductionReviewStatus(to), "terminal_by": trustedActorID,
+					"terminal_reason": comment, "completed_at": now, "updated_at": now,
+				})
+			return translateProductionReviewError(terminal.Error)
+		}
+
+		var remaining int64
+		if countErr := db.Model(&types.ProductionReviewStep{}).
+			Where("review_request_id = ? AND decision <> ?", scope.ReviewID, types.ProductionReviewApproved).
+			Count(&remaining).Error; countErr != nil {
+			return countErr
+		}
+		if remaining != 0 {
+			return nil
+		}
+		approved := db.Model(&types.ProductionReviewRequest{}).
+			Where("tenant_id = ? AND id = ? AND status = ?", tenantID, scope.ReviewID, types.ProductionReviewPending).
+			Updates(map[string]any{
+				"status": types.ProductionReviewApproved, "terminal_by": trustedActorID,
+				"terminal_reason": nil, "completed_at": now, "updated_at": now,
+			})
+		if approved.Error != nil {
+			return translateProductionReviewError(approved.Error)
+		}
+		if approved.RowsAffected != 1 {
+			return types.ErrProductionReviewLifecycle
+		}
+		document := db.Model(&types.ProductionDocument{}).
+			Where("id = ? AND tenant_id = ? AND project_id = ? AND current_version_id = ?",
+				scope.DocumentID, tenantID, scope.ProjectID, scope.VersionID).
+			Updates(map[string]any{
+				"status":                     types.ProductionDocumentApproved,
+				"latest_approved_version_id": scope.VersionID,
+				"updated_at":                 now,
+			})
+		if document.Error != nil {
+			return translateProductionReviewError(document.Error)
+		}
+		if document.RowsAffected != 1 {
+			return types.ErrProductionReviewScopeInvalid
+		}
+		return nil
+	})
+	return changed, err
+}
+
+type productionReviewDecisionScope struct {
+	ReviewID         string
+	ProjectID        string
+	DocumentID       string
+	VersionID        string
+	CurrentVersionID string
+	DocumentStatus   types.ProductionDocumentStatus
+	Status           types.ProductionReviewStatus
+}
+
+func lockProductionReviewDecisionScope(db *gorm.DB, tenantID uint64, stepID string) (*productionReviewDecisionScope, error) {
+	if db.Dialector.Name() != "postgres" {
+		// SQLite has no row locks. Reserve its single writer before reading the
+		// aggregate so concurrent decisions do not both begin as readers and
+		// deadlock while upgrading to writes.
+		result := db.Model(&types.ProductionReviewStep{}).
+			Where("tenant_id = ? AND id = ? AND decision = ?", tenantID, stepID, types.ProductionReviewPending).
+			Where("EXISTS (SELECT 1 FROM production_review_requests AS request WHERE request.id = production_review_steps.review_request_id AND request.status = ?)",
+				types.ProductionReviewPending).
+			UpdateColumn("updated_at", gorm.Expr("updated_at"))
+		if result.Error != nil {
+			return nil, translateProductionReviewError(result.Error)
+		}
+	}
+	query := `SELECT request.id AS review_id, request.project_id, request.document_id,
+	       request.version_id, document.current_version_id, document.status AS document_status, request.status
+FROM production_review_requests AS request
+JOIN production_review_steps AS step ON step.review_request_id = request.id
+JOIN production_documents AS document ON document.id = request.document_id
+WHERE request.tenant_id = ? AND step.tenant_id = ? AND step.id = ?`
+	if db.Dialector.Name() == "postgres" {
+		query += " FOR UPDATE OF request, document"
+	}
+	var scope productionReviewDecisionScope
+	if err := db.Raw(query, tenantID, tenantID, stepID).Scan(&scope).Error; err != nil {
+		return nil, err
+	}
+	if scope.ReviewID == "" {
+		return nil, gorm.ErrRecordNotFound
+	}
+	return &scope, nil
+}
+
+func (r *productionReviewRepository) RejectReviewByTenantAuthority(
+	ctx context.Context, tenantID uint64, reviewID, actorID, reason string,
+) (bool, error) {
+	return r.terminalizeReviewByTenantAuthority(ctx, tenantID, reviewID, actorID, reason, types.ProductionReviewRejected)
+}
+
+func (r *productionReviewRepository) CancelReviewByTenantAuthority(
+	ctx context.Context, tenantID uint64, reviewID, actorID, reason string,
+) (bool, error) {
+	return r.terminalizeReviewByTenantAuthority(ctx, tenantID, reviewID, actorID, reason, types.ProductionReviewCancelled)
+}
+
+func (r *productionReviewRepository) terminalizeReviewByTenantAuthority(
+	ctx context.Context,
+	tenantID uint64,
+	reviewID, actorID, reason string,
+	status types.ProductionReviewStatus,
+) (bool, error) {
+	trustedActorID, err := trustedProductionReviewActor(ctx, tenantID, actorID)
+	if err != nil {
+		return false, err
+	}
+	if err := requireProductionReviewUUID("review id", reviewID); err != nil {
+		return false, err
+	}
+	reason = strings.TrimSpace(reason)
+	if length := utf8.RuneCountInString(reason); length < 1 || length > 5000 {
+		return false, errors.New("terminal production review reason must contain between 1 and 5000 characters")
+	}
 	now := r.nowUTC()
 	result := database.DBFromContext(ctx, r.db).WithContext(ctx).
-		Model(&types.ProductionReviewStep{}).
-		Where("tenant_id = ? AND id = ? AND decision = ?", tenantID, stepID, from).
+		Model(&types.ProductionReviewRequest{}).
+		Where("tenant_id = ? AND id = ? AND status = ?", tenantID, reviewID, types.ProductionReviewPending).
+		Where(productionTenantReviewAuthoritySQL,
+			trustedActorID, types.TenantMemberStatusActive, types.TenantRoleAdmin, types.TenantRoleOwner).
 		Updates(map[string]any{
-			"decision": to, "reviewer_user_id": trustedActorID, "comment": comment,
-			"decided_at": now, "updated_at": now,
+			"status": status, "terminal_by": trustedActorID, "terminal_reason": reason,
+			"completed_at": now, "updated_at": now,
 		})
 	if result.Error != nil {
 		return false, translateProductionReviewError(result.Error)

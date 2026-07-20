@@ -21,6 +21,7 @@ type productionDocumentService struct {
 	resources     interfaces.ResourceCatalog
 	audit         interfaces.AuditLogService
 	uow           interfaces.ProductionUnitOfWork
+	reviews       interfaces.ProductionReviewRepository
 }
 
 func NewProductionDocumentService(
@@ -31,10 +32,11 @@ func NewProductionDocumentService(
 	resources interfaces.ResourceCatalog,
 	audit interfaces.AuditLogService,
 	uow interfaces.ProductionUnitOfWork,
+	reviews interfaces.ProductionReviewRepository,
 ) *productionDocumentService {
 	return &productionDocumentService{
 		documents: documents, sources: sources, documentTypes: documentTypes, projects: projects,
-		resources: resources, audit: audit, uow: uow,
+		resources: resources, audit: audit, uow: uow, reviews: reviews,
 	}
 }
 
@@ -312,7 +314,17 @@ func (s *productionDocumentService) loadAcceptedProductionEvidence(
 	tenantID uint64,
 	projectID, sourceSetID string,
 ) (map[string]struct{}, map[string]*types.ProductionEvidenceSnapshot, error) {
-	snapshots, err := s.sources.ListAcceptedEvidence(ctx, tenantID, projectID, sourceSetID)
+	return loadProductionAcceptedEvidence(ctx, s.sources, s.resources, tenantID, projectID, sourceSetID)
+}
+
+func loadProductionAcceptedEvidence(
+	ctx context.Context,
+	sources interfaces.ProductionSourceRepository,
+	resources interfaces.ResourceCatalog,
+	tenantID uint64,
+	projectID, sourceSetID string,
+) (map[string]struct{}, map[string]*types.ProductionEvidenceSnapshot, error) {
+	snapshots, err := sources.ListAcceptedEvidence(ctx, tenantID, projectID, sourceSetID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -323,10 +335,10 @@ func (s *productionDocumentService) loadAcceptedProductionEvidence(
 			return nil, nil, &ProductionDocumentValidationError{Cause: errors.New("accepted evidence snapshot is invalid")}
 		}
 		if snapshot.StoragePath != "" {
-			if s.resources == nil {
+			if resources == nil {
 				return nil, nil, &ProductionDocumentValidationError{Cause: errors.New("resource catalog is required for registry-backed evidence")}
 			}
-			resource, resolveErr := s.resources.ResolveBound(ctx, snapshot.StoragePath, interfaces.ResourceBindingRequirement{
+			resource, resolveErr := resources.ResolveBound(ctx, snapshot.StoragePath, interfaces.ResourceBindingRequirement{
 				TenantID: tenantID, OwnerType: types.ResourceOwnerTypeProductionProject, OwnerID: projectID,
 			})
 			if resolveErr != nil {
@@ -451,6 +463,12 @@ func (s *productionDocumentService) AppendVersion(
 	}
 	if err := s.uow.WithinTransaction(ctx, func(txCtx context.Context) error {
 		if err := s.documents.AppendVersion(txCtx, version, blocks, lineage); err != nil {
+			return err
+		}
+		if s.reviews == nil {
+			return errors.New("production review repository is required")
+		}
+		if err := s.reviews.ObsoletePendingByDocument(txCtx, tenantID, document.ID, version.ID); err != nil {
 			return err
 		}
 		return emitRequiredProductionAudit(txCtx, s.audit, &types.AuditLog{

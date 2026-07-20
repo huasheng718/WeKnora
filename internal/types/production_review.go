@@ -25,6 +25,7 @@ var (
 	ErrProductionReviewScopeInvalid      = errors.New("production review scope is invalid")
 	ErrProductionReviewPolicyInvalid     = errors.New("production review policy is invalid")
 	ErrProductionBlockingAnnotations     = errors.New("open blocking annotations prevent review submission")
+	ErrProductionContentDigestMismatch   = errors.New("production content digest mismatch")
 	ErrProductionJSONResourceLimit       = errors.New("production JSON resource limit exceeded")
 )
 

@@ -59,7 +59,11 @@ func newProductionDocumentServiceFixtureWithEvidenceDigest(t *testing.T, evidenc
 	t.Cleanup(func() { _ = sqlDB.Close() })
 	_, filename, _, ok := runtime.Caller(0)
 	require.True(t, ok)
-	for _, name := range []string{"000001_knowledge_production_foundation.up.sql", "000002_knowledge_production_documents.up.sql"} {
+	for _, name := range []string{
+		"000001_knowledge_production_foundation.up.sql",
+		"000002_knowledge_production_documents.up.sql",
+		"000004_knowledge_production_reviews.up.sql",
+	} {
 		migration, readErr := os.ReadFile(filepath.Join(filepath.Dir(filename), "../../../migrations/sqlite", name))
 		require.NoError(t, readErr)
 		require.NoError(t, db.Exec(string(migration)).Error)
@@ -108,6 +112,7 @@ func newProductionDocumentServiceFixtureWithEvidenceDigest(t *testing.T, evidenc
 		nil,
 		audit,
 		apprepository.NewProductionUnitOfWork(db),
+		apprepository.NewProductionReviewRepository(db),
 	)
 	return service, documents, db, authorizer
 }
@@ -271,6 +276,40 @@ func TestProductionDocumentServiceGovernedAppendSucceeds(t *testing.T) {
 	require.NotNil(t, version)
 	require.Equal(t, int64(2), countServiceRows(t, db, &types.ProductionDocumentVersion{}))
 	require.Equal(t, int64(len(version.Blocks)), countServiceRows(t, db, &types.ProductionDocumentBlock{}))
+}
+
+func TestNewVersionObsoletesPendingReview(t *testing.T) {
+	svc, _, db, _ := newProductionDocumentServiceFixture(t)
+	document := createServiceDocument(t, svc)
+	reviewedVersion, err := svc.AppendVersion(productionDocumentContext(7), document.ID, interfaces.AppendProductionVersionInput{
+		ParentVersionID: *document.CurrentVersionID, SourceSetID: documentServiceSetID,
+		Origin: types.ProductionDocumentOriginHuman,
+		Blocks: governedServiceBlocks(governedServiceParagraph("reviewed", `"reviewed"`)),
+	})
+	require.NoError(t, err)
+	requestID := "83000000-0000-4000-8000-000000000001"
+	stepID := "83000000-0000-4000-8000-000000000002"
+	require.NoError(t, db.Exec(`
+INSERT INTO production_review_requests
+    (id, tenant_id, project_id, document_id, version_id, policy_snapshot, policy_digest, submitted_by)
+VALUES (?, 7, ?, ?, ?, '{"steps":["business_reviewer"]}', ?, ?)
+`, requestID, documentServiceProjectID, document.ID, reviewedVersion.ID, strings.Repeat("a", 64), productionReviewAuthorID).Error)
+	require.NoError(t, db.Exec(`
+INSERT INTO production_review_steps
+    (id, review_request_id, tenant_id, project_id, document_id, version_id, required_role, sequence)
+VALUES (?, ?, 7, ?, ?, ?, 'business_reviewer', 1)
+`, stepID, requestID, documentServiceProjectID, document.ID, reviewedVersion.ID).Error)
+
+	newVersion, err := svc.AppendVersion(productionDocumentContext(7), document.ID, interfaces.AppendProductionVersionInput{
+		ParentVersionID: reviewedVersion.ID, SourceSetID: documentServiceSetID,
+		Origin: types.ProductionDocumentOriginHuman,
+		Blocks: governedServiceBlocks(governedServiceParagraph("new-version", `"new version"`)),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, newVersion)
+	var review types.ProductionReviewRequest
+	require.NoError(t, db.First(&review, "id = ?", requestID).Error)
+	require.Equal(t, types.ProductionReviewStatus(types.ProductionReviewObsolete), review.Status)
 }
 
 func TestProductionDocumentServiceBindsInternalPrincipalToAIProvenance(t *testing.T) {

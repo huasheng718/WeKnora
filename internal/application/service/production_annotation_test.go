@@ -93,12 +93,24 @@ func (r *productionAnnotationReviewRepoStub) CreateReview(context.Context, *type
 	return errors.New("unexpected CreateReview")
 }
 
+func (r *productionAnnotationReviewRepoStub) CreateCurrentReview(context.Context, *types.ProductionReviewRequest, []*types.ProductionReviewStep) error {
+	return errors.New("unexpected CreateCurrentReview")
+}
+
 func (r *productionAnnotationReviewRepoStub) GetReview(context.Context, uint64, string) (*types.ProductionReviewRequest, error) {
 	return nil, errors.New("unexpected GetReview")
 }
 
 func (r *productionAnnotationReviewRepoStub) DecideStep(context.Context, uint64, string, types.ProductionReviewDecision, types.ProductionReviewDecision, string, string) (bool, error) {
 	return false, errors.New("unexpected DecideStep")
+}
+
+func (r *productionAnnotationReviewRepoStub) RejectReviewByTenantAuthority(context.Context, uint64, string, string, string) (bool, error) {
+	return false, errors.New("unexpected RejectReviewByTenantAuthority")
+}
+
+func (r *productionAnnotationReviewRepoStub) CancelReviewByTenantAuthority(context.Context, uint64, string, string, string) (bool, error) {
+	return false, errors.New("unexpected CancelReviewByTenantAuthority")
 }
 
 func (r *productionAnnotationReviewRepoStub) ObsoletePendingByDocument(context.Context, uint64, string, string) error {
