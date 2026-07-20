@@ -65,6 +65,19 @@ func (r *initialPostProcessTenantRepo) AdjustStorageUsed(context.Context, uint64
 	return nil
 }
 
+func (r *initialPostProcessTenantRepo) GetTenantByID(context.Context, uint64) (*types.Tenant, error) {
+	return &types.Tenant{ID: 1}, nil
+}
+
+type initialPostProcessKBService struct {
+	interfaces.KnowledgeBaseService
+	kb *types.KnowledgeBase
+}
+
+func (s *initialPostProcessKBService) GetKnowledgeBaseByID(context.Context, string) (*types.KnowledgeBase, error) {
+	return s.kb, nil
+}
+
 type initialPostProcessGraphRepo struct {
 	interfaces.RetrieveGraphRepository
 }
@@ -78,6 +91,42 @@ type initialPostProcessEnqueuer struct {
 	errors   []error
 	taskIDs  []string
 	payloads []*asynq.Task
+}
+
+type manualAttemptRetryEnqueuer struct {
+	mu                      sync.Mutex
+	accepted                map[string]*asynq.Task
+	taskIDs                 []string
+	ambiguousPostProcessErr error
+	postProcessAccepted     int
+}
+
+func (e *manualAttemptRetryEnqueuer) Enqueue(task *asynq.Task, opts ...asynq.Option) (*asynq.TaskInfo, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	taskID := ""
+	for _, opt := range opts {
+		if opt.Type() == asynq.TaskIDOpt {
+			taskID = opt.Value().(string)
+		}
+	}
+	e.taskIDs = append(e.taskIDs, taskID)
+	if _, exists := e.accepted[taskID]; taskID != "" && exists {
+		return nil, asynq.ErrTaskIDConflict
+	}
+	if taskID != "" {
+		e.accepted[taskID] = task
+	}
+	if task.Type() == types.TypeKnowledgePostProcess {
+		e.postProcessAccepted++
+		if e.ambiguousPostProcessErr != nil {
+			err := e.ambiguousPostProcessErr
+			e.ambiguousPostProcessErr = nil
+			return nil, err
+		}
+	}
+	return &asynq.TaskInfo{ID: taskID, Queue: types.QueueDefault}, nil
 }
 
 func (e *initialPostProcessEnqueuer) Enqueue(task *asynq.Task, opts ...asynq.Option) (*asynq.TaskInfo, error) {
@@ -233,4 +282,102 @@ func TestOrdinaryMultimodalPostProcessEnqueueFailureRemainsBestEffort(t *testing
 	})
 	require.NoError(t, err)
 	require.NoError(t, service.Handle(context.Background(), asynq.NewTask(types.TypeImageMultimodal, payload)))
+}
+
+func TestProductionProjectionManualRetryReusesPersistedAttempt(t *testing.T) {
+	t.Setenv("RETRIEVE_DRIVER", "")
+	tracker, _ := setupSpanTrackerTest(t)
+	queueErr := errors.New("post-process enqueue response lost")
+	knowledge := initialPostProcessProjectionKnowledge(t, types.ParseStatusPending)
+	repo := &initialPostProcessKnowledgeRepo{knowledge: knowledge}
+	tasks := &manualAttemptRetryEnqueuer{
+		accepted:                make(map[string]*asynq.Task),
+		ambiguousPostProcessErr: queueErr,
+	}
+	service := &knowledgeService{
+		repo: repo,
+		kbService: &initialPostProcessKBService{kb: &types.KnowledgeBase{
+			ID: knowledge.KnowledgeBaseID, TenantID: knowledge.TenantID,
+		}},
+		tenantRepo:   &initialPostProcessTenantRepo{},
+		chunkService: &initialPostProcessChunkService{},
+		graphEngine:  &initialPostProcessGraphRepo{},
+		task:         tasks,
+		spanTracker:  tracker,
+	}
+
+	require.NoError(t, service.enqueueManualProcessing(context.Background(), knowledge, "# governed projection", false))
+	manualTaskID := "production-projection-build-target-1-projection-knowledge-1"
+	manualTask := tasks.accepted[manualTaskID]
+	require.NotNil(t, manualTask)
+	var payload types.ManualProcessPayload
+	require.NoError(t, json.Unmarshal(manualTask.Payload(), &payload))
+	require.Equal(t, 1, payload.Attempt)
+
+	require.NoError(t, service.enqueueManualProcessing(context.Background(), knowledge, "# governed projection", false))
+	require.Equal(t, 1, tracker.LatestAttempt(context.Background(), knowledge.ID),
+		"pending replay must reuse the attempt persisted before the first enqueue")
+
+	require.ErrorIs(t, service.ProcessManualUpdate(context.Background(), manualTask), queueErr)
+	require.NoError(t, service.ProcessManualUpdate(context.Background(), manualTask))
+	postProcessTaskID := "production-projection-post-process-attempt-1-target-1-projection-knowledge-1"
+	require.Equal(t, []string{manualTaskID, manualTaskID, postProcessTaskID, postProcessTaskID}, tasks.taskIDs)
+	require.Equal(t, 1, tasks.postProcessAccepted,
+		"the ambiguous first response accepted the task; retry must conflict instead of duplicating it")
+	require.Equal(t, 1, tracker.LatestAttempt(context.Background(), knowledge.ID),
+		"an Asynq retry of the same payload must not allocate a second parse attempt")
+}
+
+func TestProductionProjectionFailedRetryAllocatesFreshPersistedAttempt(t *testing.T) {
+	tracker, _ := setupSpanTrackerTest(t)
+	knowledge := initialPostProcessProjectionKnowledge(t, types.ParseStatusPending)
+	tasks := &initialPostProcessEnqueuer{}
+	service := &knowledgeService{task: tasks, spanTracker: tracker}
+
+	require.NoError(t, service.enqueueManualProcessing(context.Background(), knowledge, "# governed projection", false))
+	require.NoError(t, service.enqueueManualProcessing(context.Background(), knowledge, "# governed projection", true))
+	require.Len(t, tasks.payloads, 2)
+
+	var initialPayload, retryPayload types.ManualProcessPayload
+	require.NoError(t, json.Unmarshal(tasks.payloads[0].Payload(), &initialPayload))
+	require.NoError(t, json.Unmarshal(tasks.payloads[1].Payload(), &retryPayload))
+	require.Equal(t, 1, initialPayload.Attempt)
+	require.Equal(t, 2, retryPayload.Attempt)
+	require.Equal(t, 2, tracker.LatestAttempt(context.Background(), knowledge.ID))
+}
+
+func TestOrdinaryManualEnqueueRemainsCompatibleWithoutSpanTracker(t *testing.T) {
+	knowledge := &types.Knowledge{
+		ID: "ordinary-knowledge-1", TenantID: 1, KnowledgeBaseID: "kb-1", Type: types.KnowledgeTypeManual,
+	}
+	tasks := &initialPostProcessEnqueuer{}
+	service := &knowledgeService{task: tasks}
+
+	require.NoError(t, service.enqueueManualProcessing(context.Background(), knowledge, "# ordinary", false))
+	require.Len(t, tasks.payloads, 1)
+	var payload types.ManualProcessPayload
+	require.NoError(t, json.Unmarshal(tasks.payloads[0].Payload(), &payload))
+	require.Zero(t, payload.Attempt)
+	require.Equal(t, []string{""}, tasks.taskIDs)
+}
+
+func TestOrdinaryManualEnqueueReusesPresetReparseAttempt(t *testing.T) {
+	tracker, _ := setupSpanTrackerTest(t)
+	knowledge := &types.Knowledge{
+		ID: "ordinary-knowledge-1", TenantID: 1, KnowledgeBaseID: "kb-1", Type: types.KnowledgeTypeManual,
+	}
+	_, reparseAttempt, err := tracker.OpenAttempt(context.Background(), knowledge.ID, "")
+	require.NoError(t, err)
+	require.Equal(t, 1, reparseAttempt)
+	tasks := &initialPostProcessEnqueuer{}
+	service := &knowledgeService{task: tasks, spanTracker: tracker}
+
+	require.NoError(t, service.enqueueManualProcessing(
+		context.Background(), knowledge, "# ordinary", true, reparseAttempt,
+	))
+	var payload types.ManualProcessPayload
+	require.NoError(t, json.Unmarshal(tasks.payloads[0].Payload(), &payload))
+	require.Equal(t, reparseAttempt, payload.Attempt)
+	require.Equal(t, reparseAttempt, tracker.LatestAttempt(context.Background(), knowledge.ID),
+		"enqueue must not allocate a second attempt after reparse already opened one")
 }

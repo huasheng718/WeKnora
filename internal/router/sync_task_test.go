@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -11,6 +12,40 @@ import (
 	"github.com/hibiken/asynq"
 	"github.com/stretchr/testify/require"
 )
+
+type syncTaskTestClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *syncTaskTestClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *syncTaskTestClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	c.mu.Unlock()
+}
+
+func waitForRetainedTaskIDs(t *testing.T, executor *SyncTaskExecutor, want int) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		executor.mu.RLock()
+		defer executor.mu.RUnlock()
+		if len(executor.taskIDs) != want {
+			return false
+		}
+		for _, expiresAt := range executor.taskIDs {
+			if expiresAt.IsZero() {
+				return false
+			}
+		}
+		return true
+	}, time.Second, time.Millisecond)
+}
 
 func TestSyncTaskExecutorDeduplicatesConcurrentRetainedTaskID(t *testing.T) {
 	const concurrentEnqueues = 32
@@ -82,4 +117,124 @@ func TestSyncTaskExecutorDeduplicatesConcurrentRetainedTaskID(t *testing.T) {
 	)
 	require.Nil(t, info)
 	require.ErrorIs(t, err, asynq.ErrTaskIDConflict)
+}
+
+func TestSyncTaskExecutorPrunesExpiredRetainedTaskIDOnUnrelatedEnqueue(t *testing.T) {
+	clock := &syncTaskTestClock{now: time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)}
+	executor := newSyncTaskExecutor(clock.Now)
+	executor.RegisterHandler("done", func(context.Context, *asynq.Task) error { return nil })
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	executor.RegisterHandler("blocked", func(context.Context, *asynq.Task) error {
+		<-release
+		return nil
+	})
+
+	_, err := executor.Enqueue(asynq.NewTask("done", nil),
+		asynq.TaskID("expired-id"), asynq.Retention(time.Minute), asynq.MaxRetry(0))
+	require.NoError(t, err)
+	waitForRetainedTaskIDs(t, executor, 1)
+	clock.Advance(2 * time.Minute)
+
+	_, err = executor.Enqueue(asynq.NewTask("blocked", nil),
+		asynq.TaskID("unrelated-active-id"), asynq.Retention(time.Hour), asynq.MaxRetry(0))
+	require.NoError(t, err)
+	executor.mu.RLock()
+	_, expiredExists := executor.taskIDs["expired-id"]
+	activeExpiry, activeExists := executor.taskIDs["unrelated-active-id"]
+	executor.mu.RUnlock()
+	require.False(t, expiredExists)
+	require.True(t, activeExists)
+	require.True(t, activeExpiry.IsZero(), "an active claim must never be pruned")
+}
+
+func TestSyncTaskExecutorPruningKeepsActiveAndUnexpiredTaskIDsConflicting(t *testing.T) {
+	clock := &syncTaskTestClock{now: time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)}
+	executor := newSyncTaskExecutor(clock.Now)
+	executor.RegisterHandler("done", func(context.Context, *asynq.Task) error { return nil })
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	executor.RegisterHandler("blocked", func(context.Context, *asynq.Task) error {
+		<-release
+		return nil
+	})
+
+	_, err := executor.Enqueue(asynq.NewTask("done", nil),
+		asynq.TaskID("unexpired-id"), asynq.Retention(time.Hour), asynq.MaxRetry(0))
+	require.NoError(t, err)
+	waitForRetainedTaskIDs(t, executor, 1)
+	_, err = executor.Enqueue(asynq.NewTask("blocked", nil),
+		asynq.TaskID("active-id"), asynq.Retention(time.Hour), asynq.MaxRetry(0))
+	require.NoError(t, err)
+	clock.Advance(30 * time.Minute)
+
+	_, err = executor.Enqueue(asynq.NewTask("done", nil), asynq.MaxRetry(0))
+	require.NoError(t, err)
+	for _, taskID := range []string{"unexpired-id", "active-id"} {
+		info, conflictErr := executor.Enqueue(asynq.NewTask("done", nil), asynq.TaskID(taskID))
+		require.Nil(t, info)
+		require.ErrorIs(t, conflictErr, asynq.ErrTaskIDConflict)
+	}
+}
+
+func TestSyncTaskExecutorBoundsExpiredTaskIDPruningWorkAndMapGrowth(t *testing.T) {
+	const retainedTasks = syncTaskIDPruneBudget * 4
+	clock := &syncTaskTestClock{now: time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)}
+	executor := newSyncTaskExecutor(clock.Now)
+	executor.RegisterHandler("done", func(context.Context, *asynq.Task) error { return nil })
+
+	for i := range retainedTasks {
+		_, err := executor.Enqueue(asynq.NewTask("done", nil),
+			asynq.TaskID(fmt.Sprintf("retained-%d", i)), asynq.Retention(time.Minute), asynq.MaxRetry(0))
+		require.NoError(t, err)
+	}
+	waitForRetainedTaskIDs(t, executor, retainedTasks)
+	clock.Advance(2 * time.Minute)
+
+	_, err := executor.Enqueue(asynq.NewTask("done", nil), asynq.MaxRetry(0))
+	require.NoError(t, err)
+	executor.mu.RLock()
+	remainingAfterOnePrune := len(executor.taskIDs)
+	executor.mu.RUnlock()
+	require.Equal(t, retainedTasks-syncTaskIDPruneBudget, remainingAfterOnePrune,
+		"one enqueue must perform only the bounded prune budget")
+
+	for range retainedTasks / syncTaskIDPruneBudget {
+		_, err = executor.Enqueue(asynq.NewTask("done", nil), asynq.MaxRetry(0))
+		require.NoError(t, err)
+	}
+	executor.mu.RLock()
+	remaining := len(executor.taskIDs)
+	executor.mu.RUnlock()
+	require.Zero(t, remaining, "unrelated enqueues must eventually reclaim every expired retained ID")
+}
+
+func TestSyncTaskExecutorConcurrentEnqueueAndPrune(t *testing.T) {
+	const expiredTasks = syncTaskIDPruneBudget * 2
+	clock := &syncTaskTestClock{now: time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)}
+	executor := newSyncTaskExecutor(clock.Now)
+	executor.RegisterHandler("done", func(context.Context, *asynq.Task) error { return nil })
+
+	for i := range expiredTasks {
+		_, err := executor.Enqueue(asynq.NewTask("done", nil),
+			asynq.TaskID(fmt.Sprintf("expired-%d", i)), asynq.Retention(time.Minute), asynq.MaxRetry(0))
+		require.NoError(t, err)
+	}
+	waitForRetainedTaskIDs(t, executor, expiredTasks)
+	clock.Advance(2 * time.Minute)
+
+	var enqueues sync.WaitGroup
+	for range 8 {
+		enqueues.Add(1)
+		go func() {
+			defer enqueues.Done()
+			_, err := executor.Enqueue(asynq.NewTask("done", nil), asynq.MaxRetry(0))
+			require.NoError(t, err)
+		}()
+	}
+	enqueues.Wait()
+	executor.mu.RLock()
+	remaining := len(executor.taskIDs)
+	executor.mu.RUnlock()
+	require.Zero(t, remaining)
 }

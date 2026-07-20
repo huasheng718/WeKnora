@@ -1442,8 +1442,13 @@ func TestProductionProjectionIntegritySQLiteUpgradesAndDowngradesPopulatedPublic
 	seedProductionReleaseScope(t, db)
 	insertProductionPublicationRelease(t, db, "release-upgrade", "version-1", "review-pub-1", strings.Repeat("a", 64))
 	insertProductionPublicationTarget(t, db, "target-upgrade", "release-upgrade", "version-1", "kb-1", "knowledge-upgrade", strings.Repeat("a", 64))
+	insertProductionPublicationTarget(t, db, "target-upgrade-failed", "release-upgrade", "version-1", "kb-2", "knowledge-upgrade-failed", strings.Repeat("a", 64))
+	_, err := db.Exec(`UPDATE production_release_targets
+		SET status = 'failed', failed_at = '2026-01-01 00:00:00', retention_until = '2026-01-31 00:00:00'
+		WHERE id = 'target-upgrade-failed'`)
+	require.NoError(t, err)
 
-	_, err := db.Exec(mustReadMigration(t, "../../migrations/sqlite/000006_knowledge_production_projection_integrity.up.sql"))
+	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000006_knowledge_production_projection_integrity.up.sql"))
 	require.NoError(t, err)
 	var digestVersion int
 	var failureCode, failureReason string
@@ -1452,6 +1457,9 @@ func TestProductionProjectionIntegritySQLiteUpgradesAndDowngradesPopulatedPublic
 	require.NoError(t, db.QueryRow(`SELECT failure_code, failure_reason FROM production_release_targets WHERE id = 'target-upgrade'`).Scan(&failureCode, &failureReason))
 	require.Empty(t, failureCode)
 	require.Empty(t, failureReason)
+	require.NoError(t, db.QueryRow(`SELECT failure_code, failure_reason FROM production_release_targets WHERE id = 'target-upgrade-failed'`).Scan(&failureCode, &failureReason))
+	require.Equal(t, "LEGACY_PROJECTION_FAILURE", failureCode)
+	require.Equal(t, "legacy failed target migrated without recorded failure details", failureReason)
 	_, err = db.Exec(`UPDATE production_releases SET release_digest_version = 1 WHERE id = 'release-upgrade'`)
 	require.ErrorContains(t, err, "release identity is immutable")
 	_, err = db.Exec(`UPDATE production_release_targets

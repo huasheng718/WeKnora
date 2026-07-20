@@ -177,13 +177,14 @@ func (s *createKnowledgeTaskEnqueuerStub) Enqueue(
 func TestCreateKnowledgeFromProductionProjectionUsesReservedIDAndImmutableMetadata(t *testing.T) {
 	repo := &createKnowledgeFileRepoStub{}
 	tasks := &createKnowledgeTaskEnqueuerStub{}
+	tracker, _ := setupSpanTrackerTest(t)
 	svc := &knowledgeService{
 		repo: repo,
 		kbService: &createKnowledgeFileKBServiceStub{kb: &types.KnowledgeBase{
 			ID: "kb-1", TenantID: 1, Type: types.KnowledgeBaseTypeDocument,
 			EmbeddingModelID: "live-model",
 		}},
-		fileSvc: &createKnowledgeFileServiceStub{}, task: tasks,
+		fileSvc: &createKnowledgeFileServiceStub{}, task: tasks, spanTracker: tracker,
 	}
 	payload := &types.ProductionProjectionKnowledgePayload{
 		KnowledgeID:     "93000000-0000-4000-8000-000000000007",
@@ -287,7 +288,8 @@ func TestCreateKnowledgeFromProductionProjectionRetriesFailedOwnedKnowledgeOnce(
 	require.NoError(t, owned.SetManualMetadata(meta))
 	repo := &createKnowledgeFileRepoStub{existingKnowledge: owned}
 	tasks := &createKnowledgeTaskEnqueuerStub{}
-	svc := &knowledgeService{repo: repo, task: tasks}
+	tracker, _ := setupSpanTrackerTest(t)
+	svc := &knowledgeService{repo: repo, task: tasks, spanTracker: tracker}
 
 	got, err := svc.CreateKnowledgeFromProductionProjection(
 		newCreateKnowledgeFileContext(),
@@ -320,7 +322,8 @@ func TestCreateKnowledgeFromProductionProjectionRearmsPendingWithDeterministicTa
 	require.NoError(t, owned.SetManualMetadata(meta))
 	repo := &createKnowledgeFileRepoStub{existingKnowledge: owned}
 	tasks := &createKnowledgeTaskEnqueuerStub{}
-	svc := &knowledgeService{repo: repo, task: tasks}
+	tracker, _ := setupSpanTrackerTest(t)
+	svc := &knowledgeService{repo: repo, task: tasks, spanTracker: tracker}
 	payload := &types.ProductionProjectionKnowledgePayload{
 		KnowledgeID: "knowledge-1", KnowledgeBaseID: "kb-1", Content: "# owned",
 		EmbeddingModelID: "snapshot-embedding", SummaryModelID: "snapshot-summary",
@@ -353,7 +356,8 @@ func TestCreateKnowledgeFromProductionProjectionTreatsRetryTaskConflictAsDurable
 	require.NoError(t, owned.SetManualMetadata(meta))
 	repo := &createKnowledgeFileRepoStub{existingKnowledge: owned}
 	tasks := &createKnowledgeTaskEnqueuerStub{enqueueErr: asynq.ErrTaskIDConflict}
-	svc := &knowledgeService{repo: repo, task: tasks}
+	tracker, _ := setupSpanTrackerTest(t)
+	svc := &knowledgeService{repo: repo, task: tasks, spanTracker: tracker}
 
 	_, err := svc.CreateKnowledgeFromProductionProjection(newCreateKnowledgeFileContext(), &types.ProductionProjectionKnowledgePayload{
 		KnowledgeID: "knowledge-1", KnowledgeBaseID: "kb-1", Content: "# owned",

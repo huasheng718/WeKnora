@@ -7,6 +7,11 @@ ALTER TABLE production_release_targets
 ALTER TABLE production_release_targets
     ADD COLUMN failure_reason VARCHAR(256) NOT NULL DEFAULT '' CHECK (length(failure_reason) <= 256);
 
+UPDATE production_release_targets
+SET failure_code = 'LEGACY_PROJECTION_FAILURE',
+    failure_reason = 'legacy failed target migrated without recorded failure details'
+WHERE status = 'failed';
+
 DROP TRIGGER IF EXISTS trg_production_releases_guard_identity;
 CREATE TRIGGER trg_production_releases_guard_identity
     BEFORE UPDATE ON production_releases

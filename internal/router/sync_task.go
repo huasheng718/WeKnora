@@ -1,6 +1,7 @@
 package router
 
 import (
+	"container/heap"
 	"context"
 	"fmt"
 	"sync"
@@ -14,18 +15,53 @@ import (
 	"go.uber.org/dig"
 )
 
+const syncTaskIDPruneBudget = 64
+
+type syncTaskIDExpiry struct {
+	taskID    string
+	expiresAt time.Time
+}
+
+type syncTaskIDExpiryHeap []syncTaskIDExpiry
+
+func (h syncTaskIDExpiryHeap) Len() int           { return len(h) }
+func (h syncTaskIDExpiryHeap) Less(i, j int) bool { return h[i].expiresAt.Before(h[j].expiresAt) }
+func (h syncTaskIDExpiryHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+
+func (h *syncTaskIDExpiryHeap) Push(value interface{}) {
+	*h = append(*h, value.(syncTaskIDExpiry))
+}
+
+func (h *syncTaskIDExpiryHeap) Pop() interface{} {
+	old := *h
+	last := len(old) - 1
+	value := old[last]
+	*h = old[:last]
+	return value
+}
+
 // SyncTaskExecutor executes tasks synchronously (in a goroutine) without Redis.
 // Used in Lite mode as a drop-in replacement for *asynq.Client.
 type SyncTaskExecutor struct {
-	mu       sync.RWMutex
-	handlers map[string]func(context.Context, *asynq.Task) error
-	taskIDs  map[string]time.Time
+	mu             sync.RWMutex
+	handlers       map[string]func(context.Context, *asynq.Task) error
+	taskIDs        map[string]time.Time
+	taskIDExpiries syncTaskIDExpiryHeap
+	now            func() time.Time
 }
 
 func NewSyncTaskExecutor() *SyncTaskExecutor {
+	return newSyncTaskExecutor(time.Now)
+}
+
+func newSyncTaskExecutor(now func() time.Time) *SyncTaskExecutor {
+	if now == nil {
+		now = time.Now
+	}
 	return &SyncTaskExecutor{
 		handlers: make(map[string]func(context.Context, *asynq.Task) error),
 		taskIDs:  make(map[string]time.Time),
+		now:      now,
 	}
 }
 
@@ -84,9 +120,11 @@ func (e *SyncTaskExecutor) Enqueue(task *asynq.Task, opts ...asynq.Option) (*asy
 		e.mu.Unlock()
 		return nil, fmt.Errorf("sync task executor: no handler registered for type %q", task.Type())
 	}
+	now := e.now()
+	e.pruneExpiredTaskIDsLocked(now)
 	if hasTaskID {
 		if expiresAt, exists := e.taskIDs[requestedTaskID]; exists &&
-			(expiresAt.IsZero() || time.Now().Before(expiresAt)) {
+			(expiresAt.IsZero() || now.Before(expiresAt)) {
 			e.mu.Unlock()
 			return nil, asynq.ErrTaskIDConflict
 		}
@@ -153,7 +191,22 @@ func (e *SyncTaskExecutor) finishTaskID(taskID string, retention time.Duration) 
 		delete(e.taskIDs, taskID)
 		return
 	}
-	e.taskIDs[taskID] = time.Now().Add(retention)
+	expiresAt := e.now().Add(retention)
+	e.taskIDs[taskID] = expiresAt
+	heap.Push(&e.taskIDExpiries, syncTaskIDExpiry{taskID: taskID, expiresAt: expiresAt})
+}
+
+func (e *SyncTaskExecutor) pruneExpiredTaskIDsLocked(now time.Time) {
+	for scanned := 0; scanned < syncTaskIDPruneBudget && e.taskIDExpiries.Len() > 0; scanned++ {
+		next := e.taskIDExpiries[0]
+		if now.Before(next.expiresAt) {
+			return
+		}
+		heap.Pop(&e.taskIDExpiries)
+		if current, exists := e.taskIDs[next.taskID]; exists && current.Equal(next.expiresAt) {
+			delete(e.taskIDs, next.taskID)
+		}
+	}
 }
 
 type SyncTaskParams struct {

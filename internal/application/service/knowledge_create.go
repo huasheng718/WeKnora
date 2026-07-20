@@ -1218,8 +1218,12 @@ func (s *knowledgeService) UpdateManualKnowledge(ctx context.Context,
 
 // enqueueManualProcessing enqueues a manual:process Asynq task for async cleanup + re-indexing.
 func (s *knowledgeService) enqueueManualProcessing(ctx context.Context,
-	knowledge *types.Knowledge, content string, needCleanup bool,
+	knowledge *types.Knowledge, content string, needCleanup bool, presetAttempt ...int,
 ) error {
+	projection, integrityErr := types.ValidateProductionProjectionIntegrity(knowledge)
+	if integrityErr != nil {
+		return integrityErr
+	}
 	requestID, _ := types.RequestIDFromContext(ctx)
 	payload := types.ManualProcessPayload{
 		RequestId:       requestID,
@@ -1230,6 +1234,25 @@ func (s *knowledgeService) enqueueManualProcessing(ctx context.Context,
 		NeedCleanup:     needCleanup,
 	}
 	langfuse.InjectTracing(ctx, &payload)
+	if len(presetAttempt) > 0 && presetAttempt[0] > 0 {
+		payload.Attempt = presetAttempt[0]
+	} else if projection != nil && !needCleanup {
+		payload.Attempt = s.tracker().LatestAttempt(ctx, knowledge.ID)
+	}
+	if payload.Attempt <= 0 {
+		root, attempt, attemptErr := s.tracker().OpenAttempt(ctx, knowledge.ID, payload.LangfuseTraceID)
+		if attemptErr != nil {
+			if projection != nil {
+				return fmt.Errorf("failed to persist production projection parse attempt: %w", attemptErr)
+			}
+			logger.Warnf(ctx, "Failed to persist manual processing attempt for %s: %v", knowledge.ID, attemptErr)
+		} else if root != nil && attempt > 0 {
+			payload.Attempt = attempt
+		}
+	}
+	if projection != nil && payload.Attempt <= 0 {
+		return fmt.Errorf("failed to persist production projection parse attempt")
+	}
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("failed to marshal manual process payload: %w", err)
@@ -1238,9 +1261,7 @@ func (s *knowledgeService) enqueueManualProcessing(ctx context.Context,
 	task := asynq.NewTask(types.TypeManualProcess, payloadBytes,
 		asynq.Queue(types.QueueDefault), asynq.MaxRetry(3), asynq.Timeout(30*time.Minute))
 	var enqueueOptions []asynq.Option
-	if projection, integrityErr := types.ValidateProductionProjectionIntegrity(knowledge); integrityErr != nil {
-		return integrityErr
-	} else if projection != nil {
+	if projection != nil {
 		phase := "build"
 		if needCleanup {
 			phase = "retry"
