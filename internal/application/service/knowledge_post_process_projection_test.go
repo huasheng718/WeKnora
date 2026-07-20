@@ -83,6 +83,26 @@ type projectionPostProcessEnqueuer struct {
 	enqueueErr error
 }
 
+type projectionRetainingEnqueuer struct {
+	claimed  map[string]struct{}
+	accepted []string
+}
+
+func (e *projectionRetainingEnqueuer) Enqueue(_ *asynq.Task, opts ...asynq.Option) (*asynq.TaskInfo, error) {
+	var taskID string
+	for _, opt := range opts {
+		if opt.Type() == asynq.TaskIDOpt {
+			taskID = opt.Value().(string)
+		}
+	}
+	if _, exists := e.claimed[taskID]; exists {
+		return nil, asynq.ErrTaskIDConflict
+	}
+	e.claimed[taskID] = struct{}{}
+	e.accepted = append(e.accepted, taskID)
+	return &asynq.TaskInfo{ID: taskID}, nil
+}
+
 func (e *projectionPostProcessEnqueuer) Enqueue(task *asynq.Task, opts ...asynq.Option) (*asynq.TaskInfo, error) {
 	e.taskTypes = append(e.taskTypes, task.Type())
 	e.tasks = append(e.tasks, task)
@@ -162,13 +182,59 @@ func productionProjectionKnowledgeForPostProcess(t *testing.T) *types.Knowledge 
 }
 
 func projectionPostProcessTask(t *testing.T) *asynq.Task {
+	return projectionPostProcessTaskForAttempt(t, 0)
+}
+
+func projectionPostProcessTaskForAttempt(t *testing.T, attempt int) *asynq.Task {
 	t.Helper()
 	payload, err := json.Marshal(types.KnowledgePostProcessPayload{
 		TenantID: projectionTenantID, KnowledgeBaseID: projectionKBID,
-		KnowledgeID: projectionKnowledgeID,
+		KnowledgeID: projectionKnowledgeID, Attempt: attempt,
 	})
 	require.NoError(t, err)
 	return asynq.NewTask(types.TypeKnowledgePostProcess, payload)
+}
+
+func TestProductionProjectionPostProcessAttemptCanRecoverWithRetainedFanoutIDs(t *testing.T) {
+	t.Setenv("NEO4J_ENABLE", "true")
+	knowledgeRepo := &projectionPostProcessKnowledgeRepo{
+		knowledge: productionProjectionKnowledgeForPostProcess(t), updates: map[string]interface{}{},
+	}
+	graphEnabled := true
+	require.NoError(t, knowledgeRepo.knowledge.SetProcessOverrides(&types.KnowledgeProcessOverrides{
+		QuestionGenerationConfig: &types.QuestionGenerationConfig{Enabled: true, QuestionCount: 2},
+		GraphEnabled:             &graphEnabled,
+		ExtractConfig:            &types.ExtractConfig{Enabled: true},
+	}))
+	enqueuer := &projectionRetainingEnqueuer{claimed: map[string]struct{}{}}
+	handler := NewKnowledgePostProcessService(
+		knowledgeRepo,
+		&projectionPostProcessKBService{kb: &types.KnowledgeBase{
+			ID: projectionKBID, TenantID: projectionTenantID,
+		}},
+		&projectionPostProcessChunkService{chunks: []*types.Chunk{{
+			ID: "chunk-1", KnowledgeID: projectionKnowledgeID, ChunkType: types.ChunkTypeText,
+		}}},
+		enqueuer, nil, nil, nil, &projectionPostProcessReleaseRepo{},
+	)
+
+	require.NoError(t, handler.Handle(context.Background(), projectionPostProcessTaskForAttempt(t, 1)))
+	require.ElementsMatch(t, []string{
+		"production-projection-summary-attempt-1-" + projectionTargetID + "-" + projectionKnowledgeID,
+		"production-projection-question-0-attempt-1-" + projectionTargetID + "-" + projectionKnowledgeID,
+		"production-projection-graph-0-attempt-1-" + projectionTargetID + "-" + projectionKnowledgeID,
+	}, enqueuer.accepted)
+
+	knowledgeRepo.knowledge.ParseStatus = types.ParseStatusProcessing
+	knowledgeRepo.knowledge.PendingSubtasksCount = 0
+	require.NoError(t, handler.Handle(context.Background(), projectionPostProcessTaskForAttempt(t, 2)))
+	require.ElementsMatch(t, []string{
+		"production-projection-summary-attempt-2-" + projectionTargetID + "-" + projectionKnowledgeID,
+		"production-projection-question-0-attempt-2-" + projectionTargetID + "-" + projectionKnowledgeID,
+		"production-projection-graph-0-attempt-2-" + projectionTargetID + "-" + projectionKnowledgeID,
+	}, enqueuer.accepted[3:])
+	require.Equal(t, 3, knowledgeRepo.knowledge.PendingSubtasksCount,
+		"the recovered attempt must wait for its newly accepted fan-out tasks")
 }
 
 func TestProductionProjectionBuildDoesNotEnqueueWikiBeforeActivation(t *testing.T) {
@@ -302,15 +368,15 @@ func TestProductionProjectionPostProcessEnqueueFailureRetriesDeterministically(t
 		enqueuer, nil, nil, nil, &projectionPostProcessReleaseRepo{},
 	)
 
-	err := handler.Handle(context.Background(), projectionPostProcessTask(t))
+	err := handler.Handle(context.Background(), projectionPostProcessTaskForAttempt(t, 1))
 	require.ErrorContains(t, err, "queue unavailable")
 	require.Equal(t, types.ParseStatusFinalizing, knowledgeRepo.knowledge.ParseStatus)
 	require.Equal(t, 1, knowledgeRepo.knowledge.PendingSubtasksCount)
 	require.Equal(t, []string{
-		"production-projection-summary-" + projectionTargetID + "-" + projectionKnowledgeID,
+		"production-projection-summary-attempt-1-" + projectionTargetID + "-" + projectionKnowledgeID,
 	}, enqueuer.taskIDs)
 
-	require.NoError(t, handler.Handle(context.Background(), projectionPostProcessTask(t)))
+	require.NoError(t, handler.Handle(context.Background(), projectionPostProcessTaskForAttempt(t, 1)))
 	require.Len(t, enqueuer.taskIDs, 2)
 	var payload types.SummaryGenerationPayload
 	require.NoError(t, json.Unmarshal(enqueuer.tasks[1].Payload(), &payload))

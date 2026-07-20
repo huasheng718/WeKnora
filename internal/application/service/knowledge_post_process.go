@@ -418,7 +418,7 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 		for i, chunk := range textChunks {
 			var taskID string
 			if projection != nil {
-				taskID = productionProjectionTaskID(projection.ReleaseTargetID, payload.KnowledgeID, fmt.Sprintf("graph-%d", i))
+				taskID = productionProjectionAttemptTaskID(projection.ReleaseTargetID, payload.KnowledgeID, fmt.Sprintf("graph-%d", i), attempt)
 			}
 			ok, err := NewChunkExtractTask(ctx, s.taskEnqueuer, payload.TenantID, chunk.ID, graphModelID,
 				payload.KnowledgeID, attempt, i, taskID)
@@ -558,7 +558,7 @@ func (s *KnowledgePostProcessService) enqueueSummaryGenerationTask(
 		taskPayload.SummaryModelID = projection.SummaryModelID
 		taskPayload.EmbeddingModelID = knowledge.EmbeddingModelID
 		enqueueOptions = append(enqueueOptions,
-			asynq.TaskID(productionProjectionTaskID(projection.ReleaseTargetID, payload.KnowledgeID, "summary")),
+			asynq.TaskID(productionProjectionAttemptTaskID(projection.ReleaseTargetID, payload.KnowledgeID, "summary", attempt)),
 			asynq.Retention(24*time.Hour),
 		)
 	}
@@ -660,7 +660,7 @@ func (s *KnowledgePostProcessService) enqueueQuestionGenerationTasks(
 			taskPayload.SummaryModelID = projection.SummaryModelID
 			taskPayload.EmbeddingModelID = knowledge.EmbeddingModelID
 			enqueueOptions = append(enqueueOptions,
-				asynq.TaskID(productionProjectionTaskID(projection.ReleaseTargetID, payload.KnowledgeID, fmt.Sprintf("question-%d", batchIndex))),
+				asynq.TaskID(productionProjectionAttemptTaskID(projection.ReleaseTargetID, payload.KnowledgeID, fmt.Sprintf("question-%d", batchIndex), attempt)),
 				asynq.Retention(24*time.Hour),
 			)
 		}

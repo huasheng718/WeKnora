@@ -15,7 +15,6 @@ import (
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/utils/ollama"
 	"github.com/Tencent/WeKnora/internal/models/vlm"
-	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
@@ -134,7 +133,7 @@ func (s *ImageMultimodalService) tracker() SpanTracker {
 }
 
 // Handle implements asynq handler for TypeImageMultimodal.
-func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) error {
+func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) (retErr error) {
 	var payload types.ImageMultimodalPayload
 	if err := json.Unmarshal(task.Payload(), &payload); err != nil {
 		return fmt.Errorf("unmarshal image multimodal payload: %w", err)
@@ -151,7 +150,7 @@ func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) e
 	// Drop orphaned or user-aborted work before touching VLM. Missing
 	// knowledge/KB rows are permanent failures — retrying only burns queue
 	// capacity (asynq default MaxRetry=25 on legacy tasks).
-	drop, dropErr := s.shouldDropOrphanedMultimodal(ctx, &payload)
+	knowledge, drop, dropErr := s.shouldDropOrphanedMultimodal(ctx, &payload)
 	if dropErr != nil {
 		return dropErr
 	}
@@ -161,8 +160,7 @@ func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) e
 			payload.ChunkID, payload.KnowledgeID, payload.KnowledgeBaseID, payload.ImageURL)
 		// Still count this image toward the parent finalize gate so a batch
 		// of dropped orphans cannot strand multimodal:pending forever.
-		s.checkAndFinalizeAllImages(ctx, payload)
-		return nil
+		return s.checkAndFinalizeAllImages(ctx, payload, knowledge)
 	}
 
 	// Open a per-image subspan under the parent attempt's multimodal
@@ -216,7 +214,10 @@ func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) e
 			}
 		}
 		if handleErr == nil || isFinalAsynqAttempt(ctx) {
-			s.checkAndFinalizeAllImages(ctx, payload)
+			if finalizeErr := s.checkAndFinalizeAllImages(ctx, payload, knowledge); finalizeErr != nil && handleErr == nil {
+				handleErr = finalizeErr
+				retErr = finalizeErr
+			}
 		} else {
 			logger.Infof(ctx,
 				"[ImageMultimodal] Skip finalize on retryable error for %s (will count on last attempt)",
@@ -371,33 +372,35 @@ func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) e
 // survived).
 func (s *ImageMultimodalService) shouldDropOrphanedMultimodal(
 	ctx context.Context, payload *types.ImageMultimodalPayload,
-) (bool, error) {
+) (*types.Knowledge, bool, error) {
+	var knowledge *types.Knowledge
 	if payload.KnowledgeID != "" && s.knowledgeRepo != nil {
 		k, err := s.knowledgeRepo.GetKnowledgeByIDOnly(ctx, payload.KnowledgeID)
 		if errors.Is(err, repository.ErrKnowledgeNotFound) {
-			return true, nil
+			return nil, true, nil
 		}
 		if err != nil {
-			return false, err
+			return nil, false, err
 		}
+		knowledge = k
 		switch k.ParseStatus {
 		case types.ParseStatusCancelled, types.ParseStatusDeleting:
-			return true, nil
+			return knowledge, true, nil
 		}
 	}
 	if payload.KnowledgeBaseID != "" && s.kbService != nil {
 		kb, err := s.kbService.GetKnowledgeBaseByIDOnly(ctx, payload.KnowledgeBaseID)
 		if errors.Is(err, repository.ErrKnowledgeBaseNotFound) {
-			return true, nil
+			return knowledge, true, nil
 		}
 		if err != nil {
-			return false, err
+			return knowledge, false, err
 		}
 		if kb == nil {
-			return true, nil
+			return knowledge, true, nil
 		}
 	}
-	return false, nil
+	return knowledge, false, nil
 }
 
 // isFinalAsynqAttempt reports whether the current task context belongs to the
@@ -655,10 +658,11 @@ func downloadImageFromURL(imageURL string) ([]byte, error) {
 	return secutils.DownloadBytes(imageURL)
 }
 
-func (s *ImageMultimodalService) checkAndFinalizeAllImages(ctx context.Context, payload types.ImageMultimodalPayload) {
+func (s *ImageMultimodalService) checkAndFinalizeAllImages(
+	ctx context.Context, payload types.ImageMultimodalPayload, knowledge *types.Knowledge,
+) error {
 	if s.redisClient == nil {
-		s.enqueueKnowledgePostProcessTask(ctx, payload)
-		return
+		return s.enqueueKnowledgePostProcessTask(ctx, payload, knowledge)
 	}
 
 	redisKey := fmt.Sprintf("multimodal:pending:%s", payload.KnowledgeID)
@@ -674,41 +678,39 @@ func (s *ImageMultimodalService) checkAndFinalizeAllImages(ctx context.Context, 
 		logger.Warnf(ctx,
 			"[ImageMultimodal] Decrement failed for %s (%v); fallback-enqueueing post-process",
 			payload.KnowledgeID, err)
-		s.enqueueKnowledgePostProcessTask(ctx, payload)
-		return
+		return s.enqueueKnowledgePostProcessTask(ctx, payload, knowledge)
 	}
 
 	if pendingCount <= 0 {
 		logger.Infof(ctx, "[ImageMultimodal] All images processed for knowledge %s. Finalizing...", payload.KnowledgeID)
 		s.redisClient.Del(ctx, redisKey)
 
-		s.enqueueKnowledgePostProcessTask(ctx, payload)
+		return s.enqueueKnowledgePostProcessTask(ctx, payload, knowledge)
 	}
+	return nil
 }
 
-func (s *ImageMultimodalService) enqueueKnowledgePostProcessTask(ctx context.Context, payload types.ImageMultimodalPayload) {
-	if s.taskEnqueuer == nil {
-		return
-	}
-
+func (s *ImageMultimodalService) enqueueKnowledgePostProcessTask(
+	ctx context.Context, payload types.ImageMultimodalPayload, knowledge *types.Knowledge,
+) error {
 	taskPayload := types.KnowledgePostProcessPayload{
 		TenantID:        payload.TenantID,
 		KnowledgeID:     payload.KnowledgeID,
 		KnowledgeBaseID: payload.KnowledgeBaseID,
 		Language:        payload.Language,
+		Attempt:         payload.Attempt,
 	}
-	langfuse.InjectTracing(ctx, &taskPayload)
-	payloadBytes, err := json.Marshal(taskPayload)
-	if err != nil {
-		logger.Warnf(ctx, "[ImageMultimodal] Failed to marshal post process payload: %v", err)
-		return
+	projection, projectionErr := types.ValidateProductionProjectionIntegrity(knowledge)
+	if projectionErr != nil {
+		return projectionErr
 	}
-
-	task := asynq.NewTask(types.TypeKnowledgePostProcess, payloadBytes,
-		knowledgePostProcessTaskOptions()...)
-	if _, err := s.taskEnqueuer.Enqueue(task); err != nil {
+	if err := enqueueInitialKnowledgePostProcess(ctx, s.taskEnqueuer, knowledge, taskPayload); err != nil {
 		logger.Warnf(ctx, "[ImageMultimodal] Failed to enqueue post process task for %s: %v", payload.KnowledgeID, err)
-	} else {
-		logger.Infof(ctx, "[ImageMultimodal] Enqueued post process task for %s", payload.KnowledgeID)
+		if projection != nil {
+			return err
+		}
+		return nil
 	}
+	logger.Infof(ctx, "[ImageMultimodal] Enqueued post process task for %s", payload.KnowledgeID)
+	return nil
 }

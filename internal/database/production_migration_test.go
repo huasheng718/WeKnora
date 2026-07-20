@@ -1,12 +1,16 @@
 package database
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	_ "github.com/mattn/go-sqlite3"
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 	"github.com/stretchr/testify/require"
@@ -1350,6 +1354,87 @@ func TestProductionProjectionIntegrityMigrationsAreAdditiveAndParse(t *testing.T
 		require.Contains(t, migration, "failure_code")
 		require.Contains(t, migration, "failure_reason")
 	}
+}
+
+func TestProductionProjectionIntegrityPostgreSQLBackfillsLegacyFailedTargetsBeforeConstraint(t *testing.T) {
+	postgresUp := mustReadMigration(t, "../../migrations/versioned/000075_knowledge_production_projection_integrity.up.sql")
+	backfill := "UPDATE production_release_targets\nSET failure_code = 'LEGACY_PROJECTION_FAILURE'"
+	constraint := "ADD CONSTRAINT chk_production_release_targets_failure"
+
+	require.Contains(t, postgresUp, backfill)
+	require.Less(t, strings.Index(postgresUp, backfill), strings.Index(postgresUp, constraint),
+		"legacy failed rows must be backfilled before the failure metadata constraint is installed")
+}
+
+func TestProductionProjectionIntegrityPostgreSQLUpgradesPopulatedFailedTarget(t *testing.T) {
+	dsn := os.Getenv("WEKNORA_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("WEKNORA_TEST_POSTGRES_DSN is not configured")
+	}
+
+	config, err := pgx.ParseConfig(dsn)
+	require.NoError(t, err)
+	config.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	conn, err := pgx.ConnectConfig(ctx, config)
+	require.NoError(t, err)
+	defer conn.Close(context.Background())
+
+	schema := "production_projection_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	_, err = conn.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA "%s"`, schema))
+	require.NoError(t, err)
+	defer func() {
+		_, _ = conn.Exec(context.Background(), fmt.Sprintf(`DROP SCHEMA "%s" CASCADE`, schema))
+	}()
+	_, err = conn.Exec(ctx, fmt.Sprintf(`SET search_path TO "%s"`, schema))
+	require.NoError(t, err)
+
+	_, err = conn.Exec(ctx, `
+CREATE TABLE production_releases (
+    id VARCHAR(36) PRIMARY KEY, tenant_id BIGINT NOT NULL, project_id VARCHAR(36) NOT NULL,
+    document_id VARCHAR(36) NOT NULL, version_id VARCHAR(36) NOT NULL, review_request_id VARCHAR(36) NOT NULL,
+    release_digest VARCHAR(64) NOT NULL, status VARCHAR(20) NOT NULL DEFAULT 'building',
+    retention_days INTEGER NOT NULL DEFAULT 30, created_by VARCHAR(36) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE production_release_targets (
+    id VARCHAR(36) PRIMARY KEY, release_id VARCHAR(36) NOT NULL, tenant_id BIGINT NOT NULL,
+    project_id VARCHAR(36) NOT NULL, document_id VARCHAR(36) NOT NULL, version_id VARCHAR(36) NOT NULL,
+    target_knowledge_base_id VARCHAR(36) NOT NULL, knowledge_id VARCHAR(36) NOT NULL,
+    release_digest VARCHAR(64) NOT NULL, config_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+    config_digest VARCHAR(64) NOT NULL, status VARCHAR(20) NOT NULL DEFAULT 'building',
+    retention_days INTEGER NOT NULL DEFAULT 30, retention_until TIMESTAMP NULL,
+    activated_at TIMESTAMP NULL, failed_at TIMESTAMP NULL, rolled_back_at TIMESTAMP NULL,
+    cleanup_requested_at TIMESTAMP NULL, cleaned_at TIMESTAMP NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE production_projection_heads (
+    tenant_id BIGINT NOT NULL, document_id VARCHAR(36) NOT NULL,
+    target_knowledge_base_id VARCHAR(36) NOT NULL, active_release_target_id VARCHAR(36) NOT NULL,
+    lock_version INTEGER NOT NULL DEFAULT 1, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+INSERT INTO production_releases
+    (id, tenant_id, project_id, document_id, version_id, review_request_id, release_digest, created_by)
+VALUES
+    ('release-legacy', 1, 'project-1', 'document-1', 'version-1', 'review-1', repeat('a', 64), 'owner-1');
+INSERT INTO production_release_targets
+    (id, release_id, tenant_id, project_id, document_id, version_id, target_knowledge_base_id,
+     knowledge_id, release_digest, config_digest, status, failed_at, retention_until)
+VALUES
+    ('target-legacy-failed', 'release-legacy', 1, 'project-1', 'document-1', 'version-1', 'kb-1',
+     'knowledge-1', repeat('a', 64), repeat('b', 64), 'failed',
+     TIMESTAMP '2026-01-01 00:00:00', TIMESTAMP '2026-01-31 00:00:00');
+`)
+	require.NoError(t, err)
+
+	_, err = conn.Exec(ctx, mustReadMigration(t, "../../migrations/versioned/000075_knowledge_production_projection_integrity.up.sql"))
+	require.NoError(t, err)
+	var failureCode, failureReason string
+	err = conn.QueryRow(ctx, `SELECT failure_code, failure_reason FROM production_release_targets WHERE id = 'target-legacy-failed'`).Scan(&failureCode, &failureReason)
+	require.NoError(t, err)
+	require.Equal(t, "LEGACY_PROJECTION_FAILURE", failureCode)
+	require.Equal(t, "legacy failed target migrated without recorded failure details", failureReason)
 }
 
 func TestProductionProjectionIntegritySQLiteUpgradesAndDowngradesPopulatedPublication(t *testing.T) {

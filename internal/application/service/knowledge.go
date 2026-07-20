@@ -201,6 +201,10 @@ func productionProjectionTaskID(targetID, knowledgeID, phase string) string {
 	return fmt.Sprintf("production-projection-%s-%s-%s", phase, targetID, knowledgeID)
 }
 
+func productionProjectionAttemptTaskID(targetID, knowledgeID, phase string, attempt int) string {
+	return productionProjectionTaskID(targetID, knowledgeID, fmt.Sprintf("%s-attempt-%d", phase, attempt))
+}
+
 // finalizeSubtaskDetached evaluates the drain decision for a subtask's
 // terminal exit and — when the subtask should drain — decrements
 // pending_subtasks_count using a context DETACHED from the caller's

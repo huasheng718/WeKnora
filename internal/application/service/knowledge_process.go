@@ -148,7 +148,7 @@ func (s *knowledgeService) processDocumentFromPassage(ctx context.Context,
 			opts.QuestionCount = 3
 		}
 	}
-	s.processChunks(ctx, kb, knowledge, chunks, opts)
+	_ = s.processChunks(ctx, kb, knowledge, chunks, opts)
 }
 
 // ProcessChunksOptions contains options for processing chunks
@@ -259,7 +259,7 @@ func buildParentChildConfigs(cc types.ChunkingConfig, base chunker.SplitterConfi
 func (s *knowledgeService) processChunks(ctx context.Context,
 	kb *types.KnowledgeBase, knowledge *types.Knowledge, chunks []types.ParsedChunk,
 	opts ...ProcessChunksOptions,
-) {
+) error {
 	// Get options
 	var options ProcessChunksOptions
 	if len(opts) > 0 {
@@ -271,17 +271,19 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 	// up yet so the branch is purely "stop early".
 	if aborted, status := s.isKnowledgeAborted(ctx, knowledge.TenantID, knowledge.ID); aborted {
 		logger.Infof(ctx, "Knowledge aborted (%s), skipping chunk processing: %s", status, knowledge.ID)
-		return
+		return nil
 	}
 
 	// Get embedding model for vectorization — only needed when vector/keyword indexing is enabled
 	var embeddingModel embedding.Embedder
 	embeddingModelID := knowledge.EmbeddingModelID
 	indexingStrategy := kb.IndexingStrategy
-	if projection, projectionErr := types.ValidateProductionProjectionIntegrity(knowledge); projectionErr != nil {
+	projection, projectionErr := types.ValidateProductionProjectionIntegrity(knowledge)
+	if projectionErr != nil {
 		logger.Errorf(ctx, "Production projection integrity verification failed: %v", projectionErr)
-		return
-	} else if projection != nil {
+		return projectionErr
+	}
+	if projection != nil {
 		indexingStrategy = projection.IndexingStrategy
 	}
 	if embeddingModelID == "" {
@@ -292,7 +294,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 		embeddingModel, err = s.modelService.GetEmbeddingModel(ctx, embeddingModelID)
 		if err != nil {
 			logger.GetLogger(ctx).WithField("error", err).Errorf("processChunks get embedding model failed")
-			return
+			return nil
 		}
 	} else {
 		logger.Infof(ctx, "Vector/keyword indexing disabled for KB %s, skipping embedding model", kb.ID)
@@ -496,7 +498,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 	// Nothing has been persisted yet, so both branches just bail.
 	if aborted, status := s.isKnowledgeAborted(ctx, knowledge.TenantID, knowledge.ID); aborted {
 		logger.Infof(ctx, "Knowledge aborted (%s), skipping chunk write: %s", status, knowledge.ID)
-		return
+		return nil
 	}
 
 	// Save chunks to database — ALWAYS, regardless of indexing strategy.
@@ -512,7 +514,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 		s.repo.UpdateKnowledge(ctx, knowledge)
 		s.failStage(ctx, knowledge.ID, types.StageChunking,
 			werrors.ErrCodeChunkingFailed, "create chunks failed", err)
-		return
+		return nil
 	}
 	totalChunkChars := 0
 	for _, c := range insertChunks {
@@ -570,7 +572,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 				knowledge.ErrorMessage = err.Error()
 				knowledge.UpdatedAt = time.Now()
 				s.repo.UpdateKnowledge(ctx, knowledge)
-				return
+				return nil
 			}
 			// Check if there's enough storage quota available
 			if tenantInfo.StorageUsed+totalStorageSize > tenantInfo.StorageQuota {
@@ -578,7 +580,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 				knowledge.ErrorMessage = "存储空间不足"
 				knowledge.UpdatedAt = time.Now()
 				s.repo.UpdateKnowledge(ctx, knowledge)
-				return
+				return nil
 			}
 		}
 
@@ -592,7 +594,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 					logger.Warnf(ctx, "Failed to cleanup chunks after deletion detected: %v", err)
 				}
 			}
-			return
+			return nil
 		}
 
 		err = retrieveEngine.BatchIndex(ctx, embeddingModel, indexInfoList)
@@ -621,7 +623,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 			}
 			s.failStage(ctx, knowledge.ID, types.StageEmbedding,
 				code, "batch index failed", err)
-			return
+			return nil
 		}
 		logger.GetLogger(ctx).Infof("processChunks batch index successfully, with %d index", len(indexInfoList))
 		s.endStage(ctx, knowledge.ID, types.StageEmbedding, types.JSONMap{
@@ -643,7 +645,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 					logger.Warnf(ctx, "Failed to cleanup index after deletion detected: %v", err)
 				}
 			}
-			return
+			return nil
 		}
 	} else {
 		logger.Infof(ctx, "Vector/keyword indexing disabled for KB %s, skipping BatchIndex", kb.ID)
@@ -688,18 +690,13 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 			Language:        lang,
 			Attempt:         attemptFromCtx(ctx),
 		}
-		langfuse.InjectTracing(ctx, &postProcessPayload)
-		payloadBytes, err := json.Marshal(postProcessPayload)
-		if err == nil {
-			task := asynq.NewTask(types.TypeKnowledgePostProcess, payloadBytes,
-				knowledgePostProcessTaskOptions()...)
-			if _, err := s.task.Enqueue(task); err != nil {
-				logger.Errorf(ctx, "Failed to enqueue knowledge post process task: %v", err)
-			} else {
-				logger.Infof(ctx, "Enqueued knowledge post process task for %s", knowledge.ID)
+		if err := enqueueInitialKnowledgePostProcess(ctx, s.task, knowledge, postProcessPayload); err != nil {
+			logger.Errorf(ctx, "Failed to enqueue knowledge post process task: %v", err)
+			if projection != nil {
+				return err
 			}
 		} else {
-			logger.Errorf(ctx, "Failed to marshal knowledge post process payload: %v", err)
+			logger.Infof(ctx, "Enqueued knowledge post process task for %s", knowledge.ID)
 		}
 	}
 
@@ -709,6 +706,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 		logger.GetLogger(ctx).WithField("error", err).Errorf("processChunks update tenant storage used failed")
 	}
 	logger.GetLogger(ctx).Infof("processChunks successfully")
+	return nil
 }
 
 // defaultMaxInputChars is the default maximum characters used as input for summary generation.
@@ -3006,8 +3004,7 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 			EnableQuestionGeneration: payload.EnableQuestionGeneration,
 			QuestionCount:            payload.QuestionCount,
 		}
-		s.processChunks(ctx, kb, knowledge, passageChunks, passageOpts)
-		return nil
+		return s.processChunks(ctx, kb, knowledge, passageChunks, passageOpts)
 	} else {
 		// File import
 		convertResult, err = s.convert(ctx, payload, kb, knowledge, eff, isLastRetry)
@@ -3153,9 +3150,7 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 	}
 
 	// Step 4: Process chunks (vectorize + index + enqueue async tasks)
-	s.processChunks(ctx, kb, knowledge, chunks, processOpts)
-
-	return nil
+	return s.processChunks(ctx, kb, knowledge, chunks, processOpts)
 }
 
 // convert handles both file and URL reading using a unified ReadRequest.
@@ -3482,11 +3477,27 @@ func (s *knowledgeService) ProcessKnowledgeListReparse(ctx context.Context, t *a
 	ctx = context.WithValue(ctx, types.TenantIDContextKey, payload.TenantID)
 	ctx = context.WithValue(ctx, types.TenantInfoContextKey, tenant)
 
+	knowledgeList, err := s.repo.GetKnowledgeBatch(ctx, payload.TenantID, payload.KnowledgeIDs)
+	if err != nil {
+		return fmt.Errorf("preflight knowledge list reparse: %w", err)
+	}
+	if len(knowledgeList) != len(payload.KnowledgeIDs) {
+		return fmt.Errorf("preflight knowledge list reparse: expected %d knowledge rows, got %d",
+			len(payload.KnowledgeIDs), len(knowledgeList))
+	}
+	for _, knowledge := range knowledgeList {
+		if err := types.RejectProductionProjectionMutation(knowledge); err != nil {
+			return err
+		}
+	}
+
 	var failed int
+	var reparseErr error
 	for _, id := range payload.KnowledgeIDs {
 		if _, err := s.ReparseKnowledge(ctx, id, payload.ProcessConfig); err != nil {
 			logger.Errorf(ctx, "Failed to reparse knowledge %s: %v", id, err)
 			failed++
+			reparseErr = errors.Join(reparseErr, fmt.Errorf("reparse knowledge %s: %w", id, err))
 		}
 	}
 
@@ -3495,5 +3506,5 @@ func (s *knowledgeService) ProcessKnowledgeListReparse(ctx context.Context, t *a
 	}
 	logger.Infof(ctx, "Knowledge list reparse task finished: %d submitted, %d failed",
 		len(payload.KnowledgeIDs)-failed, failed)
-	return nil
+	return reparseErr
 }

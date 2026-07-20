@@ -241,6 +241,15 @@ func (h *KnowledgeHandler) handleDuplicateKnowledgeError(c *gin.Context,
 	return false
 }
 
+func rejectProductionProjectionMutationRequest(knowledgeList ...*types.Knowledge) error {
+	for _, knowledge := range knowledgeList {
+		if err := types.RejectProductionProjectionMutation(knowledge); err != nil {
+			return errors.NewBadRequestError(err.Error())
+		}
+	}
+	return nil
+}
+
 // enqueueKnowledgeListDelete enqueues an async batch-delete task for the
 // given knowledge IDs and returns the asynq task ID.
 func (h *KnowledgeHandler) enqueueKnowledgeListDelete(
@@ -1035,8 +1044,12 @@ func (h *KnowledgeHandler) DeleteKnowledge(c *gin.Context) {
 		return
 	}
 
-	_, effCtx, err := h.resolveKnowledgeAndValidateKBAccess(c, id, types.OrgRoleEditor)
+	knowledge, effCtx, err := h.resolveKnowledgeAndValidateKBAccess(c, id, types.OrgRoleEditor)
 	if err != nil {
+		c.Error(err)
+		return
+	}
+	if err := rejectProductionProjectionMutationRequest(knowledge); err != nil {
 		c.Error(err)
 		return
 	}
@@ -1158,6 +1171,10 @@ func (h *KnowledgeHandler) BatchDeleteKnowledge(c *gin.Context) {
 			return
 		}
 	}
+	if err := rejectProductionProjectionMutationRequest(knowledgeList...); err != nil {
+		c.Error(err)
+		return
+	}
 
 	taskID, err := h.enqueueKnowledgeListDelete(ctx, effectiveTenantID, ids)
 	if err != nil {
@@ -1225,6 +1242,10 @@ func (h *KnowledgeHandler) ClearKnowledgeBaseContents(c *gin.Context) {
 			"message": "Knowledge base is already empty",
 			"data":    gin.H{"deleted_count": 0},
 		})
+		return
+	}
+	if err := rejectProductionProjectionMutationRequest(knowledgeList...); err != nil {
+		c.Error(err)
 		return
 	}
 
@@ -2462,6 +2483,10 @@ func (h *KnowledgeHandler) BatchReparseKnowledge(c *gin.Context) {
 					secutils.SanitizeForLog(k.ID), secutils.SanitizeForLog(kbID))))
 			return
 		}
+	}
+	if err := rejectProductionProjectionMutationRequest(knowledgeList...); err != nil {
+		c.Error(err)
+		return
 	}
 
 	taskID, err := h.enqueueKnowledgeListReparse(ctx, effectiveTenantID, ids, req.ProcessConfig)

@@ -44,7 +44,7 @@ func TestShouldDropOrphanedMultimodal(t *testing.T) {
 	t.Parallel()
 	svc := &ImageMultimodalService{}
 
-	drop, err := svc.shouldDropOrphanedMultimodal(context.Background(), &types.ImageMultimodalPayload{
+	_, drop, err := svc.shouldDropOrphanedMultimodal(context.Background(), &types.ImageMultimodalPayload{
 		KnowledgeID: "missing",
 	})
 	if err != nil || drop {
@@ -52,7 +52,7 @@ func TestShouldDropOrphanedMultimodal(t *testing.T) {
 	}
 
 	svc.knowledgeRepo = &orphanKnowledgeRepo{err: repository.ErrKnowledgeNotFound}
-	drop, err = svc.shouldDropOrphanedMultimodal(context.Background(), &types.ImageMultimodalPayload{
+	_, drop, err = svc.shouldDropOrphanedMultimodal(context.Background(), &types.ImageMultimodalPayload{
 		KnowledgeID: "missing",
 	})
 	if err != nil || !drop {
@@ -60,7 +60,7 @@ func TestShouldDropOrphanedMultimodal(t *testing.T) {
 	}
 
 	svc.knowledgeRepo = &orphanKnowledgeRepo{knowledge: &types.Knowledge{ParseStatus: types.ParseStatusCancelled}}
-	drop, err = svc.shouldDropOrphanedMultimodal(context.Background(), &types.ImageMultimodalPayload{
+	_, drop, err = svc.shouldDropOrphanedMultimodal(context.Background(), &types.ImageMultimodalPayload{
 		KnowledgeID: "cancelled",
 	})
 	if err != nil || !drop {
@@ -69,7 +69,7 @@ func TestShouldDropOrphanedMultimodal(t *testing.T) {
 
 	svc.knowledgeRepo = &orphanKnowledgeRepo{knowledge: &types.Knowledge{ParseStatus: types.ParseStatusProcessing}}
 	svc.kbService = &orphanKBService{err: repository.ErrKnowledgeBaseNotFound}
-	drop, err = svc.shouldDropOrphanedMultimodal(context.Background(), &types.ImageMultimodalPayload{
+	_, drop, err = svc.shouldDropOrphanedMultimodal(context.Background(), &types.ImageMultimodalPayload{
 		KnowledgeID:     "live",
 		KnowledgeBaseID: "missing-kb",
 	})

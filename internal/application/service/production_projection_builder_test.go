@@ -322,6 +322,22 @@ func TestProjectionBuildRetryReturnsExistingOwnedKnowledgeWithoutDuplicateEnqueu
 	require.Nil(t, fixture.knowledge.created)
 }
 
+func TestProjectionBuildReplayRejectsTamperedPersistedManualContent(t *testing.T) {
+	fixture := newProjectionBuilderFixture(t)
+	existing, err := fixture.builder.Build(projectionBuildContext(), projectionTargetID)
+	require.NoError(t, err)
+	meta, err := existing.ManualMetadata()
+	require.NoError(t, err)
+	meta.Content = "# tampered persisted projection"
+	require.NoError(t, existing.SetManualMetadata(meta))
+	fixture.knowledge.existing = existing
+	fixture.knowledge.created = nil
+
+	_, err = fixture.builder.Build(projectionBuildContext(), projectionTargetID)
+	require.ErrorIs(t, err, types.ErrProductionContentDigestMismatch)
+	require.Nil(t, fixture.knowledge.created)
+}
+
 func TestProjectionBuildRejectsReleaseReviewScopeOrDigestDrift(t *testing.T) {
 	for name, mutate := range map[string]func(*projectionBuilderFixture){
 		"review_not_approved":  func(f *projectionBuilderFixture) { f.releases.release.ReviewRequestID = "wrong-review" },

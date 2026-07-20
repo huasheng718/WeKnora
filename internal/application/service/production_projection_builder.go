@@ -297,6 +297,9 @@ func validateProductionProjectionKnowledge(
 		*meta.ProductionProjection != *payload.ProductionProjection {
 		return types.ErrProductionProjectionConflict
 	}
+	if _, err := types.ValidateProductionProjectionIntegrity(knowledge); err != nil {
+		return err
+	}
 	return nil
 }
 

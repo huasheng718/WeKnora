@@ -1377,11 +1377,14 @@ func (s *knowledgeService) triggerManualProcessing(ctx context.Context,
 	}
 
 	if doSync {
-		s.processChunks(ctx, kb, knowledge, parsed, opts)
-		return nil
+		return s.processChunks(ctx, kb, knowledge, parsed, opts)
 	}
 
 	newCtx := logger.CloneContext(ctx)
-	go s.processChunks(newCtx, kb, knowledge, parsed, opts)
+	go func() {
+		if err := s.processChunks(newCtx, kb, knowledge, parsed, opts); err != nil {
+			logger.Errorf(newCtx, "background manual chunk processing failed: %v", err)
+		}
+	}()
 	return nil
 }

@@ -1,0 +1,236 @@
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"sync"
+	"testing"
+
+	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/hibiken/asynq"
+	"github.com/stretchr/testify/require"
+)
+
+type initialPostProcessKnowledgeRepo struct {
+	interfaces.KnowledgeRepository
+	knowledge *types.Knowledge
+}
+
+type initialPostProcessOneReadRepo struct {
+	interfaces.KnowledgeRepository
+	knowledge *types.Knowledge
+	calls     int
+}
+
+func (r *initialPostProcessOneReadRepo) GetKnowledgeByIDOnly(context.Context, string) (*types.Knowledge, error) {
+	r.calls++
+	if r.calls == 1 {
+		return r.knowledge, nil
+	}
+	return nil, errors.New("transient second read failure")
+}
+
+func (r *initialPostProcessKnowledgeRepo) GetKnowledgeByID(context.Context, uint64, string) (*types.Knowledge, error) {
+	return r.knowledge, nil
+}
+
+func (r *initialPostProcessKnowledgeRepo) GetKnowledgeByIDOnly(context.Context, string) (*types.Knowledge, error) {
+	return r.knowledge, nil
+}
+
+func (r *initialPostProcessKnowledgeRepo) UpdateKnowledge(_ context.Context, knowledge *types.Knowledge) error {
+	r.knowledge = knowledge
+	return nil
+}
+
+type initialPostProcessChunkService struct {
+	interfaces.ChunkService
+}
+
+func (s *initialPostProcessChunkService) DeleteChunksByKnowledgeID(context.Context, string) error {
+	return nil
+}
+
+func (s *initialPostProcessChunkService) CreateChunks(context.Context, []*types.Chunk) error {
+	return nil
+}
+
+type initialPostProcessTenantRepo struct {
+	interfaces.TenantRepository
+}
+
+func (r *initialPostProcessTenantRepo) AdjustStorageUsed(context.Context, uint64, int64) error {
+	return nil
+}
+
+type initialPostProcessGraphRepo struct {
+	interfaces.RetrieveGraphRepository
+}
+
+func (r *initialPostProcessGraphRepo) DelGraph(context.Context, []types.NameSpace) error {
+	return nil
+}
+
+type initialPostProcessEnqueuer struct {
+	mu       sync.Mutex
+	errors   []error
+	taskIDs  []string
+	payloads []*asynq.Task
+}
+
+func (e *initialPostProcessEnqueuer) Enqueue(task *asynq.Task, opts ...asynq.Option) (*asynq.TaskInfo, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	taskID := ""
+	for _, opt := range opts {
+		if opt.Type() == asynq.TaskIDOpt {
+			taskID = opt.Value().(string)
+		}
+	}
+	e.taskIDs = append(e.taskIDs, taskID)
+	e.payloads = append(e.payloads, task)
+	call := len(e.taskIDs) - 1
+	if call < len(e.errors) && e.errors[call] != nil {
+		return nil, e.errors[call]
+	}
+	return &asynq.TaskInfo{ID: taskID, Queue: types.QueueDefault}, nil
+}
+
+func initialPostProcessProjectionKnowledge(t *testing.T, status string) *types.Knowledge {
+	t.Helper()
+	content := "# governed projection"
+	knowledge := &types.Knowledge{
+		ID: "projection-knowledge-1", TenantID: 1, KnowledgeBaseID: "kb-1",
+		Type: types.KnowledgeTypeManual, ParseStatus: status,
+	}
+	meta := types.NewManualKnowledgeMetadata(content, types.ManualKnowledgeStatusPublish, 1)
+	meta.ProductionProjection = &types.ProductionProjectionMetadata{
+		DocumentID: "document-1", VersionID: "version-1", ReleaseTargetID: "target-1",
+		ContentDigest: projectionKnowledgeContentDigest(content), SummaryModelID: "summary-1",
+		IndexingStrategy: types.IndexingStrategy{WikiEnabled: true},
+	}
+	require.NoError(t, knowledge.SetManualMetadata(meta))
+	graphEnabled := false
+	require.NoError(t, knowledge.SetProcessOverrides(&types.KnowledgeProcessOverrides{
+		ChunkingConfig: &types.ChunkingConfig{Strategy: "recursive", ChunkSize: 512, ChunkOverlap: 32},
+		GraphEnabled:   &graphEnabled,
+		ExtractConfig:  &types.ExtractConfig{Enabled: false},
+	}))
+	return knowledge
+}
+
+func initialPostProcessContext(attempt int) context.Context {
+	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(1))
+	ctx = context.WithValue(ctx, types.TenantInfoContextKey, &types.Tenant{ID: 1})
+	return withAttempt(ctx, attempt)
+}
+
+func TestProductionProjectionDirectPostProcessEnqueueFailureRetriesDeterministically(t *testing.T) {
+	t.Setenv("RETRIEVE_DRIVER", "")
+	queueErr := errors.New("post-process queue unavailable")
+	knowledge := initialPostProcessProjectionKnowledge(t, types.ParseStatusProcessing)
+	repo := &initialPostProcessKnowledgeRepo{knowledge: knowledge}
+	tasks := &initialPostProcessEnqueuer{errors: []error{queueErr, nil, asynq.ErrTaskIDConflict}}
+	service := &knowledgeService{
+		repo: repo, chunkService: &initialPostProcessChunkService{},
+		tenantRepo: &initialPostProcessTenantRepo{}, graphEngine: &initialPostProcessGraphRepo{},
+		task: tasks,
+	}
+	kb := &types.KnowledgeBase{ID: knowledge.KnowledgeBaseID, TenantID: knowledge.TenantID}
+	content := "# governed projection"
+
+	err := service.triggerManualProcessing(initialPostProcessContext(7), kb, knowledge, content, true)
+	require.ErrorIs(t, err, queueErr)
+	require.NoError(t, service.triggerManualProcessing(initialPostProcessContext(7), kb, knowledge, content, true))
+	require.NoError(t, service.triggerManualProcessing(initialPostProcessContext(7), kb, knowledge, content, true))
+	require.Equal(t, []string{
+		"production-projection-post-process-attempt-7-target-1-projection-knowledge-1",
+		"production-projection-post-process-attempt-7-target-1-projection-knowledge-1",
+		"production-projection-post-process-attempt-7-target-1-projection-knowledge-1",
+	}, tasks.taskIDs)
+}
+
+func TestOrdinaryDirectPostProcessEnqueueFailureRemainsBestEffort(t *testing.T) {
+	t.Setenv("RETRIEVE_DRIVER", "")
+	knowledge := &types.Knowledge{
+		ID: "ordinary-knowledge-1", TenantID: 1, KnowledgeBaseID: "kb-1",
+		Type: types.KnowledgeTypeManual, ParseStatus: types.ParseStatusProcessing,
+	}
+	require.NoError(t, knowledge.SetManualMetadata(types.NewManualKnowledgeMetadata(
+		"# ordinary", types.ManualKnowledgeStatusPublish, 1,
+	)))
+	tasks := &initialPostProcessEnqueuer{errors: []error{errors.New("queue unavailable")}}
+	service := &knowledgeService{
+		repo:         &initialPostProcessKnowledgeRepo{knowledge: knowledge},
+		chunkService: &initialPostProcessChunkService{}, tenantRepo: &initialPostProcessTenantRepo{},
+		graphEngine: &initialPostProcessGraphRepo{}, task: tasks,
+	}
+
+	require.NoError(t, service.triggerManualProcessing(
+		initialPostProcessContext(3), &types.KnowledgeBase{ID: "kb-1"}, knowledge, "# ordinary", true,
+	))
+}
+
+func TestProductionProjectionMultimodalPostProcessEnqueueFailureRetriesDeterministically(t *testing.T) {
+	queueErr := errors.New("post-process queue unavailable")
+	knowledge := initialPostProcessProjectionKnowledge(t, types.ParseStatusCancelled)
+	tasks := &initialPostProcessEnqueuer{errors: []error{queueErr, nil, asynq.ErrTaskIDConflict}}
+	service := &ImageMultimodalService{
+		knowledgeRepo: &initialPostProcessKnowledgeRepo{knowledge: knowledge}, taskEnqueuer: tasks,
+	}
+	payload := types.ImageMultimodalPayload{
+		TenantID: knowledge.TenantID, KnowledgeID: knowledge.ID, KnowledgeBaseID: knowledge.KnowledgeBaseID,
+		Attempt: 7,
+	}
+	payloadBytes, err := json.Marshal(payload)
+	require.NoError(t, err)
+	task := asynq.NewTask(types.TypeImageMultimodal, payloadBytes)
+
+	require.ErrorIs(t, service.Handle(context.Background(), task), queueErr)
+	require.NoError(t, service.Handle(context.Background(), task))
+	require.NoError(t, service.Handle(context.Background(), task))
+	require.Equal(t, []string{
+		"production-projection-post-process-attempt-7-target-1-projection-knowledge-1",
+		"production-projection-post-process-attempt-7-target-1-projection-knowledge-1",
+		"production-projection-post-process-attempt-7-target-1-projection-knowledge-1",
+	}, tasks.taskIDs)
+	var postProcessPayload types.KnowledgePostProcessPayload
+	require.NoError(t, json.Unmarshal(tasks.payloads[1].Payload(), &postProcessPayload))
+	require.Equal(t, 7, postProcessPayload.Attempt)
+}
+
+func TestProductionProjectionMultimodalCarriesGuardedKnowledgeIntoEnqueue(t *testing.T) {
+	queueErr := errors.New("post-process queue unavailable")
+	knowledge := initialPostProcessProjectionKnowledge(t, types.ParseStatusCancelled)
+	repo := &initialPostProcessOneReadRepo{knowledge: knowledge}
+	service := &ImageMultimodalService{
+		knowledgeRepo: repo,
+		taskEnqueuer:  &initialPostProcessEnqueuer{errors: []error{queueErr}},
+	}
+	payload, err := json.Marshal(types.ImageMultimodalPayload{
+		TenantID: 1, KnowledgeID: knowledge.ID, KnowledgeBaseID: knowledge.KnowledgeBaseID, Attempt: 7,
+	})
+	require.NoError(t, err)
+
+	err = service.Handle(context.Background(), asynq.NewTask(types.TypeImageMultimodal, payload))
+	require.ErrorIs(t, err, queueErr)
+	require.Equal(t, 1, repo.calls, "the guarded Knowledge row must be reused at the enqueue boundary")
+}
+
+func TestOrdinaryMultimodalPostProcessEnqueueFailureRemainsBestEffort(t *testing.T) {
+	knowledge := &types.Knowledge{
+		ID: "ordinary-knowledge-1", TenantID: 1, KnowledgeBaseID: "kb-1",
+		ParseStatus: types.ParseStatusCancelled,
+	}
+	service := &ImageMultimodalService{
+		knowledgeRepo: &initialPostProcessKnowledgeRepo{knowledge: knowledge},
+		taskEnqueuer:  &initialPostProcessEnqueuer{errors: []error{errors.New("queue unavailable")}},
+	}
+	payload, err := json.Marshal(types.ImageMultimodalPayload{
+		TenantID: 1, KnowledgeID: knowledge.ID, KnowledgeBaseID: knowledge.KnowledgeBaseID, Attempt: 2,
+	})
+	require.NoError(t, err)
+	require.NoError(t, service.Handle(context.Background(), asynq.NewTask(types.TypeImageMultimodal, payload)))
+}

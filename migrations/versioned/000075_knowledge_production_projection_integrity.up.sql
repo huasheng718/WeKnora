@@ -8,6 +8,11 @@ ALTER TABLE production_release_targets
     ADD COLUMN failure_code VARCHAR(64) NOT NULL DEFAULT '',
     ADD COLUMN failure_reason VARCHAR(256) NOT NULL DEFAULT '';
 
+UPDATE production_release_targets
+SET failure_code = 'LEGACY_PROJECTION_FAILURE',
+    failure_reason = 'legacy failed target migrated without recorded failure details'
+WHERE status = 'failed';
+
 ALTER TABLE production_release_targets
     ADD CONSTRAINT chk_production_release_targets_failure CHECK (
         failure_code ~ '^[A-Z0-9_]*$' AND
