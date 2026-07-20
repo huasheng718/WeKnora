@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -240,7 +241,7 @@ func (r *productionReleaseRepository) GetTarget(ctx context.Context, tenantID ui
 	err := database.DBFromContext(ctx, r.db).WithContext(ctx).
 		Where("tenant_id = ? AND id = ?", tenantID, targetID).First(&target).Error
 	if err != nil {
-		return nil, err
+		return nil, translateProductionReleaseTargetReadError(err)
 	}
 	if err := normalizeProductionReleaseTargetConfig(&target); err != nil {
 		return nil, err
@@ -254,6 +255,9 @@ func normalizeProductionReleaseTargetConfig(target *types.ProductionReleaseTarge
 	if target == nil {
 		return fmt.Errorf("%w: persisted target is missing", types.ErrProductionReleaseConfigInvalid)
 	}
+	if len(target.ConfigSnapshot) == 0 {
+		return fmt.Errorf("%w: persisted snapshot is missing", types.ErrProductionReleaseConfigInvalid)
+	}
 	canonical, digest, err := types.CanonicalProductionReleaseTargetConfig(target.ConfigSnapshot)
 	if err != nil {
 		return err
@@ -263,6 +267,19 @@ func normalizeProductionReleaseTargetConfig(target *types.ProductionReleaseTarge
 	}
 	target.ConfigSnapshot = canonical
 	return nil
+}
+
+func translateProductionReleaseTargetReadError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var syntaxError *json.SyntaxError
+	lower := strings.ToLower(err.Error())
+	if errors.As(err, &syntaxError) ||
+		(strings.Contains(lower, "config_snapshot") && strings.Contains(lower, "scan error")) {
+		return fmt.Errorf("%w: persisted snapshot cannot be decoded", types.ErrProductionReleaseConfigInvalid)
+	}
+	return err
 }
 
 func (r *productionReleaseRepository) TransitionTarget(
@@ -475,7 +492,7 @@ func (r *productionReleaseRepository) ListProjectionHistory(
 		Where("tenant_id = ? AND document_id = ? AND target_knowledge_base_id = ?", tenantID, documentID, kbID).
 		Order("created_at DESC, id DESC").Find(&targets).Error
 	if err != nil {
-		return nil, err
+		return nil, translateProductionReleaseTargetReadError(err)
 	}
 	for _, target := range targets {
 		if err := normalizeProductionReleaseTargetConfig(target); err != nil {

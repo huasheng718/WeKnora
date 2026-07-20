@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"database/sql/driver"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -227,6 +228,117 @@ func TestProductionReleaseGetTargetCanonicalizesPostgresJSONBScan(t *testing.T) 
 	require.Equal(t, canonical, target.ConfigSnapshot)
 	require.Equal(t, digest, target.ConfigDigest)
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestProductionReleaseGetTargetRejectsNullOrEmptyPersistedConfig(t *testing.T) {
+	_, emptyDigest, err := types.CanonicalProductionReleaseTargetConfig(types.JSON(`{}`))
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name     string
+		snapshot any
+	}{
+		{name: "null", snapshot: nil},
+		{name: "empty bytes", snapshot: []byte{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sqlDB, mock, mockErr := sqlmock.New()
+			require.NoError(t, mockErr)
+			t.Cleanup(func() { _ = sqlDB.Close() })
+			db, openErr := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{})
+			require.NoError(t, openErr)
+			mock.ExpectQuery(`SELECT \* FROM "production_release_targets"`).
+				WithArgs(reviewTenantID, releaseTarget1, 1).
+				WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "config_snapshot", "config_digest"}).
+					AddRow(releaseTarget1, reviewTenantID, tc.snapshot, emptyDigest))
+
+			target, getErr := NewProductionReleaseRepository(db).GetTarget(context.Background(), reviewTenantID, releaseTarget1)
+			require.ErrorIs(t, getErr, types.ErrProductionReleaseConfigInvalid)
+			require.Nil(t, target)
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
+func TestProductionReleaseHistoryRejectsNullOrEmptyPersistedConfig(t *testing.T) {
+	_, emptyDigest, err := types.CanonicalProductionReleaseTargetConfig(types.JSON(`{}`))
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name     string
+		snapshot any
+	}{
+		{name: "null", snapshot: nil},
+		{name: "empty bytes", snapshot: []byte{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sqlDB, mock, mockErr := sqlmock.New()
+			require.NoError(t, mockErr)
+			t.Cleanup(func() { _ = sqlDB.Close() })
+			db, openErr := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{})
+			require.NoError(t, openErr)
+			mock.ExpectQuery(`SELECT \* FROM "production_release_targets"`).
+				WithArgs(reviewTenantID, reviewDocumentID, releaseKBOne).
+				WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "document_id", "target_knowledge_base_id", "config_snapshot", "config_digest"}).
+					AddRow(releaseTarget1, reviewTenantID, reviewDocumentID, releaseKBOne, tc.snapshot, emptyDigest))
+
+			history, listErr := NewProductionReleaseRepository(db).ListProjectionHistory(
+				context.Background(), reviewTenantID, reviewDocumentID, releaseKBOne,
+			)
+			require.ErrorIs(t, listErr, types.ErrProductionReleaseConfigInvalid)
+			require.Nil(t, history)
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
+func TestProductionReleaseTargetReadsTranslateInvalidJSONScanError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		read func(*gorm.DB) error
+		args []driver.Value
+		row  *sqlmock.Rows
+	}{
+		{
+			name: "get target",
+			read: func(db *gorm.DB) error {
+				target, err := NewProductionReleaseRepository(db).GetTarget(context.Background(), reviewTenantID, releaseTarget1)
+				require.Nil(t, target)
+				return err
+			},
+			args: []driver.Value{reviewTenantID, releaseTarget1, 1},
+			row: sqlmock.NewRows([]string{"id", "tenant_id", "config_snapshot", "config_digest"}).
+				AddRow(releaseTarget1, reviewTenantID, []byte(`{"broken":`), strings.Repeat("a", 64)),
+		},
+		{
+			name: "history",
+			read: func(db *gorm.DB) error {
+				history, err := NewProductionReleaseRepository(db).ListProjectionHistory(
+					context.Background(), reviewTenantID, reviewDocumentID, releaseKBOne,
+				)
+				require.Nil(t, history)
+				return err
+			},
+			args: []driver.Value{reviewTenantID, reviewDocumentID, releaseKBOne},
+			row: sqlmock.NewRows([]string{"id", "tenant_id", "document_id", "target_knowledge_base_id", "config_snapshot", "config_digest"}).
+				AddRow(releaseTarget1, reviewTenantID, reviewDocumentID, releaseKBOne, []byte(`{"broken":`), strings.Repeat("a", 64)),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sqlDB, mock, err := sqlmock.New()
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = sqlDB.Close() })
+			db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{
+				Logger: logger.Default.LogMode(logger.Silent),
+			})
+			require.NoError(t, err)
+			mock.ExpectQuery(`SELECT \* FROM "production_release_targets"`).WithArgs(tc.args...).WillReturnRows(tc.row)
+
+			readErr := tc.read(db)
+			require.ErrorIs(t, readErr, types.ErrProductionReleaseConfigInvalid)
+			require.NotContains(t, readErr.Error(), "unexpected end of JSON input")
+			require.NotContains(t, readErr.Error(), "Scan error")
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
 }
 
 func TestProductionReleasePostgresLiveJSONBRoundTrip(t *testing.T) {
