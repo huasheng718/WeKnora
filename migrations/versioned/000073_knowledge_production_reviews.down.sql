@@ -1,0 +1,36 @@
+DROP TRIGGER IF EXISTS trg_production_review_steps_prevent_replace ON production_review_steps;
+DROP FUNCTION IF EXISTS prevent_production_review_step_replace();
+DROP TRIGGER IF EXISTS trg_production_review_steps_prevent_delete ON production_review_steps;
+DROP FUNCTION IF EXISTS prevent_production_review_step_delete();
+DROP TRIGGER IF EXISTS trg_production_review_steps_guard_decision ON production_review_steps;
+DROP FUNCTION IF EXISTS guard_production_review_step_decision();
+DROP TRIGGER IF EXISTS trg_production_review_steps_fence_parent_insert ON production_review_steps;
+DROP FUNCTION IF EXISTS validate_production_review_step_parent();
+DROP TRIGGER IF EXISTS trg_production_review_requests_fence_terminal_children ON production_review_requests;
+DROP FUNCTION IF EXISTS fence_terminal_production_review_children();
+DROP TRIGGER IF EXISTS trg_production_review_requests_prevent_replace ON production_review_requests;
+DROP FUNCTION IF EXISTS prevent_production_review_request_replace();
+DROP TRIGGER IF EXISTS trg_production_review_requests_prevent_delete ON production_review_requests;
+DROP FUNCTION IF EXISTS prevent_production_review_request_delete();
+DROP TRIGGER IF EXISTS trg_production_review_requests_guard_identity ON production_review_requests;
+DROP FUNCTION IF EXISTS guard_production_review_request_identity();
+DROP FUNCTION IF EXISTS validate_production_review_request_submission();
+DROP TRIGGER IF EXISTS trg_production_annotations_prevent_replace ON production_annotations;
+DROP FUNCTION IF EXISTS prevent_production_annotation_replace();
+DROP TRIGGER IF EXISTS trg_production_annotations_prevent_delete ON production_annotations;
+DROP FUNCTION IF EXISTS prevent_production_annotation_delete();
+DROP TRIGGER IF EXISTS trg_production_annotations_guard ON production_annotations;
+DROP FUNCTION IF EXISTS guard_production_annotation();
+
+DROP TABLE IF EXISTS production_review_steps;
+DROP TABLE IF EXISTS production_review_requests;
+DROP TABLE IF EXISTS production_annotations;
+
+DROP INDEX IF EXISTS uq_production_review_requests_pending_version_policy;
+DROP INDEX IF EXISTS idx_production_review_steps_request_role_decision;
+DROP INDEX IF EXISTS idx_production_review_steps_request_sequence;
+DROP INDEX IF EXISTS idx_production_review_requests_document_version_status;
+DROP INDEX IF EXISTS idx_production_annotations_block_status;
+DROP INDEX IF EXISTS idx_production_annotations_document_version_status;
+DROP INDEX IF EXISTS uq_production_document_blocks_review_anchor;
+DROP INDEX IF EXISTS uq_production_document_versions_review_context;

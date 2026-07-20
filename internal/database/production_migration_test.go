@@ -62,6 +62,117 @@ func TestProductionRunsMigrationsDeclareRequiredTables(t *testing.T) {
 	}
 }
 
+func TestProductionReviewMigrationsDeclareRequiredTables(t *testing.T) {
+	postgres := mustReadMigration(t, "../../migrations/versioned/000073_knowledge_production_reviews.up.sql")
+	sqlite := mustReadMigration(t, "../../migrations/sqlite/000004_knowledge_production_reviews.up.sql")
+
+	for _, table := range []string{
+		"production_annotations",
+		"production_review_requests",
+		"production_review_steps",
+	} {
+		require.Contains(t, postgres, "CREATE TABLE IF NOT EXISTS "+table)
+		require.Contains(t, sqlite, "CREATE TABLE IF NOT EXISTS "+table)
+	}
+}
+
+func TestProductionReviewPostgreSQLMigrationDeclaresIntegrityGuards(t *testing.T) {
+	up := mustReadMigration(t, "../../migrations/versioned/000073_knowledge_production_reviews.up.sql")
+	_, err := pg_query.Parse(up)
+	require.NoError(t, err)
+
+	for _, declaration := range []string{
+		"policy_snapshot JSONB NOT NULL",
+		"policy_digest VARCHAR(64) NOT NULL",
+		"FOREIGN KEY (document_id, tenant_id, project_id)\n        REFERENCES production_documents(id, tenant_id, project_id)",
+		"FOREIGN KEY (version_id, document_id, tenant_id, project_id)\n        REFERENCES production_document_versions(id, document_id, tenant_id, project_id)",
+		"FOREIGN KEY (block_id, version_id)\n        REFERENCES production_document_blocks(id, version_id)",
+		"CREATE UNIQUE INDEX IF NOT EXISTS uq_production_review_requests_pending_version_policy",
+		"CREATE INDEX IF NOT EXISTS idx_production_review_requests_document_version_status",
+		"CREATE INDEX IF NOT EXISTS idx_production_review_steps_request_sequence",
+		"CREATE INDEX IF NOT EXISTS idx_production_review_steps_request_role_decision",
+		"CREATE TRIGGER trg_production_review_requests_guard_identity",
+		"CREATE TRIGGER trg_production_review_steps_guard_decision",
+		"CREATE TRIGGER trg_production_review_requests_fence_terminal_children",
+	} {
+		require.Contains(t, up, declaration)
+	}
+
+	down := mustReadMigration(t, "../../migrations/versioned/000073_knowledge_production_reviews.down.sql")
+	_, err = pg_query.Parse(down)
+	require.NoError(t, err)
+	require.Less(t, strings.Index(down, "DROP TABLE IF EXISTS production_review_steps"), strings.Index(down, "DROP TABLE IF EXISTS production_review_requests"))
+	require.Less(t, strings.Index(down, "DROP TABLE IF EXISTS production_review_requests"), strings.Index(down, "DROP TABLE IF EXISTS production_annotations"))
+}
+
+func TestProductionReviewSQLiteMigrationEnforcesAnchorsAndTerminalReviewGuards(t *testing.T) {
+	db := openProductionReviewSQLite(t)
+	seedProductionRunScopes(t, db)
+	insertProductionVersion(t, db, "version-review", "document-1", 1, "project-1", 2, "source-set-1", "")
+	_, err := db.Exec(`INSERT INTO production_document_versions (id, document_id, tenant_id, project_id, version_number, source_set_id, origin, content_digest, created_by, frozen_at) VALUES ('version-frozen', 'document-1', 1, 'project-1', 3, 'source-set-1', 'human', 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', 'owner-1', CURRENT_TIMESTAMP)`)
+	require.NoError(t, err)
+	insertProductionBlock(t, db, "block-review", "version-review", "block-review")
+	insertProductionBlock(t, db, "block-frozen", "version-frozen", "block-frozen")
+	insertProductionBlock(t, db, "block-other", "version-2", "block-other")
+	_, err = db.Exec(`INSERT INTO production_project_members (project_id, user_id, role, assigned_by) VALUES ('project-1', 'compliance-1', 'compliance_reviewer', 'owner-1')`)
+	require.NoError(t, err)
+
+	_, err = db.Exec(`INSERT INTO production_annotations (id, tenant_id, project_id, document_id, version_id, block_id, annotation_type, severity, anchor, body, created_by) VALUES ('bad-anchor', 1, 'project-1', 'document-1', 'version-review', 'block-other', 'comment', 'info', '{}', 'bad', 'author-1')`)
+	require.Error(t, err, "a cross-version block must not be a valid annotation anchor")
+	_, err = db.Exec(`INSERT INTO production_annotations (id, tenant_id, project_id, document_id, version_id, block_id, annotation_type, severity, anchor, body, created_by) VALUES ('bad-quality-tag', 1, 'project-1', 'document-1', 'version-frozen', 'block-frozen', 'quality_tag', 'warning', '{}', 'missing category', 'author-1')`)
+	require.Error(t, err, "quality tags require an explicit constrained category")
+	_, err = db.Exec(`INSERT INTO production_annotations (id, tenant_id, project_id, document_id, version_id, block_id, annotation_type, quality_tag, severity, anchor, body, created_by) VALUES ('annotation-1', 1, 'project-1', 'document-1', 'version-frozen', 'block-frozen', 'quality_tag', 'missing_evidence', 'blocking', '{"path":"/title"}', 'needs evidence', 'author-1')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_review_requests (id, tenant_id, project_id, document_id, version_id, policy_snapshot, policy_digest, submitted_by) VALUES ('review-blocked', 1, 'project-1', 'document-1', 'version-frozen', '{"steps":["compliance_reviewer"]}', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'author-1')`)
+	require.ErrorContains(t, err, "open blocking annotations prevent review submission")
+	_, err = db.Exec(`UPDATE production_annotations SET status = 'resolved', resolved_by = 'author-1', resolved_at = CURRENT_TIMESTAMP WHERE id = 'annotation-1'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_annotations SET block_id = 'block-review' WHERE id = 'annotation-1'`)
+	require.ErrorContains(t, err, "production annotation anchor is immutable")
+	_, err = db.Exec(`UPDATE production_annotations SET status = 'open', resolved_by = NULL, resolved_at = NULL WHERE id = 'annotation-1'`)
+	require.ErrorContains(t, err, "terminal production annotations are immutable")
+
+	_, err = db.Exec(`INSERT INTO production_review_requests (id, tenant_id, project_id, document_id, version_id, policy_snapshot, policy_digest, submitted_by) VALUES ('review-unfrozen-version', 1, 'project-1', 'document-1', 'version-review', '{}', '9999999999999999999999999999999999999999999999999999999999999999', 'author-1')`)
+	require.NoError(t, err, "append-only document versions are immutable review targets without a mutable freeze update")
+	_, err = db.Exec(`INSERT INTO production_review_requests (id, tenant_id, project_id, document_id, version_id, policy_snapshot, policy_digest, submitted_by) VALUES ('review-1', 1, 'project-1', 'document-1', 'version-frozen', '{"steps":["compliance_reviewer"]}', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'author-1')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_review_requests (id, tenant_id, project_id, document_id, version_id, policy_snapshot, policy_digest, submitted_by) VALUES ('review-missing-reason', 1, 'project-1', 'document-1', 'version-frozen', '{}', 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', 'author-1')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_review_requests SET status = 'rejected', terminal_by = 'owner-1', completed_at = CURRENT_TIMESTAMP WHERE id = 'review-missing-reason'`)
+	require.Error(t, err, "terminal rejection requires a reason")
+	_, err = db.Exec(`INSERT INTO production_review_steps (id, review_request_id, tenant_id, project_id, document_id, version_id, required_role, sequence) VALUES ('step-1', 'review-1', 1, 'project-1', 'document-1', 'version-frozen', 'compliance_reviewer', 1)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_review_steps SET decision = 'approved', reviewer_user_id = 'owner-1', comment = 'ok', decided_at = CURRENT_TIMESTAMP WHERE id = 'step-1'`)
+	require.ErrorContains(t, err, "required review role")
+	_, err = db.Exec(`UPDATE production_review_steps SET decision = 'approved', reviewer_user_id = 'compliance-1', comment = 'ok', decided_at = CURRENT_TIMESTAMP WHERE id = 'step-1'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_review_requests SET status = 'approved', terminal_by = 'owner-1', completed_at = CURRENT_TIMESTAMP WHERE id = 'review-1'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_review_steps SET comment = 'changed' WHERE id = 'step-1'`)
+	require.ErrorContains(t, err, "terminal production review steps are immutable")
+	_, err = db.Exec(`INSERT OR REPLACE INTO production_review_requests (id, tenant_id, project_id, document_id, version_id, policy_snapshot, policy_digest, submitted_by) VALUES ('review-1', 1, 'project-1', 'document-1', 'version-frozen', '{}', 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', 'author-1')`)
+	require.ErrorContains(t, err, "production review requests cannot be replaced")
+}
+
+func TestProductionReviewSQLiteMigrationRollsBackPopulatedSchema(t *testing.T) {
+	db := openProductionReviewSQLite(t)
+	seedProductionRunScopes(t, db)
+	_, err := db.Exec(`INSERT INTO production_document_versions (id, document_id, tenant_id, project_id, version_number, source_set_id, origin, content_digest, created_by, frozen_at) VALUES ('version-rollback-review', 'document-1', 1, 'project-1', 3, 'source-set-1', 'human', 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', 'owner-1', CURRENT_TIMESTAMP)`)
+	require.NoError(t, err)
+	insertProductionBlock(t, db, "block-rollback-review", "version-rollback-review", "block-rollback-review")
+	_, err = db.Exec(`INSERT INTO production_annotations (id, tenant_id, project_id, document_id, version_id, block_id, annotation_type, severity, anchor, body, created_by) VALUES ('annotation-rollback', 1, 'project-1', 'document-1', 'version-rollback-review', 'block-rollback-review', 'comment', 'info', '{}', 'note', 'author-1')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_review_requests (id, tenant_id, project_id, document_id, version_id, policy_snapshot, policy_digest, submitted_by) VALUES ('review-rollback', 1, 'project-1', 'document-1', 'version-rollback-review', '{"steps":["business_reviewer"]}', 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff', 'author-1')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_review_steps (id, review_request_id, tenant_id, project_id, document_id, version_id, required_role, sequence) VALUES ('step-rollback', 'review-rollback', 1, 'project-1', 'document-1', 'version-rollback-review', 'business_reviewer', 1)`)
+	require.NoError(t, err)
+	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000004_knowledge_production_reviews.down.sql"))
+	require.NoError(t, err)
+	for _, table := range []string{"production_review_steps", "production_review_requests", "production_annotations"} {
+		require.Empty(t, sqliteMasterSQL(t, db, "table", table))
+	}
+}
+
 func TestProductionRunsPostgreSQLMigrationDeclaresEquivalentStructure(t *testing.T) {
 	up := mustReadMigration(t, "../../migrations/versioned/000072_knowledge_production_runs.up.sql")
 	_, err := pg_query.Parse(up)
@@ -1098,6 +1209,15 @@ func openProductionRunsSQLite(t *testing.T) *sql.DB {
 
 	db := openProductionDocumentsSQLite(t)
 	_, err := db.Exec(mustReadMigration(t, "../../migrations/sqlite/000003_knowledge_production_runs.up.sql"))
+	require.NoError(t, err)
+	return db
+}
+
+func openProductionReviewSQLite(t *testing.T) *sql.DB {
+	t.Helper()
+
+	db := openProductionRunsSQLite(t)
+	_, err := db.Exec(mustReadMigration(t, "../../migrations/sqlite/000004_knowledge_production_reviews.up.sql"))
 	require.NoError(t, err)
 	return db
 }

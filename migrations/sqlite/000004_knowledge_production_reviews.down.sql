@@ -1,0 +1,30 @@
+DROP TRIGGER IF EXISTS trg_production_review_steps_prevent_replace;
+DROP TRIGGER IF EXISTS trg_production_review_steps_prevent_delete;
+DROP TRIGGER IF EXISTS trg_production_review_steps_validate_role;
+DROP TRIGGER IF EXISTS trg_production_review_steps_guard_identity;
+DROP TRIGGER IF EXISTS trg_production_review_steps_guard_terminal;
+DROP TRIGGER IF EXISTS trg_production_review_steps_fence_parent_update;
+DROP TRIGGER IF EXISTS trg_production_review_steps_fence_parent_insert;
+DROP TRIGGER IF EXISTS trg_production_review_requests_fence_terminal_children;
+DROP TRIGGER IF EXISTS trg_production_review_requests_prevent_replace;
+DROP TRIGGER IF EXISTS trg_production_review_requests_prevent_delete;
+DROP TRIGGER IF EXISTS trg_production_review_requests_guard_identity;
+DROP TRIGGER IF EXISTS trg_production_review_requests_guard_terminal;
+DROP TRIGGER IF EXISTS trg_production_review_requests_blocking_annotations;
+DROP TRIGGER IF EXISTS trg_production_annotations_prevent_replace;
+DROP TRIGGER IF EXISTS trg_production_annotations_prevent_delete;
+DROP TRIGGER IF EXISTS trg_production_annotations_guard_anchor;
+DROP TRIGGER IF EXISTS trg_production_annotations_guard;
+
+DROP TABLE IF EXISTS production_review_steps;
+DROP TABLE IF EXISTS production_review_requests;
+DROP TABLE IF EXISTS production_annotations;
+
+DROP INDEX IF EXISTS uq_production_review_requests_pending_version_policy;
+DROP INDEX IF EXISTS idx_production_review_steps_request_role_decision;
+DROP INDEX IF EXISTS idx_production_review_steps_request_sequence;
+DROP INDEX IF EXISTS idx_production_review_requests_document_version_status;
+DROP INDEX IF EXISTS idx_production_annotations_block_status;
+DROP INDEX IF EXISTS idx_production_annotations_document_version_status;
+DROP INDEX IF EXISTS uq_production_document_blocks_review_anchor;
+DROP INDEX IF EXISTS uq_production_document_versions_review_context;
