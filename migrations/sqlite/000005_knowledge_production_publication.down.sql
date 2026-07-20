@@ -1,0 +1,18 @@
+DROP TRIGGER IF EXISTS trg_production_projection_heads_guard;
+DROP TRIGGER IF EXISTS trg_production_projection_heads_validate_insert;
+DROP TRIGGER IF EXISTS trg_production_release_targets_prevent_replace;
+DROP TRIGGER IF EXISTS trg_production_release_targets_prevent_delete;
+DROP TRIGGER IF EXISTS trg_production_release_targets_guard;
+DROP TRIGGER IF EXISTS trg_production_release_targets_validate_initial_state;
+DROP TRIGGER IF EXISTS trg_production_releases_prevent_replace;
+DROP TRIGGER IF EXISTS trg_production_releases_prevent_delete;
+DROP TRIGGER IF EXISTS trg_production_releases_guard_identity;
+DROP TRIGGER IF EXISTS trg_production_releases_validate_approved_review;
+
+DROP TABLE IF EXISTS production_projection_heads;
+DROP TABLE IF EXISTS production_release_targets;
+DROP TABLE IF EXISTS production_releases;
+
+DROP INDEX IF EXISTS idx_production_release_targets_document_status;
+DROP INDEX IF EXISTS idx_production_releases_document_status;
+DROP INDEX IF EXISTS uq_knowledge_bases_id_tenant;

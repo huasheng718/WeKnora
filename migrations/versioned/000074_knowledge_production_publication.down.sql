@@ -1,0 +1,28 @@
+DROP TRIGGER IF EXISTS trg_production_projection_heads_guard ON production_projection_heads;
+DROP FUNCTION IF EXISTS guard_production_projection_head();
+DROP TRIGGER IF EXISTS trg_production_projection_heads_validate_insert ON production_projection_heads;
+DROP FUNCTION IF EXISTS validate_production_projection_head_insert();
+DROP TRIGGER IF EXISTS trg_production_release_targets_prevent_replace ON production_release_targets;
+DROP FUNCTION IF EXISTS prevent_production_release_target_replace();
+DROP TRIGGER IF EXISTS trg_production_release_targets_prevent_delete ON production_release_targets;
+DROP FUNCTION IF EXISTS prevent_production_release_target_delete();
+DROP TRIGGER IF EXISTS trg_production_release_targets_guard ON production_release_targets;
+DROP FUNCTION IF EXISTS guard_production_release_target();
+DROP TRIGGER IF EXISTS trg_production_release_targets_validate_initial_state ON production_release_targets;
+DROP FUNCTION IF EXISTS validate_production_release_target_initial_state();
+DROP TRIGGER IF EXISTS trg_production_releases_prevent_replace ON production_releases;
+DROP FUNCTION IF EXISTS prevent_production_release_replace();
+DROP TRIGGER IF EXISTS trg_production_releases_prevent_delete ON production_releases;
+DROP FUNCTION IF EXISTS prevent_production_release_delete();
+DROP TRIGGER IF EXISTS trg_production_releases_guard_identity ON production_releases;
+DROP FUNCTION IF EXISTS guard_production_release_identity();
+DROP TRIGGER IF EXISTS trg_production_releases_validate_approved_review ON production_releases;
+DROP FUNCTION IF EXISTS validate_production_release_approved_review();
+
+DROP TABLE IF EXISTS production_projection_heads;
+DROP TABLE IF EXISTS production_release_targets;
+DROP TABLE IF EXISTS production_releases;
+
+DROP INDEX IF EXISTS idx_production_release_targets_document_status;
+DROP INDEX IF EXISTS idx_production_releases_document_status;
+DROP INDEX IF EXISTS uq_knowledge_bases_id_tenant;

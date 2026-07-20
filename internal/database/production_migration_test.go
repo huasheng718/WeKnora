@@ -1319,6 +1319,96 @@ func TestProductionDocumentsSQLiteMigrationRollsBackPopulatedSchema(t *testing.T
 	}
 }
 
+func TestProductionPublicationMigrationsDeclareRequiredTables(t *testing.T) {
+	postgres := mustReadMigration(t, "../../migrations/versioned/000074_knowledge_production_publication.up.sql")
+	sqlite := mustReadMigration(t, "../../migrations/sqlite/000005_knowledge_production_publication.up.sql")
+
+	for _, table := range []string{
+		"production_releases",
+		"production_release_targets",
+		"production_projection_heads",
+	} {
+		require.Contains(t, postgres, "CREATE TABLE IF NOT EXISTS "+table)
+		require.Contains(t, sqlite, "CREATE TABLE IF NOT EXISTS "+table)
+	}
+}
+
+func TestProductionPublicationPostgreSQLMigrationDeclaresReleaseAndProjectionIntegrity(t *testing.T) {
+	up := mustReadMigration(t, "../../migrations/versioned/000074_knowledge_production_publication.up.sql")
+	_, err := pg_query.Parse(up)
+	require.NoError(t, err)
+
+	for _, declaration := range []string{
+		"release_digest VARCHAR(64) NOT NULL",
+		"retention_days INTEGER NOT NULL DEFAULT 30",
+		"knowledge_id VARCHAR(36) NOT NULL UNIQUE",
+		"status IN ('building', 'ready', 'active', 'failed', 'rolled_back', 'cleanup_pending', 'cleaned')",
+		"PRIMARY KEY (tenant_id, document_id, target_knowledge_base_id)",
+		"FOREIGN KEY (active_release_target_id, tenant_id, document_id, target_knowledge_base_id)",
+		"REFERENCES production_release_targets(id, tenant_id, document_id, target_knowledge_base_id)",
+		"CREATE TRIGGER trg_production_releases_validate_approved_review",
+		"CREATE TRIGGER trg_production_release_targets_guard",
+		"CREATE TRIGGER trg_production_projection_heads_guard",
+		"production projection heads require active targets",
+		"production projection head updates require CAS lock versions",
+	} {
+		require.Contains(t, up, declaration)
+	}
+
+	down := mustReadMigration(t, "../../migrations/versioned/000074_knowledge_production_publication.down.sql")
+	_, err = pg_query.Parse(down)
+	require.NoError(t, err)
+	require.Less(t, strings.Index(down, "DROP TABLE IF EXISTS production_projection_heads"), strings.Index(down, "DROP TABLE IF EXISTS production_release_targets"))
+	require.Less(t, strings.Index(down, "DROP TABLE IF EXISTS production_release_targets"), strings.Index(down, "DROP TABLE IF EXISTS production_releases"))
+}
+
+func TestProductionPublicationSQLiteMigrationEnforcesScopedTargetsAndCASHeads(t *testing.T) {
+	db := openProductionPublicationSQLite(t)
+	seedProductionReleaseScope(t, db)
+
+	_, err := db.Exec(`INSERT INTO production_releases (id, tenant_id, project_id, document_id, version_id, review_request_id, release_digest, created_by) VALUES ('release-1', 1, 'project-1', 'document-1', 'version-1', 'review-pub-1', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'owner-1')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_releases (id, tenant_id, project_id, document_id, version_id, review_request_id, release_digest, created_by) VALUES ('release-unapproved', 1, 'project-1', 'document-1', 'version-2', 'review-pub-2', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'owner-1')`)
+	require.ErrorContains(t, err, "approved review")
+
+	_, err = db.Exec(`INSERT INTO production_release_targets (id, release_id, tenant_id, project_id, document_id, version_id, target_knowledge_base_id, knowledge_id, release_digest) VALUES ('target-wrong-kb', 'release-1', 1, 'project-1', 'document-1', 'version-1', 'kb-other-tenant', 'knowledge-wrong-kb', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')`)
+	require.Error(t, err, "target knowledge bases cannot cross tenant boundaries")
+	_, err = db.Exec(`INSERT INTO production_release_targets (id, release_id, tenant_id, project_id, document_id, version_id, target_knowledge_base_id, knowledge_id, release_digest) VALUES ('target-1', 'release-1', 1, 'project-1', 'document-1', 'version-1', 'kb-1', 'knowledge-1', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_release_targets (id, release_id, tenant_id, project_id, document_id, version_id, target_knowledge_base_id, knowledge_id, release_digest) VALUES ('target-duplicate-knowledge', 'release-1', 1, 'project-1', 'document-1', 'version-1', 'kb-1', 'knowledge-1', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')`)
+	require.Error(t, err, "a preassigned Knowledge ID belongs to only one target")
+	_, err = db.Exec(`UPDATE production_release_targets SET knowledge_id = 'knowledge-changed' WHERE id = 'target-1'`)
+	require.ErrorContains(t, err, "target identity is immutable")
+
+	_, err = db.Exec(`INSERT INTO production_projection_heads (tenant_id, document_id, target_knowledge_base_id, active_release_target_id) VALUES (1, 'document-1', 'kb-1', 'target-1')`)
+	require.ErrorContains(t, err, "require active targets")
+	_, err = db.Exec(`UPDATE production_release_targets SET status = 'ready' WHERE id = 'target-1'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_release_targets SET status = 'active', activated_at = CURRENT_TIMESTAMP WHERE id = 'target-1'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_projection_heads (tenant_id, document_id, target_knowledge_base_id, active_release_target_id) VALUES (1, 'document-1', 'kb-1', 'target-1')`)
+	require.NoError(t, err)
+
+	_, err = db.Exec(`UPDATE production_projection_heads SET lock_version = 3 WHERE tenant_id = 1 AND document_id = 'document-1' AND target_knowledge_base_id = 'kb-1'`)
+	require.ErrorContains(t, err, "require CAS lock versions")
+	_, err = db.Exec(`UPDATE production_release_targets SET status = 'rolled_back', rolled_back_at = CURRENT_TIMESTAMP WHERE id = 'target-1'`)
+	require.ErrorContains(t, err, "active projection heads")
+}
+
+func TestProductionPublicationSQLiteMigrationRollsBackPopulatedSchema(t *testing.T) {
+	db := openProductionPublicationSQLite(t)
+	seedProductionReleaseScope(t, db)
+	_, err := db.Exec(`INSERT INTO production_releases (id, tenant_id, project_id, document_id, version_id, review_request_id, release_digest, created_by) VALUES ('release-rollback', 1, 'project-1', 'document-1', 'version-1', 'review-pub-1', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'owner-1')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_release_targets (id, release_id, tenant_id, project_id, document_id, version_id, target_knowledge_base_id, knowledge_id, release_digest) VALUES ('target-rollback', 'release-rollback', 1, 'project-1', 'document-1', 'version-1', 'kb-1', 'knowledge-rollback', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')`)
+	require.NoError(t, err)
+	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000005_knowledge_production_publication.down.sql"))
+	require.NoError(t, err)
+	for _, table := range []string{"production_projection_heads", "production_release_targets", "production_releases"} {
+		require.Empty(t, sqliteMasterSQL(t, db, "table", table))
+	}
+}
+
 func openProductionFoundationSQLite(t *testing.T) *sql.DB {
 	t.Helper()
 
@@ -1365,6 +1455,40 @@ func openProductionReviewSQLite(t *testing.T) *sql.DB {
 	_, err := db.Exec(mustReadMigration(t, "../../migrations/sqlite/000004_knowledge_production_reviews.up.sql"))
 	require.NoError(t, err)
 	return db
+}
+
+func openProductionPublicationSQLite(t *testing.T) *sql.DB {
+	t.Helper()
+
+	db := openProductionReviewSQLite(t)
+	_, err := db.Exec(`CREATE TABLE knowledge_bases (
+        id VARCHAR(36) PRIMARY KEY,
+        tenant_id INTEGER NOT NULL,
+        UNIQUE(id, tenant_id)
+    )`)
+	require.NoError(t, err)
+	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000005_knowledge_production_publication.up.sql"))
+	require.NoError(t, err)
+	return db
+}
+
+func seedProductionReleaseScope(t *testing.T, db *sql.DB) {
+	t.Helper()
+
+	seedProductionRunScopes(t, db)
+	insertProductionVersion(t, db, "version-pub-2", "document-1", 1, "project-1", 2, "source-set-1", "version-1")
+	_, err := db.Exec(`INSERT INTO knowledge_bases (id, tenant_id) VALUES ('kb-1', 1), ('kb-other-tenant', 2)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_project_members (project_id, user_id, role, assigned_by) VALUES ('project-1', 'business-1', 'business_reviewer', 'owner-1')`)
+	require.NoError(t, err)
+	insertProductionReviewRequest(t, db, "review-pub-1", "version-1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "{}")
+	_, err = db.Exec(`INSERT INTO production_review_steps (id, review_request_id, tenant_id, project_id, document_id, version_id, required_role, sequence) VALUES ('step-pub-1', 'review-pub-1', 1, 'project-1', 'document-1', 'version-1', 'business_reviewer', 1)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_review_steps SET decision = 'approved', reviewer_user_id = 'business-1', comment = 'approved', decided_at = CURRENT_TIMESTAMP WHERE id = 'step-pub-1'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_review_requests SET status = 'approved', terminal_by = 'owner-1', completed_at = CURRENT_TIMESTAMP WHERE id = 'review-pub-1'`)
+	require.NoError(t, err)
+	insertProductionReviewRequest(t, db, "review-pub-2", "version-pub-2", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "{}")
 }
 
 func seedProductionReviewFixture(t *testing.T, db *sql.DB) {
