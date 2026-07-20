@@ -248,6 +248,30 @@ func (r *productionReviewRepository) CreateAnnotation(ctx context.Context, annot
 	return translateProductionReviewError(err)
 }
 
+func (r *productionReviewRepository) GetAnnotation(
+	ctx context.Context,
+	tenantID uint64,
+	annotationID string,
+) (*types.ProductionAnnotation, error) {
+	if tenantID == 0 {
+		return nil, types.ErrProductionReviewScopeInvalid
+	}
+	if err := requireProductionReviewTenantContext(ctx, tenantID); err != nil {
+		return nil, err
+	}
+	if err := requireProductionReviewUUID("annotation id", annotationID); err != nil {
+		return nil, err
+	}
+	var annotation types.ProductionAnnotation
+	err := database.DBFromContext(ctx, r.db).WithContext(ctx).
+		Where("tenant_id = ? AND id = ?", tenantID, annotationID).
+		First(&annotation).Error
+	if err != nil {
+		return nil, err
+	}
+	return &annotation, nil
+}
+
 func (r *productionReviewRepository) ResolveAnnotation(
 	ctx context.Context,
 	tenantID uint64,

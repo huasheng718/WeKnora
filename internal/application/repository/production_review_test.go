@@ -208,6 +208,26 @@ func TestProductionReviewRepositoryCreatesAndResolvesNormalizedAnnotation(t *tes
 	require.NotNil(t, persisted.ResolvedAt)
 }
 
+func TestProductionReviewRepositoryGetsAnnotationWithinTenantScope(t *testing.T) {
+	repo, _ := newProductionReviewRepoFixture(t)
+	annotation := &types.ProductionAnnotation{
+		ID: reviewID(2), TenantID: reviewTenantID, ProjectID: reviewProjectID,
+		DocumentID: reviewDocumentID, VersionID: reviewVersionOne, BlockID: reviewBlockOne,
+		AnnotationType: types.ProductionAnnotationComment, Severity: types.ProductionAnnotationInfo,
+		Anchor: types.JSON(`{}`), Body: "scope check", Status: types.ProductionAnnotationOpen, CreatedBy: reviewAuthorID,
+	}
+	require.NoError(t, repo.CreateAnnotation(productionReviewContext(reviewTenantID, reviewAuthorID), annotation))
+
+	got, err := repo.GetAnnotation(productionReviewTenantContext(reviewTenantID), reviewTenantID, annotation.ID)
+	require.NoError(t, err)
+	require.Equal(t, annotation.ID, got.ID)
+	require.Equal(t, reviewAuthorID, got.CreatedBy)
+
+	got, err = repo.GetAnnotation(productionReviewTenantContext(reviewTenantID+1), reviewTenantID+1, annotation.ID)
+	require.Nil(t, got)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+}
+
 func TestProductionReviewPostgresVersionLockScopesExactImmutableVersion(t *testing.T) {
 	upper := strings.ToUpper(postgresProductionReviewLockSQL)
 	for _, fragment := range []string{"FROM PRODUCTION_DOCUMENT_VERSIONS", "ID = ?", "DOCUMENT_ID = ?", "TENANT_ID = ?", "PROJECT_ID = ?", "FOR UPDATE"} {
@@ -215,15 +235,16 @@ func TestProductionReviewPostgresVersionLockScopesExactImmutableVersion(t *testi
 	}
 }
 
-func TestProductionReviewRepositoryExactTaskTwoSurface(t *testing.T) {
+func TestProductionReviewRepositoryExactTaskThreeSurface(t *testing.T) {
 	repositoryType := reflect.TypeOf((*interfaces.ProductionReviewRepository)(nil)).Elem()
-	require.Equal(t, 7, repositoryType.NumMethod())
+	require.Equal(t, 8, repositoryType.NumMethod())
 	methods := make([]string, 0, repositoryType.NumMethod())
 	for index := range repositoryType.NumMethod() {
 		methods = append(methods, repositoryType.Method(index).Name)
 	}
 	require.ElementsMatch(t, []string{
 		"CreateAnnotation",
+		"GetAnnotation",
 		"ResolveAnnotation",
 		"CountOpenBlocking",
 		"CreateReview",
