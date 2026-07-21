@@ -276,12 +276,23 @@ func (s *chunkService) ListPagedChunksByKnowledgeID(ctx context.Context,
 // This method handles the actual update logic for a chunk, including updating the vector database representation
 func (s *chunkService) UpdateChunk(ctx context.Context, chunk *types.Chunk) error {
 	logger.Infof(ctx, "Updating chunk, ID: %s, knowledge ID: %s", chunk.ID, chunk.KnowledgeID)
-	if err := s.rejectProjectionChunkMutation(ctx, chunk.TenantID, []string{chunk.KnowledgeID}); err != nil {
+	tenantID := types.MustTenantIDFromContext(ctx)
+	persisted, err := s.chunkRepository.GetChunkByID(ctx, tenantID, chunk.ID)
+	if err != nil {
 		return err
 	}
+	if persisted == nil || persisted.ID != chunk.ID || persisted.TenantID != tenantID {
+		return fmt.Errorf("%w: persisted chunk ownership does not match the request", types.ErrProductionForbidden)
+	}
+	if err := s.rejectProjectionChunkMutation(ctx, tenantID, []string{persisted.KnowledgeID}); err != nil {
+		return err
+	}
+	chunk.TenantID = persisted.TenantID
+	chunk.KnowledgeID = persisted.KnowledgeID
+	chunk.KnowledgeBaseID = persisted.KnowledgeBaseID
 
 	// Update the chunk in the repository
-	err := s.chunkRepository.UpdateChunk(ctx, chunk)
+	err = s.chunkRepository.UpdateChunk(ctx, chunk)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"chunk_id":     chunk.ID,
@@ -300,20 +311,63 @@ func (s *chunkService) UpdateChunks(ctx context.Context, chunks []*types.Chunk) 
 		return nil
 	}
 	logger.Infof(ctx, "Updating %d chunks in batch", len(chunks))
-	byTenant := make(map[uint64][]string)
+	tenantID := types.MustTenantIDFromContext(ctx)
+	requested := make(map[string]*types.Chunk, len(chunks))
+	ids := make([]string, 0, len(chunks))
+	hasDuplicate := false
 	for _, chunk := range chunks {
-		if chunk != nil {
-			byTenant[chunk.TenantID] = append(byTenant[chunk.TenantID], chunk.KnowledgeID)
+		if chunk == nil || chunk.ID == "" {
+			return errors.New("chunk update set contains an empty chunk or id")
+		}
+		if _, exists := requested[chunk.ID]; exists {
+			hasDuplicate = true
+		}
+		requested[chunk.ID] = chunk
+		ids = append(ids, chunk.ID)
+	}
+	persistedRows, err := s.chunkRepository.ListChunksByID(ctx, tenantID, ids)
+	if err != nil {
+		return err
+	}
+	if hasDuplicate || len(persistedRows) != len(chunks) {
+		return fmt.Errorf("%w: persisted chunk set does not match the update request", ErrChunkNotFound)
+	}
+	persistedByID := make(map[string]*types.Chunk, len(persistedRows))
+	knowledgeIDs := make([]string, 0, len(persistedRows))
+	seenKnowledgeIDs := make(map[string]struct{}, len(persistedRows))
+	for _, persisted := range persistedRows {
+		if persisted == nil || persisted.TenantID != tenantID {
+			return fmt.Errorf("%w: persisted chunk ownership does not match the request", types.ErrProductionForbidden)
+		}
+		if _, requestedID := requested[persisted.ID]; !requestedID {
+			return fmt.Errorf("%w: repository returned an unexpected chunk", types.ErrProductionForbidden)
+		}
+		if _, duplicate := persistedByID[persisted.ID]; duplicate {
+			return fmt.Errorf("%w: repository returned a duplicate chunk", types.ErrProductionForbidden)
+		}
+		persistedByID[persisted.ID] = persisted
+		if _, seen := seenKnowledgeIDs[persisted.KnowledgeID]; !seen {
+			knowledgeIDs = append(knowledgeIDs, persisted.KnowledgeID)
+			seenKnowledgeIDs[persisted.KnowledgeID] = struct{}{}
 		}
 	}
-	for tenantID, ids := range byTenant {
-		if err := s.rejectProjectionChunkMutation(ctx, tenantID, ids); err != nil {
-			return err
+	for _, chunk := range chunks {
+		if _, exists := persistedByID[chunk.ID]; !exists {
+			return fmt.Errorf("%w: persisted chunk is missing", ErrChunkNotFound)
 		}
+	}
+	if err := s.rejectProjectionChunkMutation(ctx, tenantID, knowledgeIDs); err != nil {
+		return err
+	}
+	for _, chunk := range chunks {
+		persisted := persistedByID[chunk.ID]
+		chunk.TenantID = persisted.TenantID
+		chunk.KnowledgeID = persisted.KnowledgeID
+		chunk.KnowledgeBaseID = persisted.KnowledgeBaseID
 	}
 
 	// Update the chunks in the repository
-	err := s.chunkRepository.UpdateChunks(ctx, chunks)
+	err = s.chunkRepository.UpdateChunks(ctx, chunks)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"chunk_count": len(chunks),

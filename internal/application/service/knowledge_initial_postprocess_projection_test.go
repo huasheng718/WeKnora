@@ -175,6 +175,25 @@ func initialPostProcessProjectionKnowledge(t *testing.T, status string) *types.K
 	return knowledge
 }
 
+func initialPostProcessProjectionReleaseRepo(
+	t *testing.T,
+	knowledge *types.Knowledge,
+) interfaces.ProductionReleaseRepository {
+	t.Helper()
+	meta, err := knowledge.ManualMetadata()
+	require.NoError(t, err)
+	snapshot, digest, err := types.CanonicalProductionReleaseTargetConfig(
+		types.JSON(`{"version":1,"indexing_strategy":{"wiki_enabled":true}}`),
+	)
+	require.NoError(t, err)
+	return &projectionManualReleaseRepo{target: &types.ProductionReleaseTarget{
+		ID: meta.ProductionProjection.ReleaseTargetID, TenantID: knowledge.TenantID,
+		KnowledgeID: knowledge.ID, TargetKnowledgeBaseID: knowledge.KnowledgeBaseID,
+		DocumentID: meta.ProductionProjection.DocumentID, VersionID: meta.ProductionProjection.VersionID,
+		Status: types.ReleaseTargetBuilding, ConfigSnapshot: snapshot, ConfigDigest: digest,
+	}}
+}
+
 func initialPostProcessContext(attempt int) context.Context {
 	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(1))
 	ctx = context.WithValue(ctx, types.TenantInfoContextKey, &types.Tenant{ID: 1})
@@ -305,11 +324,12 @@ func TestProductionProjectionManualRetryReusesPersistedAttempt(t *testing.T) {
 		kbService: &initialPostProcessKBService{kb: &types.KnowledgeBase{
 			ID: knowledge.KnowledgeBaseID, TenantID: knowledge.TenantID,
 		}},
-		tenantRepo:   &initialPostProcessTenantRepo{},
-		chunkService: &initialPostProcessChunkService{},
-		graphEngine:  &initialPostProcessGraphRepo{},
-		task:         tasks,
-		spanTracker:  tracker,
+		tenantRepo:            &initialPostProcessTenantRepo{},
+		chunkService:          &initialPostProcessChunkService{},
+		graphEngine:           &initialPostProcessGraphRepo{},
+		task:                  tasks,
+		spanTracker:           tracker,
+		productionReleaseRepo: initialPostProcessProjectionReleaseRepo(t, knowledge),
 	}
 
 	require.NoError(t, service.enqueueManualProcessing(context.Background(), knowledge, "# governed projection", false))
@@ -455,11 +475,12 @@ func TestProductionProjectionConcurrentPendingBuildEnqueueClaimsOneAttempt(t *te
 		kbService: &initialPostProcessKBService{kb: &types.KnowledgeBase{
 			ID: knowledge.KnowledgeBaseID, TenantID: knowledge.TenantID,
 		}},
-		tenantRepo:   &initialPostProcessTenantRepo{},
-		chunkService: &initialPostProcessChunkService{},
-		graphEngine:  &initialPostProcessGraphRepo{},
-		task:         tasks,
-		spanTracker:  tracker,
+		tenantRepo:            &initialPostProcessTenantRepo{},
+		chunkService:          &initialPostProcessChunkService{},
+		graphEngine:           &initialPostProcessGraphRepo{},
+		task:                  tasks,
+		spanTracker:           tracker,
+		productionReleaseRepo: initialPostProcessProjectionReleaseRepo(t, knowledge),
 	}
 	meta, err := knowledge.ManualMetadata()
 	require.NoError(t, err)

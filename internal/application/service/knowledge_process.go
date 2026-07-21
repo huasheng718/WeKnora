@@ -294,6 +294,9 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 		embeddingModel, err = s.modelService.GetEmbeddingModel(ctx, embeddingModelID)
 		if err != nil {
 			logger.GetLogger(ctx).WithField("error", err).Errorf("processChunks get embedding model failed")
+			if projection != nil {
+				return s.recordChunkProcessingFailure(ctx, knowledge, projection, err)
+			}
 			return nil
 		}
 	} else {
@@ -508,13 +511,10 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 		"chunks_planned": len(insertChunks),
 	})
 	if err := s.chunkService.CreateChunks(ctx, insertChunks); err != nil {
-		knowledge.ParseStatus = types.ParseStatusFailed
-		knowledge.ErrorMessage = err.Error()
-		knowledge.UpdatedAt = time.Now()
-		s.repo.UpdateKnowledge(ctx, knowledge)
+		retryErr := s.recordChunkProcessingFailure(ctx, knowledge, projection, err)
 		s.failStage(ctx, knowledge.ID, types.StageChunking,
 			werrors.ErrCodeChunkingFailed, "create chunks failed", err)
-		return nil
+		return retryErr
 	}
 	totalChunkChars := 0
 	for _, c := range insertChunks {
@@ -568,19 +568,11 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 			// Re-fetch tenant storage information
 			tenantInfo, err = s.tenantRepo.GetTenantByID(ctx, tenantInfo.ID)
 			if err != nil {
-				knowledge.ParseStatus = types.ParseStatusFailed
-				knowledge.ErrorMessage = err.Error()
-				knowledge.UpdatedAt = time.Now()
-				s.repo.UpdateKnowledge(ctx, knowledge)
-				return nil
+				return s.recordChunkProcessingFailure(ctx, knowledge, projection, err)
 			}
 			// Check if there's enough storage quota available
 			if tenantInfo.StorageUsed+totalStorageSize > tenantInfo.StorageQuota {
-				knowledge.ParseStatus = types.ParseStatusFailed
-				knowledge.ErrorMessage = "存储空间不足"
-				knowledge.UpdatedAt = time.Now()
-				s.repo.UpdateKnowledge(ctx, knowledge)
-				return nil
+				return s.recordChunkProcessingFailure(ctx, knowledge, projection, errors.New("存储空间不足"))
 			}
 		}
 
@@ -599,10 +591,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 
 		err = retrieveEngine.BatchIndex(ctx, embeddingModel, indexInfoList)
 		if err != nil {
-			knowledge.ParseStatus = types.ParseStatusFailed
-			knowledge.ErrorMessage = err.Error()
-			knowledge.UpdatedAt = time.Now()
-			s.repo.UpdateKnowledge(ctx, knowledge)
+			retryErr := s.recordChunkProcessingFailure(ctx, knowledge, projection, err)
 
 			// delete failed chunks
 			if err := s.chunkService.DeleteChunksByKnowledgeID(ctx, knowledge.ID); err != nil {
@@ -623,7 +612,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 			}
 			s.failStage(ctx, knowledge.ID, types.StageEmbedding,
 				code, "batch index failed", err)
-			return nil
+			return retryErr
 		}
 		logger.GetLogger(ctx).Infof("processChunks batch index successfully, with %d index", len(indexInfoList))
 		s.endStage(ctx, knowledge.ID, types.StageEmbedding, types.JSONMap{
@@ -669,6 +658,9 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 
 	if err := s.repo.UpdateKnowledge(ctx, knowledge); err != nil {
 		logger.GetLogger(ctx).WithField("error", err).Errorf("processChunks update knowledge failed")
+		if projection != nil {
+			return s.recordChunkProcessingFailure(ctx, knowledge, projection, err)
+		}
 	}
 
 	// Enqueue multimodal tasks for images (async, non-blocking)
@@ -706,6 +698,27 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 		logger.GetLogger(ctx).WithField("error", err).Errorf("processChunks update tenant storage used failed")
 	}
 	logger.GetLogger(ctx).Infof("processChunks successfully")
+	return nil
+}
+
+func (s *knowledgeService) recordChunkProcessingFailure(
+	ctx context.Context,
+	knowledge *types.Knowledge,
+	projection *types.ProductionProjectionMetadata,
+	cause error,
+) error {
+	knowledge.ParseStatus = types.ParseStatusFailed
+	knowledge.ErrorMessage = cause.Error()
+	knowledge.UpdatedAt = time.Now()
+	if err := s.repo.UpdateKnowledge(ctx, knowledge); err != nil {
+		logger.GetLogger(ctx).WithField("error", err).Errorf("processChunks persist failure status failed")
+		if projection != nil {
+			return errors.Join(cause, fmt.Errorf("persist projection knowledge failure: %w", err))
+		}
+	}
+	if projection != nil {
+		return cause
+	}
 	return nil
 }
 
@@ -2715,6 +2728,10 @@ func (s *knowledgeService) ProcessManualUpdate(ctx context.Context, t *asynq.Tas
 		knowledge.UpdatedAt = time.Now()
 		s.repo.UpdateKnowledge(ctx, knowledge)
 		return nil
+	}
+	ctx, err = s.requireProductionProjectionSubtaskRouting(ctx, knowledge, kb)
+	if err != nil {
+		return err
 	}
 
 	// Re-check abort status right before marking processing — see the same
