@@ -30,6 +30,17 @@ axios.defaults.adapter = async config => {
 const production = await import('./index')
 const { createProductionCommand } = await import('./idempotency')
 
+type ReviewStepCommand = Parameters<typeof production.decideProductionReviewStep>[2]
+type ReviewStepInput = ReviewStepCommand extends import('./idempotency').ProductionCommand<infer T> ? T : never
+const supportedReviewStepDecisions: ReviewStepInput['decision'][] = ['approved', 'rejected', 'changes_requested']
+// @ts-expect-error The backend does not accept the legacy imperative spelling.
+const legacyApproveDecision: ReviewStepInput['decision'] = 'approve'
+// @ts-expect-error The backend does not accept the legacy imperative spelling.
+const legacyRejectDecision: ReviewStepInput['decision'] = 'reject'
+void supportedReviewStepDecisions
+void legacyApproveDecision
+void legacyRejectDecision
+
 function bodyOf(request: Record<string, any>) {
   return typeof request.data === 'string' ? JSON.parse(request.data) : request.data
 }
@@ -50,6 +61,10 @@ test('production review clients match annotation and terminal review HTTP contra
     version_id: 'version-1', status: 'open', annotation_type: 'comment', severity: 'info', page: 2, page_size: 25,
   })
   await production.updateProductionAnnotationStatus('annotation-1', command({ status: 'resolved' }))
+  await production.decideProductionReviewStep('review-1', 'step-1', command({
+    decision: 'approved',
+    comment: 'Ready to publish',
+  }))
   await production.rejectProductionReview('review-1', command({ reason: 'Policy mismatch' }))
   await production.cancelProductionReview('review-1', command({ reason: 'Superseded' }))
 
@@ -57,6 +72,7 @@ test('production review clients match annotation and terminal review HTTP contra
     ['post', '/api/v1/production/documents/document-1/annotations'],
     ['get', '/api/v1/production/documents/document-1/annotations'],
     ['put', '/api/v1/production/annotations/annotation-1/status'],
+    ['post', '/api/v1/production/reviews/review-1/steps/step-1/decision'],
     ['post', '/api/v1/production/reviews/review-1/reject'],
     ['post', '/api/v1/production/reviews/review-1/cancel'],
   ])
@@ -65,7 +81,9 @@ test('production review clients match annotation and terminal review HTTP contra
   })
   assert.equal(requests[0].headers['Idempotency-Key'], 'review-command')
   assert.deepEqual(bodyOf(requests[2]), { status: 'resolved' })
-  assert.deepEqual(bodyOf(requests[3]), { reason: 'Policy mismatch' })
+  assert.equal(requests[3].headers['Idempotency-Key'], 'review-command')
+  assert.deepEqual(bodyOf(requests[3]), { decision: 'approved', comment: 'Ready to publish' })
+  assert.deepEqual(bodyOf(requests[4]), { reason: 'Policy mismatch' })
 })
 
 test('production commands preserve If-Match, DELETE config, and an empty retry body', async () => {

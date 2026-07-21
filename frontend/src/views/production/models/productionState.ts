@@ -1,4 +1,5 @@
 import type { ProductionReleaseTarget } from '@/api/production'
+import { snapshotProductionJSON } from '@/api/production/jsonSnapshot'
 
 export interface ProductionReleaseTargetGroups {
   retryable: ProductionReleaseTarget[]
@@ -8,7 +9,7 @@ export interface ProductionReleaseTargetGroups {
 }
 
 export function normalizeProductionCollection<T extends { id: string }>(items?: readonly T[] | null): Record<string, T> {
-  return Object.fromEntries((items ?? []).map(item => [item.id, { ...item }]))
+  return Object.fromEntries((items ?? []).map(item => [item.id, snapshotProductionJSON(item)]))
 }
 
 export function groupReleaseTargets(targets?: readonly ProductionReleaseTarget[] | null): ProductionReleaseTargetGroups {

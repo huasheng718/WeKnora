@@ -12,11 +12,12 @@ import type {
   ProductionSourceSet,
 } from '@/api/production'
 import { normalizeProductionCollection } from '@/views/production/models/productionState'
+import { snapshotProductionJSON } from '@/api/production/jsonSnapshot'
 
 type ProductionEntity = { id: string }
 
 function upsertProductionEntity<T extends ProductionEntity>(collection: Record<string, T>, entity: T): Record<string, T> {
-  return { ...collection, [entity.id]: entity }
+  return { ...collection, [entity.id]: snapshotProductionJSON(entity) }
 }
 
 export const useProductionStore = defineStore('production', () => {
@@ -42,7 +43,11 @@ export const useProductionStore = defineStore('production', () => {
 
   function replaceProjects(projects?: readonly ProductionProject[] | null) {
     projectsById.value = normalizeProductionCollection(projects)
-    if (activeProjectId.value && !projectsById.value[activeProjectId.value]) activeProjectId.value = null
+    if (activeProjectId.value && !projectsById.value[activeProjectId.value]) {
+      activeProjectId.value = null
+      activeDocumentId.value = null
+      activeVersionId.value = null
+    }
   }
 
   function replaceDocumentTypes(documentTypes?: readonly ProductionDocumentType[] | null) {
@@ -64,7 +69,10 @@ export const useProductionStore = defineStore('production', () => {
 
   function replaceDocuments(documents?: readonly ProductionDocument[] | null) {
     documentsById.value = normalizeProductionCollection(documents)
-    if (activeDocumentId.value && !documentsById.value[activeDocumentId.value]) activeDocumentId.value = null
+    if (activeDocumentId.value && !documentsById.value[activeDocumentId.value]) {
+      activeDocumentId.value = null
+      activeVersionId.value = null
+    }
   }
 
   function replaceRuns(runs?: readonly ProductionRun[] | null) {

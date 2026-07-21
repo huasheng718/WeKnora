@@ -1,3 +1,5 @@
+import { snapshotProductionJSON } from './jsonSnapshot'
+
 export interface ProductionCommand<T> {
   readonly idempotencyKey: string
   readonly payload: T
@@ -13,7 +15,7 @@ export function createProductionCommand<T>(
 ): ProductionCommand<T> {
   return {
     idempotencyKey: createKey(),
-    payload: payload === undefined ? payload : JSON.parse(JSON.stringify(payload)) as T,
+    payload: snapshotProductionJSON(payload),
   }
 }
 

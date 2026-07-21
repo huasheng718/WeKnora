@@ -390,6 +390,11 @@ export interface ProductionReviewStep {
   updated_at: ProductionTimestamp
 }
 
+export interface DecideProductionReviewStepInput {
+  decision: Extract<ProductionReviewStep['decision'], 'approved' | 'rejected' | 'changes_requested'>
+  comment: string
+}
+
 export type ProductionReleaseStatus =
   | 'building'
   | 'ready'
@@ -547,7 +552,7 @@ export function getProductionReview(id: string) {
   return get<ProductionResponse<ProductionReview>>(`/api/v1/production/reviews/${id}`)
 }
 
-export function decideProductionReviewStep(reviewId: string, stepId: string, command: ProductionCommand<{ decision: 'approve' | 'reject' | 'changes_requested'; comment: string }>) {
+export function decideProductionReviewStep(reviewId: string, stepId: string, command: ProductionCommand<DecideProductionReviewStepInput>) {
   return post<ProductionResponse<void>>(`/api/v1/production/reviews/${reviewId}/steps/${stepId}/decision`, command.payload, productionCommandConfig(command))
 }
 
