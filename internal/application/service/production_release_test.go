@@ -16,17 +16,18 @@ import (
 
 type productionReleaseRepoStub struct {
 	interfaces.ProductionReleaseRepository
-	mu              sync.Mutex
-	txMu            sync.Mutex
-	release         *types.ProductionRelease
-	targets         map[string]*types.ProductionReleaseTarget
-	history         []*types.ProductionReleaseTarget
-	lock            int
-	events          *[]string
-	transitionCalls int
-	transitionErrAt int
-	transitionErr   error
-	switchErr       error
+	mu               sync.Mutex
+	txMu             sync.Mutex
+	release          *types.ProductionRelease
+	targets          map[string]*types.ProductionReleaseTarget
+	history          []*types.ProductionReleaseTarget
+	lock             int
+	events           *[]string
+	transitionCalls  int
+	transitionErrAt  int
+	transitionErr    error
+	switchErr        error
+	cleanupListCalls int
 }
 
 func (r *productionReleaseRepoStub) CreateRelease(_ context.Context, release *types.ProductionRelease, targets []*types.ProductionReleaseTarget) error {
@@ -60,6 +61,7 @@ func (r *productionReleaseRepoStub) ListProjectionHistory(context.Context, uint6
 func (r *productionReleaseRepoStub) ListCleanupEligible(_ context.Context, _ uint64, limit int) ([]*types.ProductionReleaseTarget, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.cleanupListCalls++
 	now := time.Now()
 	out := make([]*types.ProductionReleaseTarget, 0, limit)
 	for _, target := range r.targets {
@@ -87,7 +89,9 @@ func (r *productionReleaseRepoStub) SwitchHead(_ context.Context, _ uint64, _, _
 	for _, target := range r.targets {
 		if target.Status == types.ReleaseTargetActive {
 			target.Status = types.ReleaseTargetRolledBack
-			retained := time.Now().Add(time.Hour)
+			rolledBack := time.Now()
+			retained := rolledBack.Add(time.Hour)
+			target.RolledBackAt = &rolledBack
 			target.RetentionUntil = &retained
 		}
 	}
@@ -97,6 +101,8 @@ func (r *productionReleaseRepoStub) SwitchHead(_ context.Context, _ uint64, _, _
 	}
 	target.Status = types.ReleaseTargetActive
 	target.RetentionUntil = nil
+	target.FailedAt = nil
+	target.RolledBackAt = nil
 	r.lock++
 	if r.events != nil {
 		*r.events = append(*r.events, "projection.head_switched")
@@ -122,6 +128,8 @@ func (r *productionReleaseRepoStub) TransitionTarget(_ context.Context, id strin
 	target.Status = to
 	if to == types.ReleaseTargetBuilding || to == types.ReleaseTargetReady {
 		target.RetentionUntil = nil
+		target.FailedAt = nil
+		target.RolledBackAt = nil
 	}
 	return true, nil
 }
@@ -537,7 +545,9 @@ func TestProductionReleaseRetryOnlyEnqueuesOneDeterministicBuild(t *testing.T) {
 	const callers = 32
 	svc, repo, _ := newProductionReleaseServiceFixture(t)
 	repo.targets["target-new"].Status = types.ReleaseTargetFailed
+	failedAt := time.Now()
 	retained := time.Now().Add(time.Hour)
+	repo.targets["target-new"].FailedAt = &failedAt
 	repo.targets["target-new"].RetentionUntil = &retained
 	builder := &productionReleaseBuilderStub{}
 	tasks := &productionReleaseTaskEnqueuerStub{accepted: make(map[string]*asynq.Task)}
@@ -570,6 +580,43 @@ func TestProductionReleaseRetryOnlyEnqueuesOneDeterministicBuild(t *testing.T) {
 	handler := NewProductionProjectionTaskHandler(svc, &ProductionProjectionCleanup{})
 	require.NoError(t, handler.Handle(productionReleaseContext(), task))
 	require.Equal(t, 1, builder.calls)
+}
+
+func TestProductionReleaseRetryTaskIDTracksPersistedFailureGeneration(t *testing.T) {
+	const callers = 24
+	svc, repo, _ := newProductionReleaseServiceFixture(t)
+	tasks := &productionReleaseTaskEnqueuerStub{accepted: make(map[string]*asynq.Task)}
+	builder := &productionReleaseBuilderStub{err: errors.New("worker failed")}
+	svc.tasks = tasks
+	svc.builder = builder
+	target := repo.targets["target-new"]
+	target.Status = types.ReleaseTargetFailed
+	firstFailure := time.Date(2026, 7, 21, 8, 0, 0, 0, time.UTC)
+	firstRetention := firstFailure.Add(time.Hour)
+	target.FailedAt = &firstFailure
+	target.RetentionUntil = &firstRetention
+
+	retryConcurrently(t, svc, callers)
+	require.Len(t, tasks.accepted, 1)
+	firstID, firstTask := onlyAcceptedProductionTask(t, tasks, "")
+	handler := NewProductionProjectionTaskHandler(svc, &ProductionProjectionCleanup{})
+	require.Error(t, handler.Handle(productionReleaseContext(), firstTask))
+	require.Equal(t, 1, builder.calls)
+
+	secondFailure := firstFailure.Add(time.Minute)
+	secondRetention := secondFailure.Add(time.Hour)
+	repo.mu.Lock()
+	target.Status = types.ReleaseTargetFailed
+	target.FailedAt = &secondFailure
+	target.RetentionUntil = &secondRetention
+	repo.mu.Unlock()
+
+	retryConcurrently(t, svc, callers)
+	require.Len(t, tasks.accepted, 2, "a later persisted failure must create a fresh retained task ID")
+	secondID, secondTask := onlyAcceptedProductionTask(t, tasks, firstID)
+	require.NotEqual(t, firstID, secondID)
+	require.Error(t, handler.Handle(productionReleaseContext(), secondTask))
+	require.Equal(t, 2, builder.calls)
 }
 
 func TestProductionReleaseRetryFailsClosedWithoutTaskQueue(t *testing.T) {
@@ -689,8 +736,10 @@ func TestProductionCleanupSchedulerRetainsCleanupOperation(t *testing.T) {
 	tasks := &productionReleaseTaskEnqueuerStub{accepted: make(map[string]*asynq.Task)}
 	scheduler := NewProductionCleanupTaskScheduler(tasks)
 	retained := time.Now().Add(time.Hour)
+	rolledBack := retained.Add(-time.Hour)
 	target := &types.ProductionReleaseTarget{
-		ID: "target-old", TenantID: 7, ProjectID: "project-1", KnowledgeID: "knowledge-old", RetentionUntil: &retained,
+		ID: "target-old", TenantID: 7, ProjectID: "project-1", KnowledgeID: "knowledge-old",
+		Status: types.ReleaseTargetRolledBack, RolledBackAt: &rolledBack, RetentionUntil: &retained,
 	}
 
 	require.NoError(t, scheduler.EnqueueCleanup(productionReleaseContext(), target))
@@ -699,7 +748,72 @@ func TestProductionCleanupSchedulerRetainsCleanupOperation(t *testing.T) {
 		var payload types.ProductionProjectionTaskPayload
 		require.NoError(t, json.Unmarshal(task.Payload(), &payload))
 		require.Equal(t, types.ProductionProjectionOperationCleanup, payload.Operation)
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(task.Payload(), &raw))
+		require.NotEmpty(t, raw["cleanup_generation"])
 	}
+}
+
+func TestProductionCleanupSchedulerUsesRetentionGeneration(t *testing.T) {
+	tasks := &productionReleaseTaskEnqueuerStub{accepted: make(map[string]*asynq.Task)}
+	scheduler := NewProductionCleanupTaskScheduler(tasks)
+	firstRollback := time.Date(2026, 7, 21, 8, 0, 0, 0, time.UTC)
+	firstRetention := firstRollback.Add(time.Hour)
+	target := &types.ProductionReleaseTarget{
+		ID: "target-old", TenantID: 7, ProjectID: "project-1", KnowledgeID: "knowledge-old",
+		Status: types.ReleaseTargetRolledBack, RolledBackAt: &firstRollback, RetentionUntil: &firstRetention,
+	}
+	require.NoError(t, scheduler.EnqueueCleanup(productionReleaseContext(), target))
+	firstID, _ := onlyAcceptedProductionTask(t, tasks, "")
+
+	secondRollback := firstRollback.Add(time.Minute)
+	secondRetention := secondRollback.Add(time.Hour)
+	target.RolledBackAt = &secondRollback
+	target.RetentionUntil = &secondRetention
+	require.NoError(t, scheduler.EnqueueCleanup(productionReleaseContext(), target))
+
+	require.Len(t, tasks.accepted, 2)
+	secondID, _ := onlyAcceptedProductionTask(t, tasks, firstID)
+	require.NotEqual(t, firstID, secondID)
+}
+
+func TestProductionCleanupStaleTaskReconcilesCurrentRetentionGeneration(t *testing.T) {
+	svc, repo, _ := newProductionReleaseServiceFixture(t)
+	tasks := &productionReleaseTaskEnqueuerStub{accepted: make(map[string]*asynq.Task)}
+	scheduler := NewProductionCleanupTaskScheduler(tasks)
+	svc.cleanup = scheduler
+	firstRollback := time.Date(2026, 7, 21, 8, 0, 0, 0, time.UTC)
+	firstRetention := firstRollback.Add(time.Hour)
+	target := repo.targets["target-old"]
+	target.Status = types.ReleaseTargetRolledBack
+	target.RolledBackAt = &firstRollback
+	target.RetentionUntil = &firstRetention
+	require.NoError(t, scheduler.EnqueueCleanup(productionReleaseContext(), target))
+	firstID, firstTask := onlyAcceptedProductionTask(t, tasks, "")
+
+	secondRollback := firstRollback.Add(2 * time.Minute)
+	secondRetention := secondRollback.Add(time.Hour)
+	target.Status = types.ReleaseTargetRolledBack
+	target.RolledBackAt = &secondRollback
+	target.RetentionUntil = &secondRetention
+	chunks := &productionCleanupChunksStub{chunks: []*types.Chunk{{ID: "chunk-1", KnowledgeID: target.KnowledgeID, IsEnabled: true}}}
+	indexes := &productionCleanupIndexStub{}
+	cleanup := &ProductionProjectionCleanup{
+		releases: repo, chunks: chunks, indexes: indexes, uow: productionReleaseUOWStub{repo: repo}, audit: &productionReleaseAuditStub{},
+		now: func() time.Time { return firstRetention.Add(time.Second) },
+	}
+	handler := NewProductionProjectionTaskHandler(svc, cleanup)
+
+	require.NoError(t, handler.Handle(context.Background(), firstTask), "obsolete cleanup must reconcile instead of retrying")
+	require.Equal(t, types.ReleaseTargetRolledBack, target.Status)
+	require.Zero(t, indexes.calls)
+	require.Len(t, tasks.accepted, 2)
+	_, secondTask := onlyAcceptedProductionTask(t, tasks, firstID)
+
+	cleanup.now = func() time.Time { return secondRetention.Add(time.Second) }
+	require.NoError(t, handler.Handle(context.Background(), secondTask))
+	require.Equal(t, types.ReleaseTargetCleaned, target.Status)
+	require.Equal(t, 1, indexes.calls)
 }
 
 func TestProductionReleaseRollbackReadinessFailurePrecedesMutation(t *testing.T) {
@@ -810,14 +924,45 @@ func TestProductionReleaseAuditFailurePreventsHeadSwitch(t *testing.T) {
 }
 
 func prepareProductionRollbackFixture(svc *ProductionReleaseService, repo *productionReleaseRepoStub) time.Time {
-	retained := time.Now().Add(time.Hour)
+	rolledBack := time.Now()
+	retained := rolledBack.Add(time.Hour)
 	repo.targets["target-old"].Status = types.ReleaseTargetRolledBack
+	repo.targets["target-old"].RolledBackAt = &rolledBack
 	repo.targets["target-old"].RetentionUntil = &retained
 	repo.targets["target-new"].Status = types.ReleaseTargetActive
 	repo.history = []*types.ProductionReleaseTarget{repo.targets["target-new"], repo.targets["target-old"]}
 	repo.lock = 2
 	svc.knowledge = productionReleaseKnowledgeStub{knowledge: &types.Knowledge{ID: "knowledge-old", TenantID: 7, KnowledgeBaseID: "kb-1", ParseStatus: types.ParseStatusCompleted}}
 	return retained
+}
+
+func retryConcurrently(t *testing.T, svc *ProductionReleaseService, callers int) {
+	t.Helper()
+	start := make(chan struct{})
+	errs := make(chan error, callers)
+	for range callers {
+		go func() {
+			<-start
+			errs <- svc.Retry(productionReleaseContext(), "target-new")
+		}()
+	}
+	close(start)
+	for range callers {
+		require.NoError(t, <-errs)
+	}
+}
+
+func onlyAcceptedProductionTask(t *testing.T, tasks *productionReleaseTaskEnqueuerStub, exceptID string) (string, *asynq.Task) {
+	t.Helper()
+	tasks.mu.Lock()
+	defer tasks.mu.Unlock()
+	for id, task := range tasks.accepted {
+		if id != exceptID {
+			return id, task
+		}
+	}
+	t.Fatal("accepted production task not found")
+	return "", nil
 }
 
 func productionStringPtr(value string) *string     { return &value }

@@ -204,9 +204,12 @@ func (u *ProductionProjectionRetrieveIndexUpdater) DisableChunks(ctx context.Con
 	if kb == nil || kb.ID != target.TargetKnowledgeBaseID || kb.TenantID != target.TenantID {
 		return types.ErrProductionForbidden
 	}
-	vectorStoreID, retrieverEngines, err := authenticatedProductionProjectionRetrievalSnapshot(target)
+	vectorStoreID, retrieverEngines, externalIndexes, err := authenticatedProductionProjectionRetrievalSnapshot(target)
 	if err != nil {
 		return err
+	}
+	if !externalIndexes {
+		return nil
 	}
 	status := make(map[string]bool, len(chunks))
 	for _, chunk := range chunks {
@@ -241,24 +244,36 @@ func (u *ProductionProjectionRetrieveIndexUpdater) DisableChunks(ctx context.Con
 	return engine.BatchUpdateChunkEnabledStatus(ctx, status)
 }
 
-func authenticatedProductionProjectionRetrievalSnapshot(target *types.ProductionReleaseTarget) (string, []types.RetrieverEngineParams, error) {
+func authenticatedProductionProjectionRetrievalSnapshot(target *types.ProductionReleaseTarget) (string, []types.RetrieverEngineParams, bool, error) {
 	if target == nil {
-		return "", nil, fmt.Errorf("%w: retained target is unavailable", types.ErrProductionReleaseConfigInvalid)
+		return "", nil, false, fmt.Errorf("%w: retained target is unavailable", types.ErrProductionReleaseConfigInvalid)
 	}
 	canonical, digest, err := types.CanonicalProductionReleaseTargetConfig(target.ConfigSnapshot)
 	if err != nil || digest != target.ConfigDigest || string(canonical) != string(target.ConfigSnapshot) {
-		return "", nil, fmt.Errorf("%w: retained configuration authentication failed", types.ErrProductionReleaseConfigInvalid)
+		return "", nil, false, fmt.Errorf("%w: retained configuration authentication failed", types.ErrProductionReleaseConfigInvalid)
 	}
 	var snapshot struct {
+		IndexingStrategy *types.IndexingStrategy       `json:"indexing_strategy"`
 		VectorStoreID    *string                       `json:"vector_store_id"`
 		RetrieverEngines []types.RetrieverEngineParams `json:"retriever_engines"`
 	}
 	if err := json.Unmarshal(canonical, &snapshot); err != nil {
-		return "", nil, fmt.Errorf("%w: retained retrieval configuration cannot be decoded", types.ErrProductionReleaseConfigInvalid)
+		return "", nil, false, fmt.Errorf("%w: retained retrieval configuration cannot be decoded", types.ErrProductionReleaseConfigInvalid)
+	}
+	if snapshot.IndexingStrategy == nil || !snapshot.IndexingStrategy.HasAnyIndexing() {
+		return "", nil, false, fmt.Errorf("%w: retained indexing strategy is unavailable", types.ErrProductionReleaseConfigInvalid)
 	}
 	vectorStoreID := strings.TrimSpace(valueOrEmpty(snapshot.VectorStoreID))
-	if (vectorStoreID == "") == (len(snapshot.RetrieverEngines) == 0) {
-		return "", nil, fmt.Errorf("%w: retained retrieval configuration is ambiguous", types.ErrProductionReleaseConfigInvalid)
+	hasVectorStore := vectorStoreID != ""
+	hasRetrieverEngines := len(snapshot.RetrieverEngines) != 0
+	if hasVectorStore && hasRetrieverEngines {
+		return "", nil, false, fmt.Errorf("%w: retained retrieval configuration is ambiguous", types.ErrProductionReleaseConfigInvalid)
 	}
-	return vectorStoreID, snapshot.RetrieverEngines, nil
+	if !snapshot.IndexingStrategy.NeedsEmbedding() && !hasVectorStore && !hasRetrieverEngines {
+		return "", nil, false, nil
+	}
+	if !hasVectorStore && !hasRetrieverEngines {
+		return "", nil, false, fmt.Errorf("%w: retained retrieval configuration is unavailable", types.ErrProductionReleaseConfigInvalid)
+	}
+	return vectorStoreID, snapshot.RetrieverEngines, true, nil
 }

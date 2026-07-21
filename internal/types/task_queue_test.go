@@ -126,6 +126,9 @@ func TestProductionProjectionTaskOperationsAreStrictAndStable(t *testing.T) {
 			Operation: operation,
 			TenantID:  7, ProjectID: "project-1", TargetID: "target-1",
 		}
+		if operation == ProductionProjectionOperationCleanup {
+			payload.CleanupGeneration = "rolled-back-1-retain-2"
+		}
 		if err := payload.Validate(); err != nil {
 			t.Fatalf("operation %q should validate: %v", operation, err)
 		}

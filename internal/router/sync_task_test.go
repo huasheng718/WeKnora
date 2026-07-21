@@ -305,3 +305,52 @@ func TestSyncTaskExecutorLastSchedulingOptionWins(t *testing.T) {
 		})
 	}
 }
+
+func TestSyncTaskExecutorRetainsOneIDPerFailureGeneration(t *testing.T) {
+	executor := NewSyncTaskExecutor()
+	var executions atomic.Int32
+	executed := make(chan struct{}, 2)
+	executor.RegisterHandler("production:build", func(context.Context, *asynq.Task) error {
+		executions.Add(1)
+		executed <- struct{}{}
+		return nil
+	})
+
+	enqueueGeneration := func(taskID string) {
+		const callers = 20
+		start := make(chan struct{})
+		results := make(chan error, callers)
+		for range callers {
+			go func() {
+				<-start
+				_, err := executor.Enqueue(
+					asynq.NewTask("production:build", nil),
+					asynq.TaskID(taskID), asynq.Retention(24*time.Hour), asynq.MaxRetry(0),
+				)
+				results <- err
+			}()
+		}
+		close(start)
+		successes := 0
+		for range callers {
+			err := <-results
+			if err == nil {
+				successes++
+				continue
+			}
+			require.ErrorIs(t, err, asynq.ErrTaskIDConflict)
+		}
+		require.Equal(t, 1, successes)
+		select {
+		case <-executed:
+		case <-time.After(time.Second):
+			t.Fatal("accepted generation did not execute")
+		}
+	}
+
+	enqueueGeneration("production-build-failed-1721548800000000000")
+	waitForRetainedTaskIDs(t, executor, 1)
+	enqueueGeneration("production-build-failed-1721548860000000000")
+	waitForRetainedTaskIDs(t, executor, 2)
+	require.EqualValues(t, 2, executions.Load())
+}

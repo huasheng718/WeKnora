@@ -281,17 +281,19 @@ func (o ProductionProjectionOperation) IsValid() bool {
 // expectation needed by publication workers. ActorUserID is copied from the
 // authorized API request so the eventual activation audit preserves authorship.
 type ProductionProjectionTaskPayload struct {
-	Operation    ProductionProjectionOperation `json:"operation"`
-	TenantID     uint64                        `json:"tenant_id"`
-	ProjectID    string                        `json:"project_id"`
-	TargetID     string                        `json:"target_id"`
-	ActorUserID  string                        `json:"actor_user_id,omitempty"`
-	ExpectedLock int                           `json:"expected_lock,omitempty"`
+	Operation         ProductionProjectionOperation `json:"operation"`
+	TenantID          uint64                        `json:"tenant_id"`
+	ProjectID         string                        `json:"project_id"`
+	TargetID          string                        `json:"target_id"`
+	ActorUserID       string                        `json:"actor_user_id,omitempty"`
+	ExpectedLock      int                           `json:"expected_lock,omitempty"`
+	CleanupGeneration string                        `json:"cleanup_generation,omitempty"`
 }
 
 func (p ProductionProjectionTaskPayload) Validate() error {
 	if !p.Operation.IsValid() || p.TenantID == 0 || strings.TrimSpace(p.ProjectID) == "" || p.ProjectID != strings.TrimSpace(p.ProjectID) ||
-		strings.TrimSpace(p.TargetID) == "" || p.TargetID != strings.TrimSpace(p.TargetID) || p.ExpectedLock < 0 {
+		strings.TrimSpace(p.TargetID) == "" || p.TargetID != strings.TrimSpace(p.TargetID) || p.ExpectedLock < 0 ||
+		(p.Operation == ProductionProjectionOperationCleanup && (strings.TrimSpace(p.CleanupGeneration) == "" || p.CleanupGeneration != strings.TrimSpace(p.CleanupGeneration))) {
 		return ErrProductionReleaseInvalid
 	}
 	return nil

@@ -244,7 +244,12 @@ func (s *ProductionReleaseService) enqueueProjectionTask(
 		return err
 	}
 	phase := string(operation)
-	if operation == types.ProductionProjectionOperationActivate || operation == types.ProductionProjectionOperationRollback {
+	if operation == types.ProductionProjectionOperationBuild {
+		phase, err = productionProjectionBuildTaskPhase(target)
+		if err != nil {
+			return err
+		}
+	} else if operation == types.ProductionProjectionOperationActivate || operation == types.ProductionProjectionOperationRollback {
 		phase = fmt.Sprintf("%s-lock-%d", operation, expectedLock)
 	}
 	taskOptions := []asynq.Option{asynq.Queue(types.QueueProduction), asynq.MaxRetry(8)}
@@ -263,6 +268,28 @@ func (s *ProductionReleaseService) enqueueProjectionTask(
 		return nil
 	}
 	return err
+}
+
+func productionProjectionBuildTaskPhase(target *types.ProductionReleaseTarget) (string, error) {
+	if target == nil {
+		return "", types.ErrProductionReleaseInvalid
+	}
+	switch target.Status {
+	case types.ReleaseTargetBuilding:
+		return "build-initial", nil
+	case types.ReleaseTargetFailed:
+		if target.FailedAt == nil || target.FailedAt.IsZero() {
+			return "", fmt.Errorf("%w: failed target generation is unavailable", types.ErrProductionReleaseLifecycle)
+		}
+		return fmt.Sprintf("build-failed-%d", target.FailedAt.UTC().UnixNano()), nil
+	case types.ReleaseTargetRolledBack:
+		if target.RolledBackAt == nil || target.RolledBackAt.IsZero() {
+			return "", fmt.Errorf("%w: rolled-back target generation is unavailable", types.ErrProductionReleaseLifecycle)
+		}
+		return fmt.Sprintf("build-rolled-back-%d", target.RolledBackAt.UTC().UnixNano()), nil
+	default:
+		return "", types.ErrProductionReleaseLifecycle
+	}
 }
 
 func (s *ProductionReleaseService) activateAuthorized(ctx context.Context, target *types.ProductionReleaseTarget, expectedLock int) error {
@@ -746,13 +773,22 @@ func (s *ProductionCleanupTaskScheduler) EnqueueCleanup(_ context.Context, targe
 	if s == nil || s.tasks == nil || target == nil {
 		return errors.New("production cleanup scheduler is unavailable")
 	}
-	payload, err := json.Marshal(types.ProductionProjectionTaskPayload{Operation: types.ProductionProjectionOperationCleanup, TenantID: target.TenantID,
-		ProjectID: target.ProjectID, TargetID: target.ID})
+	generation, err := productionProjectionCleanupGeneration(target)
+	if err != nil {
+		return err
+	}
+	payload, err := json.Marshal(types.ProductionProjectionTaskPayload{
+		Operation: types.ProductionProjectionOperationCleanup, TenantID: target.TenantID,
+		ProjectID: target.ProjectID, TargetID: target.ID, CleanupGeneration: generation,
+	})
 	if err != nil {
 		return err
 	}
 	task := asynq.NewTask(types.TypeProductionCleanup, payload, asynq.Queue(types.QueueProduction), asynq.MaxRetry(8))
-	opts := []asynq.Option{asynq.TaskID(productionProjectionTaskID(target.ID, target.KnowledgeID, "cleanup")), asynq.Retention(productionProjectionTaskRetention)}
+	opts := []asynq.Option{
+		asynq.TaskID(productionProjectionTaskID(target.ID, target.KnowledgeID, "cleanup-"+generation)),
+		asynq.Retention(productionProjectionTaskRetention),
+	}
 	if target.RetentionUntil != nil && target.RetentionUntil.After(time.Now()) {
 		opts = append(opts, asynq.ProcessAt(*target.RetentionUntil))
 	}
@@ -761,4 +797,21 @@ func (s *ProductionCleanupTaskScheduler) EnqueueCleanup(_ context.Context, targe
 		return nil
 	}
 	return err
+}
+
+func productionProjectionCleanupGeneration(target *types.ProductionReleaseTarget) (string, error) {
+	if target == nil || target.RetentionUntil == nil || target.RetentionUntil.IsZero() {
+		return "", fmt.Errorf("%w: cleanup retention generation is unavailable", types.ErrProductionReleaseLifecycle)
+	}
+	var kind string
+	var lifecycleAt *time.Time
+	switch {
+	case target.RolledBackAt != nil && !target.RolledBackAt.IsZero():
+		kind, lifecycleAt = "rolled-back", target.RolledBackAt
+	case target.FailedAt != nil && !target.FailedAt.IsZero():
+		kind, lifecycleAt = "failed", target.FailedAt
+	default:
+		return "", fmt.Errorf("%w: cleanup lifecycle generation is unavailable", types.ErrProductionReleaseLifecycle)
+	}
+	return fmt.Sprintf("%s-%d-retain-%d", kind, lifecycleAt.UTC().UnixNano(), target.RetentionUntil.UTC().UnixNano()), nil
 }

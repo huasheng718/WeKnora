@@ -62,10 +62,32 @@ func (h *ProductionProjectionTaskHandler) Handle(ctx context.Context, task *asyn
 		}
 		return h.releases.activateAuthorized(ctx, target, payload.ExpectedLock)
 	case types.TypeProductionCleanup:
-		return h.cleanup.Cleanup(ctx, target.ID)
+		return h.handleCleanup(ctx, target, payload.CleanupGeneration)
 	default:
 		return errors.New("unsupported production projection task type")
 	}
+}
+
+func (h *ProductionProjectionTaskHandler) handleCleanup(
+	ctx context.Context,
+	target *types.ProductionReleaseTarget,
+	queuedGeneration string,
+) error {
+	switch target.Status {
+	case types.ReleaseTargetActive, types.ReleaseTargetReady, types.ReleaseTargetBuilding, types.ReleaseTargetCleaned:
+		return nil
+	}
+	currentGeneration, err := productionProjectionCleanupGeneration(target)
+	if err != nil {
+		return err
+	}
+	if currentGeneration != queuedGeneration {
+		if h.releases.cleanup == nil {
+			return errors.New("production cleanup scheduler is unavailable")
+		}
+		return h.releases.cleanup.EnqueueCleanup(ctx, target)
+	}
+	return h.cleanup.Cleanup(ctx, target.ID)
 }
 
 func productionProjectionOperationMatchesTaskType(operation types.ProductionProjectionOperation, taskType string) bool {

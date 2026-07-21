@@ -334,6 +334,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(service.NewProductionCleanupTaskScheduler))
 	must(container.Provide(service.NewProductionProjectionRetrieveIndexUpdater))
 	must(container.Provide(service.NewProductionProjectionCleanup))
+	must(container.Provide(service.NewProductionCleanupRecoveryRunner))
 	must(container.Provide(service.NewProductionReleaseService))
 	must(container.Provide(service.NewProductionProjectionTaskHandler,
 		dig.Name("productionProjection"), dig.As(new(interfaces.TaskHandler))))
@@ -453,6 +454,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 		must(container.Invoke(router.RunAsynqServer))
 	} else {
 		must(container.Invoke(router.RegisterSyncHandlers))
+		must(container.Invoke(startProductionCleanupRecovery))
 	}
 	must(container.Invoke(recoverPendingProductionRuns))
 	// Wiki operation rows are durable, while their wake-up triggers may be
@@ -1692,6 +1694,32 @@ func startAuditLogRetention(
 ) {
 	runner.Start(context.Background())
 	cleaner.RegisterWithName("AuditLogRetentionRunner", func() error {
+		runner.Stop()
+		return nil
+	})
+}
+
+type productionCleanupRecoveryLifecycle interface {
+	Start(context.Context)
+	Stop()
+}
+
+func startProductionCleanupRecovery(
+	runner *service.ProductionCleanupRecoveryRunner,
+	cleaner interfaces.ResourceCleaner,
+) {
+	startProductionCleanupRecoveryLifecycle(runner, cleaner)
+}
+
+func startProductionCleanupRecoveryLifecycle(
+	runner productionCleanupRecoveryLifecycle,
+	cleaner interfaces.ResourceCleaner,
+) {
+	if runner == nil || cleaner == nil {
+		return
+	}
+	runner.Start(context.Background())
+	cleaner.RegisterWithName("ProductionCleanupRecoveryRunner", func() error {
 		runner.Stop()
 		return nil
 	})

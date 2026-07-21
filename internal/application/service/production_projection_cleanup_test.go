@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -113,7 +114,7 @@ func TestProjectionRetentionSweepIsBoundedAndSkipsActiveHead(t *testing.T) {
 }
 
 func TestProjectionCleanupUsesAuthenticatedSnapshotVectorStoreDespiteLiveKBDrift(t *testing.T) {
-	snapshot, digest, err := types.CanonicalProductionReleaseTargetConfig(types.JSON(`{"version":1,"vector_store_id":"snapshot-store"}`))
+	snapshot, digest, err := types.CanonicalProductionReleaseTargetConfig(types.JSON(`{"version":1,"indexing_strategy":{"vector_enabled":true},"vector_store_id":"snapshot-store"}`))
 	require.NoError(t, err)
 	liveStore := "live-store"
 	target := &types.ProductionReleaseTarget{
@@ -137,7 +138,7 @@ func TestProjectionCleanupUsesAuthenticatedSnapshotVectorStoreDespiteLiveKBDrift
 }
 
 func TestProjectionCleanupRejectsTamperedOrIncompleteSnapshot(t *testing.T) {
-	valid, digest, err := types.CanonicalProductionReleaseTargetConfig(types.JSON(`{"version":1,"vector_store_id":"snapshot-store"}`))
+	valid, digest, err := types.CanonicalProductionReleaseTargetConfig(types.JSON(`{"version":1,"indexing_strategy":{"vector_enabled":true},"vector_store_id":"snapshot-store"}`))
 	require.NoError(t, err)
 	incomplete, incompleteDigest, err := types.CanonicalProductionReleaseTargetConfig(types.JSON(`{"version":1}`))
 	require.NoError(t, err)
@@ -147,7 +148,7 @@ func TestProjectionCleanupRejectsTamperedOrIncompleteSnapshot(t *testing.T) {
 		digest   string
 	}{
 		{name: "digest mismatch", snapshot: valid, digest: incompleteDigest},
-		{name: "noncanonical", snapshot: types.JSON(`{ "version": 1, "vector_store_id": "snapshot-store" }`), digest: digest},
+		{name: "noncanonical", snapshot: types.JSON(`{ "version": 1, "indexing_strategy": { "vector_enabled": true }, "vector_store_id": "snapshot-store" }`), digest: digest},
 		{name: "missing retrieval configuration", snapshot: incomplete, digest: incompleteDigest},
 	}
 	for _, tc := range tests {
@@ -166,5 +167,64 @@ func TestProjectionCleanupRejectsTamperedOrIncompleteSnapshot(t *testing.T) {
 			require.Empty(t, registry.requested)
 			require.Zero(t, engine.calls)
 		})
+	}
+}
+
+func TestProjectionCleanupSkipsExternalIndexesForNonRetrievalStrategies(t *testing.T) {
+	tests := []struct {
+		name     string
+		strategy types.IndexingStrategy
+	}{
+		{name: "wiki only", strategy: types.IndexingStrategy{WikiEnabled: true}},
+		{name: "graph only", strategy: types.IndexingStrategy{GraphEnabled: true}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(map[string]any{"version": 1, "indexing_strategy": tc.strategy})
+			require.NoError(t, err)
+			snapshot, digest, err := types.CanonicalProductionReleaseTargetConfig(types.JSON(raw))
+			require.NoError(t, err)
+			engine := &productionCleanupEngineStub{}
+			registry := &productionCleanupRegistryStub{engine: engine}
+			ownership := &productionCleanupOwnershipStub{owned: true}
+			updater := NewProductionProjectionRetrieveIndexUpdater(
+				productionReleaseKBStub{kb: &types.KnowledgeBase{ID: "kb-1", TenantID: 7}}, registry, ownership,
+			)
+			target := &types.ProductionReleaseTarget{
+				ID: "target-old", TenantID: 7, TargetKnowledgeBaseID: "kb-1",
+				ConfigSnapshot: snapshot, ConfigDigest: digest,
+			}
+
+			require.NoError(t, updater.DisableChunks(productionReleaseContext(), target, []*types.Chunk{{ID: "chunk-1"}}))
+			require.Empty(t, registry.requested)
+			require.Zero(t, engine.calls)
+			require.Empty(t, ownership.storeID)
+		})
+	}
+}
+
+func TestProjectionCleanupRequiresRetrievalConfigForEmbeddingStrategy(t *testing.T) {
+	for _, raw := range []types.JSON{
+		types.JSON(`{"version":1,"indexing_strategy":{"vector_enabled":true}}`),
+		types.JSON(`{"version":1,"vector_store_id":"snapshot-store"}`),
+	} {
+		snapshot, digest, err := types.CanonicalProductionReleaseTargetConfig(raw)
+		require.NoError(t, err)
+		engine := &productionCleanupEngineStub{}
+		registry := &productionCleanupRegistryStub{engine: engine}
+		ownership := &productionCleanupOwnershipStub{owned: true}
+		updater := NewProductionProjectionRetrieveIndexUpdater(
+			productionReleaseKBStub{kb: &types.KnowledgeBase{ID: "kb-1", TenantID: 7}}, registry, ownership,
+		)
+		target := &types.ProductionReleaseTarget{
+			ID: "target-old", TenantID: 7, TargetKnowledgeBaseID: "kb-1",
+			ConfigSnapshot: snapshot, ConfigDigest: digest,
+		}
+
+		err = updater.DisableChunks(productionReleaseContext(), target, []*types.Chunk{{ID: "chunk-1"}})
+
+		require.ErrorIs(t, err, types.ErrProductionReleaseConfigInvalid)
+		require.Empty(t, registry.requested)
+		require.Zero(t, engine.calls)
 	}
 }
