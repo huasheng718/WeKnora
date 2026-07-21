@@ -199,6 +199,113 @@ func (s *ProductionReleaseService) Retry(ctx context.Context, targetID string) e
 	return s.enqueueProjectionTask(ctx, types.TypeProductionBuild, types.ProductionProjectionOperationBuild, target, 0)
 }
 
+func productionProjectionFailureStage(taskType string) (string, bool) {
+	switch taskType {
+	case types.TypeProductionBuild:
+		return "build", true
+	case types.TypeDocumentProcess:
+		return "document_parse", true
+	case types.TypeManualProcess:
+		return "manual_parse", true
+	case types.TypeKnowledgePostProcess:
+		return "post_process", true
+	default:
+		return "", false
+	}
+}
+
+func (s *ProductionReleaseService) recordProjectionTargetFailure(
+	ctx context.Context,
+	targetID string,
+	taskType string,
+) error {
+	tenantID, ok := types.TenantIDFromContext(ctx)
+	stage, stageOK := productionProjectionFailureStage(taskType)
+	if !ok || tenantID == 0 || !stageOK || strings.TrimSpace(targetID) == "" {
+		return types.ErrProductionReleaseInvalid
+	}
+	if s == nil || s.releases == nil || s.uow == nil || s.audit == nil {
+		return errors.New("production projection failure dependencies are unavailable")
+	}
+	target, err := s.releases.GetTarget(ctx, tenantID, targetID)
+	if err != nil {
+		return err
+	}
+	if target == nil || target.ID != targetID || target.TenantID != tenantID {
+		return types.ErrProductionForbidden
+	}
+	if target.Status != types.ReleaseTargetBuilding {
+		return nil
+	}
+	details, _ := json.Marshal(map[string]string{
+		"failure_code":  types.ProductionProjectionFailureBuildFailed,
+		"failure_stage": stage,
+	})
+	actorID, _ := types.UserIDFromContext(ctx)
+	return s.uow.WithinTransaction(ctx, func(txCtx context.Context) error {
+		changed, transitionErr := s.releases.TransitionTarget(
+			txCtx, target.ID, types.ReleaseTargetBuilding, types.ReleaseTargetFailed, nil,
+		)
+		if transitionErr != nil {
+			return transitionErr
+		}
+		if !changed {
+			current, loadErr := s.releases.GetTarget(txCtx, tenantID, target.ID)
+			if loadErr != nil {
+				return loadErr
+			}
+			if current != nil && current.Status != types.ReleaseTargetBuilding {
+				return nil
+			}
+			return types.ErrProductionProjectionConflict
+		}
+		return emitRequiredProductionAudit(txCtx, s.audit, &types.AuditLog{
+			TenantID: target.TenantID, ActorUserID: actorID, ActorRole: "system",
+			Action: types.AuditActionProductionProjectionFailed, TargetType: "production_release_target", TargetID: target.ID,
+			Outcome: types.AuditOutcomeDenied, Details: types.JSON(details),
+		})
+	})
+}
+
+// RecordProjectionKnowledgeFailure resolves server-owned projection metadata
+// before failing the bound release target. A false result means the Knowledge
+// is ordinary and the caller should retain its existing failure behavior.
+func (s *ProductionReleaseService) RecordProjectionKnowledgeFailure(
+	ctx context.Context,
+	knowledgeID string,
+	taskType string,
+) (bool, error) {
+	if s == nil || s.knowledge == nil || s.releases == nil || strings.TrimSpace(knowledgeID) == "" {
+		return false, errors.New("production projection knowledge failure dependencies are unavailable")
+	}
+	knowledge, err := s.knowledge.GetKnowledgeByIDOnly(ctx, knowledgeID)
+	if err != nil {
+		return false, err
+	}
+	projection, err := types.ValidateProductionProjectionIntegrity(knowledge)
+	if err != nil {
+		return errors.Is(err, types.ErrProductionContentDigestMismatch), err
+	}
+	if projection == nil {
+		return false, nil
+	}
+	if knowledge == nil || knowledge.ID != knowledgeID || knowledge.TenantID == 0 {
+		return false, types.ErrProductionProjectionConflict
+	}
+	ctx = context.WithValue(ctx, types.TenantIDContextKey, knowledge.TenantID)
+	ctx = context.WithValue(ctx, types.UserIDContextKey, types.ProductionSystemActorID)
+	target, err := s.releases.GetTarget(ctx, knowledge.TenantID, projection.ReleaseTargetID)
+	if err != nil {
+		return true, err
+	}
+	if target == nil || target.ID != projection.ReleaseTargetID || target.TenantID != knowledge.TenantID ||
+		target.KnowledgeID != knowledge.ID || target.TargetKnowledgeBaseID != knowledge.KnowledgeBaseID ||
+		target.DocumentID != projection.DocumentID || target.VersionID != projection.VersionID {
+		return true, types.ErrProductionProjectionConflict
+	}
+	return true, s.recordProjectionTargetFailure(ctx, target.ID, taskType)
+}
+
 func (s *ProductionReleaseService) Activate(ctx context.Context, targetID string, expectedLock int) error {
 	target, err := s.authorizeTarget(ctx, targetID)
 	if err != nil {

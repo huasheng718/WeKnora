@@ -55,6 +55,12 @@ func (h *ProductionProjectionTaskHandler) Handle(ctx context.Context, task *asyn
 			return errors.New("production projection builder is unavailable")
 		}
 		_, err = h.releases.builder.Build(ctx, target.ID)
+		if err == nil {
+			return nil
+		}
+		if failureErr := h.releases.recordProjectionTargetFailure(ctx, target.ID, task.Type()); failureErr != nil {
+			return errors.Join(err, failureErr)
+		}
 		return err
 	case types.TypeProductionActivate:
 		if payload.Operation == types.ProductionProjectionOperationRollback {

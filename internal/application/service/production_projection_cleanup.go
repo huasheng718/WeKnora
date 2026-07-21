@@ -263,14 +263,14 @@ func authenticatedProductionProjectionRetrievalSnapshot(target *types.Production
 	if snapshot.IndexingStrategy == nil || !snapshot.IndexingStrategy.HasAnyIndexing() {
 		return "", nil, false, fmt.Errorf("%w: retained indexing strategy is unavailable", types.ErrProductionReleaseConfigInvalid)
 	}
+	if !snapshot.IndexingStrategy.NeedsEmbedding() {
+		return "", nil, false, nil
+	}
 	vectorStoreID := strings.TrimSpace(valueOrEmpty(snapshot.VectorStoreID))
 	hasVectorStore := vectorStoreID != ""
 	hasRetrieverEngines := len(snapshot.RetrieverEngines) != 0
 	if hasVectorStore && hasRetrieverEngines {
 		return "", nil, false, fmt.Errorf("%w: retained retrieval configuration is ambiguous", types.ErrProductionReleaseConfigInvalid)
-	}
-	if !snapshot.IndexingStrategy.NeedsEmbedding() && !hasVectorStore && !hasRetrieverEngines {
-		return "", nil, false, nil
 	}
 	if !hasVectorStore && !hasRetrieverEngines {
 		return "", nil, false, fmt.Errorf("%w: retained retrieval configuration is unavailable", types.ErrProductionReleaseConfigInvalid)

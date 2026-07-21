@@ -46,6 +46,7 @@ type AsynqTaskParams struct {
 	WikiIngest           interfaces.TaskHandler `name:"wikiIngest"`
 	ProductionRun        interfaces.TaskHandler `name:"productionRun"`
 	ProductionProjection interfaces.TaskHandler `name:"productionProjection"`
+	ProductionRelease    *service.ProductionReleaseService
 	DeadLetterRepo       interfaces.TaskDeadLetterRepository
 	SpanTracker          service.SpanTracker
 	ResourceCleaner      interfaces.ResourceCleaner
@@ -285,7 +286,7 @@ func RunAsynqServer(params AsynqTaskParams) *asynq.ServeMux {
 	// a permanently-failing task left its parent knowledge stranded in
 	// "processing" until housekeeping cron caught it minutes later — the
 	// UI signal users actually see.
-	knowledgeFailer := newDeadLetterKnowledgeFailer(params.KnowledgeService, params.SpanTracker)
+	knowledgeFailer := newDeadLetterKnowledgeFailer(params.KnowledgeService, params.SpanTracker, params.ProductionRelease)
 	mux.Use(asynqdl.MiddlewareWithCallback(params.DeadLetterRepo, knowledgeFailer))
 
 	// Mark every asynq worker execution as a background task so the chat
@@ -431,7 +432,15 @@ type deadLetterKnowledgeListDeletePayload struct {
 // errors are logged and swallowed. The dead-letter record is the source of
 // truth — this is purely a UX shortcut so users don't wait for the
 // housekeeping cron's next sweep.
-func newDeadLetterKnowledgeFailer(ks interfaces.KnowledgeService, tracker service.SpanTracker) asynqdl.OnDeadLetter {
+type productionProjectionFailureRecorder interface {
+	RecordProjectionKnowledgeFailure(context.Context, string, string) (bool, error)
+}
+
+func newDeadLetterKnowledgeFailer(
+	ks interfaces.KnowledgeService,
+	tracker service.SpanTracker,
+	projectionFailures productionProjectionFailureRecorder,
+) asynqdl.OnDeadLetter {
 	if ks == nil {
 		return nil
 	}
@@ -454,7 +463,20 @@ func newDeadLetterKnowledgeFailer(ks interfaces.KnowledgeService, tracker servic
 		if err := json.Unmarshal(t.Payload(), &probe); err != nil || probe.KnowledgeID == "" {
 			return
 		}
+		projectionKnowledge := false
+		if projectionFailures != nil {
+			var projectionErr error
+			projectionKnowledge, projectionErr = projectionFailures.RecordProjectionKnowledgeFailure(
+				ctx, probe.KnowledgeID, t.Type(),
+			)
+			if projectionErr != nil {
+				logger.Warnf(ctx, "dead-letter callback: failed to mark projection target for knowledge %s: %v", probe.KnowledgeID, projectionErr)
+			}
+		}
 		errMsg := "task " + t.Type() + " exhausted retries: " + taskErr.Error()
+		if projectionKnowledge {
+			errMsg = types.ProductionProjectionFailureReasonBuildFailed
+		}
 		// 8KB is the same cap the dead-letter row uses for last_error.
 		if len(errMsg) > 8192 {
 			errMsg = errMsg[:8192]

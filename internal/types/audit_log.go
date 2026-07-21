@@ -146,6 +146,7 @@ const (
 	AuditActionProductionContentDigestMismatch    AuditAction = "production.content_digest_mismatch"
 	AuditActionProductionReleaseConfirmed         AuditAction = "production.release_confirmed"
 	AuditActionProductionProjectionActivated      AuditAction = "production.projection_activated"
+	AuditActionProductionProjectionFailed         AuditAction = "production.projection_failed"
 	AuditActionProductionProjectionRolledBack     AuditAction = "production.projection_rolled_back"
 	AuditActionProductionProjectionCleanupStarted AuditAction = "production.projection_cleanup_started"
 	AuditActionProductionProjectionCleaned        AuditAction = "production.projection_cleaned"

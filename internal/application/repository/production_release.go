@@ -652,7 +652,11 @@ func (r *productionReleaseRepository) ListCleanupEligible(
 	var targets []*types.ProductionReleaseTarget
 	err := database.DBFromContext(ctx, r.db).WithContext(ctx).
 		Where("tenant_id = ? AND status IN ? AND retention_until IS NOT NULL AND retention_until <= ?",
-			tenantID, []types.ProductionReleaseTargetStatus{types.ReleaseTargetFailed, types.ReleaseTargetRolledBack}, r.nowUTC()).
+			tenantID, []types.ProductionReleaseTargetStatus{
+				types.ReleaseTargetFailed,
+				types.ReleaseTargetRolledBack,
+				types.ReleaseTargetCleanupPending,
+			}, r.nowUTC()).
 		Where(`NOT EXISTS (
 			SELECT 1 FROM production_projection_heads AS head
 			WHERE head.tenant_id = production_release_targets.tenant_id

@@ -158,8 +158,8 @@ func TestProductionApprovedReviewLookupIsTenantAndVersionScoped(t *testing.T) {
 }
 
 func TestProductionReleaseRepositoryListsOnlyExpiredCleanupTargets(t *testing.T) {
-	clock := &productionReleaseTestClock{current: time.Date(2026, 7, 21, 3, 0, 0, 0, time.UTC)}
-	repo, _ := newProductionReleaseRepoFixture(t, clock)
+	clock := &productionReleaseTestClock{current: time.Now().UTC().Add(-31 * 24 * time.Hour).Truncate(time.Second)}
+	repo, db := newProductionReleaseRepoFixture(t, clock)
 	release := productionRelease(releaseIDOne, reviewVersionOne, reviewID(700))
 	target := productionReleaseTarget(releaseTarget1, releaseKBOne, releaseKnowledge1)
 	ctx := productionReleaseContext(reviewTenantID, reviewAuthorID)
@@ -180,6 +180,27 @@ func TestProductionReleaseRepositoryListsOnlyExpiredCleanupTargets(t *testing.T)
 	require.NoError(t, err)
 	require.Len(t, eligible, 1)
 	require.Equal(t, target.ID, eligible[0].ID)
+
+	changed, err = repo.TransitionTarget(
+		ctx, target.ID, types.ReleaseTargetFailed, types.ReleaseTargetCleanupPending, nil,
+	)
+	require.NoError(t, err)
+	require.True(t, changed)
+	eligible, err = lister.ListCleanupEligible(ctx, reviewTenantID, 10)
+	require.NoError(t, err)
+	require.Len(t, eligible, 1, "restart recovery must resume work committed as cleanup_pending")
+	require.Equal(t, types.ReleaseTargetCleanupPending, eligible[0].Status)
+
+	require.NoError(t, db.Exec(`DROP TRIGGER trg_production_projection_heads_validate_insert`).Error)
+	require.NoError(t, db.Exec(`DROP TRIGGER trg_production_projection_heads_activate_target_insert`).Error)
+	require.NoError(t, db.Exec(`
+		INSERT INTO production_projection_heads
+		(tenant_id, document_id, target_knowledge_base_id, active_release_target_id, lock_version, updated_at)
+		VALUES (?, ?, ?, ?, 1, ?)
+	`, reviewTenantID, reviewDocumentID, releaseKBOne, target.ID, clock.current).Error)
+	eligible, err = lister.ListCleanupEligible(ctx, reviewTenantID, 10)
+	require.NoError(t, err)
+	require.Empty(t, eligible, "even cleanup_pending recovery must anti-join active heads")
 }
 
 func TestProductionReleaseRepositoryComputesAuthoritativeDigest(t *testing.T) {

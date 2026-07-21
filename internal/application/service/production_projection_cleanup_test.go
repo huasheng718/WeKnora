@@ -39,6 +39,14 @@ type productionCleanupEngineStub struct {
 	status map[string]bool
 }
 
+func (s *productionCleanupEngineStub) EngineType() types.RetrieverEngineType {
+	return types.PostgresRetrieverEngineType
+}
+
+func (s *productionCleanupEngineStub) Support() []types.RetrieverType {
+	return []types.RetrieverType{types.VectorRetrieverType}
+}
+
 func (s *productionCleanupEngineStub) BatchUpdateChunkEnabledStatus(_ context.Context, status map[string]bool) error {
 	s.calls++
 	s.status = status
@@ -47,12 +55,18 @@ func (s *productionCleanupEngineStub) BatchUpdateChunkEnabledStatus(_ context.Co
 
 type productionCleanupRegistryStub struct {
 	interfaces.RetrieveEngineRegistry
-	engine    interfaces.RetrieveEngineService
-	requested []string
+	engine            interfaces.RetrieveEngineService
+	requested         []string
+	retrievalRequests []types.RetrieverEngineType
 }
 
 func (s *productionCleanupRegistryStub) GetByStoreID(storeID string) (interfaces.RetrieveEngineService, error) {
 	s.requested = append(s.requested, storeID)
+	return s.engine, nil
+}
+
+func (s *productionCleanupRegistryStub) GetRetrieveEngineService(engineType types.RetrieverEngineType) (interfaces.RetrieveEngineService, error) {
+	s.retrievalRequests = append(s.retrievalRequests, engineType)
 	return s.engine, nil
 }
 
@@ -198,6 +212,66 @@ func TestProjectionCleanupSkipsExternalIndexesForNonRetrievalStrategies(t *testi
 			require.NoError(t, updater.DisableChunks(productionReleaseContext(), target, []*types.Chunk{{ID: "chunk-1"}}))
 			require.Empty(t, registry.requested)
 			require.Zero(t, engine.calls)
+			require.Empty(t, ownership.storeID)
+		})
+	}
+}
+
+func TestProjectionCleanupPreparedNonRetrievalTargetsIgnoreDormantRetrievalSelectors(t *testing.T) {
+	storeID := "snapshot-store"
+	for _, tc := range []struct {
+		name     string
+		strategy types.IndexingStrategy
+		storeID  *string
+		extract  *types.ExtractConfig
+	}{
+		{name: "wiki only with vector store", strategy: types.IndexingStrategy{WikiEnabled: true}, storeID: &storeID},
+		{name: "graph only with tenant retrievers", strategy: types.IndexingStrategy{GraphEnabled: true}, extract: &types.ExtractConfig{Enabled: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, repo, _ := newProductionReleaseServiceFixture(t)
+			engine := &productionCleanupEngineStub{}
+			registry := &productionCleanupRegistryStub{engine: engine}
+			ownership := &productionCleanupOwnershipStub{owned: true}
+			svc.registry = registry
+			svc.ownership = ownership
+			svc.kbs = productionReleaseKBStub{kb: &types.KnowledgeBase{
+				ID: "kb-1", TenantID: 7, CreatorID: "00000000-0000-4000-8000-000000000007", Type: types.KnowledgeBaseTypeDocument,
+				StorageProviderConfig: &types.StorageProviderConfig{Provider: "local"},
+				ChunkingConfig:        types.ChunkingConfig{Strategy: "recursive", ChunkSize: 256},
+				EmbeddingModelID:      "embedding-1", SummaryModelID: "summary-1",
+				IndexingStrategy: tc.strategy, ExtractConfig: tc.extract, VectorStoreID: tc.storeID,
+			}}
+
+			release, err := svc.Prepare(productionReleaseContext(), "document-1", "version-3", []string{"kb-1"})
+			require.NoError(t, err)
+			require.Len(t, release.Targets, 1)
+			target := release.Targets[0]
+			repo.targets[target.ID] = target
+			rolledBackAt := time.Now().Add(-2 * time.Hour)
+			retentionUntil := time.Now().Add(-time.Hour)
+			target.Status = types.ReleaseTargetRolledBack
+			target.RolledBackAt = &rolledBackAt
+			target.RetentionUntil = &retentionUntil
+			registry.requested = nil
+			registry.retrievalRequests = nil
+			ownership.storeID = ""
+			chunks := &productionCleanupChunksStub{chunks: []*types.Chunk{{
+				ID: "chunk-1", KnowledgeID: target.KnowledgeID, IsEnabled: true,
+			}}}
+			cleanup := &ProductionProjectionCleanup{
+				releases: repo, chunks: chunks,
+				indexes: NewProductionProjectionRetrieveIndexUpdater(svc.kbs, registry, ownership),
+				uow:     productionReleaseUOWStub{repo: repo}, audit: &productionReleaseAuditStub{}, now: time.Now,
+			}
+
+			require.NoError(t, cleanup.Cleanup(productionReleaseContext(), target.ID))
+			require.Equal(t, types.ReleaseTargetCleaned, target.Status)
+			require.Equal(t, 1, chunks.updates)
+			require.False(t, chunks.chunks[0].IsEnabled)
+			require.Zero(t, engine.calls)
+			require.Empty(t, registry.requested)
+			require.Empty(t, registry.retrievalRequests)
 			require.Empty(t, ownership.storeID)
 		})
 	}
