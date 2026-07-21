@@ -250,6 +250,7 @@ import UserMenu from '@/components/UserMenu.vue';
 import TenantSelector from '@/components/TenantSelector.vue';
 import { useI18n } from 'vue-i18n';
 import { getSystemInfo } from '@/api/system';
+import { isMenuPathActive } from './menuActiveState';
 
 const chatResources = useChatResourcesStore();
 // Platform logos reused from IMChannelsOverviewPanel — keeps the session list
@@ -387,24 +388,7 @@ const isInOrganizationList = computed<boolean>(() => route.name === 'organizatio
 
 // 统一的菜单项激活状态判断
 const isMenuItemActive = (itemPath: string): boolean => {
-    const currentRoute = route.name;
-
-    switch (itemPath) {
-        case 'knowledge-bases':
-            return currentRoute === 'knowledgeBaseList' ||
-                currentRoute === 'knowledgeBaseDetail' ||
-                currentRoute === 'knowledgeBaseSettings';
-        case 'agents':
-            return currentRoute === 'agentList';
-        case 'organizations':
-            return currentRoute === 'organizationList';
-        case 'creatChat':
-            return currentRoute === 'kbCreatChat' || currentRoute === 'globalCreatChat';
-        case 'settings':
-            return currentRoute === 'settings';
-        default:
-            return itemPath === currentpath.value;
-    }
+    return isMenuPathActive(itemPath, route.name);
 };
 
 // 统一的图标激活状态判断
