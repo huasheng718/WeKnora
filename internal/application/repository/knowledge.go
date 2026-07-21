@@ -111,7 +111,8 @@ func applyKnowledgeListFilter(query *gorm.DB, filter types.KnowledgeListFilter) 
 				AND target.knowledge_id = knowledges.id
 				AND (head.active_release_target_id IS NULL OR target.status <> ?)
 		)`, types.ReleaseTargetActive)
-	} else if len(filter.ExcludeKnowledgeIDs) > 0 {
+	}
+	if len(filter.ExcludeKnowledgeIDs) > 0 {
 		query = query.Where("id NOT IN ?", filter.ExcludeKnowledgeIDs)
 	}
 	if len(filter.TagIDs) > 0 {

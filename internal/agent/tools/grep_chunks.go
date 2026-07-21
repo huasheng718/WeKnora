@@ -400,6 +400,18 @@ func (t *GrepChunksTool) searchChunks(
 	logger.Infof(ctx, "[Tool][GrepChunks] Scope: %d knowledge IDs, %d tag scopes, %d KBs",
 		len(knowledgeIDs), len(tagTargets), len(kbIDs))
 	query = query.Where(scopeSQL, scopeArgs...)
+	query = query.Where(`NOT EXISTS (
+		SELECT 1 FROM production_release_targets AS target
+		LEFT JOIN production_projection_heads AS head
+			ON head.tenant_id = target.tenant_id
+			AND head.document_id = target.document_id
+			AND head.target_knowledge_base_id = target.target_knowledge_base_id
+			AND head.active_release_target_id = target.id
+		WHERE target.tenant_id = chunks.tenant_id
+			AND target.target_knowledge_base_id = chunks.knowledge_base_id
+			AND target.knowledge_id = chunks.knowledge_id
+			AND (head.active_release_target_id IS NULL OR target.status <> ?)
+	)`, types.ReleaseTargetActive)
 	if len(excludeKnowledgeIDs) > 0 {
 		query = query.Where("chunks.knowledge_id NOT IN ?", excludeKnowledgeIDs)
 	}

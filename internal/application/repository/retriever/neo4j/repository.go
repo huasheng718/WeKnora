@@ -213,9 +213,10 @@ func (n *Neo4jRepository) SearchNode(
 			// Convert relationship to types.Relation
 			relData := rel.(neo4j.Relationship)
 			graphData.Relation = append(graphData.Relation, &types.GraphRelation{
-				Node1: nodeData.Props["name"].(string),
-				Node2: targetNodeData.Props["name"].(string),
-				Type:  relData.Type,
+				Node1:        nodeData.Props["name"].(string),
+				Node2:        targetNodeData.Props["name"].(string),
+				Type:         relData.Type,
+				KnowledgeIDs: graphPropertyStrings(relData.Props, "kg"),
 			})
 		}
 		return graphData, nil
@@ -225,6 +226,14 @@ func (n *Neo4jRepository) SearchNode(
 		return nil, err
 	}
 	return result.(*types.GraphData), nil
+}
+
+func graphPropertyStrings(properties map[string]any, key string) []string {
+	raw, ok := properties[key].([]interface{})
+	if !ok {
+		return nil
+	}
+	return listI2listS(raw)
 }
 
 func listI2listS(list []any) []string {

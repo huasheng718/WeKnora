@@ -21,8 +21,9 @@ func (*projectionEntityGraphRepo) SearchNode(context.Context, types.NameSpace, [
 			{Name: "building", Chunks: []string{"chunk-building"}},
 		},
 		Relation: []*types.GraphRelation{
-			{Node1: "active", Node2: "old", Type: "related"},
-			{Node1: "old", Node2: "building", Type: "related"},
+			{Node1: "active", Node2: "active", Type: "inactive-only", KnowledgeIDs: []string{"knowledge-old"}},
+			{Node1: "active", Node2: "old", Type: "related", KnowledgeIDs: []string{"knowledge-old"}},
+			{Node1: "old", Node2: "building", Type: "related", KnowledgeIDs: []string{"knowledge-building"}},
 		},
 	}, nil
 }

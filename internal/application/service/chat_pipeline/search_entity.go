@@ -274,6 +274,16 @@ func (p *PluginSearchEntity) pruneExcludedProjectionGraph(
 		if relation == nil {
 			continue
 		}
+		blocked := false
+		for _, knowledgeID := range relation.KnowledgeIDs {
+			if _, excluded := excluded[knowledgeID]; excluded {
+				blocked = true
+				break
+			}
+		}
+		if blocked {
+			continue
+		}
 		if _, left := allowedNodes[relation.Node1]; !left {
 			continue
 		}
