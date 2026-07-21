@@ -404,8 +404,26 @@ func (r *productionReleaseRepository) TransitionTarget(
 		return false, types.ErrProductionReleaseLifecycle
 	}
 
-	now := r.nowUTC()
-	updates := map[string]any{"status": to, "updated_at": now}
+	db := database.DBFromContext(ctx, r.db).WithContext(ctx)
+	var currentGeneration struct {
+		UpdatedAt time.Time
+	}
+	loadErr := db.Model(&types.ProductionReleaseTarget{}).
+		Select("updated_at").
+		Where("tenant_id = ? AND id = ? AND status = ?", tenantID, targetID, from).
+		Take(&currentGeneration).Error
+	if errors.Is(loadErr, gorm.ErrRecordNotFound) {
+		return false, nil
+	}
+	if loadErr != nil {
+		return false, translateProductionReleaseError(loadErr)
+	}
+	lifecycleNow := r.nowUTC()
+	nextUpdatedAt := lifecycleNow
+	if !nextUpdatedAt.After(currentGeneration.UpdatedAt) {
+		nextUpdatedAt = currentGeneration.UpdatedAt.UTC().Add(time.Second)
+	}
+	updates := map[string]any{"status": to, "updated_at": nextUpdatedAt}
 	clearLifecycle := func() {
 		updates["retention_until"] = nil
 		updates["activated_at"] = nil
@@ -423,24 +441,25 @@ func (r *productionReleaseRepository) TransitionTarget(
 		clearLifecycle()
 		updates["failure_code"] = failureCode
 		updates["failure_reason"] = failureReason
-		updates["failed_at"] = now
-		updates["retention_until"] = r.retentionDeadlineExpression(now)
+		updates["failed_at"] = lifecycleNow
+		updates["retention_until"] = r.retentionDeadlineExpression(lifecycleNow)
 	case types.ReleaseTargetRolledBack:
 		clearLifecycle()
-		updates["rolled_back_at"] = now
-		updates["retention_until"] = r.retentionDeadlineExpression(now)
+		updates["rolled_back_at"] = lifecycleNow
+		updates["retention_until"] = r.retentionDeadlineExpression(lifecycleNow)
 	case types.ReleaseTargetCleanupPending:
 		updates["activated_at"] = nil
-		updates["cleanup_requested_at"] = now
+		updates["cleanup_requested_at"] = lifecycleNow
 		updates["cleaned_at"] = nil
 	case types.ReleaseTargetCleaned:
 		updates["activated_at"] = nil
-		updates["cleaned_at"] = now
+		updates["cleaned_at"] = lifecycleNow
 	}
 
-	result := database.DBFromContext(ctx, r.db).WithContext(ctx).
+	result := db.
 		Model(&types.ProductionReleaseTarget{}).
-		Where("tenant_id = ? AND id = ? AND status = ?", tenantID, targetID, from).
+		Where("tenant_id = ? AND id = ? AND status = ? AND updated_at = ?",
+			tenantID, targetID, from, currentGeneration.UpdatedAt).
 		Updates(updates)
 	if result.Error != nil {
 		return false, translateProductionReleaseError(result.Error)
@@ -461,7 +480,7 @@ func (r *productionReleaseRepository) TransitionTargetForRetry(
 	if err := requireProductionReleaseIdentity("target_id", targetID); err != nil {
 		return nil, false, err
 	}
-	if from != types.ReleaseTargetBuilding && from != types.ReleaseTargetFailed && from != types.ReleaseTargetRolledBack {
+	if from != types.ReleaseTargetBuilding && from != types.ReleaseTargetFailed {
 		return nil, false, types.ErrProductionReleaseLifecycle
 	}
 	nextGeneration := r.nowUTC()

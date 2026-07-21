@@ -76,12 +76,26 @@ func markProductionProjectionReady(
 	if err != nil {
 		return err
 	}
+	return reconcileCompletedProductionProjection(ctx, knowledge, releaseRepo)
+}
+
+func reconcileCompletedProductionProjection(
+	ctx context.Context,
+	knowledge *types.Knowledge,
+	releaseRepo interfaces.ProductionReleaseRepository,
+) error {
+	if knowledge == nil || releaseRepo == nil {
+		return errors.New("production projection completion dependencies are unavailable")
+	}
 	projection, err := productionProjectionMetadata(knowledge)
 	if err != nil || projection == nil {
 		return err
 	}
 	if knowledge.ParseStatus != types.ParseStatusCompleted {
 		return nil
+	}
+	if knowledge.PendingSubtasksCount != 0 {
+		return types.ErrProductionReleaseLifecycle
 	}
 	target, err := releaseRepo.GetTarget(ctx, knowledge.TenantID, projection.ReleaseTargetID)
 	if err != nil {

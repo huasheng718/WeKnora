@@ -190,7 +190,7 @@ func (s *ProductionReleaseService) Retry(ctx context.Context, targetID string) e
 	if err != nil {
 		return err
 	}
-	if target.Status != types.ReleaseTargetFailed && target.Status != types.ReleaseTargetRolledBack && target.Status != types.ReleaseTargetBuilding {
+	if target.Status != types.ReleaseTargetFailed && target.Status != types.ReleaseTargetBuilding {
 		return types.ErrProductionReleaseLifecycle
 	}
 	if s.tasks == nil {
@@ -225,8 +225,7 @@ func claimProductionProjectionRetry(
 			return err
 		}
 		if target == nil || target.ID != targetID || target.TenantID != tenantID ||
-			(target.Status != types.ReleaseTargetBuilding && target.Status != types.ReleaseTargetFailed &&
-				target.Status != types.ReleaseTargetRolledBack) {
+			(target.Status != types.ReleaseTargetBuilding && target.Status != types.ReleaseTargetFailed) {
 			return types.ErrProductionReleaseLifecycle
 		}
 
@@ -234,7 +233,7 @@ func claimProductionProjectionRetry(
 		if knowledgeErr != nil && !errors.Is(knowledgeErr, apprepository.ErrKnowledgeNotFound) {
 			return knowledgeErr
 		}
-		advanceGeneration := target.Status != types.ReleaseTargetBuilding
+		advanceGeneration := target.Status == types.ReleaseTargetFailed
 		if knowledgeErr == nil {
 			projection, integrityErr := types.ValidateProductionProjectionIntegrity(knowledge)
 			if integrityErr != nil {
@@ -254,7 +253,6 @@ func claimProductionProjectionRetry(
 				if !claimed {
 					return types.ErrProductionProjectionConflict
 				}
-				advanceGeneration = true
 			case types.ParseStatusPending, types.ParseStatusProcessing, types.ParseStatusFinalizing:
 				// A committed claim is replayed without allocating another generation.
 			case types.ParseStatusCompleted:
@@ -262,8 +260,6 @@ func claimProductionProjectionRetry(
 			default:
 				return types.ErrProductionReleaseLifecycle
 			}
-		} else {
-			advanceGeneration = true
 		}
 		if !advanceGeneration {
 			claimedTarget = target

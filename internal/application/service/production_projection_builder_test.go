@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -495,7 +497,9 @@ func TestProjectionBuildRejectsIncompleteProcessingSnapshots(t *testing.T) {
 	}
 }
 
-func TestProductionReleaseRepositoryCreateFeedsProjectionBuilder(t *testing.T) {
+func newProductionProjectionBuilderIntegrationFixture(
+	t *testing.T,
+) (*projectionBuilderFixture, *gorm.DB, interfaces.ProductionReleaseRepository, interfaces.KnowledgeRepository, context.Context) {
 	fixture := newProjectionBuilderFixture(t)
 	_, filename, _, ok := runtime.Caller(0)
 	require.True(t, ok)
@@ -526,6 +530,9 @@ func TestProductionReleaseRepositoryCreateFeedsProjectionBuilder(t *testing.T) {
 		require.NoError(t, readErr)
 		require.NoError(t, db.Exec(string(migration)).Error)
 	}
+	require.NoError(t, db.AutoMigrate(
+		&types.Knowledge{}, &types.KnowledgeTag{}, &types.KnowledgeTagRelation{},
+	))
 
 	actorID := "93000000-0000-4000-8000-000000000099"
 	typeID := "93000000-0000-4000-8000-000000000090"
@@ -587,11 +594,298 @@ func TestProductionReleaseRepositoryCreateFeedsProjectionBuilder(t *testing.T) {
 	require.NoError(t, releaseRepo.CreateRelease(createCtx, &release, []*types.ProductionReleaseTarget{&target}))
 	require.Equal(t, types.ProductionReleaseDigestVersionCurrent, release.ReleaseDigestVersion)
 	require.Equal(t, release.ReleaseDigest, target.ReleaseDigest)
+	return fixture, db, releaseRepo, apprepository.NewKnowledgeRepository(db), createCtx
+}
 
+func TestProductionReleaseRepositoryCreateFeedsProjectionBuilder(t *testing.T) {
+	fixture, _, releaseRepo, _, _ := newProductionProjectionBuilderIntegrationFixture(t)
 	fixture.builder.releases = releaseRepo
 	knowledge, err := fixture.builder.Build(projectionBuildContext(), projectionTargetID)
 	require.NoError(t, err)
 	require.Equal(t, projectionKnowledgeID, knowledge.ID)
+}
+
+func TestProductionProjectionBuilderReconcilesCompletedCrashResidueWithRealRepositories(t *testing.T) {
+	t.Run("completed building target becomes ready once", func(t *testing.T) {
+		fixture, db, releaseRepo, knowledgeRepo, _ := newProductionProjectionBuilderIntegrationFixture(t)
+		target, err := releaseRepo.GetTarget(projectionBuildContext(), projectionTenantID, projectionTargetID)
+		require.NoError(t, err)
+		knowledge := completedProjectionKnowledgeForBuilder(t, fixture, target, 0)
+		require.NoError(t, knowledgeRepo.CreateKnowledge(projectionBuildContext(), knowledge))
+		fixture.builder.releases = releaseRepo
+		fixture.builder.knowledge = &knowledgeService{repo: knowledgeRepo}
+		fixture.builder.uow = apprepository.NewProductionUnitOfWork(db)
+
+		first, err := fixture.builder.Build(projectionBuildContext(), projectionTargetID)
+		require.NoError(t, err)
+		require.Equal(t, knowledge.ID, first.ID)
+		ready, err := releaseRepo.GetTarget(projectionBuildContext(), projectionTenantID, projectionTargetID)
+		require.NoError(t, err)
+		require.Equal(t, types.ReleaseTargetReady, ready.Status)
+
+		second, err := fixture.builder.Build(projectionBuildContext(), projectionTargetID)
+		require.NoError(t, err)
+		require.Equal(t, knowledge.ID, second.ID)
+		replayed, err := releaseRepo.GetTarget(projectionBuildContext(), projectionTenantID, projectionTargetID)
+		require.NoError(t, err)
+		require.Equal(t, types.ReleaseTargetReady, replayed.Status)
+		require.True(t, replayed.UpdatedAt.Equal(ready.UpdatedAt), "ready replay must not mutate the target again")
+	})
+
+	t.Run("completed row with pending work stays building", func(t *testing.T) {
+		fixture, db, releaseRepo, knowledgeRepo, _ := newProductionProjectionBuilderIntegrationFixture(t)
+		target, err := releaseRepo.GetTarget(projectionBuildContext(), projectionTenantID, projectionTargetID)
+		require.NoError(t, err)
+		knowledge := completedProjectionKnowledgeForBuilder(t, fixture, target, 1)
+		require.NoError(t, knowledgeRepo.CreateKnowledge(projectionBuildContext(), knowledge))
+		fixture.builder.releases = releaseRepo
+		fixture.builder.knowledge = &knowledgeService{repo: knowledgeRepo}
+		fixture.builder.uow = apprepository.NewProductionUnitOfWork(db)
+
+		_, err = fixture.builder.Build(projectionBuildContext(), projectionTargetID)
+		require.ErrorIs(t, err, types.ErrProductionReleaseLifecycle)
+		persisted, err := releaseRepo.GetTarget(projectionBuildContext(), projectionTenantID, projectionTargetID)
+		require.NoError(t, err)
+		require.Equal(t, types.ReleaseTargetBuilding, persisted.Status)
+	})
+}
+
+func TestProductionProjectionRolledBackRetryIsRejectedWithoutClearingRetention(t *testing.T) {
+	for _, entrypoint := range []string{"service", "builder"} {
+		t.Run(entrypoint, func(t *testing.T) {
+			fixture, db, releaseRepo, knowledgeRepo, actorCtx := newProductionProjectionBuilderIntegrationFixture(t)
+			changed, err := releaseRepo.TransitionTarget(
+				actorCtx, projectionTargetID, types.ReleaseTargetBuilding, types.ReleaseTargetRolledBack, nil,
+			)
+			require.NoError(t, err)
+			require.True(t, changed)
+			before, err := releaseRepo.GetTarget(actorCtx, projectionTenantID, projectionTargetID)
+			require.NoError(t, err)
+			require.NotNil(t, before.RolledBackAt)
+			require.NotNil(t, before.RetentionUntil)
+			knowledge := completedProjectionKnowledgeForBuilder(t, fixture, before, 0)
+			require.NoError(t, knowledgeRepo.CreateKnowledge(actorCtx, knowledge))
+
+			switch entrypoint {
+			case "service":
+				tasks := &productionReleaseTaskEnqueuerStub{accepted: make(map[string]*asynq.Task)}
+				svc := &ProductionReleaseService{
+					releases: releaseRepo, authorizer: productionReleaseAuthorizerStub{},
+					members: productionReleaseMembershipStub{role: types.TenantRoleContributor},
+					kbs: productionReleaseKBStub{kb: &types.KnowledgeBase{
+						ID: projectionKBID, TenantID: projectionTenantID, CreatorID: "93000000-0000-4000-8000-000000000099",
+						Type: types.KnowledgeBaseTypeDocument,
+					}},
+					knowledge: &knowledgeService{repo: knowledgeRepo},
+					uow:       apprepository.NewProductionUnitOfWork(db), tasks: tasks,
+				}
+				err = svc.Retry(actorCtx, projectionTargetID)
+				require.ErrorIs(t, err, types.ErrProductionReleaseLifecycle)
+				require.Empty(t, tasks.accepted)
+			case "builder":
+				fixture.builder.releases = releaseRepo
+				fixture.builder.knowledge = &knowledgeService{repo: knowledgeRepo}
+				fixture.builder.uow = apprepository.NewProductionUnitOfWork(db)
+				_, err = fixture.builder.Build(projectionBuildContext(), projectionTargetID)
+				require.ErrorIs(t, err, types.ErrProductionReleaseLifecycle)
+			}
+
+			after, err := releaseRepo.GetTarget(actorCtx, projectionTenantID, projectionTargetID)
+			require.NoError(t, err)
+			require.Equal(t, types.ReleaseTargetRolledBack, after.Status)
+			require.Equal(t, before.RolledBackAt, after.RolledBackAt)
+			require.Equal(t, before.RetentionUntil, after.RetentionUntil)
+			require.True(t, after.UpdatedAt.Equal(before.UpdatedAt))
+		})
+	}
+}
+
+func TestProductionReleaseConcurrentRetryWithoutKnowledgeUsesOneRealGeneration(t *testing.T) {
+	const callers = 16
+	_, db, releaseRepo, knowledgeRepo, actorCtx := newProductionProjectionBuilderIntegrationFixture(t)
+	changed, err := releaseRepo.TransitionTarget(
+		actorCtx, projectionTargetID, types.ReleaseTargetBuilding, types.ReleaseTargetFailed, nil,
+	)
+	require.NoError(t, err)
+	require.True(t, changed)
+	firstFailure, err := releaseRepo.GetTarget(actorCtx, projectionTenantID, projectionTargetID)
+	require.NoError(t, err)
+	tasks := &productionReleaseTaskEnqueuerStub{accepted: make(map[string]*asynq.Task)}
+	realUOW := apprepository.NewProductionUnitOfWork(db)
+	svc := &ProductionReleaseService{
+		releases: releaseRepo, authorizer: productionReleaseAuthorizerStub{},
+		members: productionReleaseMembershipStub{role: types.TenantRoleContributor},
+		kbs: productionReleaseKBStub{kb: &types.KnowledgeBase{
+			ID: projectionKBID, TenantID: projectionTenantID, CreatorID: "93000000-0000-4000-8000-000000000099",
+			Type: types.KnowledgeBaseTypeDocument,
+		}},
+		knowledge: &knowledgeService{repo: knowledgeRepo},
+		uow:       realUOW, tasks: tasks, audit: &productionReleaseAuditStub{},
+	}
+
+	firstBarrier := newProductionRetryBarrierUOW(realUOW, callers)
+	svc.uow = firstBarrier
+	retryProductionProjectionConcurrently(t, svc, actorCtx, projectionTargetID, callers, firstBarrier)
+	firstRetry, err := releaseRepo.GetTarget(actorCtx, projectionTenantID, projectionTargetID)
+	require.NoError(t, err)
+	require.Equal(t, types.ReleaseTargetBuilding, firstRetry.Status)
+	require.True(t, firstRetry.UpdatedAt.After(firstFailure.UpdatedAt))
+	firstIDs := acceptedProductionRetryTaskIDs(tasks)
+	require.Len(t, firstIDs, 1)
+	require.Contains(t, firstIDs[0], fmt.Sprintf("build-retry-%d", firstRetry.UpdatedAt.UnixNano()))
+
+	// A worker can fail before the preassigned Knowledge row is created. The
+	// next concurrent request wave owns exactly one new failed generation.
+	svc.uow = realUOW
+	require.NoError(t, svc.recordProjectionTargetFailure(actorCtx, projectionTargetID, types.TypeProductionBuild))
+	secondFailure, err := releaseRepo.GetTarget(actorCtx, projectionTenantID, projectionTargetID)
+	require.NoError(t, err)
+	require.Equal(t, types.ReleaseTargetFailed, secondFailure.Status)
+
+	secondBarrier := newProductionRetryBarrierUOW(realUOW, callers)
+	svc.uow = secondBarrier
+	retryProductionProjectionConcurrently(t, svc, actorCtx, projectionTargetID, callers, secondBarrier)
+	secondRetry, err := releaseRepo.GetTarget(actorCtx, projectionTenantID, projectionTargetID)
+	require.NoError(t, err)
+	require.Equal(t, types.ReleaseTargetBuilding, secondRetry.Status)
+	require.True(t, secondRetry.UpdatedAt.After(secondFailure.UpdatedAt))
+	require.True(t, secondRetry.UpdatedAt.After(firstRetry.UpdatedAt), "next failed retry must own a fresh generation")
+	secondIDs := acceptedProductionRetryTaskIDs(tasks)
+	require.Len(t, secondIDs, 2)
+	require.Contains(t, secondIDs[1], fmt.Sprintf("build-retry-%d", secondRetry.UpdatedAt.UnixNano()))
+	require.NotEqual(t, firstIDs[0], secondIDs[1])
+}
+
+func TestProductionReleaseBuildingFailedKnowledgeClaimReusesRealGeneration(t *testing.T) {
+	fixture, db, releaseRepo, knowledgeRepo, actorCtx := newProductionProjectionBuilderIntegrationFixture(t)
+	before, err := releaseRepo.GetTarget(actorCtx, projectionTenantID, projectionTargetID)
+	require.NoError(t, err)
+	knowledge := completedProjectionKnowledgeForBuilder(t, fixture, before, 0)
+	knowledge.ParseStatus = types.ParseStatusFailed
+	knowledge.ErrorMessage = "sanitized worker failure"
+	require.NoError(t, knowledgeRepo.CreateKnowledge(actorCtx, knowledge))
+	tasks := &productionReleaseTaskEnqueuerStub{accepted: make(map[string]*asynq.Task)}
+	svc := &ProductionReleaseService{
+		releases: releaseRepo, authorizer: productionReleaseAuthorizerStub{},
+		members: productionReleaseMembershipStub{role: types.TenantRoleContributor},
+		kbs: productionReleaseKBStub{kb: &types.KnowledgeBase{
+			ID: projectionKBID, TenantID: projectionTenantID, CreatorID: "93000000-0000-4000-8000-000000000099",
+			Type: types.KnowledgeBaseTypeDocument,
+		}},
+		knowledge: &knowledgeService{repo: knowledgeRepo},
+		uow:       apprepository.NewProductionUnitOfWork(db), tasks: tasks,
+	}
+
+	require.NoError(t, svc.Retry(actorCtx, projectionTargetID))
+	after, err := releaseRepo.GetTarget(actorCtx, projectionTenantID, projectionTargetID)
+	require.NoError(t, err)
+	require.Equal(t, types.ReleaseTargetBuilding, after.Status)
+	require.True(t, after.UpdatedAt.Equal(before.UpdatedAt), "building target must retain its claimed generation")
+	claimed, err := knowledgeRepo.GetKnowledgeByIDOnly(actorCtx, knowledge.ID)
+	require.NoError(t, err)
+	require.Equal(t, types.ParseStatusPending, claimed.ParseStatus)
+	require.Empty(t, claimed.ErrorMessage)
+	require.Len(t, acceptedProductionRetryTaskIDs(tasks), 1)
+}
+
+type productionRetryBarrierUOW struct {
+	delegate interfaces.ProductionUnitOfWork
+	arrived  chan struct{}
+	release  chan struct{}
+	serial   sync.Mutex
+}
+
+func newProductionRetryBarrierUOW(
+	delegate interfaces.ProductionUnitOfWork,
+	callers int,
+) *productionRetryBarrierUOW {
+	return &productionRetryBarrierUOW{
+		delegate: delegate, arrived: make(chan struct{}, callers), release: make(chan struct{}),
+	}
+}
+
+func (u *productionRetryBarrierUOW) WithinTransaction(
+	ctx context.Context,
+	fn func(context.Context) error,
+) error {
+	u.arrived <- struct{}{}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-u.release:
+	}
+	u.serial.Lock()
+	defer u.serial.Unlock()
+	return u.delegate.WithinTransaction(ctx, fn)
+}
+
+func retryProductionProjectionConcurrently(
+	t *testing.T,
+	svc *ProductionReleaseService,
+	ctx context.Context,
+	targetID string,
+	callers int,
+	barrier *productionRetryBarrierUOW,
+) {
+	t.Helper()
+	start := make(chan struct{})
+	errs := make(chan error, callers)
+	for range callers {
+		go func() {
+			<-start
+			errs <- svc.Retry(ctx, targetID)
+		}()
+	}
+	close(start)
+	for range callers {
+		select {
+		case <-barrier.arrived:
+		case <-time.After(2 * time.Second):
+			t.Fatal("concurrent Retry callers did not reach the claim transaction barrier")
+		}
+	}
+	close(barrier.release)
+	for range callers {
+		require.NoError(t, <-errs)
+	}
+}
+
+func acceptedProductionRetryTaskIDs(tasks *productionReleaseTaskEnqueuerStub) []string {
+	tasks.mu.Lock()
+	defer tasks.mu.Unlock()
+	ids := make([]string, 0, len(tasks.accepted))
+	for id := range tasks.accepted {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func completedProjectionKnowledgeForBuilder(
+	t *testing.T,
+	fixture *projectionBuilderFixture,
+	target *types.ProductionReleaseTarget,
+	pendingSubtasks int,
+) *types.Knowledge {
+	t.Helper()
+	markdown, err := RenderProductionMarkdown(fixture.version)
+	require.NoError(t, err)
+	_, _, summaryModelID, graphModelID, indexingStrategy, err := productionProjectionProcessSnapshot(target.ConfigSnapshot)
+	require.NoError(t, err)
+	contentSum := sha256.Sum256([]byte(markdown))
+	meta := types.NewManualKnowledgeMetadata(markdown, types.ManualKnowledgeStatusPublish, 1)
+	meta.ProductionProjection = &types.ProductionProjectionMetadata{
+		DocumentID: target.DocumentID, VersionID: target.VersionID, ReleaseTargetID: target.ID,
+		ContentDigest: hex.EncodeToString(contentSum[:]), GraphModelID: graphModelID,
+		SummaryModelID: summaryModelID, IndexingStrategy: indexingStrategy,
+	}
+	knowledge := &types.Knowledge{
+		ID: target.KnowledgeID, TenantID: target.TenantID, KnowledgeBaseID: target.TargetKnowledgeBaseID,
+		Type: types.KnowledgeTypeManual, ParseStatus: types.ParseStatusCompleted,
+		PendingSubtasksCount: pendingSubtasks,
+	}
+	require.NoError(t, knowledge.SetManualMetadata(meta))
+	return knowledge
 }
 
 func projectionTimePtr(value time.Time) *time.Time { return &value }

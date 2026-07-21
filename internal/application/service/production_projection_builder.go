@@ -62,7 +62,7 @@ func (b *ProductionProjectionBuilder) Build(ctx context.Context, targetID string
 	if target == nil || target.ID != targetID || target.TenantID != tenantID {
 		return nil, types.ErrProductionReleaseInvalid
 	}
-	if target.Status == types.ReleaseTargetFailed || target.Status == types.ReleaseTargetRolledBack {
+	if target.Status == types.ReleaseTargetFailed {
 		target, err = claimProductionProjectionRetry(ctx, b.uow, b.releases, b.knowledge, target.ID)
 		if err != nil {
 			return nil, err
@@ -146,6 +146,12 @@ func (b *ProductionProjectionBuilder) Build(ctx context.Context, targetID string
 	if existing, loadErr := b.knowledge.GetKnowledgeByID(ctx, target.KnowledgeID); loadErr == nil {
 		if err := validateProductionProjectionKnowledge(existing, payload); err != nil {
 			return nil, err
+		}
+		if existing.ParseStatus == types.ParseStatusCompleted {
+			if err := reconcileCompletedProductionProjection(ctx, existing, b.releases); err != nil {
+				return nil, err
+			}
+			return existing, nil
 		}
 		if (existing.ParseStatus == types.ParseStatusFailed ||
 			(existing.ParseStatus == types.ParseStatusPending && payload.RetryClaimed)) &&
