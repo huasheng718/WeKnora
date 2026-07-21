@@ -382,6 +382,28 @@ func TestProductionProjectionFailedRetryEscapesArchivedPriorAttemptTaskID(t *tes
 	require.Equal(t, []string{firstRetryID, secondRetryID, secondRetryID}, tasks.taskIDs)
 }
 
+func TestProductionProjectionClaimedRetryAllocatesOnceAndReplaysSameAttempt(t *testing.T) {
+	tracker, spanDB := setupSpanTrackerTest(t)
+	knowledge := initialPostProcessProjectionKnowledge(t, types.ParseStatusPending)
+	seedSpanTrackerKnowledgeTest(t, spanDB, knowledge.TenantID, knowledge.ID)
+	tasks := &manualAttemptRetryEnqueuer{accepted: make(map[string]*asynq.Task)}
+	service := &knowledgeService{task: tasks, spanTracker: tracker}
+
+	root, attempt, err := tracker.OpenAttempt(context.Background(), knowledge.ID, "")
+	require.NoError(t, err)
+	require.NotNil(t, root)
+	tracker.FinalizeAttempt(context.Background(), knowledge.ID, attempt,
+		types.SpanStatusFailed, nil, "MANUAL_TASK_DEAD_LETTERED", "prior attempt failed")
+
+	require.NoError(t, service.enqueueClaimedProjectionRetry(context.Background(), knowledge, "# governed projection"))
+	require.NoError(t, service.enqueueClaimedProjectionRetry(context.Background(), knowledge, "# governed projection"))
+	require.Equal(t, attempt+1, tracker.LatestAttempt(context.Background(), knowledge.ID))
+	retryID := productionProjectionAttemptTaskID("target-1", knowledge.ID, "retry", attempt+1)
+	require.NotNil(t, tasks.accepted[retryID])
+	require.Len(t, tasks.accepted, 1)
+	require.Equal(t, []string{retryID, retryID}, tasks.taskIDs)
+}
+
 func TestOrdinaryManualEnqueueRemainsCompatibleWithoutSpanTracker(t *testing.T) {
 	knowledge := &types.Knowledge{
 		ID: "ordinary-knowledge-1", TenantID: 1, KnowledgeBaseID: "kb-1", Type: types.KnowledgeTypeManual,

@@ -892,7 +892,13 @@ func (s *knowledgeService) CreateKnowledgeFromProductionProjection(
 			if metaErr != nil || meta == nil {
 				return nil, types.ErrProductionProjectionConflict
 			}
-			if enqueueErr := s.enqueueManualProcessing(ctx, owned, meta.Content, false); enqueueErr != nil {
+			var enqueueErr error
+			if payload.RetryClaimed {
+				enqueueErr = s.enqueueClaimedProjectionRetry(ctx, owned, meta.Content)
+			} else {
+				enqueueErr = s.enqueueManualProcessing(ctx, owned, meta.Content, false)
+			}
+			if enqueueErr != nil {
 				return nil, enqueueErr
 			}
 			return owned, nil
@@ -1220,10 +1226,23 @@ func (s *knowledgeService) UpdateManualKnowledge(ctx context.Context,
 func (s *knowledgeService) enqueueManualProcessing(ctx context.Context,
 	knowledge *types.Knowledge, content string, needCleanup bool, presetAttempt ...int,
 ) error {
-	return s.enqueueManualProcessingWithEncoder(
+	return s.enqueueManualProcessingWithMode(
 		ctx, knowledge, content, needCleanup,
 		func(payload types.ManualProcessPayload) ([]byte, error) { return json.Marshal(payload) },
+		false,
 		presetAttempt...,
+	)
+}
+
+func (s *knowledgeService) enqueueClaimedProjectionRetry(
+	ctx context.Context,
+	knowledge *types.Knowledge,
+	content string,
+) error {
+	return s.enqueueManualProcessingWithMode(
+		ctx, knowledge, content, true,
+		func(payload types.ManualProcessPayload) ([]byte, error) { return json.Marshal(payload) },
+		true,
 	)
 }
 
@@ -1233,6 +1252,18 @@ func (s *knowledgeService) enqueueManualProcessingWithEncoder(
 	content string,
 	needCleanup bool,
 	encode func(types.ManualProcessPayload) ([]byte, error),
+	presetAttempt ...int,
+) error {
+	return s.enqueueManualProcessingWithMode(ctx, knowledge, content, needCleanup, encode, false, presetAttempt...)
+}
+
+func (s *knowledgeService) enqueueManualProcessingWithMode(
+	ctx context.Context,
+	knowledge *types.Knowledge,
+	content string,
+	needCleanup bool,
+	encode func(types.ManualProcessPayload) ([]byte, error),
+	claimPendingRetry bool,
 	presetAttempt ...int,
 ) error {
 	projection, integrityErr := types.ValidateProductionProjectionIntegrity(knowledge)
@@ -1256,7 +1287,7 @@ func (s *knowledgeService) enqueueManualProcessingWithEncoder(
 	if len(presetAttempt) > 0 && presetAttempt[0] > 0 {
 		payload.Attempt = presetAttempt[0]
 		finalizeAttemptOnFailure = true
-	} else if projection != nil && !needCleanup {
+	} else if projection != nil && (!needCleanup || claimPendingRetry) {
 		root, attempt, created, attemptErr := s.tracker().ClaimPendingAttempt(
 			ctx, knowledge.TenantID, knowledge.ID, payload.LangfuseTraceID,
 		)

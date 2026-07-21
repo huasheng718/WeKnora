@@ -109,3 +109,28 @@ func TestProductionFailureRecoveryCancellationStopsTickerAndGoroutine(t *testing
 		t.Fatal("failure recovery ticker was not stopped")
 	}
 }
+
+func TestProductionFailureRecoveryConcurrentRunnersKeepEverySweepBounded(t *testing.T) {
+	tenants := &productionCleanupRecoveryTenantStub{tenants: []*types.Tenant{{ID: 7}, {ID: 8}}}
+	sweeper := &productionFailureRecoverySweeperStub{}
+	firstTicker := newProductionCleanupRecoveryTickerStub()
+	secondTicker := newProductionCleanupRecoveryTickerStub()
+	first := newProductionFailureRecoveryRunner(
+		sweeper, tenants, 100, time.Hour,
+		func(time.Duration) productionFailureRecoveryTicker { return firstTicker },
+	)
+	second := newProductionFailureRecoveryRunner(
+		sweeper, tenants, 100, time.Hour,
+		func(time.Duration) productionFailureRecoveryTicker { return secondTicker },
+	)
+	first.Start(context.Background())
+	second.Start(context.Background())
+	t.Cleanup(first.Stop)
+	t.Cleanup(second.Stop)
+
+	require.Eventually(t, func() bool { return len(sweeper.snapshotCalls()) == 4 }, time.Second, time.Millisecond)
+	for _, call := range sweeper.snapshotCalls() {
+		require.Equal(t, 100, call.limit)
+		require.Contains(t, []uint64{7, 8}, call.tenantID)
+	}
+}

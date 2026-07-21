@@ -520,6 +520,7 @@ func TestProductionReleaseRepositoryCreateFeedsProjectionBuilder(t *testing.T) {
 	for _, name := range []string{
 		"000005_knowledge_production_publication.up.sql",
 		"000006_knowledge_production_projection_integrity.up.sql",
+		"000007_production_projection_failure_recovery.up.sql",
 	} {
 		migration, readErr := os.ReadFile(filepath.Join(migrationDir, name))
 		require.NoError(t, readErr)

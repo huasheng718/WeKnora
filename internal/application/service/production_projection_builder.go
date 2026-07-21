@@ -63,16 +63,10 @@ func (b *ProductionProjectionBuilder) Build(ctx context.Context, targetID string
 		return nil, types.ErrProductionReleaseInvalid
 	}
 	if target.Status == types.ReleaseTargetFailed || target.Status == types.ReleaseTargetRolledBack {
-		changed, transitionErr := b.releases.TransitionTarget(
-			ctx, target.ID, target.Status, types.ReleaseTargetBuilding, nil,
-		)
-		if transitionErr != nil {
-			return nil, transitionErr
+		target, err = claimProductionProjectionRetry(ctx, b.uow, b.releases, b.knowledge, target.ID)
+		if err != nil {
+			return nil, err
 		}
-		if !changed {
-			return nil, types.ErrProductionProjectionConflict
-		}
-		target.Status = types.ReleaseTargetBuilding
 	}
 	if target.Status != types.ReleaseTargetBuilding && target.Status != types.ReleaseTargetReady &&
 		target.Status != types.ReleaseTargetActive {
@@ -142,6 +136,7 @@ func (b *ProductionProjectionBuilder) Build(ctx context.Context, targetID string
 		Title: document.Title, Content: markdown, EmbeddingModelID: embeddingModelID,
 		SummaryModelID: summaryModelID, GraphModelID: graphModelID, IndexingStrategy: indexingStrategy,
 		ProcessOverrides: processOverrides,
+		RetryClaimed:     target.Status == types.ReleaseTargetBuilding && target.UpdatedAt.After(target.CreatedAt),
 		ProductionProjection: &types.ProductionProjectionMetadata{
 			DocumentID: target.DocumentID, VersionID: target.VersionID,
 			ReleaseTargetID: target.ID, ContentDigest: hex.EncodeToString(contentSum[:]),
@@ -152,7 +147,9 @@ func (b *ProductionProjectionBuilder) Build(ctx context.Context, targetID string
 		if err := validateProductionProjectionKnowledge(existing, payload); err != nil {
 			return nil, err
 		}
-		if existing.ParseStatus == types.ParseStatusFailed && target.Status == types.ReleaseTargetBuilding {
+		if (existing.ParseStatus == types.ParseStatusFailed ||
+			(existing.ParseStatus == types.ParseStatusPending && payload.RetryClaimed)) &&
+			target.Status == types.ReleaseTargetBuilding {
 			return b.knowledge.CreateKnowledgeFromProductionProjection(ctx, payload)
 		}
 		return existing, nil

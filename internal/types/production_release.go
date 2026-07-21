@@ -152,6 +152,7 @@ type ProductionReleaseTarget struct {
 	Status                ProductionReleaseTargetStatus `json:"status" gorm:"type:varchar(20);not null;default:'building'"`
 	FailureCode           string                        `json:"failure_code,omitempty" gorm:"type:varchar(64);not null;default:''"`
 	FailureReason         string                        `json:"failure_reason,omitempty" gorm:"type:varchar(256);not null;default:''"`
+	RecoveryAttemptedAt   *time.Time                    `json:"recovery_attempted_at,omitempty"`
 	RetentionDays         int                           `json:"retention_days" gorm:"not null;default:30"`
 	RetentionUntil        *time.Time                    `json:"retention_until,omitempty"`
 	ActivatedAt           *time.Time                    `json:"activated_at,omitempty"`

@@ -2,10 +2,13 @@ package repository
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql/driver"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -58,6 +61,9 @@ func newProductionReleaseRepoFixture(t *testing.T, clock ProductionReleaseClock)
 	integrityMigration, err := os.ReadFile(filepath.Join(filepath.Dir(filename), "../../../migrations/sqlite/000006_knowledge_production_projection_integrity.up.sql"))
 	require.NoError(t, err)
 	require.NoError(t, db.Exec(string(integrityMigration)).Error)
+	recoveryMigration, err := os.ReadFile(filepath.Join(filepath.Dir(filename), "../../../migrations/sqlite/000007_production_projection_failure_recovery.up.sql"))
+	require.NoError(t, err)
+	require.NoError(t, db.Exec(string(recoveryMigration)).Error)
 	require.NoError(t, db.Exec(`INSERT INTO knowledge_bases (id, tenant_id) VALUES (?, ?), (?, ?), (?, 8)`, releaseKBOne, reviewTenantID, releaseKBTwo, reviewTenantID, releaseKBTwo+"-other", 8).Error)
 
 	approveProductionReleaseReview(t, db, reviewRepo, reviewID(700), reviewVersionOne, 700)
@@ -256,6 +262,213 @@ func TestProductionReleaseRepositoryListsBoundedBuildingTargetsWithFailedKnowled
 		productionReleaseContext(reviewTenantID+1, reviewAuthorID), reviewTenantID, 10,
 	)
 	require.ErrorIs(t, err, types.ErrProductionForbidden)
+}
+
+func TestProductionReleaseRepositoryRotatesPermanentRecoveryFailuresAcrossRestart(t *testing.T) {
+	_, db := newProductionReviewRepoFixture(t)
+	require.NoError(t, db.Exec(`
+		CREATE TABLE production_release_targets (
+			id VARCHAR(36) PRIMARY KEY,
+			release_id VARCHAR(36) NOT NULL,
+			tenant_id INTEGER NOT NULL,
+			project_id VARCHAR(36) NOT NULL,
+			document_id VARCHAR(36) NOT NULL,
+			version_id VARCHAR(36) NOT NULL,
+			target_knowledge_base_id VARCHAR(36) NOT NULL,
+			knowledge_id VARCHAR(36) NOT NULL UNIQUE,
+			release_digest VARCHAR(64) NOT NULL,
+			config_snapshot TEXT NOT NULL,
+			config_digest VARCHAR(64) NOT NULL,
+			status VARCHAR(20) NOT NULL,
+			failure_code VARCHAR(64) NOT NULL DEFAULT '',
+			failure_reason VARCHAR(256) NOT NULL DEFAULT '',
+			retention_days INTEGER NOT NULL DEFAULT 30,
+			retention_until DATETIME NULL,
+			activated_at DATETIME NULL,
+			failed_at DATETIME NULL,
+			rolled_back_at DATETIME NULL,
+			cleanup_requested_at DATETIME NULL,
+			cleaned_at DATETIME NULL,
+			recovery_attempted_at DATETIME NULL,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL
+		);
+		CREATE TABLE knowledges (
+			id VARCHAR(36) PRIMARY KEY,
+			tenant_id INTEGER NOT NULL,
+			knowledge_base_id VARCHAR(36) NOT NULL,
+			parse_status VARCHAR(50) NOT NULL,
+			deleted_at DATETIME NULL
+		);
+	`).Error)
+	canonical, digest, err := types.CanonicalProductionReleaseTargetConfig(types.JSON(
+		`{"version":1,"indexing_strategy":{"wiki_enabled":true},"chunking":{"strategy":"recursive","chunk_size":256},"summary_model_id":"summary-1","graph":{"enabled":false}}`,
+	))
+	require.NoError(t, err)
+	createdAt := time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC)
+	for index := 1; index <= 202; index++ {
+		tenantID := reviewTenantID
+		if index == 202 {
+			tenantID = reviewTenantID + 1
+		}
+		targetID := fmt.Sprintf("target-%03d", index)
+		knowledgeID := fmt.Sprintf("knowledge-%03d", index)
+		kbID := fmt.Sprintf("kb-%03d", index)
+		require.NoError(t, db.Exec(`
+			INSERT INTO production_release_targets
+			(id, release_id, tenant_id, project_id, document_id, version_id,
+			 target_knowledge_base_id, knowledge_id, release_digest, config_snapshot,
+			 config_digest, status, created_at, updated_at)
+			VALUES (?, 'release-1', ?, 'project-1', 'document-1', 'version-1', ?, ?, ?, ?, ?, ?, ?, ?)
+		`, targetID, tenantID, kbID, knowledgeID, strings.Repeat("a", 64), string(canonical), digest,
+			types.ReleaseTargetBuilding, createdAt, createdAt).Error)
+		require.NoError(t, db.Exec(`
+			INSERT INTO knowledges (id, tenant_id, knowledge_base_id, parse_status)
+			VALUES (?, ?, ?, ?)
+		`, knowledgeID, tenantID, kbID, types.ParseStatusFailed).Error)
+	}
+
+	clock := &productionReleaseTestClock{current: createdAt.Add(time.Hour)}
+	repo := NewProductionReleaseRepositoryWithClock(db, clock)
+	ctx := productionReleaseContext(reviewTenantID, reviewAuthorID)
+	first, err := repo.ListBuildingTargetsWithFailedKnowledge(ctx, reviewTenantID, 100)
+	require.NoError(t, err)
+	require.Len(t, first, 100)
+	require.Equal(t, "target-001", first[0].ID)
+	for _, candidate := range first {
+		deferred, deferErr := repo.DeferProjectionFailureRecovery(ctx, candidate.ID, candidate.UpdatedAt)
+		require.NoError(t, deferErr)
+		require.True(t, deferred)
+	}
+
+	clock.current = clock.current.Add(time.Hour)
+	second, err := repo.ListBuildingTargetsWithFailedKnowledge(ctx, reviewTenantID, 100)
+	require.NoError(t, err)
+	require.Len(t, second, 100)
+	require.Equal(t, "target-101", second[0].ID)
+	for _, candidate := range second {
+		deferred, deferErr := repo.DeferProjectionFailureRecovery(ctx, candidate.ID, candidate.UpdatedAt)
+		require.NoError(t, deferErr)
+		require.True(t, deferred)
+	}
+
+	restarted := NewProductionReleaseRepositoryWithClock(db, clock)
+	third, err := restarted.ListBuildingTargetsWithFailedKnowledge(ctx, reviewTenantID, 100)
+	require.NoError(t, err)
+	require.NotEmpty(t, third)
+	require.Equal(t, "target-201", third[0].ID,
+		"untouched candidate 201 must progress ahead of 200 persistent failures after restart")
+	for _, candidate := range third {
+		require.Equal(t, reviewTenantID, candidate.TenantID)
+	}
+
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	_, err = restarted.ListBuildingTargetsWithFailedKnowledge(cancelled, reviewTenantID, 100)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestProductionProjectionRetryClaimRollbackRestoresKnowledgeAndTarget(t *testing.T) {
+	repo, db := newProductionReleaseRepoFixture(t, nil)
+	require.NoError(t, db.Exec(`
+		CREATE TABLE knowledges (
+			id VARCHAR(36) PRIMARY KEY,
+			tenant_id INTEGER NOT NULL,
+			knowledge_base_id VARCHAR(36) NOT NULL,
+			type VARCHAR(50) NOT NULL,
+			parse_status VARCHAR(50) NOT NULL,
+			pending_subtasks_count INTEGER NOT NULL DEFAULT 0,
+			error_message TEXT,
+			metadata TEXT,
+			updated_at DATETIME NOT NULL,
+			deleted_at DATETIME NULL
+		)
+	`).Error)
+	ctx := productionReleaseContext(reviewTenantID, reviewAuthorID)
+	target := productionReleaseTarget(releaseTarget1, releaseKBOne, releaseKnowledge1)
+	require.NoError(t, repo.CreateRelease(ctx,
+		productionRelease(releaseIDOne, reviewVersionOne, reviewID(700)),
+		[]*types.ProductionReleaseTarget{target},
+	))
+	changed, err := repo.TransitionTarget(ctx, target.ID, types.ReleaseTargetBuilding, types.ReleaseTargetFailed, nil)
+	require.NoError(t, err)
+	require.True(t, changed)
+	failedTarget, err := repo.GetTarget(ctx, reviewTenantID, target.ID)
+	require.NoError(t, err)
+	content := "# governed projection"
+	knowledge := &types.Knowledge{
+		ID: target.KnowledgeID, TenantID: target.TenantID, KnowledgeBaseID: target.TargetKnowledgeBaseID,
+		Type: types.KnowledgeTypeManual, ParseStatus: types.ParseStatusFailed, UpdatedAt: time.Now().UTC(),
+	}
+	meta := types.NewManualKnowledgeMetadata(content, types.ManualKnowledgeStatusPublish, 1)
+	contentSum := sha256.Sum256([]byte(content))
+	meta.ProductionProjection = &types.ProductionProjectionMetadata{
+		DocumentID: target.DocumentID, VersionID: target.VersionID, ReleaseTargetID: target.ID,
+		ContentDigest: hex.EncodeToString(contentSum[:]), SummaryModelID: "summary-1",
+		IndexingStrategy: types.IndexingStrategy{WikiEnabled: true},
+	}
+	require.NoError(t, knowledge.SetManualMetadata(meta))
+	require.NoError(t, db.Table("knowledges").Create(map[string]any{
+		"id": knowledge.ID, "tenant_id": knowledge.TenantID,
+		"knowledge_base_id": knowledge.KnowledgeBaseID, "type": knowledge.Type,
+		"parse_status": knowledge.ParseStatus, "pending_subtasks_count": 0,
+		"error_message": "", "metadata": string(knowledge.Metadata), "updated_at": knowledge.UpdatedAt,
+	}).Error)
+	knowledgeRepo := NewKnowledgeRepository(db)
+	uow := NewProductionUnitOfWork(db)
+
+	err = uow.WithinTransaction(ctx, func(txCtx context.Context) error {
+		_, lockErr := repo.GetTargetForUpdate(txCtx, reviewTenantID, target.ID)
+		if lockErr != nil {
+			return lockErr
+		}
+		_, lockErr = knowledgeRepo.GetKnowledgeByIDOnlyForUpdate(txCtx, knowledge.ID)
+		if lockErr != nil {
+			return lockErr
+		}
+		claimed, claimErr := knowledgeRepo.ClaimFailedKnowledgeRetry(txCtx, knowledge.ID)
+		if claimErr != nil {
+			return claimErr
+		}
+		require.True(t, claimed)
+		_, transitioned, transitionErr := repo.TransitionTargetForRetry(
+			txCtx, target.ID, types.ReleaseTargetFailed, failedTarget.UpdatedAt.Add(-time.Second),
+		)
+		if transitionErr != nil {
+			return transitionErr
+		}
+		require.False(t, transitioned)
+		return types.ErrProductionProjectionConflict
+	})
+	require.ErrorIs(t, err, types.ErrProductionProjectionConflict)
+	persistedKnowledge, err := knowledgeRepo.GetKnowledgeByIDOnly(ctx, knowledge.ID)
+	require.NoError(t, err)
+	require.Equal(t, types.ParseStatusFailed, persistedKnowledge.ParseStatus)
+	persistedTarget, err := repo.GetTarget(ctx, reviewTenantID, target.ID)
+	require.NoError(t, err)
+	require.Equal(t, types.ReleaseTargetFailed, persistedTarget.Status)
+}
+
+func TestProductionReleasePostgresRecoveryQueryUsesPersistedFairOrder(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{})
+	require.NoError(t, err)
+	repo := NewProductionReleaseRepository(db)
+	ctx := productionReleaseContext(reviewTenantID, reviewAuthorID)
+
+	mock.ExpectQuery(regexp.QuoteMeta(
+		`SELECT target.* FROM production_release_targets AS target JOIN knowledges AS knowledge
+			ON knowledge.id = target.knowledge_id
+			AND knowledge.tenant_id = target.tenant_id
+			AND knowledge.knowledge_base_id = target.target_knowledge_base_id WHERE (target.tenant_id = $1 AND target.status = $2) AND (knowledge.parse_status = $3 AND knowledge.deleted_at IS NULL) ORDER BY target.recovery_attempted_at ASC NULLS FIRST, target.id ASC LIMIT $4`,
+	)).WithArgs(reviewTenantID, types.ReleaseTargetBuilding, types.ParseStatusFailed, 100).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}))
+
+	_, err = repo.ListBuildingTargetsWithFailedKnowledge(ctx, reviewTenantID, 100)
+	require.NoError(t, err)
+	require.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestProductionReleaseRepositoryComputesAuthoritativeDigest(t *testing.T) {

@@ -1,0 +1,4 @@
+DROP TRIGGER IF EXISTS trg_production_release_targets_guard_recovery_attempt ON production_release_targets;
+DROP FUNCTION IF EXISTS guard_production_release_target_recovery_attempt();
+DROP INDEX IF EXISTS idx_production_release_targets_failure_recovery;
+ALTER TABLE production_release_targets DROP COLUMN IF EXISTS recovery_attempted_at;

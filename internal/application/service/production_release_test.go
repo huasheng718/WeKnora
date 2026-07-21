@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -16,20 +17,22 @@ import (
 
 type productionReleaseRepoStub struct {
 	interfaces.ProductionReleaseRepository
-	mu               sync.Mutex
-	txMu             sync.Mutex
-	release          *types.ProductionRelease
-	targets          map[string]*types.ProductionReleaseTarget
-	history          []*types.ProductionReleaseTarget
-	lock             int
-	events           *[]string
-	transitionCalls  int
-	transitionErrAt  int
-	transitionErr    error
-	switchErr        error
-	cleanupListCalls int
-	failureListCalls int
-	now              func() time.Time
+	mu                sync.Mutex
+	txMu              sync.Mutex
+	release           *types.ProductionRelease
+	targets           map[string]*types.ProductionReleaseTarget
+	history           []*types.ProductionReleaseTarget
+	lock              int
+	events            *[]string
+	transitionCalls   int
+	transitionErrAt   int
+	transitionErr     error
+	switchErr         error
+	cleanupListCalls  int
+	failureListCalls  int
+	failureCandidates []*types.ProductionReleaseTarget
+	onTargetLock      func(context.Context)
+	now               func() time.Time
 }
 
 func (r *productionReleaseRepoStub) CreateRelease(_ context.Context, release *types.ProductionRelease, targets []*types.ProductionReleaseTarget) error {
@@ -47,6 +50,14 @@ func (r *productionReleaseRepoStub) GetTarget(_ context.Context, _ uint64, id st
 	}
 	copy := *target
 	return &copy, nil
+}
+
+func (r *productionReleaseRepoStub) GetTargetForUpdate(ctx context.Context, tenantID uint64, id string) (*types.ProductionReleaseTarget, error) {
+	target, err := r.GetTarget(ctx, tenantID, id)
+	if err == nil && r.onTargetLock != nil {
+		r.onTargetLock(ctx)
+	}
+	return target, err
 }
 
 func (r *productionReleaseRepoStub) ListProjectionHistory(context.Context, uint64, string, string) ([]*types.ProductionReleaseTarget, error) {
@@ -87,6 +98,14 @@ func (r *productionReleaseRepoStub) ListBuildingTargetsWithFailedKnowledge(
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.failureListCalls++
+	if r.failureCandidates != nil {
+		out := make([]*types.ProductionReleaseTarget, 0, len(r.failureCandidates))
+		for _, target := range r.failureCandidates {
+			copy := *target
+			out = append(out, &copy)
+		}
+		return out, nil
+	}
 	out := make([]*types.ProductionReleaseTarget, 0, limit)
 	for _, target := range r.targets {
 		if len(out) == limit {
@@ -98,6 +117,49 @@ func (r *productionReleaseRepoStub) ListBuildingTargetsWithFailedKnowledge(
 		}
 	}
 	return out, nil
+}
+
+func (r *productionReleaseRepoStub) TransitionTargetForRetry(
+	_ context.Context,
+	id string,
+	from types.ProductionReleaseTargetStatus,
+	expectedUpdatedAt time.Time,
+) (*types.ProductionReleaseTarget, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	target := r.targets[id]
+	if target == nil || target.Status != from || !target.UpdatedAt.Equal(expectedUpdatedAt) {
+		return nil, false, nil
+	}
+	next := expectedUpdatedAt.Add(time.Second)
+	target.Status = types.ReleaseTargetBuilding
+	target.FailedAt = nil
+	target.RolledBackAt = nil
+	target.RetentionUntil = nil
+	target.FailureCode = ""
+	target.FailureReason = ""
+	target.UpdatedAt = next
+	copy := *target
+	return &copy, true, nil
+}
+
+func (r *productionReleaseRepoStub) DeferProjectionFailureRecovery(
+	_ context.Context,
+	id string,
+	expectedUpdatedAt time.Time,
+) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	target := r.targets[id]
+	if target == nil || target.Status != types.ReleaseTargetBuilding || !target.UpdatedAt.Equal(expectedUpdatedAt) {
+		return false, nil
+	}
+	now := time.Now().UTC()
+	if r.now != nil {
+		now = r.now().UTC()
+	}
+	target.RecoveryAttemptedAt = &now
+	return true, nil
 }
 
 func (r *productionReleaseRepoStub) SwitchHead(_ context.Context, _ uint64, _, _, targetID string, expected int) (*types.ProductionProjectionHead, error) {
@@ -250,6 +312,7 @@ func (productionReleaseModelStub) GetModelByID(_ context.Context, id string) (*t
 type productionReleaseKnowledgeStub struct {
 	interfaces.KnowledgeService
 	knowledge *types.Knowledge
+	repo      interfaces.KnowledgeRepository
 }
 
 func (s productionReleaseKnowledgeStub) GetKnowledgeByID(context.Context, string) (*types.Knowledge, error) {
@@ -260,6 +323,56 @@ func (s productionReleaseKnowledgeStub) GetKnowledgeByID(context.Context, string
 func (s productionReleaseKnowledgeStub) GetKnowledgeByIDOnly(context.Context, string) (*types.Knowledge, error) {
 	copy := *s.knowledge
 	return &copy, nil
+}
+
+func (s productionReleaseKnowledgeStub) GetRepository() interfaces.KnowledgeRepository {
+	return s.repo
+}
+
+type productionReleaseKnowledgeRepoStub struct {
+	interfaces.KnowledgeRepository
+	mu        sync.Mutex
+	knowledge *types.Knowledge
+}
+
+func (r *productionReleaseKnowledgeRepoStub) GetKnowledgeByIDOnly(context.Context, string) (*types.Knowledge, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	copy := *r.knowledge
+	return &copy, nil
+}
+
+func (r *productionReleaseKnowledgeRepoStub) GetKnowledgeByIDOnlyForUpdate(ctx context.Context, id string) (*types.Knowledge, error) {
+	return r.GetKnowledgeByIDOnly(ctx, id)
+}
+
+func (r *productionReleaseKnowledgeRepoStub) ClaimFailedKnowledgeRetry(_ context.Context, _ string) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.knowledge.ParseStatus != types.ParseStatusFailed {
+		return false, nil
+	}
+	r.knowledge.ParseStatus = types.ParseStatusPending
+	r.knowledge.PendingSubtasksCount = 0
+	r.knowledge.ErrorMessage = ""
+	r.knowledge.UpdatedAt = time.Now().UTC()
+	return true, nil
+}
+
+func (r *productionReleaseKnowledgeRepoStub) UpdateKnowledgeColumns(
+	_ context.Context,
+	_ string,
+	updates map[string]interface{},
+) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if status, ok := updates["parse_status"].(string); ok {
+		r.knowledge.ParseStatus = status
+	}
+	if message, ok := updates["error_message"].(string); ok {
+		r.knowledge.ErrorMessage = message
+	}
+	return nil
 }
 
 type productionReleaseGraphStub struct{ err error }
@@ -498,6 +611,8 @@ func newProductionReleaseServiceFixture(t *testing.T) (*ProductionReleaseService
 	storage := &productionReleaseStorageResolverStub{backend: &types.StorageBackend{
 		ID: "storage-1", TenantID: 7, Provider: "local", Status: types.StorageBackendStatusActive,
 	}}
+	knowledge := productionReleaseProjectionKnowledge(t, ready, types.ParseStatusCompleted)
+	knowledgeRepo := &productionReleaseKnowledgeRepoStub{knowledge: knowledge}
 	service := &ProductionReleaseService{
 		releases: repo,
 		documents: &productionReleaseDocumentsStub{document: &types.ProductionDocument{ID: "document-1", TenantID: 7, ProjectID: "project-1", LatestApprovedVersionID: productionStringPtr("version-3")},
@@ -505,7 +620,7 @@ func newProductionReleaseServiceFixture(t *testing.T) (*ProductionReleaseService
 		reviews:    &productionReleaseReviewsStub{review: &types.ProductionReviewRequest{ID: "review-1", TenantID: 7, ProjectID: "project-1", DocumentID: "document-1", VersionID: "version-3", Status: types.ProductionReviewApproved}},
 		authorizer: productionReleaseAuthorizerStub{}, members: productionReleaseMembershipStub{role: types.TenantRoleContributor}, models: productionReleaseModelStub{}, storage: storage,
 		kbs:       productionReleaseKBStub{kb: &types.KnowledgeBase{ID: "kb-1", TenantID: 7, CreatorID: "00000000-0000-4000-8000-000000000007", Type: types.KnowledgeBaseTypeDocument}},
-		knowledge: productionReleaseKnowledgeStub{knowledge: &types.Knowledge{ID: "knowledge-new", TenantID: 7, KnowledgeBaseID: "kb-1", ParseStatus: types.ParseStatusCompleted}},
+		knowledge: productionReleaseKnowledgeStub{knowledge: knowledge, repo: knowledgeRepo},
 		graph:     productionReleaseGraphStub{}, wiki: productionReleaseWikiStub{events: &events}, cleanup: productionReleaseCleanupStub{events: &events},
 		uow: productionReleaseUOWStub{repo: repo}, audit: &productionReleaseAuditStub{}, now: time.Now,
 	}
@@ -844,7 +959,8 @@ func TestProductionFailureReconciliationConvergesAndIsIdempotent(t *testing.T) {
 		IndexingStrategy: types.IndexingStrategy{WikiEnabled: true},
 	}
 	require.NoError(t, knowledge.SetManualMetadata(meta))
-	svc.knowledge = productionReleaseKnowledgeStub{knowledge: knowledge}
+	knowledgeRepo := &productionReleaseKnowledgeRepoStub{knowledge: knowledge}
+	svc.knowledge = productionReleaseKnowledgeStub{knowledge: knowledge, repo: knowledgeRepo}
 
 	require.NoError(t, svc.ReconcileFailedProjectionKnowledge(productionReleaseContext(), 100))
 	failed, err := repo.GetTarget(context.Background(), target.TenantID, target.ID)
@@ -852,7 +968,7 @@ func TestProductionFailureReconciliationConvergesAndIsIdempotent(t *testing.T) {
 	require.Equal(t, types.ReleaseTargetFailed, failed.Status)
 	audit := svc.audit.(*productionReleaseAuditStub)
 	require.Len(t, audit.entries, 1)
-	require.Contains(t, string(audit.entries[0].Details), `"failure_stage":"build"`)
+	require.Contains(t, string(audit.entries[0].Details), `"failure_stage":"recovery"`)
 
 	require.NoError(t, svc.ReconcileFailedProjectionKnowledge(productionReleaseContext(), 100))
 	require.Len(t, audit.entries, 1, "a terminal target must not emit duplicate failure audit")
@@ -877,18 +993,179 @@ func TestProductionFailureReconciliationRetriesAfterRequiredAuditFailure(t *test
 		IndexingStrategy: types.IndexingStrategy{WikiEnabled: true},
 	}
 	require.NoError(t, knowledge.SetManualMetadata(meta))
-	svc.knowledge = productionReleaseKnowledgeStub{knowledge: knowledge}
+	knowledgeRepo := &productionReleaseKnowledgeRepoStub{knowledge: knowledge}
+	svc.knowledge = productionReleaseKnowledgeStub{knowledge: knowledge, repo: knowledgeRepo}
 	audit := svc.audit.(*productionReleaseAuditStub)
 	audit.err = errors.New("audit database unavailable")
 
 	err := svc.ReconcileFailedProjectionKnowledge(productionReleaseContext(), 100)
 	require.ErrorContains(t, err, "audit database unavailable")
 	require.Equal(t, types.ReleaseTargetBuilding, repo.targets[target.ID].Status)
+	require.NotNil(t, repo.targets[target.ID].RecoveryAttemptedAt)
 
 	audit.err = nil
 	require.NoError(t, svc.ReconcileFailedProjectionKnowledge(productionReleaseContext(), 100))
 	require.Equal(t, types.ReleaseTargetFailed, repo.targets[target.ID].Status)
 	require.Len(t, audit.entries, 1)
+}
+
+func TestProductionReleaseRetryClaimsFailedKnowledgeBeforeQueueAndReplaysGeneration(t *testing.T) {
+	svc, repo, _ := newProductionReleaseServiceFixture(t)
+	target := repo.targets["target-new"]
+	failedAt := time.Date(2026, 7, 21, 9, 0, 0, 0, time.UTC)
+	target.CreatedAt = failedAt.Add(-time.Hour)
+	target.UpdatedAt = failedAt
+	target.Status = types.ReleaseTargetFailed
+	target.FailedAt = &failedAt
+	retention := failedAt.Add(30 * 24 * time.Hour)
+	target.RetentionUntil = &retention
+	target.FailureCode = types.ProductionProjectionFailureBuildFailed
+	target.FailureReason = types.ProductionProjectionFailureReasonBuildFailed
+	knowledge := productionReleaseProjectionKnowledge(t, target, types.ParseStatusFailed)
+	knowledgeRepo := &productionReleaseKnowledgeRepoStub{knowledge: knowledge}
+	svc.knowledge = productionReleaseKnowledgeStub{knowledge: knowledge, repo: knowledgeRepo}
+	queueErr := errors.New("queue response unavailable")
+	tasks := &productionReleaseTaskEnqueuerStub{accepted: make(map[string]*asynq.Task), err: queueErr}
+	svc.tasks = tasks
+
+	err := svc.Retry(productionReleaseContext(), target.ID)
+	require.ErrorIs(t, err, queueErr)
+	require.Equal(t, types.ParseStatusPending, knowledge.ParseStatus)
+	require.Equal(t, types.ReleaseTargetBuilding, target.Status)
+	require.True(t, target.UpdatedAt.After(failedAt))
+	generation := target.UpdatedAt
+
+	tasks.err = nil
+	require.NoError(t, svc.Retry(productionReleaseContext(), target.ID))
+	require.Equal(t, generation, target.UpdatedAt, "replay after queue failure must retain one claimed generation")
+	require.Len(t, tasks.accepted, 1)
+	for taskID := range tasks.accepted {
+		require.Contains(t, taskID, fmt.Sprintf("build-retry-%d", generation.UnixNano()))
+	}
+}
+
+func TestProductionFailureReconciliationSkipsNewerPendingRetryGeneration(t *testing.T) {
+	svc, repo, _ := newProductionReleaseServiceFixture(t)
+	target := repo.targets["target-new"]
+	oldGeneration := time.Date(2026, 7, 21, 9, 0, 0, 0, time.UTC)
+	target.Status = types.ReleaseTargetBuilding
+	target.CreatedAt = oldGeneration.Add(-time.Hour)
+	target.UpdatedAt = oldGeneration.Add(time.Second)
+	candidate := *target
+	candidate.UpdatedAt = oldGeneration
+	repo.failureCandidates = []*types.ProductionReleaseTarget{&candidate}
+	knowledge := productionReleaseProjectionKnowledge(t, target, types.ParseStatusPending)
+	knowledgeRepo := &productionReleaseKnowledgeRepoStub{knowledge: knowledge}
+	svc.knowledge = productionReleaseKnowledgeStub{knowledge: knowledge, repo: knowledgeRepo}
+
+	require.NoError(t, svc.ReconcileFailedProjectionKnowledge(productionReleaseContext(), 100))
+	require.Equal(t, types.ReleaseTargetBuilding, target.Status)
+	require.Empty(t, svc.audit.(*productionReleaseAuditStub).entries)
+}
+
+func TestProductionRetryAndRecoverySerializeBothLockOrdersWithoutLostReady(t *testing.T) {
+	for _, first := range []string{"retry", "recovery"} {
+		t.Run(first+"_locks_first", func(t *testing.T) {
+			svc, repo, _ := newProductionReleaseServiceFixture(t)
+			target := repo.targets["target-new"]
+			generation := time.Date(2026, 7, 21, 9, 0, 0, 0, time.UTC)
+			target.Status = types.ReleaseTargetBuilding
+			target.CreatedAt = generation.Add(-time.Hour)
+			target.UpdatedAt = generation
+			candidate := *target
+			repo.failureCandidates = []*types.ProductionReleaseTarget{&candidate}
+			knowledge := productionReleaseProjectionKnowledge(t, target, types.ParseStatusFailed)
+			knowledgeRepo := &productionReleaseKnowledgeRepoStub{knowledge: knowledge}
+			svc.knowledge = productionReleaseKnowledgeStub{knowledge: knowledge, repo: knowledgeRepo}
+			svc.tasks = &productionReleaseTaskEnqueuerStub{accepted: make(map[string]*asynq.Task)}
+
+			entered := make(chan string, 2)
+			retryRelease := make(chan struct{})
+			recoveryRelease := make(chan struct{})
+			repo.onTargetLock = func(ctx context.Context) {
+				actor, _ := types.UserIDFromContext(ctx)
+				label := "retry"
+				release := retryRelease
+				if actor == types.ProductionSystemActorID {
+					label = "recovery"
+					release = recoveryRelease
+				}
+				entered <- label
+				<-release
+			}
+
+			retryResult := make(chan error, 1)
+			recoveryResult := make(chan error, 1)
+			waitEntered := func() string {
+				t.Helper()
+				select {
+				case label := <-entered:
+					return label
+				case <-time.After(time.Second):
+					t.Fatal("retry/recovery did not enter the target lock boundary")
+					return ""
+				}
+			}
+			startRetry := func() { go func() { retryResult <- svc.Retry(productionReleaseContext(), target.ID) }() }
+			startRecovery := func() {
+				recoveryCtx := context.WithValue(productionReleaseContext(), types.UserIDContextKey, types.ProductionSystemActorID)
+				go func() { recoveryResult <- svc.ReconcileFailedProjectionKnowledge(recoveryCtx, 100) }()
+			}
+			if first == "retry" {
+				startRetry()
+			} else {
+				startRecovery()
+			}
+			require.Equal(t, first, waitEntered())
+			if first == "retry" {
+				startRecovery()
+				close(retryRelease)
+				require.NoError(t, <-retryResult)
+				require.Equal(t, "recovery", waitEntered())
+				close(recoveryRelease)
+				require.NoError(t, <-recoveryResult)
+			} else {
+				startRetry()
+				close(recoveryRelease)
+				require.NoError(t, <-recoveryResult)
+				require.Equal(t, "retry", waitEntered())
+				close(retryRelease)
+				require.NoError(t, <-retryResult)
+			}
+
+			require.Equal(t, types.ParseStatusPending, knowledge.ParseStatus)
+			require.Equal(t, types.ReleaseTargetBuilding, target.Status)
+			knowledgeRepo.mu.Lock()
+			knowledge.ParseStatus = types.ParseStatusCompleted
+			knowledgeRepo.mu.Unlock()
+			require.NoError(t, markProductionProjectionReady(
+				productionReleaseContext(), knowledgeRepo, repo, knowledge.ID,
+			))
+			require.Equal(t, types.ReleaseTargetReady, target.Status)
+		})
+	}
+}
+
+func productionReleaseProjectionKnowledge(
+	t *testing.T,
+	target *types.ProductionReleaseTarget,
+	parseStatus string,
+) *types.Knowledge {
+	t.Helper()
+	content := "# governed projection"
+	knowledge := &types.Knowledge{
+		ID: target.KnowledgeID, TenantID: target.TenantID,
+		KnowledgeBaseID: target.TargetKnowledgeBaseID, Type: types.KnowledgeTypeManual,
+		ParseStatus: parseStatus,
+	}
+	meta := types.NewManualKnowledgeMetadata(content, types.ManualKnowledgeStatusPublish, 1)
+	meta.ProductionProjection = &types.ProductionProjectionMetadata{
+		DocumentID: target.DocumentID, VersionID: target.VersionID, ReleaseTargetID: target.ID,
+		ContentDigest: projectionKnowledgeContentDigest(content), SummaryModelID: "summary-1",
+		IndexingStrategy: types.IndexingStrategy{WikiEnabled: true},
+	}
+	require.NoError(t, knowledge.SetManualMetadata(meta))
+	return knowledge
 }
 
 func TestProductionReleaseRetryFailsClosedWithoutTaskQueue(t *testing.T) {

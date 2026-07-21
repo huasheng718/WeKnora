@@ -15,6 +15,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const postgresProductionProjectionHeadCASSQL = `
@@ -206,6 +207,7 @@ func (r *productionReleaseRepository) CreateRelease(
 		}
 		if target.RetentionDays < 0 || target.RetentionDays > 3650 ||
 			target.FailureCode != "" || target.FailureReason != "" ||
+			target.RecoveryAttemptedAt != nil ||
 			target.RetentionUntil != nil || target.ActivatedAt != nil || target.FailedAt != nil ||
 			target.RolledBackAt != nil || target.CleanupRequestedAt != nil || target.CleanedAt != nil {
 			return fmt.Errorf("%w: target lifecycle fields are server-owned", types.ErrProductionReleaseInvalid)
@@ -251,7 +253,7 @@ func (r *productionReleaseRepository) CreateRelease(
 				"target_knowledge_base_id": target.TargetKnowledgeBaseID, "knowledge_id": target.KnowledgeID,
 				"release_digest": target.ReleaseDigest, "config_snapshot": configValue, "config_digest": target.ConfigDigest,
 				"status": target.Status, "retention_days": target.RetentionDays,
-				"failure_code": "", "failure_reason": "",
+				"failure_code": "", "failure_reason": "", "recovery_attempted_at": nil,
 				"retention_until": nil, "activated_at": nil, "failed_at": nil, "rolled_back_at": nil,
 				"cleanup_requested_at": nil, "cleaned_at": nil,
 				"created_at": target.CreatedAt, "updated_at": target.UpdatedAt,
@@ -274,6 +276,30 @@ func (r *productionReleaseRepository) GetTarget(ctx context.Context, tenantID ui
 	}
 	var target types.ProductionReleaseTarget
 	err := database.DBFromContext(ctx, r.db).WithContext(ctx).
+		Where("tenant_id = ? AND id = ?", tenantID, targetID).First(&target).Error
+	if err != nil {
+		return nil, translateProductionReleaseTargetReadError(err)
+	}
+	if err := normalizeProductionReleaseTargetConfig(&target); err != nil {
+		return nil, err
+	}
+	return &target, nil
+}
+
+func (r *productionReleaseRepository) GetTargetForUpdate(
+	ctx context.Context,
+	tenantID uint64,
+	targetID string,
+) (*types.ProductionReleaseTarget, error) {
+	if err := requireProductionReleaseTenantContext(ctx, tenantID); err != nil {
+		return nil, err
+	}
+	if err := requireProductionReleaseIdentity("target_id", targetID); err != nil {
+		return nil, err
+	}
+	var target types.ProductionReleaseTarget
+	err := database.DBFromContext(ctx, r.db).WithContext(ctx).
+		Clauses(clause.Locking{Strength: "UPDATE"}).
 		Where("tenant_id = ? AND id = ?", tenantID, targetID).First(&target).Error
 	if err != nil {
 		return nil, translateProductionReleaseTargetReadError(err)
@@ -420,6 +446,57 @@ func (r *productionReleaseRepository) TransitionTarget(
 		return false, translateProductionReleaseError(result.Error)
 	}
 	return result.RowsAffected == 1, nil
+}
+
+func (r *productionReleaseRepository) TransitionTargetForRetry(
+	ctx context.Context,
+	targetID string,
+	from types.ProductionReleaseTargetStatus,
+	expectedUpdatedAt time.Time,
+) (*types.ProductionReleaseTarget, bool, error) {
+	tenantID, ok := types.TenantIDFromContext(ctx)
+	if !ok || tenantID == 0 {
+		return nil, false, types.ErrProductionForbidden
+	}
+	if err := requireProductionReleaseIdentity("target_id", targetID); err != nil {
+		return nil, false, err
+	}
+	if from != types.ReleaseTargetBuilding && from != types.ReleaseTargetFailed && from != types.ReleaseTargetRolledBack {
+		return nil, false, types.ErrProductionReleaseLifecycle
+	}
+	nextGeneration := r.nowUTC()
+	if !nextGeneration.After(expectedUpdatedAt) {
+		nextGeneration = expectedUpdatedAt.UTC().Add(time.Second)
+	}
+	updates := map[string]any{
+		"status":                types.ReleaseTargetBuilding,
+		"failure_code":          "",
+		"failure_reason":        "",
+		"recovery_attempted_at": nil,
+		"retention_until":       nil,
+		"activated_at":          nil,
+		"failed_at":             nil,
+		"rolled_back_at":        nil,
+		"cleanup_requested_at":  nil,
+		"cleaned_at":            nil,
+		"updated_at":            nextGeneration,
+	}
+	result := database.DBFromContext(ctx, r.db).WithContext(ctx).
+		Model(&types.ProductionReleaseTarget{}).
+		Where("tenant_id = ? AND id = ? AND status = ? AND updated_at = ?",
+			tenantID, targetID, from, expectedUpdatedAt).
+		Updates(updates)
+	if result.Error != nil {
+		return nil, false, translateProductionReleaseError(result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return nil, false, nil
+	}
+	target, err := r.GetTarget(ctx, tenantID, targetID)
+	if err != nil {
+		return nil, false, err
+	}
+	return target, true, nil
 }
 
 func (r *productionReleaseRepository) retentionDeadlineExpression(now time.Time) any {
@@ -697,7 +774,7 @@ func (r *productionReleaseRepository) ListBuildingTargetsWithFailedKnowledge(
 			AND knowledge.knowledge_base_id = target.target_knowledge_base_id`).
 		Where("target.tenant_id = ? AND target.status = ?", tenantID, types.ReleaseTargetBuilding).
 		Where("knowledge.parse_status = ? AND knowledge.deleted_at IS NULL", types.ParseStatusFailed).
-		Order("target.id ASC").
+		Order("target.recovery_attempted_at ASC NULLS FIRST, target.id ASC").
 		Limit(limit).
 		Find(&targets).Error
 	if err != nil {
@@ -709,6 +786,29 @@ func (r *productionReleaseRepository) ListBuildingTargetsWithFailedKnowledge(
 		}
 	}
 	return targets, nil
+}
+
+func (r *productionReleaseRepository) DeferProjectionFailureRecovery(
+	ctx context.Context,
+	targetID string,
+	expectedUpdatedAt time.Time,
+) (bool, error) {
+	tenantID, ok := types.TenantIDFromContext(ctx)
+	if !ok || tenantID == 0 {
+		return false, types.ErrProductionForbidden
+	}
+	if err := requireProductionReleaseIdentity("target_id", targetID); err != nil {
+		return false, err
+	}
+	result := database.DBFromContext(ctx, r.db).WithContext(ctx).
+		Model(&types.ProductionReleaseTarget{}).
+		Where("tenant_id = ? AND id = ? AND status = ? AND updated_at = ?",
+			tenantID, targetID, types.ReleaseTargetBuilding, expectedUpdatedAt).
+		Update("recovery_attempted_at", r.nowUTC())
+	if result.Error != nil {
+		return false, translateProductionReleaseError(result.Error)
+	}
+	return result.RowsAffected == 1, nil
 }
 
 func translateProductionReleaseError(err error) error {

@@ -217,6 +217,8 @@ type KnowledgeRepository interface {
 	GetKnowledgeByID(ctx context.Context, tenantID uint64, id string) (*types.Knowledge, error)
 	// GetKnowledgeByIDOnly returns knowledge by ID without tenant filter (for permission resolution).
 	GetKnowledgeByIDOnly(ctx context.Context, id string) (*types.Knowledge, error)
+	// GetKnowledgeByIDOnlyForUpdate locks one Knowledge row inside a shared UoW.
+	GetKnowledgeByIDOnlyForUpdate(ctx context.Context, id string) (*types.Knowledge, error)
 	ListKnowledgeByKnowledgeBaseID(ctx context.Context, tenantID uint64, kbID string) ([]*types.Knowledge, error)
 	// ListPagedKnowledgeByKnowledgeBaseID lists all knowledge in a knowledge base
 	// with pagination. The filter struct controls optional dimensions (tag, keyword,

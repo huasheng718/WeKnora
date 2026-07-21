@@ -240,6 +240,7 @@ type ProductionProjectionKnowledgePayload struct {
 	IndexingStrategy     IndexingStrategy
 	ProcessOverrides     *KnowledgeProcessOverrides
 	ProductionProjection *ProductionProjectionMetadata
+	RetryClaimed         bool
 }
 
 // ManualKnowledgePayload represents the payload for manual knowledge operations.

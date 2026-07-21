@@ -196,7 +196,98 @@ func (s *ProductionReleaseService) Retry(ctx context.Context, targetID string) e
 	if s.tasks == nil {
 		return errors.New("production projection task queue is unavailable")
 	}
+	target, err = claimProductionProjectionRetry(ctx, s.uow, s.releases, s.knowledge, target.ID)
+	if err != nil {
+		return err
+	}
 	return s.enqueueProjectionTask(ctx, types.TypeProductionBuild, types.ProductionProjectionOperationBuild, target, 0)
+}
+
+func claimProductionProjectionRetry(
+	ctx context.Context,
+	uow interfaces.ProductionUnitOfWork,
+	releases interfaces.ProductionReleaseRepository,
+	knowledgeService interfaces.KnowledgeService,
+	targetID string,
+) (*types.ProductionReleaseTarget, error) {
+	if uow == nil || releases == nil || knowledgeService == nil || knowledgeService.GetRepository() == nil {
+		return nil, errors.New("production projection retry dependencies are unavailable")
+	}
+	tenantID, ok := types.TenantIDFromContext(ctx)
+	if !ok || tenantID == 0 {
+		return nil, types.ErrProductionForbidden
+	}
+	knowledgeRepo := knowledgeService.GetRepository()
+	var claimedTarget *types.ProductionReleaseTarget
+	err := uow.WithinTransaction(ctx, func(txCtx context.Context) error {
+		target, err := releases.GetTargetForUpdate(txCtx, tenantID, targetID)
+		if err != nil {
+			return err
+		}
+		if target == nil || target.ID != targetID || target.TenantID != tenantID ||
+			(target.Status != types.ReleaseTargetBuilding && target.Status != types.ReleaseTargetFailed &&
+				target.Status != types.ReleaseTargetRolledBack) {
+			return types.ErrProductionReleaseLifecycle
+		}
+
+		knowledge, knowledgeErr := knowledgeRepo.GetKnowledgeByIDOnlyForUpdate(txCtx, target.KnowledgeID)
+		if knowledgeErr != nil && !errors.Is(knowledgeErr, apprepository.ErrKnowledgeNotFound) {
+			return knowledgeErr
+		}
+		advanceGeneration := target.Status != types.ReleaseTargetBuilding
+		if knowledgeErr == nil {
+			projection, integrityErr := types.ValidateProductionProjectionIntegrity(knowledge)
+			if integrityErr != nil {
+				return integrityErr
+			}
+			if projection == nil || knowledge.ID != target.KnowledgeID || knowledge.TenantID != target.TenantID ||
+				knowledge.KnowledgeBaseID != target.TargetKnowledgeBaseID || projection.ReleaseTargetID != target.ID ||
+				projection.DocumentID != target.DocumentID || projection.VersionID != target.VersionID {
+				return types.ErrProductionProjectionConflict
+			}
+			switch knowledge.ParseStatus {
+			case types.ParseStatusFailed:
+				claimed, claimErr := knowledgeRepo.ClaimFailedKnowledgeRetry(txCtx, knowledge.ID)
+				if claimErr != nil {
+					return claimErr
+				}
+				if !claimed {
+					return types.ErrProductionProjectionConflict
+				}
+				advanceGeneration = true
+			case types.ParseStatusPending, types.ParseStatusProcessing, types.ParseStatusFinalizing:
+				// A committed claim is replayed without allocating another generation.
+			case types.ParseStatusCompleted:
+				// Existing completed projections remain replayable for legacy target state.
+			default:
+				return types.ErrProductionReleaseLifecycle
+			}
+		} else {
+			advanceGeneration = true
+		}
+		if !advanceGeneration {
+			claimedTarget = target
+			return nil
+		}
+		updated, changed, transitionErr := releases.TransitionTargetForRetry(
+			txCtx, target.ID, target.Status, target.UpdatedAt,
+		)
+		if transitionErr != nil {
+			return transitionErr
+		}
+		if !changed || updated == nil {
+			return types.ErrProductionProjectionConflict
+		}
+		claimedTarget = updated
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if claimedTarget == nil {
+		return nil, types.ErrProductionProjectionConflict
+	}
+	return claimedTarget, nil
 }
 
 func productionProjectionFailureStage(taskType string) (string, bool) {
@@ -325,18 +416,73 @@ func (s *ProductionReleaseService) ReconcileFailedProjectionKnowledge(ctx contex
 		if target == nil || target.KnowledgeID == "" {
 			continue
 		}
-		projection, recoveryErr := s.RecordProjectionKnowledgeFailure(
-			ctx, target.KnowledgeID, types.TypeProductionBuild,
-		)
+		recoveryErr := s.recordProjectionRecoveryFailure(ctx, target)
 		if recoveryErr != nil {
-			failures = append(failures, fmt.Errorf("recover projection target %s: %w", target.ID, recoveryErr))
-			continue
-		}
-		if !projection {
-			failures = append(failures, fmt.Errorf("recover projection target %s: %w", target.ID, types.ErrProductionProjectionConflict))
+			_, deferErr := s.releases.DeferProjectionFailureRecovery(ctx, target.ID, target.UpdatedAt)
+			failures = append(failures, errors.Join(
+				fmt.Errorf("recover projection target %s: %w", target.ID, recoveryErr), deferErr,
+			))
 		}
 	}
 	return errors.Join(failures...)
+}
+
+func (s *ProductionReleaseService) recordProjectionRecoveryFailure(
+	ctx context.Context,
+	candidate *types.ProductionReleaseTarget,
+) error {
+	if candidate == nil || s == nil || s.releases == nil || s.knowledge == nil ||
+		s.knowledge.GetRepository() == nil || s.uow == nil || s.audit == nil {
+		return errors.New("production projection failure recovery dependencies are unavailable")
+	}
+	tenantID, ok := types.TenantIDFromContext(ctx)
+	if !ok || tenantID == 0 || candidate.TenantID != tenantID {
+		return types.ErrProductionForbidden
+	}
+	knowledgeRepo := s.knowledge.GetRepository()
+	return s.uow.WithinTransaction(ctx, func(txCtx context.Context) error {
+		target, err := s.releases.GetTargetForUpdate(txCtx, tenantID, candidate.ID)
+		if err != nil {
+			return err
+		}
+		knowledge, err := knowledgeRepo.GetKnowledgeByIDOnlyForUpdate(txCtx, candidate.KnowledgeID)
+		if err != nil {
+			return err
+		}
+		if target.Status != types.ReleaseTargetBuilding || !target.UpdatedAt.Equal(candidate.UpdatedAt) ||
+			knowledge.ParseStatus != types.ParseStatusFailed {
+			return nil
+		}
+		projection, err := types.ValidateProductionProjectionIntegrity(knowledge)
+		if err != nil {
+			return err
+		}
+		if projection == nil || target.ID != candidate.ID || target.KnowledgeID != knowledge.ID ||
+			target.TenantID != knowledge.TenantID || target.TargetKnowledgeBaseID != knowledge.KnowledgeBaseID ||
+			target.DocumentID != projection.DocumentID || target.VersionID != projection.VersionID ||
+			projection.ReleaseTargetID != target.ID {
+			return types.ErrProductionProjectionConflict
+		}
+		changed, transitionErr := s.releases.TransitionTarget(
+			txCtx, target.ID, types.ReleaseTargetBuilding, types.ReleaseTargetFailed, nil,
+		)
+		if transitionErr != nil {
+			return transitionErr
+		}
+		if !changed {
+			return types.ErrProductionProjectionConflict
+		}
+		details, _ := json.Marshal(map[string]string{
+			"failure_code":  types.ProductionProjectionFailureBuildFailed,
+			"failure_stage": "recovery",
+		})
+		actorID, _ := types.UserIDFromContext(txCtx)
+		return emitRequiredProductionAudit(txCtx, s.audit, &types.AuditLog{
+			TenantID: target.TenantID, ActorUserID: actorID, ActorRole: "system",
+			Action: types.AuditActionProductionProjectionFailed, TargetType: "production_release_target", TargetID: target.ID,
+			Outcome: types.AuditOutcomeDenied, Details: types.JSON(details),
+		})
+	})
 }
 
 func (s *ProductionReleaseService) Activate(ctx context.Context, targetID string, expectedLock int) error {
@@ -416,6 +562,9 @@ func productionProjectionBuildTaskPhase(target *types.ProductionReleaseTarget) (
 	}
 	switch target.Status {
 	case types.ReleaseTargetBuilding:
+		if target.UpdatedAt.After(target.CreatedAt) {
+			return fmt.Sprintf("build-retry-%d", target.UpdatedAt.UTC().UnixNano()), nil
+		}
 		return "build-initial", nil
 	case types.ReleaseTargetFailed:
 		if target.FailedAt == nil || target.FailedAt.IsZero() {

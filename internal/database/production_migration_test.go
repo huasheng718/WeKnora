@@ -1356,6 +1356,49 @@ func TestProductionProjectionIntegrityMigrationsAreAdditiveAndParse(t *testing.T
 	}
 }
 
+func TestProductionFailureRecoveryMigrationsAreAdditiveAndParse(t *testing.T) {
+	postgresUp := mustReadMigration(t, "../../migrations/versioned/000076_production_projection_failure_recovery.up.sql")
+	postgresDown := mustReadMigration(t, "../../migrations/versioned/000076_production_projection_failure_recovery.down.sql")
+	_, err := pg_query.Parse(postgresUp)
+	require.NoError(t, err)
+	_, err = pg_query.Parse(postgresDown)
+	require.NoError(t, err)
+
+	for _, migration := range []string{
+		postgresUp,
+		mustReadMigration(t, "../../migrations/sqlite/000007_production_projection_failure_recovery.up.sql"),
+	} {
+		require.Contains(t, migration, "recovery_attempted_at")
+		require.Contains(t, migration, "idx_production_release_targets_failure_recovery")
+		require.Contains(t, migration, "tenant_id")
+		require.Contains(t, migration, "status")
+	}
+}
+
+func TestProductionFailureRecoverySQLiteUpgradesAndDowngradesPopulatedTargets(t *testing.T) {
+	db := openProductionPublicationSQLite(t)
+	seedProductionReleaseScope(t, db)
+	insertProductionPublicationRelease(t, db, "release-recovery", "version-1", "review-pub-1", strings.Repeat("a", 64))
+	insertProductionPublicationTarget(t, db, "target-recovery", "release-recovery", "version-1", "kb-1", "knowledge-recovery", strings.Repeat("a", 64))
+	_, err := db.Exec(mustReadMigration(t, "../../migrations/sqlite/000006_knowledge_production_projection_integrity.up.sql"))
+	require.NoError(t, err)
+
+	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000007_production_projection_failure_recovery.up.sql"))
+	require.NoError(t, err)
+	var attemptedAt sql.NullTime
+	require.NoError(t, db.QueryRow(`SELECT recovery_attempted_at FROM production_release_targets WHERE id = 'target-recovery'`).Scan(&attemptedAt))
+	require.False(t, attemptedAt.Valid)
+	_, err = db.Exec(`UPDATE production_release_targets SET recovery_attempted_at = CURRENT_TIMESTAMP WHERE id = 'target-recovery'`)
+	require.NoError(t, err)
+
+	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000007_production_projection_failure_recovery.down.sql"))
+	require.NoError(t, err)
+	require.Empty(t, sqliteColumnTypeIfPresent(t, db, "production_release_targets", "recovery_attempted_at"))
+	var targetCount int
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM production_release_targets WHERE id = 'target-recovery'`).Scan(&targetCount))
+	require.Equal(t, 1, targetCount)
+}
+
 func TestProductionProjectionIntegrityPostgreSQLBackfillsLegacyFailedTargetsBeforeConstraint(t *testing.T) {
 	postgresUp := mustReadMigration(t, "../../migrations/versioned/000075_knowledge_production_projection_integrity.up.sql")
 	backfill := "UPDATE production_release_targets\nSET failure_code = 'LEGACY_PROJECTION_FAILURE'"

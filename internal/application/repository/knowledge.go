@@ -6,9 +6,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/database"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var ErrKnowledgeNotFound = errors.New("knowledge not found")
@@ -73,7 +75,20 @@ func (r *knowledgeRepository) GetKnowledgeByID(
 // GetKnowledgeByIDOnly returns knowledge by ID without tenant filter (for permission resolution).
 func (r *knowledgeRepository) GetKnowledgeByIDOnly(ctx context.Context, id string) (*types.Knowledge, error) {
 	var knowledge types.Knowledge
-	if err := r.db.WithContext(ctx).Where("id = ?", id).First(&knowledge).Error; err != nil {
+	if err := database.DBFromContext(ctx, r.db).WithContext(ctx).Where("id = ?", id).First(&knowledge).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrKnowledgeNotFound
+		}
+		return nil, err
+	}
+	return &knowledge, nil
+}
+
+func (r *knowledgeRepository) GetKnowledgeByIDOnlyForUpdate(ctx context.Context, id string) (*types.Knowledge, error) {
+	var knowledge types.Knowledge
+	if err := database.DBFromContext(ctx, r.db).WithContext(ctx).
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ?", id).First(&knowledge).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, ErrKnowledgeNotFound
 		}
@@ -348,7 +363,7 @@ func (r *knowledgeRepository) UpdateKnowledgeColumns(
 }
 
 func (r *knowledgeRepository) ClaimFailedKnowledgeRetry(ctx context.Context, id string) (bool, error) {
-	result := r.db.WithContext(ctx).Model(&types.Knowledge{}).
+	result := database.DBFromContext(ctx, r.db).WithContext(ctx).Model(&types.Knowledge{}).
 		Where("id = ? AND parse_status = ?", id, types.ParseStatusFailed).
 		Updates(map[string]interface{}{
 			"parse_status":           types.ParseStatusPending,
