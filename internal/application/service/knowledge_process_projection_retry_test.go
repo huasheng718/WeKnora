@@ -157,7 +157,7 @@ func newProjectionManualFixture(t *testing.T, snapshotStore, liveStore string, m
 	meta.ProductionProjection.IndexingStrategy = types.IndexingStrategy{VectorEnabled: true}
 	require.NoError(t, knowledge.SetManualMetadata(meta))
 	snapshot, digest, err := types.CanonicalProductionReleaseTargetConfig(types.JSON(
-		`{"version":1,"indexing_strategy":{"vector_enabled":true},"vector_store_id":"` + snapshotStore + `"}`,
+		`{"version":1,"indexing_strategy":{"vector_enabled":true},"vector_store_id":"` + snapshotStore + `","storage_backend_id":"backend-retained","storage_provider":"local"}`,
 	))
 	require.NoError(t, err)
 	kb := &types.KnowledgeBase{
@@ -183,6 +183,9 @@ func newProjectionManualFixture(t *testing.T, snapshotStore, liveStore string, m
 		service: &knowledgeService{
 			repo: repo, kbService: &projectionManualKBService{kb: kb}, tenantRepo: tenant,
 			chunkService: chunks, graphEngine: graph, modelService: model, task: tasks,
+			storageResolver: &generationFenceStorageResolver{
+				file: &generationFenceFileService{}, resolvedProvider: "local",
+			},
 			productionReleaseRepo: &projectionManualReleaseRepo{target: target},
 		},
 		knowledge: knowledge, repo: repo, chunks: chunks, chunkRepo: chunkRepo,

@@ -646,6 +646,15 @@ func (s *knowledgeService) cleanupKnowledgeResourcesWithRouting(
 		return nil
 	}
 
+	var projectionFileSvc interfaces.FileService
+	if routing != nil {
+		var err error
+		projectionFileSvc, err = s.resolveProductionProjectionFileService(ctx, routing)
+		if err != nil {
+			return err
+		}
+	}
+
 	tenantInfo := ctx.Value(types.TenantInfoContextKey).(*types.Tenant)
 	if knowledge.EmbeddingModelID != "" {
 		var retrieveEngine *retriever.CompositeRetrieveEngine
@@ -686,13 +695,13 @@ func (s *knowledgeService) cleanupKnowledgeResourcesWithRouting(
 	}
 
 	// Collect image URLs before chunks are deleted
-	var kb *types.KnowledgeBase
+	var fileSvc interfaces.FileService
 	if routing != nil {
-		kb = routing.knowledgeBase(knowledge)
+		fileSvc = projectionFileSvc
 	} else {
-		kb, _ = s.kbService.GetKnowledgeBaseByID(ctx, knowledge.KnowledgeBaseID)
+		kb, _ := s.kbService.GetKnowledgeBaseByID(ctx, knowledge.KnowledgeBaseID)
+		fileSvc = s.resolveFileService(ctx, kb)
 	}
-	fileSvc := s.resolveFileService(ctx, kb)
 	chunkImageInfos, imgErr := s.chunkService.GetRepository().ListImageInfoByKnowledgeIDs(ctx, tenantInfo.ID, []string{knowledge.ID})
 	if imgErr != nil {
 		logger.GetLogger(ctx).WithField("error", imgErr).Error("Failed to collect image URLs for cleanup")

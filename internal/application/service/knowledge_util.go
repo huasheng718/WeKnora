@@ -305,6 +305,38 @@ func (s *knowledgeService) resolveFileService(ctx context.Context, kb *types.Kno
 	return svc
 }
 
+// resolveProductionProjectionFileService resolves only the authenticated
+// backend retained by a production target. Projection workers must never use
+// the ordinary resolver's legacy/default fallbacks after the target is built.
+func (s *knowledgeService) resolveProductionProjectionFileService(
+	ctx context.Context,
+	routing *productionProjectionRoutingDescriptor,
+) (interfaces.FileService, error) {
+	if routing == nil || routing.storageBackendID == nil {
+		return nil, fmt.Errorf("%w: retained storage identity is unavailable", types.ErrProductionReleaseConfigInvalid)
+	}
+	backendID := strings.TrimSpace(*routing.storageBackendID)
+	provider := strings.TrimSpace(routing.storageProvider)
+	if backendID == "" || backendID != *routing.storageBackendID || provider == "" ||
+		provider != routing.storageProvider || provider != strings.ToLower(provider) {
+		return nil, fmt.Errorf("%w: retained storage identity is invalid", types.ErrProductionReleaseConfigInvalid)
+	}
+	tenant, ok := types.TenantInfoFromContext(ctx)
+	if !ok || tenant == nil || tenant.ID == 0 || s.storageResolver == nil {
+		return nil, fmt.Errorf("%w: retained storage resolver is unavailable", types.ErrProductionReleaseConfigInvalid)
+	}
+	fileSvc, resolvedProvider, err := s.storageResolver.ResolveFileService(
+		ctx, tenant, backendID, provider, strings.TrimSpace(os.Getenv("LOCAL_STORAGE_BASE_DIR")),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("%w: resolve retained storage: %w", types.ErrProductionReleaseConfigInvalid, err)
+	}
+	if fileSvc == nil || resolvedProvider != provider {
+		return nil, fmt.Errorf("%w: retained storage provider mismatch", types.ErrProductionReleaseConfigInvalid)
+	}
+	return fileSvc, nil
+}
+
 // resolveFileServiceForPath is like resolveFileService but adds a safety check:
 // if the resolved provider doesn't match what the filePath implies, fall back to
 // the provider inferred from the file path. This protects historical data when

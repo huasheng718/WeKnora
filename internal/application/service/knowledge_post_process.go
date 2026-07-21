@@ -139,7 +139,7 @@ func productionProjectionRoutingDescriptorFromTarget(
 		vectorStoreID:    copyOptionalString(snapshot.VectorStoreID),
 		retrieverEngines: append([]types.RetrieverEngineParams(nil), snapshot.RetrieverEngines...),
 		storageBackendID: copyOptionalString(snapshot.StorageBackendID),
-		storageProvider:  strings.TrimSpace(snapshot.StorageProvider),
+		storageProvider:  snapshot.StorageProvider,
 	}, nil
 }
 

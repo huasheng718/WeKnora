@@ -22,6 +22,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
@@ -1397,12 +1398,21 @@ func (s *knowledgeService) triggerManualProcessing(ctx context.Context,
 	// Resolve embedded data:base64 images and remote http(s) images → storage, replace URLs.
 	// Runs before chunking so chunks contain stable provider:// URLs.
 	var resolvedImages []docparser.StoredImage
-	if s.imageResolver != nil {
-		storageKB := kb
-		if routing, ok := productionProjectionRoutingFromContext(ctx); ok {
-			storageKB = routing.knowledgeBase(knowledge)
+	routing, projectionWorker := productionProjectionRoutingFromContext(ctx)
+	var projectionFileSvc interfaces.FileService
+	if projectionWorker {
+		var err error
+		projectionFileSvc, err = s.resolveProductionProjectionFileService(ctx, routing)
+		if err != nil {
+			storageErr := fmt.Errorf("resolve authenticated projection storage: %w", err)
+			return s.recordChunkProcessingFailure(ctx, knowledge, routing.projection, storageErr)
 		}
-		fileSvc := s.resolveFileService(ctx, storageKB)
+	}
+	if s.imageResolver != nil {
+		fileSvc := projectionFileSvc
+		if !projectionWorker {
+			fileSvc = s.resolveFileService(ctx, kb)
+		}
 		afterDataURI, fromDataURI, _ := s.imageResolver.ResolveDataURIImages(ctx, clean, fileSvc, knowledge.TenantID)
 		if len(fromDataURI) > 0 {
 			logger.Infof(ctx, "Resolved %d data-URI images for manual knowledge %s", len(fromDataURI), knowledge.ID)

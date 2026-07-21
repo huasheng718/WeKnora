@@ -183,7 +183,7 @@ func initialPostProcessProjectionReleaseRepo(
 	meta, err := knowledge.ManualMetadata()
 	require.NoError(t, err)
 	snapshot, digest, err := types.CanonicalProductionReleaseTargetConfig(
-		types.JSON(`{"version":1,"indexing_strategy":{"wiki_enabled":true}}`),
+		types.JSON(`{"version":1,"indexing_strategy":{"wiki_enabled":true},"storage_backend_id":"backend-retained","storage_provider":"local"}`),
 	)
 	require.NoError(t, err)
 	return &projectionManualReleaseRepo{target: &types.ProductionReleaseTarget{
@@ -329,11 +329,14 @@ func TestProductionProjectionManualRetryReusesPersistedAttempt(t *testing.T) {
 		kbService: &initialPostProcessKBService{kb: &types.KnowledgeBase{
 			ID: knowledge.KnowledgeBaseID, TenantID: knowledge.TenantID,
 		}},
-		tenantRepo:            &initialPostProcessTenantRepo{},
-		chunkService:          &initialPostProcessChunkService{},
-		graphEngine:           &initialPostProcessGraphRepo{},
-		task:                  tasks,
-		spanTracker:           tracker,
+		tenantRepo:   &initialPostProcessTenantRepo{},
+		chunkService: &initialPostProcessChunkService{},
+		graphEngine:  &initialPostProcessGraphRepo{},
+		task:         tasks,
+		spanTracker:  tracker,
+		storageResolver: &generationFenceStorageResolver{
+			file: &generationFenceFileService{}, resolvedProvider: "local",
+		},
 		productionReleaseRepo: initialPostProcessProjectionReleaseRepo(t, knowledge),
 	}
 
@@ -481,11 +484,14 @@ func TestProductionProjectionConcurrentPendingBuildEnqueueClaimsOneAttempt(t *te
 		kbService: &initialPostProcessKBService{kb: &types.KnowledgeBase{
 			ID: knowledge.KnowledgeBaseID, TenantID: knowledge.TenantID,
 		}},
-		tenantRepo:            &initialPostProcessTenantRepo{},
-		chunkService:          &initialPostProcessChunkService{},
-		graphEngine:           &initialPostProcessGraphRepo{},
-		task:                  tasks,
-		spanTracker:           tracker,
+		tenantRepo:   &initialPostProcessTenantRepo{},
+		chunkService: &initialPostProcessChunkService{},
+		graphEngine:  &initialPostProcessGraphRepo{},
+		task:         tasks,
+		spanTracker:  tracker,
+		storageResolver: &generationFenceStorageResolver{
+			file: &generationFenceFileService{}, resolvedProvider: "local",
+		},
 		productionReleaseRepo: initialPostProcessProjectionReleaseRepo(t, knowledge),
 	}
 	meta, err := knowledge.ManualMetadata()

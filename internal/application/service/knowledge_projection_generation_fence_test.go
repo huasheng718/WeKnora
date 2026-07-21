@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/infrastructure/docparser"
 	"github.com/Tencent/WeKnora/internal/models/embedding"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -160,6 +161,50 @@ type generationFenceModelService struct {
 	calls int
 }
 
+type generationFenceFileService struct {
+	interfaces.FileService
+	saveCalls   int
+	deleteCalls int
+}
+
+func (s *generationFenceFileService) SaveBytes(
+	context.Context, []byte, uint64, string, bool,
+) (string, error) {
+	s.saveCalls++
+	return "local://1/projection/image.png", nil
+}
+
+func (s *generationFenceFileService) DeleteFile(context.Context, string) error {
+	s.deleteCalls++
+	return nil
+}
+
+type generationFenceStorageResolver struct {
+	interfaces.StorageBackendResolver
+	file             interfaces.FileService
+	resolvedProvider string
+	err              error
+	calls            int
+	backendID        string
+	provider         string
+}
+
+func (r *generationFenceStorageResolver) ResolveFileService(
+	_ context.Context,
+	_ *types.Tenant,
+	backendID string,
+	provider string,
+	_ string,
+) (interfaces.FileService, string, error) {
+	r.calls++
+	r.backendID = backendID
+	r.provider = provider
+	if r.err != nil {
+		return nil, "", r.err
+	}
+	return r.file, r.resolvedProvider, nil
+}
+
 func (s *generationFenceModelService) GetEmbeddingModel(context.Context, string) (embedding.Embedder, error) {
 	s.calls++
 	return generationFenceEmbedder{}, nil
@@ -254,21 +299,23 @@ func (r *generationFenceGraphRepo) DelGraph(context.Context, []types.NameSpace) 
 }
 
 type generationFenceFixture struct {
-	service    *knowledgeService
-	knowledge  *types.Knowledge
-	knowledgeR *generationFenceKnowledgeRepo
-	chunks     *generationFenceChunkRepo
-	kbs        *generationFenceKBService
-	graph      *generationFenceGraphRepo
-	tenant     *generationFenceTenantRepo
-	vectors    *generationFenceVectorRegistry
-	vector     *generationFenceVectorEngine
-	ownership  *generationFenceOwnership
-	model      *generationFenceModelService
-	files      *countingFileService
-	releases   *generationFenceReleaseRepo
-	tasks      *initialPostProcessEnqueuer
-	generation time.Time
+	service     *knowledgeService
+	knowledge   *types.Knowledge
+	knowledgeR  *generationFenceKnowledgeRepo
+	chunks      *generationFenceChunkRepo
+	kbs         *generationFenceKBService
+	graph       *generationFenceGraphRepo
+	tenant      *generationFenceTenantRepo
+	vectors     *generationFenceVectorRegistry
+	vector      *generationFenceVectorEngine
+	ownership   *generationFenceOwnership
+	model       *generationFenceModelService
+	files       *generationFenceFileService
+	strictFiles *generationFenceFileService
+	storage     *generationFenceStorageResolver
+	releases    *generationFenceReleaseRepo
+	tasks       *initialPostProcessEnqueuer
+	generation  time.Time
 }
 
 func newGenerationFenceFixture(t *testing.T) *generationFenceFixture {
@@ -277,7 +324,7 @@ func newGenerationFenceFixture(t *testing.T) *generationFenceFixture {
 	knowledge := initialPostProcessProjectionKnowledge(t, types.ParseStatusPending)
 	generation := time.Date(2026, 7, 22, 1, 0, 0, 123456000, time.UTC)
 	snapshot, digest, err := types.CanonicalProductionReleaseTargetConfig(
-		types.JSON(`{"version":1,"indexing_strategy":{"wiki_enabled":true}}`),
+		types.JSON(`{"version":1,"indexing_strategy":{"wiki_enabled":true},"storage_backend_id":"backend-retained","storage_provider":"local"}`),
 	)
 	require.NoError(t, err)
 	meta, err := knowledge.ManualMetadata()
@@ -303,7 +350,9 @@ func newGenerationFenceFixture(t *testing.T) *generationFenceFixture {
 	vectors := &generationFenceVectorRegistry{engine: vector}
 	ownership := &generationFenceOwnership{}
 	model := &generationFenceModelService{}
-	files := &countingFileService{}
+	files := &generationFenceFileService{}
+	strictFiles := &generationFenceFileService{}
+	storage := &generationFenceStorageResolver{file: strictFiles, resolvedProvider: "local"}
 	tasks := &initialPostProcessEnqueuer{}
 	return &generationFenceFixture{
 		service: &knowledgeService{
@@ -311,11 +360,13 @@ func newGenerationFenceFixture(t *testing.T) *generationFenceFixture {
 			tenantRepo: tenant, chunkService: chunkService,
 			graphEngine: graph, task: tasks, retrieveEngine: vectors,
 			ownership: ownership, modelService: model, fileSvc: files,
+			storageResolver:       storage,
 			productionReleaseRepo: releases,
 		},
 		knowledge: knowledge, knowledgeR: knowledgeRepo, chunks: chunkRepo,
 		kbs: kbs, graph: graph, tenant: tenant, vectors: vectors, vector: vector,
 		ownership: ownership, model: model, files: files,
+		strictFiles: strictFiles, storage: storage,
 		releases: releases, tasks: tasks, generation: generation,
 	}
 }
@@ -326,15 +377,130 @@ func generationFenceManualTask(
 	generation time.Time,
 	needCleanup bool,
 ) *asynq.Task {
+	return generationFenceManualTaskWithContent(
+		t, knowledge, generation, needCleanup, "# governed projection",
+	)
+}
+
+func generationFenceManualTaskWithContent(
+	t *testing.T,
+	knowledge *types.Knowledge,
+	generation time.Time,
+	needCleanup bool,
+	content string,
+) *asynq.Task {
 	t.Helper()
 	payload := map[string]any{
 		"tenant_id": knowledge.TenantID, "knowledge_id": knowledge.ID,
-		"knowledge_base_id": knowledge.KnowledgeBaseID, "content": "# governed projection",
+		"knowledge_base_id": knowledge.KnowledgeBaseID, "content": content,
 		"need_cleanup": needCleanup, "target_updated_at": generation,
 	}
 	encoded, err := json.Marshal(payload)
 	require.NoError(t, err)
 	return asynq.NewTask(types.TypeManualProcess, encoded)
+}
+
+func configureGenerationFenceStorageFailure(
+	fixture *generationFenceFixture,
+	mode string,
+	failure error,
+) {
+	switch mode {
+	case "unavailable":
+		fixture.service.storageResolver = nil
+	case "error":
+		fixture.storage.err = failure
+	case "nil-service":
+		fixture.storage.file = nil
+	case "wrong-provider":
+		fixture.storage.resolvedProvider = "cos"
+	default:
+		panic("unknown storage failure mode: " + mode)
+	}
+}
+
+func TestProductionProjectionManualImageResolutionFailsClosedOnRetainedStorage(t *testing.T) {
+	for _, mode := range []string{"unavailable", "error", "nil-service", "wrong-provider"} {
+		t.Run(mode, func(t *testing.T) {
+			fixture := newGenerationFenceFixture(t)
+			storageErr := errors.New("retained storage resolution failed")
+			configureGenerationFenceStorageFailure(fixture, mode, storageErr)
+			fixture.service.imageResolver = docparser.NewImageResolver()
+			content := "![projection](data:image/png;base64,iVBORw0KGgo=)"
+
+			err := fixture.service.ProcessManualUpdate(
+				context.Background(),
+				generationFenceManualTaskWithContent(
+					t, fixture.knowledge, fixture.generation, false, content,
+				),
+			)
+
+			require.Error(t, err)
+			if mode == "error" {
+				require.ErrorIs(t, err, storageErr)
+			}
+			if mode == "unavailable" {
+				require.Zero(t, fixture.storage.calls)
+			} else {
+				require.Equal(t, 1, fixture.storage.calls)
+				require.Equal(t, "backend-retained", fixture.storage.backendID)
+				require.Equal(t, "local", fixture.storage.provider)
+			}
+			require.Equal(t, types.ParseStatusFailed, fixture.knowledgeR.status())
+			require.Zero(t, fixture.files.saveCalls, "default storage must never receive projection uploads")
+			require.Zero(t, fixture.strictFiles.saveCalls)
+			require.Zero(t, fixture.chunks.createCalls)
+			require.Zero(t, fixture.chunks.deleteCalls)
+			require.Zero(t, fixture.graph.deleteCalls)
+			require.Empty(t, fixture.tasks.payloads)
+		})
+	}
+}
+
+func TestProductionProjectionCleanupFailsClosedOnRetainedStorage(t *testing.T) {
+	for _, mode := range []string{"unavailable", "error", "nil-service", "wrong-provider"} {
+		t.Run(mode, func(t *testing.T) {
+			fixture := newGenerationFenceFixture(t)
+			storageErr := errors.New("retained storage resolution failed")
+			configureGenerationFenceStorageFailure(fixture, mode, storageErr)
+			fixture.knowledgeR.setStatus(types.ParseStatusFailed)
+			fixture.knowledge.StorageSize = 64
+			fixture.chunks.imageInfos = []interfaces.ChunkImageInfo{{
+				KnowledgeID: fixture.knowledge.ID,
+				ImageInfo:   `[{"url":"local://1/projection/image.png"}]`,
+			}}
+
+			err := fixture.service.ProcessManualUpdate(
+				context.Background(),
+				generationFenceManualTask(t, fixture.knowledge, fixture.generation, true),
+			)
+
+			require.Error(t, err)
+			if mode == "error" {
+				require.ErrorIs(t, err, storageErr)
+			}
+			if mode == "unavailable" {
+				require.Zero(t, fixture.storage.calls)
+			} else {
+				require.Equal(t, 1, fixture.storage.calls)
+				require.Equal(t, "backend-retained", fixture.storage.backendID)
+				require.Equal(t, "local", fixture.storage.provider)
+			}
+			require.Equal(t, types.ParseStatusFailed, fixture.knowledgeR.status())
+			require.Zero(t, fixture.ownership.calls)
+			require.Zero(t, fixture.vectors.byStoreCalls)
+			require.Zero(t, fixture.vector.deleteCalls)
+			require.Zero(t, fixture.model.calls)
+			require.Zero(t, fixture.chunks.imageReadCalls)
+			require.Zero(t, fixture.chunks.createCalls)
+			require.Zero(t, fixture.chunks.deleteCalls)
+			require.Zero(t, fixture.files.deleteCalls, "default storage must never receive projection deletes")
+			require.Zero(t, fixture.strictFiles.deleteCalls)
+			require.Zero(t, fixture.graph.deleteCalls)
+			require.Zero(t, fixture.tenant.adjustCalls)
+			require.Empty(t, fixture.tasks.payloads)
+		})
+	}
 }
 
 func TestProductionProjectionManualRetryCleansPersistedChunksWithTrustedWorker(t *testing.T) {

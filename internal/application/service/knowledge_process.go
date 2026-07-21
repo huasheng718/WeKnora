@@ -2726,25 +2726,56 @@ func (s *knowledgeService) ProcessManualUpdate(ctx context.Context, t *asynq.Tas
 		logger.Errorf(ctx, "failed to unmarshal manual process task payload: %v", err)
 		return nil
 	}
+	governedProjectionTask := !payload.TargetUpdatedAt.IsZero()
 
 	ctx = logger.WithRequestID(ctx, payload.RequestId)
 	ctx = logger.WithField(ctx, "manual_process", payload.KnowledgeID)
 	ctx = context.WithValue(ctx, types.TenantIDContextKey, payload.TenantID)
 
+	if s.tenantRepo == nil {
+		err := errors.New("manual process tenant repository is unavailable")
+		if governedProjectionTask {
+			return err
+		}
+		return nil
+	}
 	tenantInfo, err := s.tenantRepo.GetTenantByID(ctx, payload.TenantID)
 	if err != nil {
 		logger.Errorf(ctx, "ProcessManualUpdate: failed to get tenant: %v", err)
+		if governedProjectionTask {
+			return err
+		}
+		return nil
+	}
+	if tenantInfo == nil {
+		err := errors.New("manual process tenant is unavailable")
+		if governedProjectionTask {
+			return err
+		}
 		return nil
 	}
 	ctx = context.WithValue(ctx, types.TenantInfoContextKey, tenantInfo)
 
+	if s.repo == nil {
+		err := errors.New("manual process knowledge repository is unavailable")
+		if governedProjectionTask {
+			return err
+		}
+		return nil
+	}
 	knowledge, err := s.repo.GetKnowledgeByID(ctx, payload.TenantID, payload.KnowledgeID)
 	if err != nil {
 		logger.Errorf(ctx, "ProcessManualUpdate: failed to get knowledge: %v", err)
+		if governedProjectionTask {
+			return err
+		}
 		return nil
 	}
 	if knowledge == nil {
 		logger.Warnf(ctx, "ProcessManualUpdate: knowledge not found: %s", payload.KnowledgeID)
+		if governedProjectionTask {
+			return errors.New("governed manual process knowledge is unavailable")
+		}
 		return nil
 	}
 
@@ -2762,13 +2793,26 @@ func (s *knowledgeService) ProcessManualUpdate(ctx context.Context, t *asynq.Tas
 		return nil
 	}
 
+	if s.kbService == nil {
+		err := errors.New("manual process knowledge base service is unavailable")
+		if governedProjectionTask {
+			return err
+		}
+		return nil
+	}
 	kb, err := s.kbService.GetKnowledgeBaseByID(ctx, payload.KnowledgeBaseID)
 	if err != nil {
 		logger.Errorf(ctx, "ProcessManualUpdate: failed to get knowledge base: %v", err)
-		knowledge.ParseStatus = "failed"
+		knowledge.ParseStatus = types.ParseStatusFailed
 		knowledge.ErrorMessage = fmt.Sprintf("failed to get knowledge base: %v", err)
 		knowledge.UpdatedAt = time.Now()
-		s.repo.UpdateKnowledge(ctx, knowledge)
+		persistErr := s.repo.UpdateKnowledge(ctx, knowledge)
+		if governedProjectionTask {
+			if persistErr != nil {
+				return errors.Join(err, fmt.Errorf("persist governed manual failure: %w", persistErr))
+			}
+			return err
+		}
 		return nil
 	}
 	ctx, projectionRouting, err := s.claimProductionProjectionManualWorker(
@@ -2776,6 +2820,9 @@ func (s *knowledgeService) ProcessManualUpdate(ctx context.Context, t *asynq.Tas
 	)
 	if err != nil {
 		return err
+	}
+	if governedProjectionTask && projectionRouting == nil {
+		return types.ErrProductionProjectionConflict
 	}
 
 	if projectionRouting == nil {
