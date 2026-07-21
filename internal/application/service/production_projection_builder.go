@@ -63,7 +63,7 @@ func (b *ProductionProjectionBuilder) Build(ctx context.Context, targetID string
 		return nil, types.ErrProductionReleaseInvalid
 	}
 	if target.Status == types.ReleaseTargetFailed {
-		target, err = claimProductionProjectionRetry(ctx, b.uow, b.releases, b.knowledge, target.ID)
+		target, err = claimProductionProjectionRetry(ctx, b.uow, b.releases, b.knowledge, target.ID, true)
 		if err != nil {
 			return nil, err
 		}

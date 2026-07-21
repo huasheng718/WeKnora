@@ -190,15 +190,23 @@ func (s *ProductionReleaseService) Retry(ctx context.Context, targetID string) e
 	if err != nil {
 		return err
 	}
+	if target.Status == types.ReleaseTargetReady {
+		return nil
+	}
 	if target.Status != types.ReleaseTargetFailed && target.Status != types.ReleaseTargetBuilding {
 		return types.ErrProductionReleaseLifecycle
 	}
-	if s.tasks == nil {
-		return errors.New("production projection task queue is unavailable")
-	}
-	target, err = claimProductionProjectionRetry(ctx, s.uow, s.releases, s.knowledge, target.ID)
+	target, err = claimProductionProjectionRetry(
+		ctx, s.uow, s.releases, s.knowledge, target.ID, s.tasks != nil,
+	)
 	if err != nil {
 		return err
+	}
+	if target.Status == types.ReleaseTargetReady {
+		return nil
+	}
+	if s.tasks == nil {
+		return errors.New("production projection task queue is unavailable")
 	}
 	return s.enqueueProjectionTask(ctx, types.TypeProductionBuild, types.ProductionProjectionOperationBuild, target, 0)
 }
@@ -209,6 +217,7 @@ func claimProductionProjectionRetry(
 	releases interfaces.ProductionReleaseRepository,
 	knowledgeService interfaces.KnowledgeService,
 	targetID string,
+	queueAvailable bool,
 ) (*types.ProductionReleaseTarget, error) {
 	if uow == nil || releases == nil || knowledgeService == nil || knowledgeService.GetRepository() == nil {
 		return nil, errors.New("production projection retry dependencies are unavailable")
@@ -223,6 +232,11 @@ func claimProductionProjectionRetry(
 		target, err := releases.GetTargetForUpdate(txCtx, tenantID, targetID)
 		if err != nil {
 			return err
+		}
+		if target != nil && target.ID == targetID && target.TenantID == tenantID &&
+			target.Status == types.ReleaseTargetReady {
+			claimedTarget = target
+			return nil
 		}
 		if target == nil || target.ID != targetID || target.TenantID != tenantID ||
 			(target.Status != types.ReleaseTargetBuilding && target.Status != types.ReleaseTargetFailed) {
@@ -244,6 +258,23 @@ func claimProductionProjectionRetry(
 				projection.DocumentID != target.DocumentID || projection.VersionID != target.VersionID {
 				return types.ErrProductionProjectionConflict
 			}
+			if knowledge.ParseStatus == types.ParseStatusCompleted && target.Status == types.ReleaseTargetBuilding {
+				if readyErr := reconcileCompletedProductionProjection(txCtx, knowledge, releases); readyErr != nil {
+					return readyErr
+				}
+				readyTarget, readyErr := releases.GetTarget(txCtx, tenantID, target.ID)
+				if readyErr != nil {
+					return readyErr
+				}
+				if readyTarget == nil || readyTarget.Status != types.ReleaseTargetReady {
+					return types.ErrProductionProjectionConflict
+				}
+				claimedTarget = readyTarget
+				return nil
+			}
+			if !queueAvailable {
+				return errors.New("production projection task queue is unavailable")
+			}
 			switch knowledge.ParseStatus {
 			case types.ParseStatusFailed:
 				claimed, claimErr := knowledgeRepo.ClaimFailedKnowledgeRetry(txCtx, knowledge.ID)
@@ -261,6 +292,8 @@ func claimProductionProjectionRetry(
 			default:
 				return types.ErrProductionReleaseLifecycle
 			}
+		} else if !queueAvailable {
+			return errors.New("production projection task queue is unavailable")
 		}
 		if !advanceGeneration {
 			claimedTarget = target

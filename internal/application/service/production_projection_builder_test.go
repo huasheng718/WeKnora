@@ -700,6 +700,101 @@ func TestProductionProjectionRolledBackRetryIsRejectedWithoutClearingRetention(t
 	}
 }
 
+func TestProductionReleaseRetryReconcilesCompletedWithoutRetainedWorker(t *testing.T) {
+	t.Run("concurrent and repeated Retry converge ready without enqueue", func(t *testing.T) {
+		fixture := newCompletedProductionRetryIntegrationFixture(t, 0, false)
+		const callers = 16
+		barrier := newProductionRetryBarrierUOW(fixture.realUOW, callers)
+		fixture.service.uow = barrier
+		retryProductionProjectionConcurrently(
+			t, fixture.service, fixture.actorCtx, projectionTargetID, callers, barrier,
+		)
+
+		ready, err := fixture.releaseRepo.GetTarget(fixture.actorCtx, projectionTenantID, projectionTargetID)
+		require.NoError(t, err)
+		require.Equal(t, types.ReleaseTargetReady, ready.Status)
+		require.Equal(t, []string{fixture.originalTaskID}, acceptedProductionRetryTaskIDs(fixture.tasks))
+		require.Equal(t, 1, productionRetryEnqueueCalls(fixture.tasks), "readiness reconciliation must not enqueue a worker")
+
+		fixture.service.uow = fixture.realUOW
+		require.NoError(t, fixture.service.Retry(fixture.actorCtx, projectionTargetID))
+		replayed, err := fixture.releaseRepo.GetTarget(fixture.actorCtx, projectionTenantID, projectionTargetID)
+		require.NoError(t, err)
+		require.Equal(t, types.ReleaseTargetReady, replayed.Status)
+		require.True(t, replayed.UpdatedAt.Equal(ready.UpdatedAt))
+		require.Equal(t, 1, productionRetryEnqueueCalls(fixture.tasks))
+	})
+
+	t.Run("completed with pending work fails closed", func(t *testing.T) {
+		fixture := newCompletedProductionRetryIntegrationFixture(t, 1, false)
+		err := fixture.service.Retry(fixture.actorCtx, projectionTargetID)
+		require.ErrorIs(t, err, types.ErrProductionReleaseLifecycle)
+		persisted, loadErr := fixture.releaseRepo.GetTarget(fixture.actorCtx, projectionTenantID, projectionTargetID)
+		require.NoError(t, loadErr)
+		require.Equal(t, types.ReleaseTargetBuilding, persisted.Status)
+		require.Equal(t, 1, productionRetryEnqueueCalls(fixture.tasks))
+	})
+
+	t.Run("tampered completed content fails closed", func(t *testing.T) {
+		fixture := newCompletedProductionRetryIntegrationFixture(t, 0, true)
+		err := fixture.service.Retry(fixture.actorCtx, projectionTargetID)
+		require.ErrorIs(t, err, types.ErrProductionContentDigestMismatch)
+		persisted, loadErr := fixture.releaseRepo.GetTarget(fixture.actorCtx, projectionTenantID, projectionTargetID)
+		require.NoError(t, loadErr)
+		require.Equal(t, types.ReleaseTargetBuilding, persisted.Status)
+		require.Equal(t, 1, productionRetryEnqueueCalls(fixture.tasks))
+	})
+}
+
+type completedProductionRetryIntegrationFixture struct {
+	service        *ProductionReleaseService
+	releaseRepo    interfaces.ProductionReleaseRepository
+	actorCtx       context.Context
+	tasks          *productionReleaseTaskEnqueuerStub
+	realUOW        interfaces.ProductionUnitOfWork
+	originalTaskID string
+}
+
+func newCompletedProductionRetryIntegrationFixture(
+	t *testing.T,
+	pendingSubtasks int,
+	tamperContent bool,
+) *completedProductionRetryIntegrationFixture {
+	t.Helper()
+	fixture, db, releaseRepo, knowledgeRepo, actorCtx := newProductionProjectionBuilderIntegrationFixture(t)
+	target, err := releaseRepo.GetTarget(actorCtx, projectionTenantID, projectionTargetID)
+	require.NoError(t, err)
+	knowledge := completedProjectionKnowledgeForBuilder(t, fixture, target, pendingSubtasks)
+	if tamperContent {
+		meta, metaErr := knowledge.ManualMetadata()
+		require.NoError(t, metaErr)
+		meta.Content = "# tampered completed projection"
+		require.NoError(t, knowledge.SetManualMetadata(meta))
+	}
+	require.NoError(t, knowledgeRepo.CreateKnowledge(actorCtx, knowledge))
+	tasks := &productionReleaseTaskEnqueuerStub{accepted: make(map[string]*asynq.Task)}
+	originalTaskID := productionProjectionTaskID(target.ID, target.KnowledgeID, "build-initial")
+	_, err = tasks.Enqueue(
+		asynq.NewTask(types.TypeProductionBuild, nil), asynq.TaskID(originalTaskID),
+	)
+	require.NoError(t, err)
+	realUOW := apprepository.NewProductionUnitOfWork(db)
+	service := &ProductionReleaseService{
+		releases: releaseRepo, authorizer: productionReleaseAuthorizerStub{},
+		members: productionReleaseMembershipStub{role: types.TenantRoleContributor},
+		kbs: productionReleaseKBStub{kb: &types.KnowledgeBase{
+			ID: projectionKBID, TenantID: projectionTenantID, CreatorID: "93000000-0000-4000-8000-000000000099",
+			Type: types.KnowledgeBaseTypeDocument,
+		}},
+		knowledge: &knowledgeService{repo: knowledgeRepo},
+		uow:       realUOW, tasks: tasks,
+	}
+	return &completedProductionRetryIntegrationFixture{
+		service: service, releaseRepo: releaseRepo, actorCtx: actorCtx,
+		tasks: tasks, realUOW: realUOW, originalTaskID: originalTaskID,
+	}
+}
+
 func TestProductionReleaseConcurrentRetryWithoutKnowledgeUsesOneRealGeneration(t *testing.T) {
 	const callers = 16
 	_, db, releaseRepo, knowledgeRepo, actorCtx := newProductionProjectionBuilderIntegrationFixture(t)
@@ -886,6 +981,12 @@ func acceptedProductionRetryTaskIDs(tasks *productionReleaseTaskEnqueuerStub) []
 	}
 	sort.Strings(ids)
 	return ids
+}
+
+func productionRetryEnqueueCalls(tasks *productionReleaseTaskEnqueuerStub) int {
+	tasks.mu.Lock()
+	defer tasks.mu.Unlock()
+	return tasks.calls
 }
 
 func completedProjectionKnowledgeForBuilder(
