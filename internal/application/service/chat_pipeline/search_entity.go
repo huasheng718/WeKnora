@@ -2,6 +2,7 @@ package chatpipeline
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/Tencent/WeKnora/internal/logger"
@@ -63,6 +64,8 @@ func (p *PluginSearchEntity) OnEvent(ctx context.Context,
 	var mu sync.Mutex
 	var allNodes []*types.GraphNode
 	var allRelations []*types.GraphRelation
+	chunkTenants := make(map[string]uint64)
+	ownerTenantByKB := entityOwnerTenants(chatManage.SearchTargets, chatManage.TenantID)
 
 	// If specific KnowledgeIDs are provided, search by individual files
 	if len(entityKnowledge) > 0 {
@@ -92,6 +95,11 @@ func (p *PluginSearchEntity) OnEvent(ctx context.Context,
 				mu.Lock()
 				allNodes = append(allNodes, graph.Node...)
 				allRelations = append(allRelations, graph.Relation...)
+				for _, node := range graph.Node {
+					for _, chunkID := range node.Chunks {
+						chunkTenants[chunkID] = ownerTenantByKB[knowledgeBaseID]
+					}
+				}
 				mu.Unlock()
 			}(kbID, knowledgeID)
 		}
@@ -120,6 +128,11 @@ func (p *PluginSearchEntity) OnEvent(ctx context.Context,
 				mu.Lock()
 				allNodes = append(allNodes, graph.Node...)
 				allRelations = append(allRelations, graph.Relation...)
+				for _, node := range graph.Node {
+					for _, chunkID := range node.Chunks {
+						chunkTenants[chunkID] = ownerTenantByKB[knowledgeBaseID]
+					}
+				}
 				mu.Unlock()
 			}(kbID)
 		}
@@ -134,7 +147,7 @@ func (p *PluginSearchEntity) OnEvent(ctx context.Context,
 	excludedKnowledgeIDs := excludedEntityKnowledgeIDs(chatManage.SearchTargets)
 	if len(excludedKnowledgeIDs) > 0 {
 		var err error
-		graph, err = p.pruneExcludedProjectionGraph(ctx, types.MustTenantIDFromContext(ctx), graph, excludedKnowledgeIDs)
+		graph, err = p.pruneExcludedProjectionGraph(ctx, chunkTenants, graph, excludedKnowledgeIDs)
 		if err != nil {
 			logger.Errorf(ctx, "Failed to prune excluded production projections from entity graph: %v", err)
 			chatManage.GraphResult = &types.GraphData{}
@@ -149,7 +162,7 @@ func (p *PluginSearchEntity) OnEvent(ctx context.Context,
 		logger.Infof(ctx, "No new chunk found")
 		return next()
 	}
-	chunks, err := p.chunkRepo.ListChunksByID(ctx, types.MustTenantIDFromContext(ctx), chunkIDs)
+	chunks, err := p.listEntityChunks(ctx, chunkTenants, chunkIDs)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to list chunks, session_id: %s, error: %v", chatManage.SessionID, err)
 		return next()
@@ -158,11 +171,7 @@ func (p *PluginSearchEntity) OnEvent(ctx context.Context,
 	for _, chunk := range chunks {
 		knowledgeIDs = append(knowledgeIDs, chunk.KnowledgeID)
 	}
-	knowledges, err := p.knowledgeRepo.GetKnowledgeBatch(
-		ctx,
-		types.MustTenantIDFromContext(ctx),
-		knowledgeIDs,
-	)
+	knowledges, err := p.listEntityKnowledges(ctx, chunks, knowledgeIDs)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to list knowledge, session_id: %s, error: %v", chatManage.SessionID, err)
 		return next()
@@ -215,9 +224,69 @@ func excludedEntityKnowledgeIDs(targets types.SearchTargets) map[string]struct{}
 	return excluded
 }
 
+func entityOwnerTenants(targets types.SearchTargets, fallback uint64) map[string]uint64 {
+	owners := make(map[string]uint64)
+	for _, target := range targets {
+		if target != nil && target.KnowledgeBaseID != "" {
+			tenant := target.TenantID
+			if tenant == 0 {
+				tenant = fallback
+			}
+			owners[target.KnowledgeBaseID] = tenant
+		}
+	}
+	return owners
+}
+
+func (p *PluginSearchEntity) listEntityChunks(ctx context.Context, chunkTenants map[string]uint64, ids []string) ([]*types.Chunk, error) {
+	byTenant := make(map[uint64][]string)
+	for _, id := range ids {
+		tenant, ok := chunkTenants[id]
+		if !ok || tenant == 0 {
+			return nil, fmt.Errorf("entity chunk %s has no authorized owner", id)
+		}
+		byTenant[tenant] = append(byTenant[tenant], id)
+	}
+	var out []*types.Chunk
+	for tenant, chunkIDs := range byTenant {
+		rows, err := p.chunkRepo.ListChunksByID(ctx, tenant, chunkIDs)
+		if err != nil {
+			return nil, err
+		}
+		for _, row := range rows {
+			if row.TenantID != tenant {
+				return nil, fmt.Errorf("entity chunk tenant mismatch")
+			}
+			out = append(out, row)
+		}
+	}
+	return out, nil
+}
+
+func (p *PluginSearchEntity) listEntityKnowledges(ctx context.Context, chunks []*types.Chunk, _ []string) ([]*types.Knowledge, error) {
+	byTenant := make(map[uint64][]string)
+	for _, chunk := range chunks {
+		byTenant[chunk.TenantID] = append(byTenant[chunk.TenantID], chunk.KnowledgeID)
+	}
+	var out []*types.Knowledge
+	for tenant, ids := range byTenant {
+		rows, err := p.knowledgeRepo.GetKnowledgeBatch(ctx, tenant, ids)
+		if err != nil {
+			return nil, err
+		}
+		for _, row := range rows {
+			if row.TenantID != tenant {
+				return nil, fmt.Errorf("entity knowledge tenant mismatch")
+			}
+			out = append(out, row)
+		}
+	}
+	return out, nil
+}
+
 func (p *PluginSearchEntity) pruneExcludedProjectionGraph(
 	ctx context.Context,
-	tenantID uint64,
+	chunkTenants map[string]uint64,
 	graph *types.GraphData,
 	excluded map[string]struct{},
 ) (*types.GraphData, error) {
@@ -237,7 +306,7 @@ func (p *PluginSearchEntity) pruneExcludedProjectionGraph(
 			}
 		}
 	}
-	chunks, err := p.chunkRepo.ListChunksByID(ctx, tenantID, chunkIDs)
+	chunks, err := p.listEntityChunks(ctx, chunkTenants, chunkIDs)
 	if err != nil {
 		return nil, err
 	}

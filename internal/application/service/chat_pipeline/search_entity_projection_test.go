@@ -68,21 +68,21 @@ func (r *projectionEntityKnowledgeRepo) GetKnowledgeBatch(_ context.Context, _ u
 
 func TestEntitySearchPrunesInactiveProductionProjectionGraphAndChunks(t *testing.T) {
 	chunks := []*types.Chunk{
-		{ID: "chunk-active", KnowledgeID: "knowledge-active", KnowledgeBaseID: "kb-1", ImageInfo: "[]"},
-		{ID: "chunk-old", KnowledgeID: "knowledge-old", KnowledgeBaseID: "kb-1", ImageInfo: "[]"},
-		{ID: "chunk-building", KnowledgeID: "knowledge-building", KnowledgeBaseID: "kb-1", ImageInfo: "[]"},
+		{ID: "chunk-active", TenantID: 7, KnowledgeID: "knowledge-active", KnowledgeBaseID: "kb-1", ImageInfo: "[]"},
+		{ID: "chunk-old", TenantID: 7, KnowledgeID: "knowledge-old", KnowledgeBaseID: "kb-1", ImageInfo: "[]"},
+		{ID: "chunk-building", TenantID: 7, KnowledgeID: "knowledge-building", KnowledgeBaseID: "kb-1", ImageInfo: "[]"},
 	}
 	p := &PluginSearchEntity{
 		graphRepo: &projectionEntityGraphRepo{}, chunkRepo: &projectionEntityChunkRepo{chunks: chunks},
 		knowledgeRepo: &projectionEntityKnowledgeRepo{rows: []*types.Knowledge{
-			{ID: "knowledge-active", KnowledgeBaseID: "kb-1", Title: "active"},
+			{ID: "knowledge-active", TenantID: 7, KnowledgeBaseID: "kb-1", Title: "active"},
 			{ID: "knowledge-old", KnowledgeBaseID: "kb-1", Title: "old"},
 			{ID: "knowledge-building", KnowledgeBaseID: "kb-1", Title: "building"},
 		}},
 	}
 	chat := &types.ChatManage{
 		PipelineRequest: types.PipelineRequest{TenantID: 7, SearchTargets: types.SearchTargets{&types.SearchTarget{
-			Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-1",
+			Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-1", TenantID: 7,
 			ExcludeKnowledgeIDs: []string{"knowledge-old", "knowledge-building"},
 		}}},
 		PipelineState: types.PipelineState{Entity: []string{"term"}, EntityKBIDs: []string{"kb-1"}},
