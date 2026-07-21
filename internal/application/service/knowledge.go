@@ -550,12 +550,38 @@ func (s *knowledgeService) ListKnowledgeByKnowledgeBaseID(ctx context.Context,
 func (s *knowledgeService) ListPagedKnowledgeByKnowledgeBaseID(ctx context.Context,
 	kbID string, page *types.Pagination, filter types.KnowledgeListFilter,
 ) (*types.PageResult, error) {
+	var activeKnowledgeIDs []string
+	if s.productionReleaseRepo != nil {
+		scopes, err := s.productionReleaseRepo.ResolveScopes(ctx, types.MustTenantIDFromContext(ctx), []string{kbID})
+		if err != nil {
+			return nil, err
+		}
+		scope := scopes[kbID]
+		filter.ExcludeKnowledgeIDs = mergeUniqueKnowledgeIDs(filter.ExcludeKnowledgeIDs, scope.InactiveKnowledgeIDs)
+		activeKnowledgeIDs = scope.ActiveKnowledgeIDs
+	}
 	knowledges, total, err := s.repo.ListPagedKnowledgeByKnowledgeBaseID(ctx,
 		ctx.Value(types.TenantIDContextKey).(uint64), kbID, page, filter)
 	if err != nil {
 		return nil, err
 	}
-
+	if len(activeKnowledgeIDs) > 0 {
+		active := make(map[string]struct{}, len(activeKnowledgeIDs))
+		for _, id := range activeKnowledgeIDs {
+			active[id] = struct{}{}
+		}
+		for i, knowledge := range knowledges {
+			if knowledge == nil {
+				continue
+			}
+			if _, ok := active[knowledge.ID]; ok {
+				response := *knowledge
+				response.Source = "production"
+				response.ReadOnly = true
+				knowledges[i] = &response
+			}
+		}
+	}
 	// Batch load tags for all knowledge entries
 	if len(knowledges) > 0 {
 		ids := make([]string, len(knowledges))
@@ -576,6 +602,12 @@ func (s *knowledgeService) ListPagedKnowledgeByKnowledgeBaseID(ctx context.Conte
 	}
 
 	return types.NewPageResult(total, page, knowledges), nil
+}
+
+// ApplyProductionProjectionScope ensures production release visibility is
+// applied before a target can enter any retrieval or direct-load path.
+func (s *knowledgeService) ApplyProductionProjectionScope(ctx context.Context, tenantID uint64, targets types.SearchTargets) error {
+	return newProductionProjectionResolver(s.productionReleaseRepo).Apply(ctx, tenantID, targets)
 }
 
 // GetKnowledgeFile retrieves the physical file associated with a knowledge entry

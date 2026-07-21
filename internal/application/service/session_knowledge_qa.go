@@ -598,6 +598,9 @@ func (s *sessionService) buildSearchTargets(
 
 	logger.Infof(ctx, "Built %d search targets: %d full KB, %d partial/tag KB, kbTenantMap=%v",
 		len(targets), len(knowledgeBaseIDs), len(targets)-len(knowledgeBaseIDs), kbTenantMap)
+	if err := s.knowledgeService.ApplyProductionProjectionScope(ctx, tenantID, targets); err != nil {
+		return nil, err
+	}
 
 	return targets, nil
 }

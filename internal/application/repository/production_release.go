@@ -450,12 +450,12 @@ func (r *productionReleaseRepository) ResolveScopes(ctx context.Context, tenantI
 			uniqueKBs = append(uniqueKBs, kbID)
 		}
 	}
-	if len(uniqueKBs) == 0 {
+	if len(uniqueKBs) == 0 && kbIDs != nil {
 		return result, nil
 	}
 
 	var rows []productionScopeRow
-	err := database.DBFromContext(ctx, r.db).WithContext(ctx).
+	query := database.DBFromContext(ctx, r.db).WithContext(ctx).
 		Table("production_release_targets AS target").
 		Select(`target.target_knowledge_base_id, target.knowledge_id,
 			CASE WHEN head.active_release_target_id = target.id AND target.status = ? THEN TRUE ELSE FALSE END AS is_active`, types.ReleaseTargetActive).
@@ -463,10 +463,13 @@ func (r *productionReleaseRepository) ResolveScopes(ctx context.Context, tenantI
 			ON head.tenant_id = target.tenant_id
 			AND head.document_id = target.document_id
 			AND head.target_knowledge_base_id = target.target_knowledge_base_id
-			AND head.active_release_target_id = target.id`).
-		Where("target.tenant_id = ? AND target.target_knowledge_base_id IN ?", tenantID, uniqueKBs).
-		Order("target.target_knowledge_base_id ASC, target.knowledge_id ASC").
-		Scan(&rows).Error
+			AND head.active_release_target_id = target.id`)
+	if kbIDs == nil {
+		query = query.Where("target.tenant_id = ?", tenantID)
+	} else {
+		query = query.Where("target.tenant_id = ? AND target.target_knowledge_base_id IN ?", tenantID, uniqueKBs)
+	}
+	err := query.Order("target.target_knowledge_base_id ASC, target.knowledge_id ASC").Scan(&rows).Error
 	if err != nil {
 		return nil, err
 	}

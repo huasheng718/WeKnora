@@ -35,6 +35,10 @@ type tagTargetKnowledgeService struct {
 	tagIDs     map[string][]string
 }
 
+func (*tagTargetKnowledgeService) ApplyProductionProjectionScope(context.Context, uint64, types.SearchTargets) error {
+	return nil
+}
+
 func (s *tagTargetKnowledgeService) GetKnowledgeBatchWithSharedAccess(
 	_ context.Context,
 	_ uint64,

@@ -92,6 +92,8 @@ const (
 // KnowledgeListFilter aggregates optional filters for listing knowledge entries
 // under a knowledge base. Empty / zero fields mean "no filter on that dimension".
 type KnowledgeListFilter struct {
+	// ExcludeKnowledgeIDs removes known records from both the count and page query.
+	ExcludeKnowledgeIDs []string
 	// TagIDs filters by multiple tags (OR semantics: match any of the given tags).
 	TagIDs []string
 	// Keyword performs a LIKE match on file_name / title when non-empty.
@@ -130,6 +132,8 @@ type Knowledge struct {
 	Description string `json:"description"`
 	// Source of the knowledge (e.g. URL address for url type, "manual" for manual type)
 	Source string `json:"source"             gorm:"type:varchar(2048)"`
+	// ReadOnly is response-only and marks an active production projection.
+	ReadOnly bool `json:"read_only" gorm:"-"`
 	// Channel indicates through which channel the knowledge was ingested (web, api, browser_extension, wechat, etc.)
 	Channel string `json:"channel"            gorm:"type:varchar(50);default:'web'"`
 	// Parse status of the knowledge

@@ -129,6 +129,25 @@ func (s *knowledgeBaseService) HybridSearch(ctx context.Context,
 	if err := s.authorizeKBAccess(ctx, kbs, requestTenantID); err != nil {
 		return nil, err
 	}
+	if s.productionReleaseRepo != nil {
+		targetType := types.SearchTargetTypeKnowledgeBase
+		if len(params.KnowledgeIDs) > 0 {
+			targetType = types.SearchTargetTypeKnowledge
+		}
+		targets := make(types.SearchTargets, 0, len(kbs))
+		for _, kb := range kbs {
+			targets = append(targets, &types.SearchTarget{
+				Type: targetType, KnowledgeBaseID: kb.ID, TenantID: kb.TenantID,
+				KnowledgeIDs: params.KnowledgeIDs,
+			})
+		}
+		if err := newProductionProjectionResolver(s.productionReleaseRepo).Apply(ctx, requestTenantID, targets); err != nil {
+			return nil, err
+		}
+		for _, target := range targets {
+			params.ExcludeKnowledgeIDs = mergeUniqueKnowledgeIDs(params.ExcludeKnowledgeIDs, target.ExcludeKnowledgeIDs)
+		}
+	}
 
 	// Explicit embedding-model consistency check. Multi-KB searches that
 	// span different embedding spaces would otherwise silently produce
@@ -203,9 +222,9 @@ func (s *knowledgeBaseService) HybridSearch(ctx context.Context,
 			"group_count":            len(groups),
 		},
 		Metadata: map[string]interface{}{
-			"primary_kb_id":      kb.ID,
-			"primary_kb_type":    string(kb.Type),
-			"embedding_model_id": kb.EmbeddingModelID,
+			"primary_kb_id":       kb.ID,
+			"primary_kb_type":     string(kb.Type),
+			"embedding_model_id":  kb.EmbeddingModelID,
 			"has_query_embedding": len(params.QueryEmbedding) > 0,
 		},
 	})
@@ -360,15 +379,16 @@ func (s *knowledgeBaseService) buildRetrievalParams(
 
 		appendVectorParams := func(kbIDs []string, knowledgeType string) {
 			retrieveParams = append(retrieveParams, types.RetrieveParams{
-				Query:            params.QueryText,
-				Embedding:        queryEmbedding,
-				KnowledgeBaseIDs: kbIDs,
-				TopK:             matchCount,
-				Threshold:        params.VectorThreshold,
-				RetrieverType:    types.VectorRetrieverType,
-				KnowledgeIDs:     params.KnowledgeIDs,
-				TagIDs:           params.TagIDs,
-				KnowledgeType:    knowledgeType,
+				Query:               params.QueryText,
+				Embedding:           queryEmbedding,
+				KnowledgeBaseIDs:    kbIDs,
+				TopK:                matchCount,
+				Threshold:           params.VectorThreshold,
+				RetrieverType:       types.VectorRetrieverType,
+				KnowledgeIDs:        params.KnowledgeIDs,
+				ExcludeKnowledgeIDs: params.ExcludeKnowledgeIDs,
+				TagIDs:              params.TagIDs,
+				KnowledgeType:       knowledgeType,
 			})
 		}
 
@@ -390,13 +410,14 @@ func (s *knowledgeBaseService) buildRetrievalParams(
 		len(docKeywordKBIDs) > 0 {
 		logger.Info(ctx, "Keyword retrieval supported, preparing keyword retrieval parameters")
 		retrieveParams = append(retrieveParams, types.RetrieveParams{
-			Query:            params.QueryText,
-			KnowledgeBaseIDs: docKeywordKBIDs,
-			TopK:             matchCount,
-			Threshold:        params.KeywordThreshold,
-			RetrieverType:    types.KeywordsRetrieverType,
-			KnowledgeIDs:     params.KnowledgeIDs,
-			TagIDs:           params.TagIDs,
+			Query:               params.QueryText,
+			KnowledgeBaseIDs:    docKeywordKBIDs,
+			TopK:                matchCount,
+			Threshold:           params.KeywordThreshold,
+			RetrieverType:       types.KeywordsRetrieverType,
+			KnowledgeIDs:        params.KnowledgeIDs,
+			ExcludeKnowledgeIDs: params.ExcludeKnowledgeIDs,
+			TagIDs:              params.TagIDs,
 		})
 		logger.Info(ctx, "Keyword retrieval parameters setup completed")
 	}

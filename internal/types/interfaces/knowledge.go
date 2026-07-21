@@ -75,6 +75,9 @@ type KnowledgeService interface {
 	GetKnowledgeBatch(ctx context.Context, tenantID uint64, ids []string) ([]*types.Knowledge, error)
 	// GetKnowledgeBatchWithSharedAccess retrieves knowledge by IDs including items from shared KBs the user has access to.
 	GetKnowledgeBatchWithSharedAccess(ctx context.Context, tenantID uint64, ids []string) ([]*types.Knowledge, error)
+	// ApplyProductionProjectionScope annotates full KB targets with inactive
+	// projection exclusions and rejects inactive explicit document targets.
+	ApplyProductionProjectionScope(ctx context.Context, tenantID uint64, targets types.SearchTargets) error
 	// ListKnowledgeIDsByTagIDs returns document knowledge IDs carrying any of
 	// the specified KB-local tags.
 	ListKnowledgeIDsByTagIDs(ctx context.Context, tenantID uint64, kbID string, tagIDs []string) ([]string, error)

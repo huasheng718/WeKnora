@@ -36,6 +36,9 @@ type SearchTarget struct {
 	KnowledgeIDs []string `json:"knowledge_ids,omitempty"`
 	// TagIDs limits retrieval to chunks/documents carrying any of these KB-local tags.
 	TagIDs []string `json:"tag_ids,omitempty"`
+	// ExcludeKnowledgeIDs removes documents from full knowledge base retrieval.
+	// It is populated by the production projection visibility resolver.
+	ExcludeKnowledgeIDs []string `json:"exclude_knowledge_ids,omitempty"`
 	// DisableDirectLoad forces the target through retrieval even when it is
 	// represented as specific knowledge IDs. Tag-derived document scopes need
 	// this so tag filtering limits the candidate documents without loading every
@@ -160,6 +163,7 @@ type SearchParams struct {
 	DisableKeywordsMatch bool      `json:"disable_keywords_match"`
 	DisableVectorMatch   bool      `json:"disable_vector_match"`
 	KnowledgeIDs         []string  `json:"knowledge_ids"`
+	ExcludeKnowledgeIDs  []string  `json:"exclude_knowledge_ids,omitempty"`
 	TagIDs               []string  `json:"tag_ids"` // Tag IDs for filtering (used for FAQ priority filtering)
 	OnlyRecommended      bool      `json:"only_recommended"`
 	// KnowledgeBaseIDs overrides the single KB ID passed to HybridSearch,

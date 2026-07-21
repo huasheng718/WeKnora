@@ -77,3 +77,18 @@ func TestScopeClause_EmptyWhenNoUsableScope(t *testing.T) {
 		t.Fatalf("expected empty scope, got sql=%q args=%v", sql, args)
 	}
 }
+
+func TestResolveGrepScopeCarriesFullKBExclusions(t *testing.T) {
+	tool := NewGrepChunksTool(nil, types.SearchTargets{&types.SearchTarget{
+		Type:                types.SearchTargetTypeKnowledgeBase,
+		KnowledgeBaseID:     "kb-1",
+		ExcludeKnowledgeIDs: []string{"knowledge-old"},
+	}})
+	kbIDs, _, excluded, _ := tool.resolveGrepScope()
+	if len(kbIDs) != 1 || kbIDs[0] != "kb-1" {
+		t.Fatalf("full KB scope = %v, want kb-1", kbIDs)
+	}
+	if len(excluded) != 1 || excluded[0] != "knowledge-old" {
+		t.Fatalf("excluded knowledge IDs = %v, want knowledge-old", excluded)
+	}
+}

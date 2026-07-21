@@ -510,10 +510,12 @@ func (t *KnowledgeSearchTool) concurrentSearchByTargets(
 
 				// Separate full-KB targets (combinable) from specific-knowledge targets
 				var fullKBIDs []string
+				var fullKBExcludeKnowledgeIDs []string
 				var knowledgeTargets []*types.SearchTarget
 				for _, st := range targets {
 					if st.Type == types.SearchTargetTypeKnowledgeBase && len(st.TagIDs) == 0 {
 						fullKBIDs = append(fullKBIDs, st.KnowledgeBaseID)
+						fullKBExcludeKnowledgeIDs = appendUniqueKnowledgeIDs(fullKBExcludeKnowledgeIDs, st.ExcludeKnowledgeIDs)
 					} else {
 						knowledgeTargets = append(knowledgeTargets, st)
 					}
@@ -527,12 +529,13 @@ func (t *KnowledgeSearchTool) concurrentSearchByTargets(
 					go func() {
 						defer innerWg.Done()
 						searchParams := types.SearchParams{
-							QueryText:        q,
-							QueryEmbedding:   queryEmbedding,
-							KnowledgeBaseIDs: fullKBIDs,
-							MatchCount:       topK,
-							VectorThreshold:  vectorThreshold,
-							KeywordThreshold: keywordThreshold,
+							QueryText:           q,
+							QueryEmbedding:      queryEmbedding,
+							KnowledgeBaseIDs:    fullKBIDs,
+							ExcludeKnowledgeIDs: fullKBExcludeKnowledgeIDs,
+							MatchCount:          topK,
+							VectorThreshold:     vectorThreshold,
+							KeywordThreshold:    keywordThreshold,
 						}
 						kbResults, err := t.knowledgeBaseService.HybridSearch(ctx, fullKBIDs[0], searchParams)
 						if err != nil {
@@ -560,13 +563,14 @@ func (t *KnowledgeSearchTool) concurrentSearchByTargets(
 					go func() {
 						defer innerWg.Done()
 						searchParams := types.SearchParams{
-							QueryText:        q,
-							QueryEmbedding:   queryEmbedding,
-							MatchCount:       topK,
-							VectorThreshold:  vectorThreshold,
-							KeywordThreshold: keywordThreshold,
-							KnowledgeIDs:     st.KnowledgeIDs,
-							TagIDs:           st.TagIDs,
+							QueryText:           q,
+							QueryEmbedding:      queryEmbedding,
+							MatchCount:          topK,
+							VectorThreshold:     vectorThreshold,
+							KeywordThreshold:    keywordThreshold,
+							KnowledgeIDs:        st.KnowledgeIDs,
+							ExcludeKnowledgeIDs: append([]string(nil), st.ExcludeKnowledgeIDs...),
+							TagIDs:              st.TagIDs,
 						}
 						kbResults, err := t.knowledgeBaseService.HybridSearch(ctx, st.KnowledgeBaseID, searchParams)
 						if err != nil {
@@ -1589,4 +1593,22 @@ func extractSnippetForQueries(content string, queries []string) string {
 // jaccard calculates Jaccard similarity between two token sets
 func (t *KnowledgeSearchTool) jaccard(a, b map[string]struct{}) float64 {
 	return searchutil.Jaccard(a, b)
+}
+
+func appendUniqueKnowledgeIDs(existing, additions []string) []string {
+	seen := make(map[string]struct{}, len(existing)+len(additions))
+	result := make([]string, 0, len(existing)+len(additions))
+	for _, values := range [][]string{existing, additions} {
+		for _, value := range values {
+			if value == "" {
+				continue
+			}
+			if _, ok := seen[value]; ok {
+				continue
+			}
+			seen[value] = struct{}{}
+			result = append(result, value)
+		}
+	}
+	return result
 }

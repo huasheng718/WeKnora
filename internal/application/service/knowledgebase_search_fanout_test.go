@@ -28,7 +28,7 @@ func TestParamsWithTopK_RebuildsFresh(t *testing.T) {
 
 	g := &storeGroup{
 		BaseParams: []types.RetrieveParams{
-			{Query: "q1", TopK: 10, RetrieverType: types.VectorRetrieverType},
+			{Query: "q1", TopK: 10, RetrieverType: types.VectorRetrieverType, ExcludeKnowledgeIDs: []string{"old-projection"}},
 			{Query: "q2", TopK: 20, RetrieverType: types.KeywordsRetrieverType},
 		},
 		TopK: 999,
@@ -47,6 +47,8 @@ func TestParamsWithTopK_RebuildsFresh(t *testing.T) {
 	// Output slice does not alias BaseParams (mutating out must not touch base).
 	out[0].Query = "mutated"
 	assert.Equal(t, "q1", g.BaseParams[0].Query)
+	out[0].ExcludeKnowledgeIDs[0] = "mutated-projection"
+	assert.Equal(t, "old-projection", g.BaseParams[0].ExcludeKnowledgeIDs[0])
 }
 
 func TestHasMixedEngineTypes(t *testing.T) {

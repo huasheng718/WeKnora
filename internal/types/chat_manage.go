@@ -165,15 +165,18 @@ func (c *ChatManage) Clone() *ChatManage {
 		if t != nil {
 			kidsCopy := make([]string, len(t.KnowledgeIDs))
 			copy(kidsCopy, t.KnowledgeIDs)
+			excludeCopy := make([]string, len(t.ExcludeKnowledgeIDs))
+			copy(excludeCopy, t.ExcludeKnowledgeIDs)
 			tagIDsCopy := make([]string, len(t.TagIDs))
 			copy(tagIDsCopy, t.TagIDs)
 			searchTargets[i] = &SearchTarget{
-				Type:              t.Type,
-				KnowledgeBaseID:   t.KnowledgeBaseID,
-				TenantID:          t.TenantID,
-				KnowledgeIDs:      kidsCopy,
-				TagIDs:            tagIDsCopy,
-				DisableDirectLoad: t.DisableDirectLoad,
+				Type:                t.Type,
+				KnowledgeBaseID:     t.KnowledgeBaseID,
+				TenantID:            t.TenantID,
+				KnowledgeIDs:        kidsCopy,
+				ExcludeKnowledgeIDs: excludeCopy,
+				TagIDs:              tagIDsCopy,
+				DisableDirectLoad:   t.DisableDirectLoad,
 			}
 		}
 	}

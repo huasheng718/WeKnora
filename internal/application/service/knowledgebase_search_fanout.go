@@ -149,6 +149,7 @@ func paramsWithTopK(g *storeGroup) []types.RetrieveParams {
 	out := make([]types.RetrieveParams, len(g.BaseParams))
 	for i, p := range g.BaseParams {
 		p.TopK = g.TopK
+		p.ExcludeKnowledgeIDs = append([]string(nil), p.ExcludeKnowledgeIDs...)
 		out[i] = p
 	}
 	return out

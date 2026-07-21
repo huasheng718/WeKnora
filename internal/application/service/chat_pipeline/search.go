@@ -384,10 +384,12 @@ func (p *PluginSearch) searchByTargets(
 			// Separate full-KB targets (can be combined into one retrieval)
 			// from specific-knowledge targets (need per-target direct loading).
 			var fullKBIDs []string
+			var fullKBExcludeKnowledgeIDs []string
 			var knowledgeTargets []*types.SearchTarget
 			for _, t := range targets {
 				if t.Type == types.SearchTargetTypeKnowledgeBase && len(t.TagIDs) == 0 {
 					fullKBIDs = append(fullKBIDs, t.KnowledgeBaseID)
+					fullKBExcludeKnowledgeIDs = appendUniqueStrings(fullKBExcludeKnowledgeIDs, t.ExcludeKnowledgeIDs)
 				} else {
 					knowledgeTargets = append(knowledgeTargets, t)
 				}
@@ -412,6 +414,7 @@ func (p *PluginSearch) searchByTargets(
 						QueryText:             queryText,
 						QueryEmbedding:        queryEmbedding,
 						KnowledgeBaseIDs:      fullKBIDs,
+						ExcludeKnowledgeIDs:   fullKBExcludeKnowledgeIDs,
 						VectorThreshold:       chatManage.VectorThreshold,
 						KeywordThreshold:      chatManage.KeywordThreshold,
 						MatchCount:            chatManage.EmbeddingTopK,
@@ -503,6 +506,7 @@ func (p *PluginSearch) searchSingleTarget(
 		KeywordThreshold:      chatManage.KeywordThreshold,
 		MatchCount:            chatManage.EmbeddingTopK,
 		TagIDs:                t.TagIDs,
+		ExcludeKnowledgeIDs:   append([]string(nil), t.ExcludeKnowledgeIDs...),
 		SkipContextEnrichment: true,
 	}
 	if t.Type == types.SearchTargetTypeKnowledge {
@@ -526,6 +530,24 @@ func (p *PluginSearch) searchSingleTarget(
 	mu.Lock()
 	*results = append(*results, res...)
 	mu.Unlock()
+}
+
+func appendUniqueStrings(existing, additions []string) []string {
+	seen := make(map[string]struct{}, len(existing)+len(additions))
+	result := make([]string, 0, len(existing)+len(additions))
+	for _, values := range [][]string{existing, additions} {
+		for _, value := range values {
+			if value == "" {
+				continue
+			}
+			if _, ok := seen[value]; ok {
+				continue
+			}
+			seen[value] = struct{}{}
+			result = append(result, value)
+		}
+	}
+	return result
 }
 
 // tryDirectChunkLoading attempts to load chunks for given knowledge IDs directly

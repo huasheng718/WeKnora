@@ -127,7 +127,7 @@ func (t *GrepChunksTool) Execute(ctx context.Context, args json.RawMessage) (*ty
 	const limit = 30
 
 	kbTenantMap := t.searchTargets.GetKBTenantMap()
-	fullKBIDs, knowledgeIDs, tagTargets := t.resolveGrepScope()
+	fullKBIDs, knowledgeIDs, excludeKnowledgeIDs, tagTargets := t.resolveGrepScope()
 	kbIDsForMeta := fullKBIDs
 	if len(kbIDsForMeta) == 0 {
 		kbIDsForMeta = t.searchTargets.GetAllKnowledgeBaseIDs()
@@ -136,7 +136,7 @@ func (t *GrepChunksTool) Execute(ctx context.Context, args json.RawMessage) (*ty
 	logger.Infof(ctx, "[Tool][GrepChunks] Queries: %v, Limit: %d, fullKBs: %d, knowledgeIDs: %d, tagScopes: %d",
 		queries, limit, len(fullKBIDs), len(knowledgeIDs), len(tagTargets))
 
-	results, err := t.searchChunks(ctx, queries, fullKBIDs, knowledgeIDs, tagTargets, kbTenantMap)
+	results, err := t.searchChunks(ctx, queries, fullKBIDs, knowledgeIDs, excludeKnowledgeIDs, tagTargets, kbTenantMap)
 	if err != nil {
 		logger.Errorf(ctx, "[Tool][GrepChunks] Search failed: %v", err)
 		return &types.ToolResult{
@@ -255,7 +255,7 @@ func (t *GrepChunksTool) regexOperatorForDialect() string {
 // tag-constrained KB scopes. Tag scopes stay as tag IDs so the chunk query can
 // use the knowledge_tag_relations index instead of expanding a large tag into a
 // huge knowledge_id IN list.
-func (t *GrepChunksTool) resolveGrepScope() (fullKBIDs, knowledgeIDs []string, tagTargets []*types.SearchTarget) {
+func (t *GrepChunksTool) resolveGrepScope() (fullKBIDs, knowledgeIDs, excludeKnowledgeIDs []string, tagTargets []*types.SearchTarget) {
 	seenKB := make(map[string]bool)
 	seenKnowledge := make(map[string]bool)
 	seenTagScope := make(map[string]bool)
@@ -286,19 +286,21 @@ func (t *GrepChunksTool) resolveGrepScope() (fullKBIDs, knowledgeIDs []string, t
 			}
 			seenTagScope[scopeKey] = true
 			tagTargets = append(tagTargets, &types.SearchTarget{
-				Type:            types.SearchTargetTypeKnowledgeBase,
-				KnowledgeBaseID: target.KnowledgeBaseID,
-				TenantID:        tenantID,
-				TagIDs:          tagIDs,
+				Type:                types.SearchTargetTypeKnowledgeBase,
+				KnowledgeBaseID:     target.KnowledgeBaseID,
+				TenantID:            tenantID,
+				TagIDs:              tagIDs,
+				ExcludeKnowledgeIDs: target.ExcludeKnowledgeIDs,
 			})
 		default:
 			if !seenKB[target.KnowledgeBaseID] {
 				seenKB[target.KnowledgeBaseID] = true
 				fullKBIDs = append(fullKBIDs, target.KnowledgeBaseID)
+				excludeKnowledgeIDs = appendUniqueKnowledgeIDs(excludeKnowledgeIDs, target.ExcludeKnowledgeIDs)
 			}
 		}
 	}
-	return fullKBIDs, knowledgeIDs, tagTargets
+	return fullKBIDs, knowledgeIDs, excludeKnowledgeIDs, tagTargets
 }
 
 func dedupNonEmptyStrings(values []string) []string {
@@ -367,6 +369,7 @@ func (t *GrepChunksTool) searchChunks(
 	queries []string,
 	kbIDs []string,
 	knowledgeIDs []string,
+	excludeKnowledgeIDs []string,
 	tagTargets []*types.SearchTarget,
 	kbTenantMap map[string]uint64,
 ) ([]chunkWithTitle, error) {
@@ -397,6 +400,9 @@ func (t *GrepChunksTool) searchChunks(
 	logger.Infof(ctx, "[Tool][GrepChunks] Scope: %d knowledge IDs, %d tag scopes, %d KBs",
 		len(knowledgeIDs), len(tagTargets), len(kbIDs))
 	query = query.Where(scopeSQL, scopeArgs...)
+	if len(excludeKnowledgeIDs) > 0 {
+		query = query.Where("chunks.knowledge_id NOT IN ?", excludeKnowledgeIDs)
+	}
 
 	// For MySQL/SQLite REGEXP case-insensitivity we rely on the column's default
 	// collation (utf8mb4_general_ci etc.) OR the driver's REGEXP implementation,
