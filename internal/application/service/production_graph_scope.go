@@ -10,20 +10,23 @@ import (
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
 
-var errProductionGraphDependencies = errors.New("production graph scope dependencies are required")
+var (
+	ErrProductionGraphDependencies    = errors.New("production graph scope dependencies are required")
+	ErrProductionGraphScopeIncomplete = errors.New("production graph release scope is incomplete")
+)
 
 // SearchKnowledgeGraph exposes the scoped graph query to callers outside the
 // service package without allowing them to bypass production visibility.
 func (s *knowledgeService) SearchKnowledgeGraph(ctx context.Context, tenantID uint64, knowledgeBaseID string, nodes []string) (*types.GraphData, error) {
 	if s == nil {
-		return nil, errProductionGraphDependencies
+		return nil, ErrProductionGraphDependencies
 	}
 	return SearchActiveProductionGraph(ctx, tenantID, knowledgeBaseID, nodes, s.productionReleaseRepo, s.repo, s.graphEngine)
 }
 
 func (s *knowledgeService) SearchExplicitKnowledgeGraph(ctx context.Context, tenantID uint64, knowledgeBaseID, knowledgeID string, nodes []string) (*types.GraphData, error) {
 	if s == nil {
-		return nil, errProductionGraphDependencies
+		return nil, ErrProductionGraphDependencies
 	}
 	return SearchExplicitProductionGraph(ctx, tenantID, knowledgeBaseID, knowledgeID, nodes, s.productionReleaseRepo, s.graphEngine)
 }
@@ -77,7 +80,7 @@ func SearchActiveProductionGraph(
 	graphs interfaces.RetrieveGraphRepository,
 ) (*types.GraphData, error) {
 	if graphs == nil || strings.TrimSpace(knowledgeBaseID) == "" {
-		return nil, errProductionGraphDependencies
+		return nil, ErrProductionGraphDependencies
 	}
 	scopeCtx := contextWithGraphOwnerTenant(ctx, tenantID)
 	namespaces, err := activeProductionGraphNamespaces(scopeCtx, tenantID, knowledgeBaseID, releases, knowledges)
@@ -98,17 +101,20 @@ func SearchExplicitProductionGraph(
 	graphs interfaces.RetrieveGraphRepository,
 ) (*types.GraphData, error) {
 	if graphs == nil || strings.TrimSpace(knowledgeBaseID) == "" || strings.TrimSpace(knowledgeID) == "" {
-		return nil, errProductionGraphDependencies
+		return nil, ErrProductionGraphDependencies
 	}
 	if releases == nil {
-		return searchGraphNamespaces(contextWithGraphOwnerTenant(ctx, tenantID), graphs, []types.NameSpace{{KnowledgeBase: knowledgeBaseID, Knowledge: knowledgeID}}, nodes)
+		return nil, ErrProductionGraphDependencies
 	}
 	scopeCtx := contextWithGraphOwnerTenant(ctx, tenantID)
 	scopes, err := releases.ResolveScopes(scopeCtx, tenantID, []string{knowledgeBaseID})
 	if err != nil {
 		return nil, err
 	}
-	scope := scopes[knowledgeBaseID]
+	scope, found := scopes[knowledgeBaseID]
+	if !found {
+		return nil, ErrProductionGraphScopeIncomplete
+	}
 	if intersectsKnowledgeIDs([]string{knowledgeID}, scope.InactiveKnowledgeIDs) {
 		return nil, types.ErrProductionProjectionInactive
 	}
@@ -117,20 +123,23 @@ func SearchExplicitProductionGraph(
 
 func activeProductionGraphNamespaces(ctx context.Context, tenantID uint64, knowledgeBaseID string, releases interfaces.ProductionReleaseRepository, knowledges interfaces.KnowledgeRepository) ([]types.NameSpace, error) {
 	if releases == nil {
-		return []types.NameSpace{{KnowledgeBase: knowledgeBaseID}}, nil
+		return nil, ErrProductionGraphDependencies
 	}
 	scopes, err := releases.ResolveScopes(ctx, tenantID, []string{knowledgeBaseID})
 	if err != nil {
 		return nil, err
 	}
-	scope := scopes[knowledgeBaseID]
+	scope, found := scopes[knowledgeBaseID]
+	if !found {
+		return nil, ErrProductionGraphScopeIncomplete
+	}
 	productionIDs := mergeUniqueKnowledgeIDs(scope.AllProductionKnowledgeIDs, scope.ActiveKnowledgeIDs)
 	productionIDs = mergeUniqueKnowledgeIDs(productionIDs, scope.InactiveKnowledgeIDs)
 	if len(productionIDs) == 0 {
 		return []types.NameSpace{{KnowledgeBase: knowledgeBaseID}}, nil
 	}
 	if knowledges == nil {
-		return nil, errProductionGraphDependencies
+		return nil, ErrProductionGraphDependencies
 	}
 	rows, err := knowledges.ListKnowledgeByKnowledgeBaseID(ctx, tenantID, knowledgeBaseID)
 	if err != nil {
@@ -166,88 +175,14 @@ func searchGraphNamespaces(ctx context.Context, graphs interfaces.RetrieveGraphR
 		if err != nil {
 			return nil, err
 		}
-		mergeGraphData(merged, graph)
+		merged = types.MergeGraphData(merged, graph)
 	}
 	sortGraphData(merged)
 	return merged, nil
 }
 
-func mergeGraphData(destination, source *types.GraphData) {
-	if source == nil {
-		return
-	}
-	byName := make(map[string]*types.GraphNode, len(destination.Node))
-	for _, node := range destination.Node {
-		if node != nil {
-			byName[node.Name] = node
-		}
-	}
-	for _, node := range source.Node {
-		if node == nil {
-			continue
-		}
-		if existing, found := byName[node.Name]; found {
-			existing.Chunks = mergeUniqueKnowledgeIDs(existing.Chunks, node.Chunks)
-			existing.Attributes = mergeUniqueKnowledgeIDs(existing.Attributes, node.Attributes)
-			existing.ProjectionVariants = appendUniqueGraphVariants(existing.ProjectionVariants, node.ProjectionVariants)
-			continue
-		}
-		copyNode := *node
-		copyNode.Chunks = append([]string(nil), node.Chunks...)
-		copyNode.Attributes = append([]string(nil), node.Attributes...)
-		copyNode.ProjectionVariants = append([]*types.GraphNodeVariant(nil), node.ProjectionVariants...)
-		destination.Node = append(destination.Node, &copyNode)
-		byName[copyNode.Name] = &copyNode
-	}
-	byRelation := make(map[string]*types.GraphRelation, len(destination.Relation))
-	for _, relation := range destination.Relation {
-		if relation != nil {
-			byRelation[graphRelationKey(relation)] = relation
-		}
-	}
-	for _, relation := range source.Relation {
-		if relation == nil {
-			continue
-		}
-		key := graphRelationKey(relation)
-		if existing, found := byRelation[key]; found {
-			existing.KnowledgeIDs = mergeUniqueKnowledgeIDs(existing.KnowledgeIDs, relation.KnowledgeIDs)
-			continue
-		}
-		copyRelation := *relation
-		copyRelation.KnowledgeIDs = append([]string(nil), relation.KnowledgeIDs...)
-		destination.Relation = append(destination.Relation, &copyRelation)
-		byRelation[key] = &copyRelation
-	}
-}
-
-func appendUniqueGraphVariants(existing, additions []*types.GraphNodeVariant) []*types.GraphNodeVariant {
-	seen := make(map[string]struct{}, len(existing)+len(additions))
-	for _, variant := range existing {
-		if variant != nil {
-			seen[graphVariantKey(variant)] = struct{}{}
-		}
-	}
-	for _, variant := range additions {
-		if variant == nil {
-			continue
-		}
-		key := graphVariantKey(variant)
-		if _, duplicate := seen[key]; duplicate {
-			continue
-		}
-		seen[key] = struct{}{}
-		existing = append(existing, variant)
-	}
-	return existing
-}
-
 func graphRelationKey(relation *types.GraphRelation) string {
 	return relation.Node1 + "\x00" + relation.Node2 + "\x00" + relation.Type
-}
-
-func graphVariantKey(variant *types.GraphNodeVariant) string {
-	return strings.Join(variant.KnowledgeIDs, "\x00") + "\x01" + strings.Join(variant.Chunks, "\x00") + "\x01" + strings.Join(variant.Attributes, "\x00")
 }
 
 func sortGraphData(graph *types.GraphData) {

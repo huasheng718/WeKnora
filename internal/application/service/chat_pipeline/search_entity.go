@@ -2,6 +2,7 @@ package chatpipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -10,6 +11,8 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
+
+var errScopedGraphQueryUnavailable = errors.New("scoped graph query service is unavailable")
 
 // PluginSearch implements search functionality for chat pipeline
 type PluginSearchEntity struct {
@@ -62,6 +65,12 @@ func (p *PluginSearchEntity) OnEvent(ctx context.Context,
 	if len(knowledgeBaseIDs) == 0 && len(entityKnowledge) == 0 {
 		logger.Warnf(ctx, "No knowledge base IDs or knowledge IDs with ExtractConfig enabled for entity search")
 		return next()
+	}
+	if len(entityKnowledge) > 0 && p.explicitGraphQuery == nil {
+		return &PluginError{Err: errScopedGraphQueryUnavailable, Description: errScopedGraphQueryUnavailable.Error(), ErrorType: "graph_dependency_unavailable"}
+	}
+	if len(entityKnowledge) == 0 && p.graphQuery == nil {
+		return &PluginError{Err: errScopedGraphQueryUnavailable, Description: errScopedGraphQueryUnavailable.Error(), ErrorType: "graph_dependency_unavailable"}
 	}
 
 	// Parallel search across multiple knowledge bases and individual files
@@ -235,23 +244,17 @@ func (p *PluginSearchEntity) OnEvent(ctx context.Context,
 }
 
 func (p *PluginSearchEntity) searchKnowledgeBaseGraph(ctx context.Context, tenantID uint64, knowledgeBaseID string, nodes []string) (*types.GraphData, error) {
-	if p.graphQuery != nil {
-		return p.graphQuery.SearchKnowledgeGraph(ctx, tenantID, knowledgeBaseID, nodes)
+	if p.graphQuery == nil {
+		return nil, errScopedGraphQueryUnavailable
 	}
-	if p.graphRepo == nil {
-		return nil, fmt.Errorf("graph repository is unavailable")
-	}
-	return p.graphRepo.SearchNode(ctx, types.NameSpace{KnowledgeBase: knowledgeBaseID}, nodes)
+	return p.graphQuery.SearchKnowledgeGraph(ctx, tenantID, knowledgeBaseID, nodes)
 }
 
 func (p *PluginSearchEntity) searchExplicitGraph(ctx context.Context, tenantID uint64, knowledgeBaseID, knowledgeID string, nodes []string) (*types.GraphData, error) {
-	if p.explicitGraphQuery != nil {
-		return p.explicitGraphQuery.SearchExplicitKnowledgeGraph(ctx, tenantID, knowledgeBaseID, knowledgeID, nodes)
+	if p.explicitGraphQuery == nil {
+		return nil, errScopedGraphQueryUnavailable
 	}
-	if p.graphRepo == nil {
-		return nil, fmt.Errorf("graph repository is unavailable")
-	}
-	return p.graphRepo.SearchNode(ctx, types.NameSpace{KnowledgeBase: knowledgeBaseID, Knowledge: knowledgeID}, nodes)
+	return p.explicitGraphQuery.SearchExplicitKnowledgeGraph(ctx, tenantID, knowledgeBaseID, knowledgeID, nodes)
 }
 
 func excludedEntityKnowledgeIDs(targets types.SearchTargets) map[string]struct{} {

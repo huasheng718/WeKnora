@@ -19,6 +19,23 @@ type scopedEntityGraphQueryService struct {
 	err      error
 }
 
+type testScopedEntityGraphQuery struct {
+	repo interfaces.RetrieveGraphRepository
+}
+
+func (s *testScopedEntityGraphQuery) SearchKnowledgeGraph(ctx context.Context, _ uint64, knowledgeBaseID string, nodes []string) (*types.GraphData, error) {
+	return s.repo.SearchNode(ctx, types.NameSpace{KnowledgeBase: knowledgeBaseID}, nodes)
+}
+
+func (s *testScopedEntityGraphQuery) SearchExplicitKnowledgeGraph(ctx context.Context, _ uint64, knowledgeBaseID, knowledgeID string, nodes []string) (*types.GraphData, error) {
+	return s.repo.SearchNode(ctx, types.NameSpace{KnowledgeBase: knowledgeBaseID, Knowledge: knowledgeID}, nodes)
+}
+
+func newProjectionEntityPlugin(graphRepo interfaces.RetrieveGraphRepository, chunkRepo interfaces.ChunkRepository, knowledgeRepo interfaces.KnowledgeRepository) *PluginSearchEntity {
+	graphQuery := &testScopedEntityGraphQuery{repo: graphRepo}
+	return &PluginSearchEntity{graphRepo: graphRepo, chunkRepo: chunkRepo, knowledgeRepo: knowledgeRepo, graphQuery: graphQuery, explicitGraphQuery: graphQuery}
+}
+
 func (s *scopedEntityGraphQueryService) SearchKnowledgeGraph(_ context.Context, tenantID uint64, knowledgeBaseID string, nodes []string) (*types.GraphData, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -47,6 +64,18 @@ func TestEntitySearchUsesScopedGraphQueryWithTargetOwnerTenant(t *testing.T) {
 	require.Equal(t, []string{"term"}, graphQuery.nodes)
 }
 
+func TestEntitySearchDoesNotFallbackToDirectGraphRepositoryWithoutScopedService(t *testing.T) {
+	p := &PluginSearchEntity{graphRepo: &projectionEntityGraphRepo{}}
+	chat := &types.ChatManage{
+		PipelineRequest: types.PipelineRequest{TenantID: 7, SearchTargets: types.SearchTargets{&types.SearchTarget{Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-1", TenantID: 7}}},
+		PipelineState:   types.PipelineState{Entity: []string{"term"}, EntityKBIDs: []string{"kb-1"}},
+	}
+	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(7))
+	err := p.OnEvent(ctx, types.ENTITY_SEARCH, chat, func() *PluginError { return nil })
+	require.ErrorIs(t, err.Err, errScopedGraphQueryUnavailable)
+	require.Nil(t, chat.GraphResult)
+}
+
 type projectionEntityGraphRepo struct {
 	interfaces.RetrieveGraphRepository
 }
@@ -69,7 +98,7 @@ func (*projectionEntityGraphRepo) SearchNode(context.Context, types.NameSpace, [
 
 func TestEntitySearchRejectsSameTenantWrongKnowledgeBaseBackReference(t *testing.T) {
 	chunks := []*types.Chunk{{ID: "chunk-active", TenantID: 7, KnowledgeID: "knowledge-active", KnowledgeBaseID: "kb-stale", ImageInfo: "[]"}}
-	p := &PluginSearchEntity{graphRepo: &projectionEntityGraphRepo{}, chunkRepo: &projectionEntityChunkRepo{chunks: chunks}, knowledgeRepo: &projectionEntityKnowledgeRepo{rows: []*types.Knowledge{{ID: "knowledge-active", TenantID: 7, KnowledgeBaseID: "kb-stale"}}}}
+	p := newProjectionEntityPlugin(&projectionEntityGraphRepo{}, &projectionEntityChunkRepo{chunks: chunks}, &projectionEntityKnowledgeRepo{rows: []*types.Knowledge{{ID: "knowledge-active", TenantID: 7, KnowledgeBaseID: "kb-stale"}}})
 	chat := &types.ChatManage{PipelineRequest: types.PipelineRequest{TenantID: 7, SearchTargets: types.SearchTargets{&types.SearchTarget{Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-1", TenantID: 7, ExcludeKnowledgeIDs: []string{"knowledge-old", "knowledge-building"}}}}, PipelineState: types.PipelineState{Entity: []string{"term"}, EntityKBIDs: []string{"kb-1"}}}
 	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(7))
 	require.Nil(t, p.OnEvent(ctx, types.ENTITY_SEARCH, chat, func() *PluginError { return nil }))
@@ -154,14 +183,11 @@ func TestEntitySearchPrunesInactiveProductionProjectionGraphAndChunks(t *testing
 		{ID: "chunk-old", TenantID: 7, KnowledgeID: "knowledge-old", KnowledgeBaseID: "kb-1", ImageInfo: "[]"},
 		{ID: "chunk-building", TenantID: 7, KnowledgeID: "knowledge-building", KnowledgeBaseID: "kb-1", ImageInfo: "[]"},
 	}
-	p := &PluginSearchEntity{
-		graphRepo: &projectionEntityGraphRepo{}, chunkRepo: &projectionEntityChunkRepo{chunks: chunks},
-		knowledgeRepo: &projectionEntityKnowledgeRepo{rows: []*types.Knowledge{
-			{ID: "knowledge-active", TenantID: 7, KnowledgeBaseID: "kb-1", Title: "active"},
-			{ID: "knowledge-old", KnowledgeBaseID: "kb-1", Title: "old"},
-			{ID: "knowledge-building", KnowledgeBaseID: "kb-1", Title: "building"},
-		}},
-	}
+	p := newProjectionEntityPlugin(&projectionEntityGraphRepo{}, &projectionEntityChunkRepo{chunks: chunks}, &projectionEntityKnowledgeRepo{rows: []*types.Knowledge{
+		{ID: "knowledge-active", TenantID: 7, KnowledgeBaseID: "kb-1", Title: "active"},
+		{ID: "knowledge-old", KnowledgeBaseID: "kb-1", Title: "old"},
+		{ID: "knowledge-building", KnowledgeBaseID: "kb-1", Title: "building"},
+	}})
 	chat := &types.ChatManage{
 		PipelineRequest: types.PipelineRequest{TenantID: 7, SearchTargets: types.SearchTargets{&types.SearchTarget{
 			Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-1", TenantID: 7,
@@ -200,11 +226,7 @@ func TestEntitySearchPreservesActiveSameNameRelationAndEvidence(t *testing.T) {
 		{ID: "chunk-active", TenantID: 7, KnowledgeID: "knowledge-active", KnowledgeBaseID: "kb-1", ImageInfo: "[]"},
 		{ID: "chunk-old", TenantID: 7, KnowledgeID: "knowledge-old", KnowledgeBaseID: "kb-1", ImageInfo: "[]"},
 	}
-	p := &PluginSearchEntity{
-		graphRepo:     &sameNameProjectionEntityGraphRepo{},
-		chunkRepo:     &projectionEntityChunkRepo{chunks: chunks},
-		knowledgeRepo: &projectionEntityKnowledgeRepo{rows: []*types.Knowledge{{ID: "knowledge-active", TenantID: 7, KnowledgeBaseID: "kb-1"}}},
-	}
+	p := newProjectionEntityPlugin(&sameNameProjectionEntityGraphRepo{}, &projectionEntityChunkRepo{chunks: chunks}, &projectionEntityKnowledgeRepo{rows: []*types.Knowledge{{ID: "knowledge-active", TenantID: 7, KnowledgeBaseID: "kb-1"}}})
 	chat := &types.ChatManage{
 		PipelineRequest: types.PipelineRequest{TenantID: 7, SearchTargets: types.SearchTargets{&types.SearchTarget{
 			Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-1", TenantID: 7,
@@ -271,13 +293,9 @@ func TestEntitySearchPrunesSameNameVariantAttributesRegardlessOfOrder(t *testing
 			name = "inactive first"
 		}
 		t.Run(name, func(t *testing.T) {
-			p := &PluginSearchEntity{
-				graphRepo: &variantProjectionEntityGraphRepo{inactiveFirst: inactiveFirst},
-				chunkRepo: &projectionEntityChunkRepo{chunks: projectionVariantChunks()},
-				knowledgeRepo: &projectionEntityKnowledgeRepo{rows: []*types.Knowledge{
-					{ID: "knowledge-active", TenantID: 7, KnowledgeBaseID: "kb-1"},
-				}},
-			}
+			p := newProjectionEntityPlugin(&variantProjectionEntityGraphRepo{inactiveFirst: inactiveFirst}, &projectionEntityChunkRepo{chunks: projectionVariantChunks()}, &projectionEntityKnowledgeRepo{rows: []*types.Knowledge{
+				{ID: "knowledge-active", TenantID: 7, KnowledgeBaseID: "kb-1"},
+			}})
 			chat := &types.ChatManage{
 				PipelineRequest: types.PipelineRequest{TenantID: 7, SearchTargets: types.SearchTargets{&types.SearchTarget{
 					Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-1", TenantID: 7,
@@ -300,16 +318,12 @@ func TestEntitySearchPrunesSameNameVariantAttributesRegardlessOfOrder(t *testing
 }
 
 func TestEntitySearchKeepsOrdinaryMergedMultiVariantGraphWithoutExclusions(t *testing.T) {
-	p := &PluginSearchEntity{
-		graphRepo: &variantProjectionEntityGraphRepo{inactiveFirst: true},
-		chunkRepo: &projectionEntityChunkRepo{chunks: projectionVariantChunks()},
-		knowledgeRepo: &projectionEntityKnowledgeRepo{rows: []*types.Knowledge{
-			{ID: "knowledge-active", TenantID: 7, KnowledgeBaseID: "kb-1"},
-			{ID: "knowledge-old", TenantID: 7, KnowledgeBaseID: "kb-1"},
-			{ID: "knowledge-building", TenantID: 7, KnowledgeBaseID: "kb-1"},
-			{ID: "knowledge-malformed", TenantID: 7, KnowledgeBaseID: "kb-1"},
-		}},
-	}
+	p := newProjectionEntityPlugin(&variantProjectionEntityGraphRepo{inactiveFirst: true}, &projectionEntityChunkRepo{chunks: projectionVariantChunks()}, &projectionEntityKnowledgeRepo{rows: []*types.Knowledge{
+		{ID: "knowledge-active", TenantID: 7, KnowledgeBaseID: "kb-1"},
+		{ID: "knowledge-old", TenantID: 7, KnowledgeBaseID: "kb-1"},
+		{ID: "knowledge-building", TenantID: 7, KnowledgeBaseID: "kb-1"},
+		{ID: "knowledge-malformed", TenantID: 7, KnowledgeBaseID: "kb-1"},
+	}})
 	chat := &types.ChatManage{
 		PipelineRequest: types.PipelineRequest{TenantID: 7, SearchTargets: types.SearchTargets{&types.SearchTarget{Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-1", TenantID: 7}}},
 		PipelineState:   types.PipelineState{Entity: []string{"term"}, EntityKBIDs: []string{"kb-1"}},
@@ -327,11 +341,7 @@ func TestEntitySearchPreservesAuthorizedCrossTenantSharedKnowledgeBase(t *testin
 		{ID: "chunk-old", TenantID: 200, KnowledgeID: "knowledge-old", KnowledgeBaseID: "kb-shared", ImageInfo: "[]"},
 		{ID: "chunk-building", TenantID: 200, KnowledgeID: "knowledge-building", KnowledgeBaseID: "kb-shared", ImageInfo: "[]"},
 	}
-	p := &PluginSearchEntity{
-		graphRepo:     &projectionEntityGraphRepo{},
-		chunkRepo:     &projectionEntityChunkRepo{chunks: chunks},
-		knowledgeRepo: &projectionEntityKnowledgeRepo{rows: []*types.Knowledge{{ID: "knowledge-active", TenantID: 200, KnowledgeBaseID: "kb-shared", Title: "active"}}},
-	}
+	p := newProjectionEntityPlugin(&projectionEntityGraphRepo{}, &projectionEntityChunkRepo{chunks: chunks}, &projectionEntityKnowledgeRepo{rows: []*types.Knowledge{{ID: "knowledge-active", TenantID: 200, KnowledgeBaseID: "kb-shared", Title: "active"}}})
 	chat := &types.ChatManage{
 		PipelineRequest: types.PipelineRequest{TenantID: 7, SearchTargets: types.SearchTargets{&types.SearchTarget{
 			Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-shared", TenantID: 200,
@@ -364,11 +374,7 @@ func TestEntitySearchEnrichesSharedKnowledgeImagesUnderOwnerScope(t *testing.T) 
 			ImageInfo: `[{"url":"https://owner/image.png","ocr_text":"owner OCR"}]`,
 		}},
 	}
-	p := &PluginSearchEntity{
-		graphRepo:     &singleProjectionEntityGraphRepo{},
-		chunkRepo:     chunkRepo,
-		knowledgeRepo: &projectionEntityKnowledgeRepo{rows: []*types.Knowledge{{ID: "knowledge-active", TenantID: 200, KnowledgeBaseID: "kb-shared"}}},
-	}
+	p := newProjectionEntityPlugin(&singleProjectionEntityGraphRepo{}, chunkRepo, &projectionEntityKnowledgeRepo{rows: []*types.Knowledge{{ID: "knowledge-active", TenantID: 200, KnowledgeBaseID: "kb-shared"}}})
 	chat := &types.ChatManage{
 		PipelineRequest: types.PipelineRequest{TenantID: 7, SearchTargets: types.SearchTargets{&types.SearchTarget{
 			Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-shared", TenantID: 200,
@@ -397,11 +403,7 @@ func TestEntitySearchFailsClosedOnWrongScopeImageChild(t *testing.T) {
 				chunks:   []*types.Chunk{{ID: "chunk-active", TenantID: 200, KnowledgeID: "knowledge-active", KnowledgeBaseID: "kb-shared"}},
 				children: []*types.Chunk{tc.child},
 			}
-			p := &PluginSearchEntity{
-				graphRepo:     &singleProjectionEntityGraphRepo{},
-				chunkRepo:     chunkRepo,
-				knowledgeRepo: &projectionEntityKnowledgeRepo{rows: []*types.Knowledge{{ID: "knowledge-active", TenantID: 200, KnowledgeBaseID: "kb-shared"}}},
-			}
+			p := newProjectionEntityPlugin(&singleProjectionEntityGraphRepo{}, chunkRepo, &projectionEntityKnowledgeRepo{rows: []*types.Knowledge{{ID: "knowledge-active", TenantID: 200, KnowledgeBaseID: "kb-shared"}}})
 			chat := &types.ChatManage{
 				PipelineRequest: types.PipelineRequest{TenantID: 7, SearchTargets: types.SearchTargets{&types.SearchTarget{
 					Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-shared", TenantID: 200,
@@ -439,7 +441,7 @@ func TestEntitySearchFailsClosedOnMissingOrErroredProvenanceDependency(t *testin
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			p := &PluginSearchEntity{graphRepo: &projectionEntityGraphRepo{}, chunkRepo: tc.chunkRepo, knowledgeRepo: tc.knowledgeRepo}
+			p := newProjectionEntityPlugin(&projectionEntityGraphRepo{}, tc.chunkRepo, tc.knowledgeRepo)
 			chat := &types.ChatManage{
 				PipelineRequest: types.PipelineRequest{TenantID: 7, SearchTargets: types.SearchTargets{&types.SearchTarget{Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-1", TenantID: 7}}},
 				PipelineState:   types.PipelineState{Entity: []string{"term"}, EntityKBIDs: []string{"kb-1"}, SearchResult: []*types.SearchResult{{ID: "preexisting"}}},

@@ -604,9 +604,10 @@ func (s *agentService) registerTools(
 			toolToRegister = tools.NewListKnowledgeChunksTool(s.knowledgeService, s.chunkService, config.SearchTargets)
 		case tools.ToolQueryKnowledgeGraph:
 			if graphQuery, ok := s.knowledgeService.(interfaces.KnowledgeGraphQueryService); ok {
-				toolToRegister = tools.NewQueryKnowledgeGraphTool(s.knowledgeBaseService, graphQuery)
+				toolToRegister = tools.NewQueryKnowledgeGraphTool(s.knowledgeBaseService, config.SearchTargets, graphQuery)
 			} else {
-				toolToRegister = tools.NewQueryKnowledgeGraphTool(s.knowledgeBaseService)
+				logger.Warnf(ctx, "Skipped query_knowledge_graph because scoped graph query service is unavailable")
+				continue
 			}
 		case tools.ToolGetDocumentInfo:
 			toolToRegister = tools.NewGetDocumentInfoTool(s.knowledgeService, s.chunkService, config.SearchTargets)

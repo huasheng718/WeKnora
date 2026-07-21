@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -43,6 +44,7 @@ type graphScopeReleaseRepo struct {
 	tenantCalls    []uint64
 	contextTenants []uint64
 	err            error
+	omitMissing    bool
 }
 
 func (r *graphScopeReleaseRepo) ResolveScopes(ctx context.Context, tenantID uint64, kbIDs []string) (map[string]types.ProductionKnowledgeScope, error) {
@@ -53,7 +55,11 @@ func (r *graphScopeReleaseRepo) ResolveScopes(ctx context.Context, tenantID uint
 	}
 	result := make(map[string]types.ProductionKnowledgeScope, len(kbIDs))
 	for _, kbID := range kbIDs {
-		result[kbID] = r.scopes[kbID]
+		scope, found := r.scopes[kbID]
+		if !found && r.omitMissing {
+			continue
+		}
+		result[kbID] = scope
 	}
 	return result, nil
 }
@@ -117,6 +123,37 @@ func TestSearchKnowledgeGraphFailsClosedForInactiveExplicitKnowledge(t *testing.
 	require.ErrorIs(t, err, types.ErrProductionProjectionInactive)
 }
 
+func TestSearchKnowledgeGraphFailsClosedWhenReleaseScopeIsMissing(t *testing.T) {
+	_, err := SearchActiveProductionGraph(context.Background(), 7, "kb-1", []string{"term"}, &graphScopeReleaseRepo{scopes: map[string]types.ProductionKnowledgeScope{}, omitMissing: true}, &graphScopeKnowledgeRepo{}, &graphScopeGraphRepo{})
+	require.ErrorIs(t, err, ErrProductionGraphScopeIncomplete)
+
+	_, err = SearchExplicitProductionGraph(context.Background(), 7, "kb-1", "ordinary", []string{"term"}, &graphScopeReleaseRepo{scopes: map[string]types.ProductionKnowledgeScope{}, omitMissing: true}, &graphScopeGraphRepo{})
+	require.ErrorIs(t, err, ErrProductionGraphScopeIncomplete)
+}
+
+func TestMergeGraphDataPreservesProjectionVariantsAcrossKnowledgeScopes(t *testing.T) {
+	left := &types.GraphData{Node: []*types.GraphNode{{
+		Name: "shared", Chunks: []string{"chunk-one"}, Attributes: []string{"one"},
+		ProjectionVariants: []*types.GraphNodeVariant{{KnowledgeIDs: []string{"knowledge-one"}, Chunks: []string{"chunk-one"}, Attributes: []string{"one"}}},
+	}}, Relation: []*types.GraphRelation{{Node1: "shared", Node2: "peer", Type: "related", KnowledgeIDs: []string{"knowledge-one"}}}}
+	right := &types.GraphData{Node: []*types.GraphNode{{
+		Name: "shared", Chunks: []string{"chunk-two"}, Attributes: []string{"two"},
+		ProjectionVariants: []*types.GraphNodeVariant{{KnowledgeIDs: []string{"knowledge-two"}, Chunks: []string{"chunk-two"}, Attributes: []string{"two"}}},
+	}}, Relation: []*types.GraphRelation{{Node1: "shared", Node2: "peer", Type: "related", KnowledgeIDs: []string{"knowledge-two"}}}}
+
+	merged := types.MergeGraphData(nil, left)
+	merged = types.MergeGraphData(merged, right)
+	require.Len(t, merged.Node, 1)
+	require.ElementsMatch(t, []string{"chunk-one", "chunk-two"}, merged.Node[0].Chunks)
+	require.Len(t, merged.Node[0].ProjectionVariants, 2)
+	require.Equal(t, []string{"knowledge-one"}, merged.Node[0].ProjectionVariants[0].KnowledgeIDs)
+	require.Len(t, merged.Relation, 1)
+	require.ElementsMatch(t, []string{"knowledge-one", "knowledge-two"}, merged.Relation[0].KnowledgeIDs)
+	encoded, err := json.Marshal(merged)
+	require.NoError(t, err)
+	require.NotContains(t, string(encoded), "projection_variants")
+}
+
 func TestSearchKnowledgeGraphUsesOwnerTenantAndPropagatesRepositoryErrors(t *testing.T) {
 	errExpected := errors.New("neo4j unavailable")
 	knowledgeRepo := &graphScopeKnowledgeRepo{rows: []*types.Knowledge{{ID: "ordinary", KnowledgeBaseID: "kb-shared", TenantID: 200}}}
@@ -131,6 +168,26 @@ func TestSearchKnowledgeGraphUsesOwnerTenantAndPropagatesRepositoryErrors(t *tes
 	require.Equal(t, []uint64{200}, releases.tenantCalls)
 	require.Equal(t, []uint64{200}, releases.contextTenants)
 	require.Equal(t, []uint64{200}, knowledgeRepo.tenantCalls)
+	require.Equal(t, []uint64{200}, knowledgeRepo.contextTenants)
+}
+
+func TestSearchKnowledgeGraphUsesSharedOwnerScopeForActiveProjectionNamespaces(t *testing.T) {
+	knowledgeRepo := &graphScopeKnowledgeRepo{rows: []*types.Knowledge{
+		{ID: "ordinary", TenantID: 200, KnowledgeBaseID: "kb-shared"},
+		{ID: "prod-active", TenantID: 200, KnowledgeBaseID: "kb-shared"},
+		{ID: "prod-old", TenantID: 200, KnowledgeBaseID: "kb-shared"},
+		{ID: "prod-building", TenantID: 200, KnowledgeBaseID: "kb-shared"},
+	}}
+	releases := &graphScopeReleaseRepo{scopes: map[string]types.ProductionKnowledgeScope{
+		"kb-shared": {ActiveKnowledgeIDs: []string{"prod-active"}, InactiveKnowledgeIDs: []string{"prod-old", "prod-building"}, AllProductionKnowledgeIDs: []string{"prod-active", "prod-old", "prod-building"}},
+	}}
+	graphRepo := &graphScopeGraphRepo{graphs: map[string]*types.GraphData{"ordinary": {}, "prod-active": {}}}
+	callerCtx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(7))
+
+	_, err := SearchActiveProductionGraph(callerCtx, 200, "kb-shared", []string{"term"}, releases, knowledgeRepo, graphRepo)
+	require.NoError(t, err)
+	require.Equal(t, []types.NameSpace{{KnowledgeBase: "kb-shared", Knowledge: "ordinary"}, {KnowledgeBase: "kb-shared", Knowledge: "prod-active"}}, graphRepo.namespaces)
+	require.Equal(t, []uint64{200}, releases.contextTenants)
 	require.Equal(t, []uint64{200}, knowledgeRepo.contextTenants)
 }
 

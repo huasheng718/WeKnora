@@ -27,17 +27,25 @@ type scopedGraphQueryCall struct {
 }
 
 type stubScopedGraphQueryService struct {
-	mu    sync.Mutex
-	calls []scopedGraphQueryCall
-	err   error
+	mu     sync.Mutex
+	calls  []scopedGraphQueryCall
+	err    error
+	errors map[string]error
+	graphs map[string]*types.GraphData
 }
 
 func (s *stubScopedGraphQueryService) SearchKnowledgeGraph(ctx context.Context, tenantID uint64, knowledgeBaseID string, nodes []string) (*types.GraphData, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls = append(s.calls, scopedGraphQueryCall{tenantID: tenantID, kbID: knowledgeBaseID, nodes: append([]string(nil), nodes...)})
+	if err := s.errors[knowledgeBaseID]; err != nil {
+		return nil, err
+	}
 	if s.err != nil {
 		return nil, s.err
+	}
+	if graph := s.graphs[knowledgeBaseID]; graph != nil {
+		return graph, nil
 	}
 	return &types.GraphData{Node: []*types.GraphNode{{Name: "active"}}}, nil
 }
@@ -173,7 +181,7 @@ func TestQueryKnowledgeGraph_ReportsConfiguredEntityAndRelationTypes(t *testing.
 				MatchType:      types.MatchTypeEmbedding,
 			},
 		},
-	})
+	}, types.SearchTargets{&types.SearchTarget{Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-1", TenantID: 1}}, &stubScopedGraphQueryService{})
 
 	args, err := json.Marshal(QueryKnowledgeGraphInput{
 		KnowledgeBaseIDs: []string{"kb-1"},
@@ -212,7 +220,7 @@ func TestQueryKnowledgeGraphUsesScopedGraphQueryAndReportsGraphErrors(t *testing
 	graphQuery := &stubScopedGraphQueryService{}
 	tool := NewQueryKnowledgeGraphTool(&stubKnowledgeBaseService{kb: &types.KnowledgeBase{
 		ID: "kb-1", ExtractConfig: &types.ExtractConfig{Enabled: true, Nodes: []*types.GraphNode{{Name: "term"}}},
-	}}, graphQuery)
+	}}, types.SearchTargets{&types.SearchTarget{Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-1", TenantID: 200}}, graphQuery)
 	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(200))
 	args, err := json.Marshal(QueryKnowledgeGraphInput{KnowledgeBaseIDs: []string{"kb-1"}, Query: "term"})
 	require.NoError(t, err)
@@ -227,7 +235,74 @@ func TestQueryKnowledgeGraphUsesScopedGraphQueryAndReportsGraphErrors(t *testing
 
 	graphQuery.err = errors.New("neo4j unavailable")
 	result, err = tool.Execute(ctx, args)
+	require.ErrorIs(t, err, errQueryKnowledgeGraphAllFailed)
+	require.False(t, result.Success)
+	require.Contains(t, strings.Join(result.Data["errors"].([]string), "\n"), "graph query failed")
+}
+
+func TestQueryKnowledgeGraphUsesAuthorizedOwnerScopeAndRejectsUnauthorizedKnowledgeBase(t *testing.T) {
+	graphQuery := &stubScopedGraphQueryService{}
+	targets := types.SearchTargets{&types.SearchTarget{Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-shared", TenantID: 200}}
+	tool := NewQueryKnowledgeGraphTool(&stubKnowledgeBaseService{kb: &types.KnowledgeBase{
+		ID: "kb-shared", ExtractConfig: &types.ExtractConfig{Enabled: true, Nodes: []*types.GraphNode{{Name: "term"}}},
+	}}, targets, graphQuery)
+	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(7))
+	args, err := json.Marshal(QueryKnowledgeGraphInput{KnowledgeBaseIDs: []string{"kb-shared"}, Query: "term"})
+	require.NoError(t, err)
+
+	result, err := tool.Execute(ctx, args)
 	require.NoError(t, err)
 	require.True(t, result.Success)
-	require.Contains(t, strings.Join(result.Data["errors"].([]string), "\n"), "graph query failed")
+	require.Equal(t, uint64(200), graphQuery.calls[0].tenantID)
+
+	args, err = json.Marshal(QueryKnowledgeGraphInput{KnowledgeBaseIDs: []string{"kb-forbidden"}, Query: "term"})
+	require.NoError(t, err)
+	result, err = tool.Execute(ctx, args)
+	require.Error(t, err)
+	require.False(t, result.Success)
+	require.Len(t, graphQuery.calls, 1)
+}
+
+func TestQueryKnowledgeGraphFailsWhenScopedDependencyOrAllScopesFail(t *testing.T) {
+	targets := types.SearchTargets{&types.SearchTarget{Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-1", TenantID: 7}}
+	args, err := json.Marshal(QueryKnowledgeGraphInput{KnowledgeBaseIDs: []string{"kb-1"}, Query: "term"})
+	require.NoError(t, err)
+
+	missing := NewQueryKnowledgeGraphTool(&stubKnowledgeBaseService{kb: &types.KnowledgeBase{ID: "kb-1", ExtractConfig: &types.ExtractConfig{Nodes: []*types.GraphNode{{Name: "term"}}}}}, targets, nil)
+	result, err := missing.Execute(context.Background(), args)
+	require.Error(t, err)
+	require.False(t, result.Success)
+
+	failed := NewQueryKnowledgeGraphTool(&stubKnowledgeBaseService{kb: &types.KnowledgeBase{ID: "kb-1", ExtractConfig: &types.ExtractConfig{Nodes: []*types.GraphNode{{Name: "term"}}}}}, targets, &stubScopedGraphQueryService{err: errors.New("neo4j unavailable")})
+	result, err = failed.Execute(context.Background(), args)
+	require.Error(t, err)
+	require.False(t, result.Success)
+}
+
+func TestQueryKnowledgeGraphReturnsPartialSuccessAndPreservesProjectionVariantsAcrossKnowledgeBases(t *testing.T) {
+	graphQuery := &stubScopedGraphQueryService{graphs: map[string]*types.GraphData{
+		"kb-1": {Node: []*types.GraphNode{{Name: "shared", Chunks: []string{"chunk-one"}, ProjectionVariants: []*types.GraphNodeVariant{{KnowledgeIDs: []string{"knowledge-one"}, Chunks: []string{"chunk-one"}}}}}, Relation: []*types.GraphRelation{{Node1: "shared", Node2: "peer", Type: "related", KnowledgeIDs: []string{"knowledge-one"}}}},
+		"kb-2": {Node: []*types.GraphNode{{Name: "shared", Chunks: []string{"chunk-two"}, ProjectionVariants: []*types.GraphNodeVariant{{KnowledgeIDs: []string{"knowledge-two"}, Chunks: []string{"chunk-two"}}}}}, Relation: []*types.GraphRelation{{Node1: "shared", Node2: "peer", Type: "related", KnowledgeIDs: []string{"knowledge-two"}}}},
+	}}
+	targets := types.SearchTargets{
+		&types.SearchTarget{Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-1", TenantID: 7},
+		&types.SearchTarget{Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-2", TenantID: 7},
+	}
+	tool := NewQueryKnowledgeGraphTool(&stubKnowledgeBaseService{kb: &types.KnowledgeBase{ExtractConfig: &types.ExtractConfig{Nodes: []*types.GraphNode{{Name: "term"}}}}}, targets, graphQuery)
+	args, err := json.Marshal(QueryKnowledgeGraphInput{KnowledgeBaseIDs: []string{"kb-1", "kb-2"}, Query: "term"})
+	require.NoError(t, err)
+
+	result, err := tool.Execute(context.WithValue(context.Background(), types.TenantIDContextKey, uint64(7)), args)
+	require.NoError(t, err)
+	require.True(t, result.Success)
+	graph := result.Data["scoped_graph"].(*types.GraphData)
+	require.Len(t, graph.Node, 1)
+	require.Len(t, graph.Node[0].ProjectionVariants, 2)
+	require.ElementsMatch(t, []string{"knowledge-one", "knowledge-two"}, graph.Relation[0].KnowledgeIDs)
+
+	graphQuery.errors = map[string]error{"kb-2": errors.New("neo4j unavailable")}
+	result, err = tool.Execute(context.WithValue(context.Background(), types.TenantIDContextKey, uint64(7)), args)
+	require.NoError(t, err)
+	require.True(t, result.Success)
+	require.Contains(t, strings.Join(result.Data["errors"].([]string), "\n"), "KB kb-2: graph query failed")
 }

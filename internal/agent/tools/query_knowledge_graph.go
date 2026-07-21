@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -10,6 +11,12 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/Tencent/WeKnora/internal/utils"
+)
+
+var (
+	errQueryKnowledgeGraphUnauthorized = errors.New("knowledge base is outside the authorized graph scope")
+	errQueryKnowledgeGraphDependency   = errors.New("scoped graph query dependency is unavailable")
+	errQueryKnowledgeGraphAllFailed    = errors.New("knowledge graph query failed for all authorized knowledge bases")
 )
 
 type graphConfigSummary struct {
@@ -70,18 +77,17 @@ type QueryKnowledgeGraphTool struct {
 	BaseTool
 	knowledgeService interfaces.KnowledgeBaseService
 	graphQuery       interfaces.KnowledgeGraphQueryService
+	searchTargets    types.SearchTargets
 }
 
 // NewQueryKnowledgeGraphTool creates a new query knowledge graph tool
-func NewQueryKnowledgeGraphTool(knowledgeService interfaces.KnowledgeBaseService, graphQuery ...interfaces.KnowledgeGraphQueryService) *QueryKnowledgeGraphTool {
-	tool := &QueryKnowledgeGraphTool{
+func NewQueryKnowledgeGraphTool(knowledgeService interfaces.KnowledgeBaseService, searchTargets types.SearchTargets, graphQuery interfaces.KnowledgeGraphQueryService) *QueryKnowledgeGraphTool {
+	return &QueryKnowledgeGraphTool{
 		BaseTool:         queryKnowledgeGraphTool,
 		knowledgeService: knowledgeService,
+		searchTargets:    searchTargets,
+		graphQuery:       graphQuery,
 	}
-	if len(graphQuery) > 0 {
-		tool.graphQuery = graphQuery[0]
-	}
-	return tool
 }
 
 // Execute performs the knowledge graph query with concurrent KB processing
@@ -118,6 +124,9 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 			Error:   "query is required",
 		}, fmt.Errorf("invalid query")
 	}
+	if t.graphQuery == nil {
+		return &types.ToolResult{Success: false, Error: errQueryKnowledgeGraphDependency.Error()}, errQueryKnowledgeGraphDependency
+	}
 
 	// Concurrently query all knowledge bases
 	type graphQueryResult struct {
@@ -125,6 +134,7 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 		kb      *types.KnowledgeBase
 		results []*types.SearchResult
 		graph   *types.GraphData
+		success bool
 		err     error
 	}
 
@@ -141,9 +151,17 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 		wg.Add(1)
 		go func(id string) {
 			defer wg.Done()
+			ownerTenantID, err := authorizedGraphTargetTenant(t.searchTargets, id)
+			if err != nil {
+				mu.Lock()
+				kbResults[id] = &graphQueryResult{kbID: id, err: err}
+				mu.Unlock()
+				return
+			}
+			ownerCtx := context.WithValue(ctx, types.TenantIDContextKey, ownerTenantID)
 
 			// Get knowledge base to check graph configuration
-			kb, err := t.knowledgeService.GetKnowledgeBaseByID(ctx, id)
+			kb, err := t.knowledgeService.GetKnowledgeBaseByID(ownerCtx, id)
 			if err != nil {
 				mu.Lock()
 				kbResults[id] = &graphQueryResult{kbID: id, err: fmt.Errorf("failed to get knowledge base: %v", err)}
@@ -159,29 +177,25 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 				return
 			}
 
-			var graph *types.GraphData
-			if t.graphQuery != nil {
-				tenantID, _ := types.TenantIDFromContext(ctx)
-				graph, err = t.graphQuery.SearchKnowledgeGraph(ctx, tenantID, id, []string{query})
-				if err != nil {
-					mu.Lock()
-					kbResults[id] = &graphQueryResult{kbID: id, kb: kb, err: fmt.Errorf("graph query failed: %v", err)}
-					mu.Unlock()
-					return
-				}
+			graph, err := t.graphQuery.SearchKnowledgeGraph(ownerCtx, ownerTenantID, id, []string{query})
+			if err != nil {
+				mu.Lock()
+				kbResults[id] = &graphQueryResult{kbID: id, kb: kb, err: fmt.Errorf("graph query failed: %v", err)}
+				mu.Unlock()
+				return
 			}
 
 			// Keep hybrid chunk recall as a companion result for existing callers.
-			results, err := t.knowledgeService.HybridSearch(ctx, id, searchParams)
+			results, err := t.knowledgeService.HybridSearch(ownerCtx, id, searchParams)
 			if err != nil {
 				mu.Lock()
-				kbResults[id] = &graphQueryResult{kbID: id, kb: kb, err: fmt.Errorf("query failed: %v", err)}
+				kbResults[id] = &graphQueryResult{kbID: id, kb: kb, graph: graph, success: true, err: fmt.Errorf("query failed: %v", err)}
 				mu.Unlock()
 				return
 			}
 
 			mu.Lock()
-			kbResults[id] = &graphQueryResult{kbID: id, kb: kb, results: results, graph: graph}
+			kbResults[id] = &graphQueryResult{kbID: id, kb: kb, results: results, graph: graph, success: true}
 			mu.Unlock()
 		}(kbID)
 	}
@@ -192,15 +206,23 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 	seenChunks := make(map[string]*types.SearchResult)
 	var scopedGraph *types.GraphData
 	var errors []string
+	successfulGraphScopes := 0
 	graphConfigs := make(map[string]graphConfigSummary)
 	kbCounts := make(map[string]int)
 
 	for _, kbID := range input.KnowledgeBaseIDs {
 		result := kbResults[kbID]
-		if result.err != nil {
-			errors = append(errors, fmt.Sprintf("KB %s: %v", kbID, result.err))
+		if result == nil {
+			errors = append(errors, fmt.Sprintf("KB %s: no graph query result", kbID))
 			continue
 		}
+		if result.err != nil {
+			errors = append(errors, fmt.Sprintf("KB %s: %v", kbID, result.err))
+		}
+		if !result.success {
+			continue
+		}
+		successfulGraphScopes++
 
 		if result.kb != nil && result.kb.ExtractConfig != nil {
 			graphConfigs[kbID] = summarizeGraphConfig(result.kb.ExtractConfig)
@@ -208,13 +230,16 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 
 		kbCounts[kbID] = len(result.results)
 		if result.graph != nil {
-			scopedGraph = appendGraphData(scopedGraph, result.graph)
+			scopedGraph = types.MergeGraphData(scopedGraph, result.graph)
 		}
 		for _, r := range result.results {
 			if _, seen := seenChunks[r.ID]; !seen {
 				seenChunks[r.ID] = r
 			}
 		}
+	}
+	if successfulGraphScopes == 0 {
+		return &types.ToolResult{Success: false, Error: errQueryKnowledgeGraphAllFailed.Error(), Data: map[string]interface{}{"knowledge_base_ids": input.KnowledgeBaseIDs, "query": query, "errors": errors}}, errQueryKnowledgeGraphAllFailed
 	}
 
 	// Convert map to slice and sort by score
@@ -366,79 +391,24 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 	}, nil
 }
 
-func appendGraphData(destination, source *types.GraphData) *types.GraphData {
-	if destination == nil {
-		destination = &types.GraphData{}
-	}
-	if source == nil {
-		return destination
-	}
-	nodes := make(map[string]*types.GraphNode, len(destination.Node))
-	for _, node := range destination.Node {
-		if node != nil {
-			nodes[node.Name] = node
-		}
-	}
-	for _, node := range source.Node {
-		if node == nil {
+func authorizedGraphTargetTenant(targets types.SearchTargets, knowledgeBaseID string) (uint64, error) {
+	var ownerTenantID uint64
+	for _, target := range targets {
+		if target == nil || target.KnowledgeBaseID != knowledgeBaseID {
 			continue
 		}
-		if existing := nodes[node.Name]; existing != nil {
-			existing.Chunks = appendUniqueStrings(existing.Chunks, node.Chunks)
-			existing.Attributes = appendUniqueStrings(existing.Attributes, node.Attributes)
-			continue
+		if target.Type != types.SearchTargetTypeKnowledgeBase || len(target.TagIDs) > 0 || len(target.KnowledgeIDs) > 0 || target.TenantID == 0 {
+			return 0, errQueryKnowledgeGraphUnauthorized
 		}
-		copyNode := *node
-		copyNode.Chunks = append([]string(nil), node.Chunks...)
-		copyNode.Attributes = append([]string(nil), node.Attributes...)
-		destination.Node = append(destination.Node, &copyNode)
-		nodes[copyNode.Name] = &copyNode
-	}
-	relations := make(map[string]*types.GraphRelation, len(destination.Relation))
-	for _, relation := range destination.Relation {
-		if relation != nil {
-			relations[toolGraphRelationKey(relation)] = relation
+		if ownerTenantID != 0 && ownerTenantID != target.TenantID {
+			return 0, errQueryKnowledgeGraphUnauthorized
 		}
+		ownerTenantID = target.TenantID
 	}
-	for _, relation := range source.Relation {
-		if relation == nil {
-			continue
-		}
-		key := toolGraphRelationKey(relation)
-		if existing := relations[key]; existing != nil {
-			existing.KnowledgeIDs = appendUniqueStrings(existing.KnowledgeIDs, relation.KnowledgeIDs)
-			continue
-		}
-		copyRelation := *relation
-		copyRelation.KnowledgeIDs = append([]string(nil), relation.KnowledgeIDs...)
-		destination.Relation = append(destination.Relation, &copyRelation)
-		relations[key] = &copyRelation
+	if ownerTenantID == 0 {
+		return 0, errQueryKnowledgeGraphUnauthorized
 	}
-	sort.Slice(destination.Node, func(i, j int) bool { return destination.Node[i].Name < destination.Node[j].Name })
-	sort.Slice(destination.Relation, func(i, j int) bool {
-		return toolGraphRelationKey(destination.Relation[i]) < toolGraphRelationKey(destination.Relation[j])
-	})
-	return destination
-}
-
-func appendUniqueStrings(existing, additions []string) []string {
-	seen := make(map[string]struct{}, len(existing)+len(additions))
-	for _, value := range existing {
-		seen[value] = struct{}{}
-	}
-	for _, value := range additions {
-		if _, duplicate := seen[value]; duplicate {
-			continue
-		}
-		seen[value] = struct{}{}
-		existing = append(existing, value)
-	}
-	sort.Strings(existing)
-	return existing
-}
-
-func toolGraphRelationKey(relation *types.GraphRelation) string {
-	return relation.Node1 + "\x00" + relation.Node2 + "\x00" + relation.Type
+	return ownerTenantID, nil
 }
 
 func summarizeGraphConfig(config *types.ExtractConfig) graphConfigSummary {
