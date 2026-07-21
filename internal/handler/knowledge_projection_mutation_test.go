@@ -350,8 +350,8 @@ func TestDirectKnowledgeMutationsPermitOrdinaryKnowledgeAndRejectMixedOrUnauthor
 		body               any
 		want               int
 	}{
-		{"tag missing", http.MethodPut, "/knowledge/tags", map[string]any{"updates": map[string][]string{ordinary.ID: {}, "missing": {}}}, http.StatusNotFound},
-		{"tag cross tenant", http.MethodPut, "/knowledge/tags", map[string]any{"updates": map[string][]string{ordinary.ID: {}, "foreign-1": {}}}, http.StatusForbidden},
+		{"tag missing", http.MethodPut, "/knowledge/tags", map[string]any{"updates": map[string][]string{ordinary.ID: {}, "missing": {}}}, http.StatusBadRequest},
+		{"tag cross tenant", http.MethodPut, "/knowledge/tags", map[string]any{"updates": map[string][]string{ordinary.ID: {}, "foreign-1": {}}}, http.StatusBadRequest},
 		{"move missing", http.MethodPost, "/knowledge/move", map[string]any{"source_kb_id": "kb-1", "target_kb_id": "kb-2", "knowledge_ids": []string{ordinary.ID, "missing"}, "mode": "reparse"}, http.StatusBadRequest},
 		{"move cross tenant", http.MethodPost, "/knowledge/move", map[string]any{"source_kb_id": "kb-1", "target_kb_id": "kb-2", "knowledge_ids": []string{ordinary.ID, "foreign-1"}, "mode": "reparse"}, http.StatusBadRequest},
 	} {

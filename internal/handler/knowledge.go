@@ -7,6 +7,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1818,7 +1819,15 @@ func (h *KnowledgeHandler) UpdateKnowledgeTagBatch(c *gin.Context) {
 		c.Error(errors.NewBadRequestError("请求参数不合法").WithDetails(err.Error()))
 		return
 	}
-	// Resolve effective tenant and the authorized KB scope.
+	knowledgeIDs := make([]string, 0, len(req.Updates))
+	for knowledgeID := range req.Updates {
+		knowledgeIDs = append(knowledgeIDs, knowledgeID)
+	}
+	sort.Strings(knowledgeIDs)
+
+	// Resolve the effective tenant. Without an explicit KB the batch read is
+	// deliberately tenant-scoped so a missing or foreign ID has one generic
+	// response and cannot depend on map iteration order.
 	var authorizedKBID string
 	if kbID := secutils.SanitizeForLog(req.KBID); kbID != "" {
 		_, _, effID, permission, err := h.validateKnowledgeBaseAccessWithKBID(c, kbID)
@@ -1832,26 +1841,6 @@ func (h *KnowledgeHandler) UpdateKnowledgeTagBatch(c *gin.Context) {
 		}
 		authorizedKBID = kbID
 		ctx = context.WithValue(ctx, types.TenantIDContextKey, effID)
-	} else if len(req.Updates) > 0 {
-		// No kb_id: infer from first knowledge ID so shared-KB updates work without client sending kb_id
-		var firstKnowledgeID string
-		for id := range req.Updates {
-			firstKnowledgeID = id
-			break
-		}
-		if firstKnowledgeID != "" {
-			knowledge, effCtx, err := h.resolveKnowledgeAndValidateKBAccess(c, firstKnowledgeID, types.OrgRoleEditor)
-			if err != nil {
-				c.Error(err)
-				return
-			}
-			authorizedKBID = knowledge.KnowledgeBaseID
-			ctx = effCtx
-		}
-	}
-	knowledgeIDs := make([]string, 0, len(req.Updates))
-	for knowledgeID := range req.Updates {
-		knowledgeIDs = append(knowledgeIDs, knowledgeID)
 	}
 	effectiveTenantID, ok := types.TenantIDFromContext(ctx)
 	if !ok || effectiveTenantID == 0 {
@@ -1867,6 +1856,9 @@ func (h *KnowledgeHandler) UpdateKnowledgeTagBatch(c *gin.Context) {
 	if len(knowledgeList) != len(knowledgeIDs) {
 		c.Error(errors.NewBadRequestError("some knowledge entries were not found"))
 		return
+	}
+	if authorizedKBID == "" && len(knowledgeList) != 0 {
+		authorizedKBID = knowledgeList[0].KnowledgeBaseID
 	}
 	for _, knowledge := range knowledgeList {
 		if knowledge == nil || knowledge.KnowledgeBaseID != authorizedKBID {
