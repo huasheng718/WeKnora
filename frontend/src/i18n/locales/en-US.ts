@@ -72,8 +72,8 @@ export default {
       emptyEditable: 'Create a document after a source set has been frozen.', emptyReadonly: 'No documents are available for this project.'
     },
     documentStatus: { draft: 'Draft', annotating: 'Annotating', in_review: 'In review', approved: 'Approved', publishing: 'Publishing', published: 'Published', archived: 'Archived' },
-    reviews: { emptyTitle: 'No review records', empty: 'Review records will appear here when documents enter governed review.' },
-    releases: { emptyTitle: 'No release records', empty: 'Release records will appear here after an approved document is prepared for publication.' },
+    reviews: { unavailableTitle: 'Reviews are not available here', unavailable: 'Open a document to view and manage its governed review.' },
+    releases: { unavailableTitle: 'Releases are not available here', unavailable: 'Open a document to view and manage its publication status.' },
     errors: {
       createProject: 'Failed to create the project.', loadSourcesTitle: 'Source sets could not be loaded', loadDocumentsTitle: 'Documents could not be loaded',
       createSource: 'Failed to create the source set.', createDocument: 'Failed to create the document.', loadProjectsTitle: 'Projects could not be loaded',

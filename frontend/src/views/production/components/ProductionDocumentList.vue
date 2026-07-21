@@ -18,11 +18,6 @@
     <div v-if="loading" class="panel-loading" aria-live="polite">
       <t-skeleton v-for="row in 4" :key="row" animation="gradient" :row-col="[{ width: '100%', height: '58px' }]" />
     </div>
-    <div v-else-if="error" class="panel-state panel-state--error" role="alert">
-      <t-icon name="error-circle" size="24px" />
-      <div><strong>{{ t('production.errors.loadDocumentsTitle') }}</strong><span>{{ error }}</span></div>
-      <t-button size="small" variant="outline" @click="emit('retry')">{{ t('production.actions.retry') }}</t-button>
-    </div>
     <div v-else-if="documents.length === 0" class="panel-state">
       <t-icon name="file-copy" size="28px" />
       <div>
@@ -102,6 +97,7 @@ import {
   type ProductionSourceSet,
 } from '@/api/production'
 import { createProductionCommand } from '@/api/production/idempotency'
+import { productionDocumentLocation } from '../models/productionViewModel'
 
 const props = defineProps<{
   projectId: string
@@ -110,10 +106,8 @@ const props = defineProps<{
   documentTypes: readonly ProductionDocumentType[]
   canEdit: boolean
   loading: boolean
-  error?: string
 }>()
 const emit = defineEmits<{
-  (event: 'retry'): void
   (event: 'created', document: ProductionDocument): void
 }>()
 
@@ -156,7 +150,7 @@ function documentTheme(status: ProductionDocumentStatus): 'default' | 'primary' 
 }
 
 function openDocument(id: string) {
-  router.push({ name: 'productionDocument', params: { documentId: id } })
+  router.push(productionDocumentLocation(id))
 }
 
 async function createDocument() {
@@ -191,8 +185,6 @@ async function createDocument() {
 .panel-state { min-height: 180px; display: flex; align-items: center; justify-content: center; gap: 14px; color: var(--td-text-color-secondary); border-block: 1px solid var(--td-component-stroke); }
 .panel-state > div { display: flex; flex-direction: column; gap: 3px; }
 .panel-state strong { color: var(--td-text-color-primary); }
-.panel-state--error { justify-content: flex-start; min-height: 96px; padding: 0 16px; color: var(--td-error-color); }
-.panel-state--error button { margin-left: auto; }
 .document-list { border-top: 1px solid var(--td-component-stroke); }
 .document-row { appearance: none; width: 100%; min-height: 68px; display: grid; grid-template-columns: 36px minmax(0, 1fr) minmax(120px, auto) 20px; align-items: center; gap: 12px; padding: 0; border: 0; border-bottom: 1px solid var(--td-component-stroke); background: transparent; color: inherit; text-align: left; cursor: pointer; }
 .document-row:hover { background: var(--td-bg-color-container-hover); }

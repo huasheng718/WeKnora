@@ -63,19 +63,39 @@ func (s ProductionProjectStatus) IsValid() bool {
 // ProductionProject is the tenant-scoped aggregate root for knowledge
 // production work.
 type ProductionProject struct {
-	ID          string                  `json:"id" gorm:"type:varchar(36);primaryKey"`
-	TenantID    uint64                  `json:"tenant_id" gorm:"not null;index"`
-	Name        string                  `json:"name" gorm:"type:varchar(255);not null"`
-	Description string                  `json:"description" gorm:"type:text;not null;default:''"`
-	OwnerUserID string                  `json:"owner_user_id" gorm:"type:varchar(36);not null"`
-	Status      ProductionProjectStatus `json:"status" gorm:"type:varchar(20);not null;default:'active'"`
-	CreatedAt   time.Time               `json:"created_at"`
-	UpdatedAt   time.Time               `json:"updated_at"`
-	DeletedAt   gorm.DeletedAt          `json:"deleted_at" gorm:"index"`
+	ID               string                    `json:"id" gorm:"type:varchar(36);primaryKey"`
+	TenantID         uint64                    `json:"tenant_id" gorm:"not null;index"`
+	Name             string                    `json:"name" gorm:"type:varchar(255);not null"`
+	Description      string                    `json:"description" gorm:"type:text;not null;default:''"`
+	OwnerUserID      string                    `json:"owner_user_id" gorm:"type:varchar(36);not null"`
+	Status           ProductionProjectStatus   `json:"status" gorm:"type:varchar(20);not null;default:'active'"`
+	CreatedAt        time.Time                 `json:"created_at"`
+	UpdatedAt        time.Time                 `json:"updated_at"`
+	DeletedAt        gorm.DeletedAt            `json:"deleted_at" gorm:"index"`
+	CurrentUserRoles []ProductionRole          `json:"current_user_roles,omitempty" gorm:"-"`
+	Summary          *ProductionProjectSummary `json:"summary,omitempty" gorm:"-"`
 }
 
 // TableName binds ProductionProject to the production_projects table.
 func (ProductionProject) TableName() string { return "production_projects" }
+
+// ProductionProjectSummary is the bounded list projection returned with a project.
+type ProductionProjectSummary struct {
+	DocumentCount  int64     `json:"document_count"`
+	SourceSetCount int64     `json:"source_set_count"`
+	PendingReviews int64     `json:"pending_reviews"`
+	FailedTargets  int64     `json:"failed_targets"`
+	InFlightRuns   int64     `json:"in_flight_runs"`
+	LatestActivity time.Time `json:"latest_activity"`
+}
+
+// ProductionProjectDecoration contains caller-specific, non-persistent list data.
+type ProductionProjectDecoration struct {
+	CurrentUserRoles []ProductionRole
+	Summary          ProductionProjectSummary
+}
+
+type ProductionProjectDecorations map[string]ProductionProjectDecoration
 
 // ProductionProjectMember records one role assignment for a project member.
 // A user may hold multiple roles in the same project.

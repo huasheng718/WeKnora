@@ -42,6 +42,7 @@ import { useI18n } from 'vue-i18n'
 import { MessagePlugin, type FormInstanceFunctions, type FormRule } from 'tdesign-vue-next'
 import { createProductionProject, type ProductionProject } from '@/api/production'
 import { createProductionCommand } from '@/api/production/idempotency'
+import { validateProductionProjectName } from '../models/productionViewModel'
 
 const props = defineProps<{ visible: boolean; canCreate: boolean }>()
 const emit = defineEmits<{
@@ -58,12 +59,12 @@ const form = reactive({ name: '', description: '' })
 const rules: Record<string, FormRule[]> = {
   name: [
     {
-      validator: (value: string) => Array.from((value ?? '').trim()).length > 0,
+      validator: (value: string) => validateProductionProjectName(value) !== 'required',
       message: t('production.validation.nameRequired'),
       trigger: 'blur',
     },
     {
-      validator: (value: string) => Array.from((value ?? '').trim()).length <= 255,
+      validator: (value: string) => validateProductionProjectName(value) !== 'too_long',
       message: t('production.validation.nameTooLong'),
       trigger: 'change',
     },

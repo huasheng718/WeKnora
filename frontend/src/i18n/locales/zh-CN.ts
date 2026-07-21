@@ -72,8 +72,8 @@ export default {
       emptyEditable: "来源集冻结后即可创建文档。", emptyReadonly: "该项目暂无可查看的文档。"
     },
     documentStatus: { draft: "草稿", annotating: "标注中", in_review: "审核中", approved: "已通过", publishing: "发布中", published: "已发布", archived: "已归档" },
-    reviews: { emptyTitle: "暂无审核记录", empty: "文档进入受治理审核后，审核记录会显示在这里。" },
-    releases: { emptyTitle: "暂无发布记录", empty: "已通过的文档准备发布后，发布记录会显示在这里。" },
+    reviews: { unavailableTitle: "此处暂不提供审核记录", unavailable: "请打开具体文档查看和处理受治理审核。" },
+    releases: { unavailableTitle: "此处暂不提供发布记录", unavailable: "请打开具体文档查看和处理发布状态。" },
     errors: {
       createProject: "创建项目失败。", loadSourcesTitle: "无法加载来源集", loadDocumentsTitle: "无法加载文档",
       createSource: "创建来源集失败。", createDocument: "创建文档失败。", loadProjectsTitle: "无法加载项目",

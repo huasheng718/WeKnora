@@ -18,11 +18,6 @@
     <div v-if="loading" class="panel-loading" aria-live="polite">
       <t-skeleton v-for="row in 3" :key="row" animation="gradient" :row-col="[{ width: '100%', height: '58px' }]" />
     </div>
-    <div v-else-if="error" class="panel-state panel-state--error" role="alert">
-      <t-icon name="error-circle" size="24px" />
-      <div><strong>{{ t('production.errors.loadSourcesTitle') }}</strong><span>{{ error }}</span></div>
-      <t-button size="small" variant="outline" @click="emit('retry')">{{ t('production.actions.retry') }}</t-button>
-    </div>
     <div v-else-if="sourceSets.length === 0" class="panel-state">
       <t-icon name="folder-open" size="28px" />
       <div>
@@ -88,10 +83,8 @@ const props = defineProps<{
   documentTypes: readonly ProductionDocumentType[]
   canEdit: boolean
   loading: boolean
-  error?: string
 }>()
 const emit = defineEmits<{
-  (event: 'retry'): void
   (event: 'created', sourceSet: ProductionSourceSet): void
 }>()
 
@@ -164,8 +157,6 @@ async function createSourceSet() {
 .panel-state { min-height: 180px; display: flex; align-items: center; justify-content: center; gap: 14px; color: var(--td-text-color-secondary); border-block: 1px solid var(--td-component-stroke); }
 .panel-state > div { display: flex; flex-direction: column; gap: 3px; }
 .panel-state strong { color: var(--td-text-color-primary); }
-.panel-state--error { justify-content: flex-start; min-height: 96px; padding: 0 16px; color: var(--td-error-color); }
-.panel-state--error button { margin-left: auto; }
 .source-list { border-top: 1px solid var(--td-component-stroke); }
 .source-row { display: grid; grid-template-columns: 36px minmax(0, 1fr) minmax(120px, auto); align-items: center; gap: 12px; min-height: 68px; border-bottom: 1px solid var(--td-component-stroke); }
 .source-icon { width: 32px; height: 32px; display: grid; place-items: center; background: var(--td-bg-color-secondarycontainer); border-radius: var(--td-radius-medium); color: var(--td-text-color-secondary); }

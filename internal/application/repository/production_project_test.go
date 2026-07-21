@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -48,6 +49,23 @@ func seedProductionProject(t *testing.T, db *gorm.DB, id string, tenantID uint64
 		OwnerUserID: "owner-1",
 		Status:      types.ProductionProjectActive,
 	}).Error)
+}
+
+type productionProjectQueryCounter struct {
+	logger.Interface
+	selects int
+}
+
+func (counter *productionProjectQueryCounter) Trace(
+	_ context.Context,
+	_ time.Time,
+	query func() (string, int64),
+	_ error,
+) {
+	sql, _ := query()
+	if strings.HasPrefix(strings.TrimSpace(strings.ToUpper(sql)), "SELECT") {
+		counter.selects++
+	}
 }
 
 func TestProductionProjectRepositoryCreatePersistsProjectAndOwner(t *testing.T) {
@@ -163,6 +181,92 @@ func TestProductionProjectRepositoryListsDistinctProjectsForTenantUser(t *testin
 	require.NoError(t, err)
 	require.Len(t, projects, 1)
 	require.Equal(t, "project-1", projects[0].ID)
+}
+
+func TestProductionProjectRepositoryListsAuthorizedDecorationsAndSummaries(t *testing.T) {
+	repo, db := newProductionRepoTestDB(t)
+	seedProductionProject(t, db, "project-1", 7)
+	seedProductionProject(t, db, "project-other-tenant", 8)
+	require.NoError(t, db.Exec(`UPDATE production_projects SET updated_at = '2026-07-20 10:00:00'`).Error)
+	for _, member := range []*types.ProductionProjectMember{
+		{ProjectID: "project-1", UserID: "user-1", Role: types.ProductionRoleAuthor, AssignedBy: "owner-1"},
+		{ProjectID: "project-1", UserID: "user-1", Role: types.ProductionRoleObserver, AssignedBy: "owner-1"},
+		{ProjectID: "project-other-tenant", UserID: "user-1", Role: types.ProductionRoleAuthor, AssignedBy: "owner-1"},
+	} {
+		require.NoError(t, db.Create(member).Error)
+	}
+	require.NoError(t, db.Exec(`
+		CREATE TABLE production_documents (id TEXT PRIMARY KEY, tenant_id INTEGER, project_id TEXT, updated_at DATETIME);
+		CREATE TABLE production_source_sets (id TEXT PRIMARY KEY, tenant_id INTEGER, project_id TEXT, created_at DATETIME);
+		CREATE TABLE production_review_requests (id TEXT PRIMARY KEY, tenant_id INTEGER, project_id TEXT, status TEXT, updated_at DATETIME);
+		CREATE TABLE production_release_targets (id TEXT PRIMARY KEY, tenant_id INTEGER, project_id TEXT, status TEXT, updated_at DATETIME);
+		CREATE TABLE production_runs (id TEXT PRIMARY KEY, tenant_id INTEGER, project_id TEXT, status TEXT, updated_at DATETIME);
+	`).Error)
+	for _, statement := range []string{
+		`INSERT INTO production_documents VALUES ('document-1', 7, 'project-1', '2026-07-20 11:00:00')`,
+		`INSERT INTO production_documents VALUES ('document-2', 7, 'project-1', '2026-07-20 12:00:00')`,
+		`INSERT INTO production_documents VALUES ('document-cross-tenant', 8, 'project-other-tenant', '2026-07-22 12:00:00')`,
+		`INSERT INTO production_source_sets VALUES ('source-1', 7, 'project-1', '2026-07-20 13:00:00')`,
+		`INSERT INTO production_review_requests VALUES ('review-1', 7, 'project-1', 'pending', '2026-07-20 14:00:00')`,
+		`INSERT INTO production_review_requests VALUES ('review-2', 7, 'project-1', 'approved', '2026-07-20 15:00:00')`,
+		`INSERT INTO production_release_targets VALUES ('target-1', 7, 'project-1', 'failed', '2026-07-20 16:00:00')`,
+		`INSERT INTO production_runs VALUES ('run-1', 7, 'project-1', 'running', '2026-07-20 17:00:00')`,
+		`INSERT INTO production_runs VALUES ('run-2', 7, 'project-1', 'completed', '2026-07-20 18:00:00')`,
+	} {
+		require.NoError(t, db.Exec(statement).Error)
+	}
+
+	decorations, err := repo.ListDecorationsByUser(context.Background(), 7, "user-1")
+
+	require.NoError(t, err)
+	require.Len(t, decorations, 1)
+	decoration := decorations["project-1"]
+	require.Equal(t, []types.ProductionRole{types.ProductionRoleAuthor, types.ProductionRoleObserver}, decoration.CurrentUserRoles)
+	require.Equal(t, int64(2), decoration.Summary.DocumentCount)
+	require.Equal(t, int64(1), decoration.Summary.SourceSetCount)
+	require.Equal(t, int64(1), decoration.Summary.PendingReviews)
+	require.Equal(t, int64(1), decoration.Summary.FailedTargets)
+	require.Equal(t, int64(1), decoration.Summary.InFlightRuns)
+	require.Equal(t, "2026-07-20T18:00:00Z", decoration.Summary.LatestActivity.UTC().Format(time.RFC3339))
+}
+
+func TestProductionProjectRepositoryDecorationQueryCountIsIndependentOfProjectCount(t *testing.T) {
+	repo, db := newProductionRepoTestDB(t)
+	require.NoError(t, db.Exec(`
+		CREATE TABLE production_documents (id TEXT PRIMARY KEY, tenant_id INTEGER, project_id TEXT, updated_at DATETIME);
+		CREATE TABLE production_source_sets (id TEXT PRIMARY KEY, tenant_id INTEGER, project_id TEXT, created_at DATETIME);
+		CREATE TABLE production_review_requests (id TEXT PRIMARY KEY, tenant_id INTEGER, project_id TEXT, status TEXT, updated_at DATETIME);
+		CREATE TABLE production_release_targets (id TEXT PRIMARY KEY, tenant_id INTEGER, project_id TEXT, status TEXT, updated_at DATETIME);
+		CREATE TABLE production_runs (id TEXT PRIMARY KEY, tenant_id INTEGER, project_id TEXT, status TEXT, updated_at DATETIME);
+	`).Error)
+	seedProductionProject(t, db, "project-1", 7)
+	require.NoError(t, db.Create(&types.ProductionProjectMember{
+		ProjectID: "project-1", UserID: "user-1", Role: types.ProductionRoleAuthor, AssignedBy: "owner-1",
+	}).Error)
+	counter := &productionProjectQueryCounter{Interface: logger.Discard}
+	db.Config.Logger = counter
+
+	_, err := repo.ListDecorationsByUser(context.Background(), 7, "user-1")
+	require.NoError(t, err)
+	require.Equal(t, 6, counter.selects)
+
+	seedProductionProject(t, db, "project-2", 7)
+	require.NoError(t, db.Create(&types.ProductionProjectMember{
+		ProjectID: "project-2", UserID: "user-1", Role: types.ProductionRoleObserver, AssignedBy: "owner-1",
+	}).Error)
+	counter.selects = 0
+	_, err = repo.ListDecorationsByUser(context.Background(), 7, "user-1")
+	require.NoError(t, err)
+	require.Equal(t, 6, counter.selects)
+}
+
+func TestParseProductionProjectActivityAcceptsPostgresTimestampText(t *testing.T) {
+	value := "2026-07-20 18:00:00+00"
+
+	parsed := parseProductionProjectActivity(&value)
+
+	require.NotNil(t, parsed)
+	require.Equal(t, "2026-07-20T18:00:00Z", parsed.Format(time.RFC3339))
 }
 
 func TestProductionProjectRepositoryScopesRoleOperationsByProjectTenant(t *testing.T) {

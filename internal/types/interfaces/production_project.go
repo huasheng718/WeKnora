@@ -18,6 +18,7 @@ type ProductionProjectRepository interface {
 	Create(ctx context.Context, project *types.ProductionProject, owner *types.ProductionProjectMember) error
 	GetByID(ctx context.Context, tenantID uint64, projectID string) (*types.ProductionProject, error)
 	ListByUser(ctx context.Context, tenantID uint64, userID string) ([]*types.ProductionProject, error)
+	ListDecorationsByUser(ctx context.Context, tenantID uint64, userID string) (types.ProductionProjectDecorations, error)
 	AssignRole(ctx context.Context, tenantID uint64, member *types.ProductionProjectMember) error
 	RemoveRole(ctx context.Context, tenantID uint64, projectID, userID string, role types.ProductionRole) error
 	ListRoles(ctx context.Context, tenantID uint64, projectID, userID string) ([]types.ProductionRole, error)

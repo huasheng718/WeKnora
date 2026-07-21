@@ -9,17 +9,17 @@
       <span>{{ t('production.workspace') }}</span>
     </div>
 
-    <div v-if="loading && !loaded" class="workbench-loading" aria-live="polite">
+    <div v-if="viewState === 'loading'" class="workbench-loading" aria-live="polite">
       <t-skeleton animation="gradient" :row-col="[{ width: '42%', height: '30px' }, { width: '72%', height: '18px' }, { width: '100%', height: '48px' }, { width: '100%', height: '220px' }]" />
     </div>
 
-    <div v-else-if="pageError" class="workbench-state workbench-state--error" role="alert">
+    <div v-else-if="viewState === 'error'" class="workbench-state workbench-state--error" role="alert">
       <t-icon name="error-circle" size="30px" />
       <div><strong>{{ t('production.errors.loadWorkbenchTitle') }}</strong><span>{{ pageError }}</span></div>
       <t-button size="small" variant="outline" @click="loadWorkbench">{{ t('production.actions.retry') }}</t-button>
     </div>
 
-    <div v-else-if="!project" class="workbench-state">
+    <div v-else-if="viewState === 'missing'" class="workbench-state">
       <t-icon name="folder-open" size="34px" />
       <div><strong>{{ t('production.projects.notFoundTitle') }}</strong><span>{{ t('production.projects.notFound') }}</span></div>
       <t-button size="small" variant="outline" @click="backToProjects">{{ t('production.actions.backToProjects') }}</t-button>
@@ -59,7 +59,6 @@
               :document-types="documentTypes"
               :can-edit="canEdit"
               :loading="loading"
-              @retry="loadWorkbench"
               @created="onSourceCreated"
             />
           </div>
@@ -73,7 +72,6 @@
               :document-types="documentTypes"
               :can-edit="canEdit"
               :loading="loading"
-              @retry="loadWorkbench"
               @created="onDocumentCreated"
             />
           </div>
@@ -81,15 +79,15 @@
         <t-tab-panel value="reviews" :label="t('production.tabs.reviews')">
           <div class="tab-content tab-state">
             <t-icon name="check-double" size="30px" />
-            <strong>{{ t('production.reviews.emptyTitle') }}</strong>
-            <span>{{ t('production.reviews.empty') }}</span>
+            <strong>{{ t('production.reviews.unavailableTitle') }}</strong>
+            <span>{{ t('production.reviews.unavailable') }}</span>
           </div>
         </t-tab-panel>
         <t-tab-panel value="releases" :label="t('production.tabs.releases')">
           <div class="tab-content tab-state">
             <t-icon name="send" size="30px" />
-            <strong>{{ t('production.releases.emptyTitle') }}</strong>
-            <span>{{ t('production.releases.empty') }}</span>
+            <strong>{{ t('production.releases.unavailableTitle') }}</strong>
+            <span>{{ t('production.releases.unavailable') }}</span>
           </div>
         </t-tab-panel>
       </t-tabs>
@@ -112,7 +110,8 @@ import {
 } from '@/api/production'
 import { useAuthStore } from '@/stores/auth'
 import { useProductionStore } from '@/stores/production'
-import { productionAccess } from './models/productionAccess'
+import { createLatestRequestCoordinator } from './models/latestRequestCoordinator'
+import { canEditProductionProject, workbenchViewState } from './models/productionViewModel'
 import ProductionDocumentList from './components/ProductionDocumentList.vue'
 import ProductionSourcePanel from './components/ProductionSourcePanel.vue'
 
@@ -125,15 +124,22 @@ const activeTab = ref('sources')
 const loading = ref(false)
 const loaded = ref(false)
 const pageError = ref('')
+const loadCoordinator = createLatestRequestCoordinator()
 
 const projectId = computed(() => typeof route.params.projectId === 'string' ? route.params.projectId : '')
 const project = computed(() => store.projectsById[projectId.value] ?? null)
 const sourceSets = computed(() => Object.values(store.sourceSetsById).filter(row => row.project_id === projectId.value))
 const documents = computed(() => Object.values(store.documentsById).filter(row => row.project_id === projectId.value))
 const documentTypes = computed(() => Object.values(store.documentTypesById))
-const projectRoles = computed(() => project.value?.owner_user_id === String(auth.currentUserId) ? ['project_owner'] as const : [] as const)
-const canEdit = computed(() => project.value?.status === 'active'
-  && productionAccess(auth.currentTenantRole as TenantRole | '', projectRoles.value).edit)
+const canEdit = computed(() => project.value
+  ? canEditProductionProject(auth.currentTenantRole as TenantRole | '', project.value)
+  : false)
+const viewState = computed(() => workbenchViewState({
+  loading: loading.value,
+  loaded: loaded.value,
+  error: pageError.value,
+  hasProject: !!project.value,
+}))
 
 function formatDate(value: string) {
   return new Intl.DateTimeFormat(locale.value, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value))
@@ -152,30 +158,37 @@ function onDocumentCreated(document: ProductionDocument) {
 }
 
 async function loadWorkbench() {
-  if (!projectId.value || loading.value) return
+  const requestedProjectId = projectId.value
+  if (!requestedProjectId) return
   loading.value = true
   pageError.value = ''
-  try {
+  await loadCoordinator.run(async () => {
     const [projectsResponse, sourcesResponse, documentsResponse, typesResponse] = await Promise.all([
       listProductionProjects(),
-      listProductionSourceSets(projectId.value),
-      listProductionDocuments(projectId.value),
+      listProductionSourceSets(requestedProjectId),
+      listProductionDocuments(requestedProjectId),
       listProductionDocumentTypes(),
     ])
     if (!projectsResponse.success || !sourcesResponse.success || !documentsResponse.success || !typesResponse.success) {
       throw new Error(t('production.errors.loadWorkbench'))
     }
-    store.replaceProjects(projectsResponse.data ?? [])
-    store.replaceSourceSets(sourcesResponse.data ?? [])
-    store.replaceDocuments(documentsResponse.data ?? [])
-    store.replaceDocumentTypes(typesResponse.data ?? [])
-    store.activeProjectId = projectId.value
-    loaded.value = true
-  } catch (cause) {
-    pageError.value = cause instanceof Error ? cause.message : t('production.errors.loadWorkbench')
-  } finally {
-    loading.value = false
-  }
+    return { projectsResponse, sourcesResponse, documentsResponse, typesResponse }
+  }, {
+    success: ({ projectsResponse, sourcesResponse, documentsResponse, typesResponse }) => {
+      store.replaceProjects(projectsResponse.data ?? [])
+      store.replaceSourceSets(sourcesResponse.data ?? [])
+      store.replaceDocuments(documentsResponse.data ?? [])
+      store.replaceDocumentTypes(typesResponse.data ?? [])
+      store.activeProjectId = requestedProjectId
+      loaded.value = true
+    },
+    error: cause => {
+      pageError.value = cause instanceof Error ? cause.message : t('production.errors.loadWorkbench')
+    },
+    settled: () => {
+      loading.value = false
+    },
+  })
 }
 
 watch(projectId, () => {

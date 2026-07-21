@@ -72,8 +72,8 @@ export default {
       emptyEditable: "소스 세트를 고정한 후 문서를 만들 수 있습니다.", emptyReadonly: "이 프로젝트에 사용할 수 있는 문서가 없습니다."
     },
     documentStatus: { draft: "초안", annotating: "주석 작성 중", in_review: "검토 중", approved: "승인됨", publishing: "게시 중", published: "게시됨", archived: "보관됨" },
-    reviews: { emptyTitle: "검토 기록 없음", empty: "문서가 관리 검토에 들어가면 기록이 여기에 표시됩니다." },
-    releases: { emptyTitle: "릴리스 기록 없음", empty: "승인된 문서가 게시 준비되면 기록이 여기에 표시됩니다." },
+    reviews: { unavailableTitle: "여기에서는 검토를 볼 수 없음", unavailable: "문서를 열어 관리 검토를 확인하고 처리하세요." },
+    releases: { unavailableTitle: "여기에서는 릴리스를 볼 수 없음", unavailable: "문서를 열어 게시 상태를 확인하고 처리하세요." },
     errors: {
       createProject: "프로젝트를 만들지 못했습니다.", loadSourcesTitle: "소스 세트를 불러올 수 없음", loadDocumentsTitle: "문서를 불러올 수 없음",
       createSource: "소스 세트를 만들지 못했습니다.", createDocument: "문서를 만들지 못했습니다.", loadProjectsTitle: "프로젝트를 불러올 수 없음",

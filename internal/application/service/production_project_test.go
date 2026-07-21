@@ -26,6 +26,7 @@ type productionProjectRepoStub struct {
 	assigned       *types.ProductionProjectMember
 	removed        *types.ProductionProjectMember
 	lastRoleTenant uint64
+	decorations    types.ProductionProjectDecorations
 }
 
 func newProductionProjectRepoStub() *productionProjectRepoStub {
@@ -69,6 +70,10 @@ func (r *productionProjectRepoStub) ListByUser(_ context.Context, tenantID uint6
 		}
 	}
 	return result, nil
+}
+
+func (r *productionProjectRepoStub) ListDecorationsByUser(_ context.Context, tenantID uint64, userID string) (types.ProductionProjectDecorations, error) {
+	return r.decorations, nil
 }
 
 func (r *productionProjectRepoStub) AssignRole(_ context.Context, tenantID uint64, member *types.ProductionProjectMember) error {
@@ -405,4 +410,26 @@ func TestProductionProjectReadMethodsReturnAuthorizedRows(t *testing.T) {
 	projects, err := svc.ListProjects(ctxForUser(7, "author-user"), 7, "author-user")
 	require.NoError(t, err)
 	require.Len(t, projects, 1)
+}
+
+func TestProductionProjectListDecoratesClonesWithCallerRolesAndSummary(t *testing.T) {
+	svc, repo, _, _ := newProductionProjectServiceFixture(t, types.TenantRoleContributor, nil)
+	repo.setRoles(7, "project-1", "author-user", []types.ProductionRole{types.ProductionRoleAuthor})
+	repo.decorations = types.ProductionProjectDecorations{
+		"project-1": {
+			CurrentUserRoles: []types.ProductionRole{types.ProductionRoleAuthor},
+			Summary:          types.ProductionProjectSummary{DocumentCount: 3, SourceSetCount: 2},
+		},
+	}
+	original := repo.projects[7]["project-1"]
+
+	projects, err := svc.ListProjects(ctxForUser(7, "author-user"), 7, "author-user")
+
+	require.NoError(t, err)
+	require.Len(t, projects, 1)
+	require.NotSame(t, original, projects[0])
+	require.Equal(t, []types.ProductionRole{types.ProductionRoleAuthor}, projects[0].CurrentUserRoles)
+	require.Equal(t, int64(3), projects[0].Summary.DocumentCount)
+	require.Empty(t, original.CurrentUserRoles)
+	require.Nil(t, original.Summary)
 }

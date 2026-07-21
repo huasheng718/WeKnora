@@ -159,7 +159,30 @@ func (s *productionProjectService) ListProjects(
 	if callerID != userID {
 		return nil, types.ErrProductionForbidden
 	}
-	return s.repo.ListByUser(ctx, tenantID, userID)
+	projects, err := s.repo.ListByUser(ctx, tenantID, userID)
+	if err != nil {
+		return nil, err
+	}
+	decorations, err := s.repo.ListDecorationsByUser(ctx, tenantID, userID)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]*types.ProductionProject, 0, len(projects))
+	for _, project := range projects {
+		if project == nil {
+			continue
+		}
+		clone := *project
+		decoration := decorations[project.ID]
+		clone.CurrentUserRoles = append([]types.ProductionRole(nil), decoration.CurrentUserRoles...)
+		summary := decoration.Summary
+		if summary.LatestActivity.IsZero() {
+			summary.LatestActivity = project.UpdatedAt.UTC()
+		}
+		clone.Summary = &summary
+		result = append(result, &clone)
+	}
+	return result, nil
 }
 
 func (s *productionProjectService) AssignRole(

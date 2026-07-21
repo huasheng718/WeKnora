@@ -123,7 +123,11 @@ func TestProductionProjectHandlerEnforcesTrimmedNameCharacterLimit(t *testing.T)
 }
 
 func TestProductionProjectHandlerListsOnlyContextTenantAndUser(t *testing.T) {
-	service := &productionProjectServiceStub{projects: []*types.ProductionProject{{ID: productionProjectID, TenantID: 7, Name: "Baseline"}}}
+	service := &productionProjectServiceStub{projects: []*types.ProductionProject{{
+		ID: productionProjectID, TenantID: 7, Name: "Baseline",
+		CurrentUserRoles: []types.ProductionRole{types.ProductionRoleAuthor},
+		Summary:          &types.ProductionProjectSummary{DocumentCount: 2, SourceSetCount: 1},
+	}}}
 	h := NewProductionProjectHandler(service)
 	c, recorder := newProductionHandlerContext(http.MethodGet, "/production/projects", "")
 
@@ -133,6 +137,8 @@ func TestProductionProjectHandlerListsOnlyContextTenantAndUser(t *testing.T) {
 	require.Equal(t, uint64(7), service.listTenant)
 	require.Equal(t, "author-1", service.listUser)
 	require.Contains(t, recorder.Body.String(), productionProjectID)
+	require.Contains(t, recorder.Body.String(), `"current_user_roles":["author"]`)
+	require.Contains(t, recorder.Body.String(), `"document_count":2`)
 }
 
 func TestProductionProjectHandlerPreservesServiceAuthorization(t *testing.T) {

@@ -34,6 +34,17 @@ export interface ProductionProject {
   created_at: ProductionTimestamp
   updated_at: ProductionTimestamp
   deleted_at: ProductionTimestamp | null
+  current_user_roles?: ProductionProjectRole[]
+  summary?: ProductionProjectSummary
+}
+
+export interface ProductionProjectSummary {
+  document_count: number
+  source_set_count: number
+  pending_reviews: number
+  failed_targets: number
+  in_flight_runs: number
+  latest_activity: ProductionTimestamp
 }
 
 export interface ProductionProjectMember {

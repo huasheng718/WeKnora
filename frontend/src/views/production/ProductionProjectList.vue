@@ -24,19 +24,19 @@
       </t-button>
     </div>
 
-    <div v-if="loading && !loaded" class="project-grid" aria-live="polite">
+    <div v-if="viewState === 'loading'" class="project-grid" aria-live="polite">
       <div v-for="card in 6" :key="card" class="project-card project-card--skeleton">
         <t-skeleton animation="gradient" :row-col="[{ width: '68%', height: '22px' }, { width: '100%', height: '42px' }, { width: '88%', height: '30px' }]" />
       </div>
     </div>
 
-    <div v-else-if="error" class="page-state page-state--error" role="alert">
+    <div v-else-if="viewState === 'error'" class="page-state page-state--error" role="alert">
       <t-icon name="error-circle" size="28px" />
       <div><strong>{{ t('production.errors.loadProjectsTitle') }}</strong><span>{{ error }}</span></div>
       <t-button variant="outline" size="small" @click="loadProjects">{{ t('production.actions.retry') }}</t-button>
     </div>
 
-    <div v-else-if="projects.length === 0" class="page-state">
+    <div v-else-if="viewState === 'empty'" class="page-state">
       <t-icon name="folder-open" size="34px" />
       <div>
         <strong>{{ t('production.projects.emptyTitle') }}</strong>
@@ -93,15 +93,17 @@ import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import type { TenantRole } from '@/api/tenant/members'
 import {
-  listProductionDocuments,
   listProductionProjects,
-  listProductionSourceSets,
   type ProductionProject,
 } from '@/api/production'
 import { useAuthStore } from '@/stores/auth'
 import { useProductionStore } from '@/stores/production'
 import { productionAccess } from './models/productionAccess'
-import { summarizeProject } from './models/projectSummary'
+import {
+  productionProjectLocation,
+  projectListViewState,
+  projectSummaryFromResponse,
+} from './models/productionViewModel'
 import ProductionProjectDialog from './components/ProductionProjectDialog.vue'
 
 const { t, locale } = useI18n()
@@ -115,16 +117,15 @@ const dialogVisible = ref(false)
 
 const projects = computed(() => Object.values(store.projectsById).sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at)))
 const canCreate = computed(() => productionAccess(auth.currentTenantRole as TenantRole | '', ['project_owner']).edit)
+const viewState = computed(() => projectListViewState({
+  loading: loading.value,
+  loaded: loaded.value,
+  error: error.value,
+  itemCount: projects.value.length,
+}))
 
 function summary(project: ProductionProject) {
-  return summarizeProject({
-    project,
-    documents: Object.values(store.documentsById),
-    sourceSets: Object.values(store.sourceSetsById),
-    reviews: Object.values(store.reviewsById),
-    releaseTargets: Object.values(store.releaseTargetsById),
-    runs: Object.values(store.runsById),
-  })
+  return projectSummaryFromResponse(project)
 }
 
 function formatDate(value: string) {
@@ -132,7 +133,7 @@ function formatDate(value: string) {
 }
 
 function openProject(projectId: string) {
-  router.push({ name: 'productionProject', params: { projectId } })
+  router.push(productionProjectLocation(projectId))
 }
 
 function onProjectCreated(project: ProductionProject) {
@@ -147,18 +148,7 @@ async function loadProjects() {
   try {
     const projectResponse = await listProductionProjects()
     if (!projectResponse.success) throw new Error(projectResponse.message || t('production.errors.loadProjects'))
-    const rows = projectResponse.data ?? []
-    store.replaceProjects(rows)
-    const related = await Promise.all(rows.map(async project => {
-      const [documents, sources] = await Promise.all([
-        listProductionDocuments(project.id),
-        listProductionSourceSets(project.id),
-      ])
-      if (!documents.success || !sources.success) throw new Error(t('production.errors.loadProjectSummary'))
-      return { documents: documents.data ?? [], sources: sources.data ?? [] }
-    }))
-    store.replaceDocuments(related.flatMap(row => row.documents))
-    store.replaceSourceSets(related.flatMap(row => row.sources))
+    store.replaceProjects(projectResponse.data ?? [])
     loaded.value = true
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : t('production.errors.loadProjects')
