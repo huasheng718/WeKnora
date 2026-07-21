@@ -3,6 +3,9 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Tencent/WeKnora/internal/types"
@@ -15,6 +18,28 @@ import (
 type stubKnowledgeBaseService struct {
 	kb      *types.KnowledgeBase
 	results []*types.SearchResult
+}
+
+type scopedGraphQueryCall struct {
+	tenantID uint64
+	kbID     string
+	nodes    []string
+}
+
+type stubScopedGraphQueryService struct {
+	mu    sync.Mutex
+	calls []scopedGraphQueryCall
+	err   error
+}
+
+func (s *stubScopedGraphQueryService) SearchKnowledgeGraph(ctx context.Context, tenantID uint64, knowledgeBaseID string, nodes []string) (*types.GraphData, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, scopedGraphQueryCall{tenantID: tenantID, kbID: knowledgeBaseID, nodes: append([]string(nil), nodes...)})
+	if s.err != nil {
+		return nil, s.err
+	}
+	return &types.GraphData{Node: []*types.GraphNode{{Name: "active"}}}, nil
 }
 
 func (s *stubKnowledgeBaseService) CreateKnowledgeBase(context.Context, *types.KnowledgeBase) (*types.KnowledgeBase, error) {
@@ -181,4 +206,28 @@ func TestQueryKnowledgeGraph_ReportsConfiguredEntityAndRelationTypes(t *testing.
 	require.True(t, ok)
 	assert.ElementsMatch(t, []string{"合同", "审批流程", "法务部门"}, graphConfig["nodes"])
 	assert.ElementsMatch(t, []string{"属于", "审批", "管理"}, graphConfig["relations"])
+}
+
+func TestQueryKnowledgeGraphUsesScopedGraphQueryAndReportsGraphErrors(t *testing.T) {
+	graphQuery := &stubScopedGraphQueryService{}
+	tool := NewQueryKnowledgeGraphTool(&stubKnowledgeBaseService{kb: &types.KnowledgeBase{
+		ID: "kb-1", ExtractConfig: &types.ExtractConfig{Enabled: true, Nodes: []*types.GraphNode{{Name: "term"}}},
+	}}, graphQuery)
+	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(200))
+	args, err := json.Marshal(QueryKnowledgeGraphInput{KnowledgeBaseIDs: []string{"kb-1"}, Query: "term"})
+	require.NoError(t, err)
+
+	result, err := tool.Execute(ctx, args)
+	require.NoError(t, err)
+	require.True(t, result.Success)
+	require.Equal(t, []scopedGraphQueryCall{{tenantID: 200, kbID: "kb-1", nodes: []string{"term"}}}, graphQuery.calls)
+	graph, ok := result.Data["scoped_graph"].(*types.GraphData)
+	require.True(t, ok)
+	require.Equal(t, "active", graph.Node[0].Name)
+
+	graphQuery.err = errors.New("neo4j unavailable")
+	result, err = tool.Execute(ctx, args)
+	require.NoError(t, err)
+	require.True(t, result.Success)
+	require.Contains(t, strings.Join(result.Data["errors"].([]string), "\n"), "graph query failed")
 }

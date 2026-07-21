@@ -15,3 +15,15 @@ type RetrieveGraphRepository interface {
 	// SearchNode searches for nodes in the repository
 	SearchNode(ctx context.Context, namespace types.NameSpace, nodes []string) (*types.GraphData, error)
 }
+
+// KnowledgeGraphQueryService scopes graph reads to visible Knowledge documents
+// before querying the graph repository.
+type KnowledgeGraphQueryService interface {
+	SearchKnowledgeGraph(ctx context.Context, tenantID uint64, knowledgeBaseID string, nodes []string) (*types.GraphData, error)
+}
+
+// ExplicitKnowledgeGraphQueryService applies production visibility to a
+// graph read that targets one Knowledge document.
+type ExplicitKnowledgeGraphQueryService interface {
+	SearchExplicitKnowledgeGraph(ctx context.Context, tenantID uint64, knowledgeBaseID, knowledgeID string, nodes []string) (*types.GraphData, error)
+}

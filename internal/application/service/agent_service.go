@@ -603,7 +603,11 @@ func (s *agentService) registerTools(
 		case tools.ToolListKnowledgeChunks:
 			toolToRegister = tools.NewListKnowledgeChunksTool(s.knowledgeService, s.chunkService, config.SearchTargets)
 		case tools.ToolQueryKnowledgeGraph:
-			toolToRegister = tools.NewQueryKnowledgeGraphTool(s.knowledgeBaseService)
+			if graphQuery, ok := s.knowledgeService.(interfaces.KnowledgeGraphQueryService); ok {
+				toolToRegister = tools.NewQueryKnowledgeGraphTool(s.knowledgeBaseService, graphQuery)
+			} else {
+				toolToRegister = tools.NewQueryKnowledgeGraphTool(s.knowledgeBaseService)
+			}
 		case tools.ToolGetDocumentInfo:
 			toolToRegister = tools.NewGetDocumentInfoTool(s.knowledgeService, s.chunkService, config.SearchTargets)
 		case tools.ToolDatabaseQuery:

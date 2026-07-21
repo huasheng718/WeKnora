@@ -69,14 +69,19 @@ type QueryKnowledgeGraphInput struct {
 type QueryKnowledgeGraphTool struct {
 	BaseTool
 	knowledgeService interfaces.KnowledgeBaseService
+	graphQuery       interfaces.KnowledgeGraphQueryService
 }
 
 // NewQueryKnowledgeGraphTool creates a new query knowledge graph tool
-func NewQueryKnowledgeGraphTool(knowledgeService interfaces.KnowledgeBaseService) *QueryKnowledgeGraphTool {
-	return &QueryKnowledgeGraphTool{
+func NewQueryKnowledgeGraphTool(knowledgeService interfaces.KnowledgeBaseService, graphQuery ...interfaces.KnowledgeGraphQueryService) *QueryKnowledgeGraphTool {
+	tool := &QueryKnowledgeGraphTool{
 		BaseTool:         queryKnowledgeGraphTool,
 		knowledgeService: knowledgeService,
 	}
+	if len(graphQuery) > 0 {
+		tool.graphQuery = graphQuery[0]
+	}
+	return tool
 }
 
 // Execute performs the knowledge graph query with concurrent KB processing
@@ -119,6 +124,7 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 		kbID    string
 		kb      *types.KnowledgeBase
 		results []*types.SearchResult
+		graph   *types.GraphData
 		err     error
 	}
 
@@ -153,7 +159,19 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 				return
 			}
 
-			// Query graph
+			var graph *types.GraphData
+			if t.graphQuery != nil {
+				tenantID, _ := types.TenantIDFromContext(ctx)
+				graph, err = t.graphQuery.SearchKnowledgeGraph(ctx, tenantID, id, []string{query})
+				if err != nil {
+					mu.Lock()
+					kbResults[id] = &graphQueryResult{kbID: id, kb: kb, err: fmt.Errorf("graph query failed: %v", err)}
+					mu.Unlock()
+					return
+				}
+			}
+
+			// Keep hybrid chunk recall as a companion result for existing callers.
 			results, err := t.knowledgeService.HybridSearch(ctx, id, searchParams)
 			if err != nil {
 				mu.Lock()
@@ -163,7 +181,7 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 			}
 
 			mu.Lock()
-			kbResults[id] = &graphQueryResult{kbID: id, kb: kb, results: results}
+			kbResults[id] = &graphQueryResult{kbID: id, kb: kb, results: results, graph: graph}
 			mu.Unlock()
 		}(kbID)
 	}
@@ -172,6 +190,7 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 
 	// Collect and deduplicate results
 	seenChunks := make(map[string]*types.SearchResult)
+	var scopedGraph *types.GraphData
 	var errors []string
 	graphConfigs := make(map[string]graphConfigSummary)
 	kbCounts := make(map[string]int)
@@ -188,6 +207,9 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 		}
 
 		kbCounts[kbID] = len(result.results)
+		if result.graph != nil {
+			scopedGraph = appendGraphData(scopedGraph, result.graph)
+		}
 		for _, r := range result.results {
 			if _, seen := seenChunks[r.ID]; !seen {
 				seenChunks[r.ID] = r
@@ -205,7 +227,7 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 		return allResults[i].Score > allResults[j].Score
 	})
 
-	if len(allResults) == 0 {
+	if len(allResults) == 0 && (scopedGraph == nil || (len(scopedGraph.Node) == 0 && len(scopedGraph.Relation) == 0)) {
 		return &types.ToolResult{
 			Success: true,
 			Output:  "No relevant graph information found.",
@@ -215,6 +237,8 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 				"results":            []interface{}{},
 				"graph_configs":      graphConfigsToData(graphConfigs),
 				"graph_config":       aggregateGraphConfig(graphConfigs),
+				"graph_data":         scopedGraph,
+				"scoped_graph":       scopedGraph,
 				"errors":             errors,
 			},
 		}, nil
@@ -334,11 +358,87 @@ func (t *QueryKnowledgeGraphTool) Execute(ctx context.Context, args json.RawMess
 			"graph_configs":      graphConfigsToData(graphConfigs),
 			"graph_config":       aggregateGraphConfig(graphConfigs),
 			"graph_data":         graphData,
+			"scoped_graph":       scopedGraph,
 			"has_graph_config":   hasGraphConfig,
 			"errors":             errors,
 			"display_type":       "graph_query_results",
 		},
 	}, nil
+}
+
+func appendGraphData(destination, source *types.GraphData) *types.GraphData {
+	if destination == nil {
+		destination = &types.GraphData{}
+	}
+	if source == nil {
+		return destination
+	}
+	nodes := make(map[string]*types.GraphNode, len(destination.Node))
+	for _, node := range destination.Node {
+		if node != nil {
+			nodes[node.Name] = node
+		}
+	}
+	for _, node := range source.Node {
+		if node == nil {
+			continue
+		}
+		if existing := nodes[node.Name]; existing != nil {
+			existing.Chunks = appendUniqueStrings(existing.Chunks, node.Chunks)
+			existing.Attributes = appendUniqueStrings(existing.Attributes, node.Attributes)
+			continue
+		}
+		copyNode := *node
+		copyNode.Chunks = append([]string(nil), node.Chunks...)
+		copyNode.Attributes = append([]string(nil), node.Attributes...)
+		destination.Node = append(destination.Node, &copyNode)
+		nodes[copyNode.Name] = &copyNode
+	}
+	relations := make(map[string]*types.GraphRelation, len(destination.Relation))
+	for _, relation := range destination.Relation {
+		if relation != nil {
+			relations[toolGraphRelationKey(relation)] = relation
+		}
+	}
+	for _, relation := range source.Relation {
+		if relation == nil {
+			continue
+		}
+		key := toolGraphRelationKey(relation)
+		if existing := relations[key]; existing != nil {
+			existing.KnowledgeIDs = appendUniqueStrings(existing.KnowledgeIDs, relation.KnowledgeIDs)
+			continue
+		}
+		copyRelation := *relation
+		copyRelation.KnowledgeIDs = append([]string(nil), relation.KnowledgeIDs...)
+		destination.Relation = append(destination.Relation, &copyRelation)
+		relations[key] = &copyRelation
+	}
+	sort.Slice(destination.Node, func(i, j int) bool { return destination.Node[i].Name < destination.Node[j].Name })
+	sort.Slice(destination.Relation, func(i, j int) bool {
+		return toolGraphRelationKey(destination.Relation[i]) < toolGraphRelationKey(destination.Relation[j])
+	})
+	return destination
+}
+
+func appendUniqueStrings(existing, additions []string) []string {
+	seen := make(map[string]struct{}, len(existing)+len(additions))
+	for _, value := range existing {
+		seen[value] = struct{}{}
+	}
+	for _, value := range additions {
+		if _, duplicate := seen[value]; duplicate {
+			continue
+		}
+		seen[value] = struct{}{}
+		existing = append(existing, value)
+	}
+	sort.Strings(existing)
+	return existing
+}
+
+func toolGraphRelationKey(relation *types.GraphRelation) string {
+	return relation.Node1 + "\x00" + relation.Node2 + "\x00" + relation.Type
 }
 
 func summarizeGraphConfig(config *types.ExtractConfig) graphConfigSummary {

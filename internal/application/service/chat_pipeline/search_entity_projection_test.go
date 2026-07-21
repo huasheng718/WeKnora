@@ -3,12 +3,49 @@ package chatpipeline
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/stretchr/testify/require"
 )
+
+type scopedEntityGraphQueryService struct {
+	mu       sync.Mutex
+	tenantID uint64
+	kbID     string
+	nodes    []string
+	err      error
+}
+
+func (s *scopedEntityGraphQueryService) SearchKnowledgeGraph(_ context.Context, tenantID uint64, knowledgeBaseID string, nodes []string) (*types.GraphData, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tenantID = tenantID
+	s.kbID = knowledgeBaseID
+	s.nodes = append([]string(nil), nodes...)
+	if s.err != nil {
+		return nil, s.err
+	}
+	return &types.GraphData{}, nil
+}
+
+func TestEntitySearchUsesScopedGraphQueryWithTargetOwnerTenant(t *testing.T) {
+	graphQuery := &scopedEntityGraphQueryService{}
+	p := &PluginSearchEntity{graphQuery: graphQuery}
+	chat := &types.ChatManage{
+		PipelineRequest: types.PipelineRequest{TenantID: 7, SearchTargets: types.SearchTargets{&types.SearchTarget{
+			Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-shared", TenantID: 200,
+		}}},
+		PipelineState: types.PipelineState{Entity: []string{"term"}, EntityKBIDs: []string{"kb-shared"}},
+	}
+	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(7))
+	require.Nil(t, p.OnEvent(ctx, types.ENTITY_SEARCH, chat, func() *PluginError { return nil }))
+	require.Equal(t, uint64(200), graphQuery.tenantID)
+	require.Equal(t, "kb-shared", graphQuery.kbID)
+	require.Equal(t, []string{"term"}, graphQuery.nodes)
+}
 
 type projectionEntityGraphRepo struct {
 	interfaces.RetrieveGraphRepository

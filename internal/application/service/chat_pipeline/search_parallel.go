@@ -63,6 +63,8 @@ func NewPluginSearchParallel(
 		chunkRepo:     chunkRepository,
 		knowledgeRepo: knowledgeRepository,
 	}
+	searchEntityPlugin.graphQuery, _ = knowledgeService.(interfaces.KnowledgeGraphQueryService)
+	searchEntityPlugin.explicitGraphQuery, _ = knowledgeService.(interfaces.ExplicitKnowledgeGraphQueryService)
 
 	res := &PluginSearchParallel{
 		knowledgeBaseService: knowledgeBaseService,

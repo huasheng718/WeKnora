@@ -13,9 +13,11 @@ import (
 
 // PluginSearch implements search functionality for chat pipeline
 type PluginSearchEntity struct {
-	graphRepo     interfaces.RetrieveGraphRepository
-	chunkRepo     interfaces.ChunkRepository
-	knowledgeRepo interfaces.KnowledgeRepository
+	graphRepo          interfaces.RetrieveGraphRepository
+	chunkRepo          interfaces.ChunkRepository
+	knowledgeRepo      interfaces.KnowledgeRepository
+	graphQuery         interfaces.KnowledgeGraphQueryService
+	explicitGraphQuery interfaces.ExplicitKnowledgeGraphQueryService
 }
 
 // NewPluginSearchEntity creates a new plugin search entity
@@ -24,12 +26,15 @@ func NewPluginSearchEntity(
 	graphRepository interfaces.RetrieveGraphRepository,
 	chunkRepository interfaces.ChunkRepository,
 	knowledgeRepository interfaces.KnowledgeRepository,
+	knowledgeService interfaces.KnowledgeService,
 ) *PluginSearchEntity {
 	res := &PluginSearchEntity{
 		graphRepo:     graphRepository,
 		chunkRepo:     chunkRepository,
 		knowledgeRepo: knowledgeRepository,
 	}
+	res.graphQuery, _ = knowledgeService.(interfaces.KnowledgeGraphQueryService)
+	res.explicitGraphQuery, _ = knowledgeService.(interfaces.ExplicitKnowledgeGraphQueryService)
 	eventManager.Register(res)
 	return res
 }
@@ -76,12 +81,16 @@ func (p *PluginSearchEntity) OnEvent(ctx context.Context,
 			go func(knowledgeBaseID, knowledgeID string) {
 				defer wg.Done()
 
-				graph, err := p.graphRepo.SearchNode(ctx, types.NameSpace{
-					KnowledgeBase: knowledgeBaseID,
-					Knowledge:     knowledgeID,
-				}, entity)
+				ownerTenantID := ownerTenantByKB[knowledgeBaseID]
+				if ownerTenantID == 0 {
+					ownerTenantID = chatManage.TenantID
+				}
+				graph, err := p.searchExplicitGraph(ctx, ownerTenantID, knowledgeBaseID, knowledgeID, entity)
 				if err != nil {
 					logger.Errorf(ctx, "Failed to search entity in Knowledge %s: %v", knowledgeID, err)
+					return
+				}
+				if graph == nil {
 					return
 				}
 
@@ -113,9 +122,16 @@ func (p *PluginSearchEntity) OnEvent(ctx context.Context,
 			go func(knowledgeBaseID string) {
 				defer wg.Done()
 
-				graph, err := p.graphRepo.SearchNode(ctx, types.NameSpace{KnowledgeBase: knowledgeBaseID}, entity)
+				ownerTenantID := ownerTenantByKB[knowledgeBaseID]
+				if ownerTenantID == 0 {
+					ownerTenantID = chatManage.TenantID
+				}
+				graph, err := p.searchKnowledgeBaseGraph(ctx, ownerTenantID, knowledgeBaseID, entity)
 				if err != nil {
 					logger.Errorf(ctx, "Failed to search entity in KB %s: %v", knowledgeBaseID, err)
+					return
+				}
+				if graph == nil {
 					return
 				}
 
@@ -216,6 +232,26 @@ func (p *PluginSearchEntity) OnEvent(ctx context.Context,
 		chatManage.SessionID,
 	)
 	return next()
+}
+
+func (p *PluginSearchEntity) searchKnowledgeBaseGraph(ctx context.Context, tenantID uint64, knowledgeBaseID string, nodes []string) (*types.GraphData, error) {
+	if p.graphQuery != nil {
+		return p.graphQuery.SearchKnowledgeGraph(ctx, tenantID, knowledgeBaseID, nodes)
+	}
+	if p.graphRepo == nil {
+		return nil, fmt.Errorf("graph repository is unavailable")
+	}
+	return p.graphRepo.SearchNode(ctx, types.NameSpace{KnowledgeBase: knowledgeBaseID}, nodes)
+}
+
+func (p *PluginSearchEntity) searchExplicitGraph(ctx context.Context, tenantID uint64, knowledgeBaseID, knowledgeID string, nodes []string) (*types.GraphData, error) {
+	if p.explicitGraphQuery != nil {
+		return p.explicitGraphQuery.SearchExplicitKnowledgeGraph(ctx, tenantID, knowledgeBaseID, knowledgeID, nodes)
+	}
+	if p.graphRepo == nil {
+		return nil, fmt.Errorf("graph repository is unavailable")
+	}
+	return p.graphRepo.SearchNode(ctx, types.NameSpace{KnowledgeBase: knowledgeBaseID, Knowledge: knowledgeID}, nodes)
 }
 
 func excludedEntityKnowledgeIDs(targets types.SearchTargets) map[string]struct{} {
