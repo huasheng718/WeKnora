@@ -113,15 +113,20 @@ func performProjectionMutationRequest(t *testing.T, router http.Handler, method,
 	return recorder
 }
 
-func TestDeleteKnowledgeRejectsProjectionBeforeEnqueue(t *testing.T) {
-	projection := projectionMutationKnowledge(t, "projection-1", "kb-1")
+func activeProductionKnowledge(t *testing.T, id string) *types.Knowledge {
+	t.Helper()
+	return projectionMutationKnowledge(t, id, "kb-1")
+}
+
+func TestDeleteKnowledgeRejectsActiveProductionProjection(t *testing.T) {
+	projection := activeProductionKnowledge(t, "knowledge-1")
 	tasks := &projectionMutationTaskEnqueuer{}
 	router := newProjectionMutationRouter(&projectionMutationKnowledgeService{
 		byID: map[string]*types.Knowledge{projection.ID: projection},
 	}, tasks)
 
 	response := performProjectionMutationRequest(t, router, http.MethodDelete, "/knowledge/"+projection.ID, nil)
-	require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+	require.Equal(t, http.StatusConflict, response.Code, response.Body.String())
 	require.Zero(t, tasks.calls.Load())
 }
 
@@ -136,7 +141,7 @@ func TestBatchDeleteKnowledgeRejectsMixedProjectionBeforeEnqueue(t *testing.T) {
 	response := performProjectionMutationRequest(t, router, http.MethodPost, "/knowledge/batch-delete", map[string]any{
 		"kb_id": "kb-1", "ids": []string{ordinary.ID, projection.ID},
 	})
-	require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+	require.Equal(t, http.StatusConflict, response.Code, response.Body.String())
 	require.Zero(t, tasks.calls.Load())
 }
 
@@ -151,7 +156,7 @@ func TestBatchReparseKnowledgeRejectsMixedProjectionBeforeEnqueue(t *testing.T) 
 	response := performProjectionMutationRequest(t, router, http.MethodPost, "/knowledge/batch-reparse", map[string]any{
 		"kb_id": "kb-1", "ids": []string{ordinary.ID, projection.ID},
 	})
-	require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+	require.Equal(t, http.StatusConflict, response.Code, response.Body.String())
 	require.Zero(t, tasks.calls.Load())
 }
 
@@ -164,6 +169,6 @@ func TestClearKnowledgeBaseRejectsProjectionBeforeEnqueue(t *testing.T) {
 	}, tasks)
 
 	response := performProjectionMutationRequest(t, router, http.MethodDelete, "/knowledge-bases/kb-1/knowledge", nil)
-	require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+	require.Equal(t, http.StatusConflict, response.Code, response.Body.String())
 	require.Zero(t, tasks.calls.Load())
 }

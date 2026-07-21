@@ -244,7 +244,7 @@ func (h *KnowledgeHandler) handleDuplicateKnowledgeError(c *gin.Context,
 func rejectProductionProjectionMutationRequest(knowledgeList ...*types.Knowledge) error {
 	for _, knowledge := range knowledgeList {
 		if err := types.RejectProductionProjectionMutation(knowledge); err != nil {
-			return errors.NewBadRequestError(err.Error())
+			return errors.NewConflictError(err.Error())
 		}
 	}
 	return nil
@@ -1562,8 +1562,12 @@ func (h *KnowledgeHandler) UpdateKnowledge(c *gin.Context) {
 		return
 	}
 
-	_, effCtx, err := h.resolveKnowledgeAndValidateKBAccess(c, id, types.OrgRoleEditor)
+	current, effCtx, err := h.resolveKnowledgeAndValidateKBAccess(c, id, types.OrgRoleEditor)
 	if err != nil {
+		c.Error(err)
+		return
+	}
+	if err := rejectProductionProjectionMutationRequest(current); err != nil {
 		c.Error(err)
 		return
 	}
@@ -1613,8 +1617,12 @@ func (h *KnowledgeHandler) UpdateManualKnowledge(c *gin.Context) {
 		return
 	}
 
-	_, effCtx, err := h.resolveKnowledgeAndValidateKBAccess(c, id, types.OrgRoleEditor)
+	current, effCtx, err := h.resolveKnowledgeAndValidateKBAccess(c, id, types.OrgRoleEditor)
 	if err != nil {
+		c.Error(err)
+		return
+	}
+	if err := rejectProductionProjectionMutationRequest(current); err != nil {
 		c.Error(err)
 		return
 	}
@@ -1672,8 +1680,12 @@ func (h *KnowledgeHandler) ReparseKnowledge(c *gin.Context) {
 	}
 
 	// Validate KB access with editor permission (reparse requires write access)
-	_, effCtx, err := h.resolveKnowledgeAndValidateKBAccess(c, id, types.OrgRoleEditor)
+	current, effCtx, err := h.resolveKnowledgeAndValidateKBAccess(c, id, types.OrgRoleEditor)
 	if err != nil {
+		c.Error(err)
+		return
+	}
+	if err := rejectProductionProjectionMutationRequest(current); err != nil {
 		c.Error(err)
 		return
 	}
@@ -1741,8 +1753,12 @@ func (h *KnowledgeHandler) CancelKnowledgeParse(c *gin.Context) {
 	}
 
 	// Editor permission — same gate as ReparseKnowledge / DeleteKnowledge.
-	_, effCtx, err := h.resolveKnowledgeAndValidateKBAccess(c, id, types.OrgRoleEditor)
+	current, effCtx, err := h.resolveKnowledgeAndValidateKBAccess(c, id, types.OrgRoleEditor)
 	if err != nil {
+		c.Error(err)
+		return
+	}
+	if err := rejectProductionProjectionMutationRequest(current); err != nil {
 		c.Error(err)
 		return
 	}
@@ -1833,6 +1849,35 @@ func (h *KnowledgeHandler) UpdateKnowledgeTagBatch(c *gin.Context) {
 			ctx = effCtx
 		}
 	}
+	knowledgeIDs := make([]string, 0, len(req.Updates))
+	for knowledgeID := range req.Updates {
+		knowledgeIDs = append(knowledgeIDs, knowledgeID)
+	}
+	effectiveTenantID, ok := types.TenantIDFromContext(ctx)
+	if !ok || effectiveTenantID == 0 {
+		c.Error(errors.NewInternalServerError("workspace context unavailable"))
+		return
+	}
+	knowledgeList, err := h.kgService.GetKnowledgeBatch(ctx, effectiveTenantID, knowledgeIDs)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, nil)
+		c.Error(errors.NewInternalServerError("failed to resolve knowledge tag updates"))
+		return
+	}
+	if len(knowledgeList) != len(knowledgeIDs) {
+		c.Error(errors.NewBadRequestError("some knowledge entries were not found"))
+		return
+	}
+	for _, knowledge := range knowledgeList {
+		if knowledge == nil || knowledge.KnowledgeBaseID != authorizedKBID {
+			c.Error(errors.NewBadRequestError("knowledge tag updates must belong to the authorized knowledge base"))
+			return
+		}
+	}
+	if err := rejectProductionProjectionMutationRequest(knowledgeList...); err != nil {
+		c.Error(err)
+		return
+	}
 	if err := h.kgService.UpdateKnowledgeTagBatch(ctx, authorizedKBID, req.Updates); err != nil {
 		logger.ErrorWithFields(ctx, err, nil)
 		c.Error(err)
@@ -1874,8 +1919,12 @@ func (h *KnowledgeHandler) UpdateImageInfo(c *gin.Context) {
 		return
 	}
 
-	_, effCtx, err := h.resolveKnowledgeAndValidateKBAccess(c, id, types.OrgRoleEditor)
+	current, effCtx, err := h.resolveKnowledgeAndValidateKBAccess(c, id, types.OrgRoleEditor)
 	if err != nil {
+		c.Error(err)
+		return
+	}
+	if err := rejectProductionProjectionMutationRequest(current); err != nil {
 		c.Error(err)
 		return
 	}
@@ -2223,7 +2272,7 @@ func (h *KnowledgeHandler) MoveKnowledge(c *gin.Context) {
 			c.Error(errors.NewBadRequestError(fmt.Sprintf("Knowledge item %s does not belong to the source knowledge base", kID)))
 			return
 		}
-		if err := types.RejectProductionProjectionMutation(knowledge); err != nil {
+		if err := rejectProductionProjectionMutationRequest(knowledge); err != nil {
 			c.Error(err)
 			return
 		}

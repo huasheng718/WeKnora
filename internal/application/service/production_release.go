@@ -211,6 +211,12 @@ func (s *ProductionReleaseService) Retry(ctx context.Context, targetID string) e
 	return s.enqueueProjectionTask(ctx, types.TypeProductionBuild, types.ProductionProjectionOperationBuild, target, 0)
 }
 
+// GetTarget returns a target only after the same publisher and target-KB
+// authorization applied to every release lifecycle command.
+func (s *ProductionReleaseService) GetTarget(ctx context.Context, targetID string) (*types.ProductionReleaseTarget, error) {
+	return s.authorizeTarget(ctx, targetID)
+}
+
 func claimProductionProjectionRetry(
 	ctx context.Context,
 	uow interfaces.ProductionUnitOfWork,

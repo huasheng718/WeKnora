@@ -336,6 +336,9 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(service.NewProductionProjectionCleanup))
 	must(container.Provide(service.NewProductionCleanupRecoveryRunner))
 	must(container.Provide(service.NewProductionReleaseService))
+	must(container.Provide(func(releases *service.ProductionReleaseService) handler.ProductionReleaseService {
+		return releases
+	}))
 	must(container.Provide(service.NewProductionFailureRecoveryRunner))
 	must(container.Provide(service.NewProductionProjectionTaskHandler,
 		dig.Name("productionProjection"), dig.As(new(interfaces.TaskHandler))))
@@ -441,6 +444,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(handler.NewProductionDocumentHandler))
 	must(container.Provide(handler.NewProductionRunHandler))
 	must(container.Provide(handler.NewProductionReviewHandler))
+	must(container.Provide(handler.NewProductionReleaseHandler))
 	logger.Debugf(ctx, "[Container] HTTP handlers registered")
 
 	// Wire the chat package's local image resolver so multimodal chat can read

@@ -108,6 +108,18 @@ type productionRouterDocumentService struct {
 
 type productionRouterRunService struct{}
 
+type productionRouterReleaseService struct{}
+
+func (*productionRouterReleaseService) Prepare(context.Context, string, string, []string) (*types.ProductionRelease, error) {
+	return &types.ProductionRelease{}, nil
+}
+func (*productionRouterReleaseService) GetTarget(_ context.Context, targetID string) (*types.ProductionReleaseTarget, error) {
+	return &types.ProductionReleaseTarget{ID: targetID}, nil
+}
+func (*productionRouterReleaseService) Activate(context.Context, string, int) error { return nil }
+func (*productionRouterReleaseService) Retry(context.Context, string) error         { return nil }
+func (*productionRouterReleaseService) Rollback(context.Context, string, int) error { return nil }
+
 type productionRouterAnnotationService struct{}
 
 func (*productionRouterAnnotationService) List(context.Context, appservice.ListProductionAnnotationsInput) (*appservice.ProductionAnnotationPage, error) {
@@ -249,6 +261,7 @@ func newProductionRouteTestEngineForRoleAndReview(
 		documentHandler,
 		runHandler,
 		handler.NewProductionReviewHandler(&productionRouterAnnotationService{}, reviewService),
+		handler.NewProductionReleaseHandler(&productionRouterReleaseService{}),
 		guards,
 		middleware.NewProductionIdempotencyMiddleware(repo),
 	)
@@ -359,6 +372,20 @@ func TestProductionReviewRoutesAreRegistered(t *testing.T) {
 	}
 }
 
+func TestProductionReleaseRoutesAreRegistered(t *testing.T) {
+	engine := newProductionRouteTestEngine(&handler.ProductionProjectHandler{}, newProductionRouterIdempotencyRepo())
+
+	for _, route := range []struct{ method, path string }{
+		{http.MethodPost, "/api/v1/production/documents/:id/releases"},
+		{http.MethodGet, "/api/v1/production/release-targets/:id"},
+		{http.MethodPost, "/api/v1/production/release-targets/:id/activate"},
+		{http.MethodPost, "/api/v1/production/release-targets/:id/retry"},
+		{http.MethodPost, "/api/v1/production/release-targets/:id/rollback"},
+	} {
+		assertProductionRoute(t, engine, route.method, route.path)
+	}
+}
+
 func TestProductionReviewTerminalRoutesRequireAdminBeforeIdempotencyAndReplay(t *testing.T) {
 	const reviewID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
@@ -448,6 +475,10 @@ func TestEveryProductionWriteRouteRequiresIdempotencyKey(t *testing.T) {
 		{http.MethodPut, "/api/v1/production/annotations/annotation-1/status", `{}`},
 		{http.MethodPost, "/api/v1/production/documents/document-1/reviews", `{}`},
 		{http.MethodPost, "/api/v1/production/reviews/review-1/steps/step-1/decision", `{}`},
+		{http.MethodPost, "/api/v1/production/documents/document-1/releases", `{}`},
+		{http.MethodPost, "/api/v1/production/release-targets/target-1/activate", `{}`},
+		{http.MethodPost, "/api/v1/production/release-targets/target-1/retry", ""},
+		{http.MethodPost, "/api/v1/production/release-targets/target-1/rollback", `{}`},
 	} {
 		t.Run(request.method+" "+request.path, func(t *testing.T) {
 			recorder := httptest.NewRecorder()

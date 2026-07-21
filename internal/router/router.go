@@ -97,6 +97,7 @@ type RouterParams struct {
 	ProductionDocumentHandler    *handler.ProductionDocumentHandler
 	ProductionRunHandler         *handler.ProductionRunHandler
 	ProductionReviewHandler      *handler.ProductionReviewHandler
+	ProductionReleaseHandler     *handler.ProductionReleaseHandler
 	ProductionIdempotency        *middleware.ProductionIdempotencyMiddleware
 }
 
@@ -276,6 +277,7 @@ func NewRouter(params RouterParams) *gin.Engine {
 			params.ProductionDocumentHandler,
 			params.ProductionRunHandler,
 			params.ProductionReviewHandler,
+			params.ProductionReleaseHandler,
 			rbacGuards,
 			params.ProductionIdempotency,
 		)
@@ -312,6 +314,7 @@ func RegisterProductionRoutes(
 	documentHandler *handler.ProductionDocumentHandler,
 	runHandler *handler.ProductionRunHandler,
 	reviewHandler *handler.ProductionReviewHandler,
+	releaseHandler *handler.ProductionReleaseHandler,
 	g *rbacGuards,
 	idempotency *middleware.ProductionIdempotencyMiddleware,
 ) {
@@ -341,6 +344,11 @@ func RegisterProductionRoutes(
 	production.POST("/reviews/:id/steps/:step_id/decision", g.Contributor(), idempotency.Require(), reviewHandler.Decide)
 	production.POST("/reviews/:id/reject", g.Admin(), idempotency.Require(), reviewHandler.Reject)
 	production.POST("/reviews/:id/cancel", g.Admin(), idempotency.Require(), reviewHandler.Cancel)
+	production.POST("/documents/:id/releases", g.Contributor(), idempotency.Require(), releaseHandler.Create)
+	production.GET("/release-targets/:id", g.Contributor(), releaseHandler.GetTarget)
+	production.POST("/release-targets/:id/activate", g.Contributor(), idempotency.Require(), releaseHandler.Activate)
+	production.POST("/release-targets/:id/retry", g.Contributor(), idempotency.Require(), releaseHandler.Retry)
+	production.POST("/release-targets/:id/rollback", g.Contributor(), idempotency.Require(), releaseHandler.Rollback)
 }
 
 // RegisterChunkerDebugRoutes wires the read-only chunker preview endpoint
