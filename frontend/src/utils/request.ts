@@ -287,10 +287,14 @@ export function post<T = any>(url: string, data = {}, config?: any): Promise<T> 
   return instance.post<T>(url, data, config) as unknown as Promise<T>;
 }
 
+export function postEmpty<T = any>(url: string, config?: any): Promise<T> {
+  return instance.post<T>(url, undefined, config) as unknown as Promise<T>;
+}
+
 export function put<T = any>(url: string, data = {}, config?: any): Promise<T> {
   return instance.put<T>(url, data, config) as unknown as Promise<T>;
 }
 
-export function del<T = any>(url: string, data?: any): Promise<T> {
-  return instance.delete<T>(url, { data }) as unknown as Promise<T>;
+export function del<T = any>(url: string, data?: any, config?: any): Promise<T> {
+  return instance.delete<T>(url, { ...config, data }) as unknown as Promise<T>;
 }
