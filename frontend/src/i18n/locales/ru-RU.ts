@@ -44,6 +44,43 @@ export default {
     integrations: 'Публикация и интеграция',
     organizations: 'Общие пространства'
   },
+  production: {
+    workspace: 'Рабочая область публикации',
+    actions: { create: 'Создать', cancel: 'Отмена', retry: 'Повторить', refresh: 'Обновить', open: 'Открыть', backToProjects: 'Назад к проектам' },
+    permissions: { createDenied: 'Ваша роль не позволяет создавать проекты.', editDenied: 'У вас доступ к проекту только для чтения.', archivedReadonly: 'Проект архивирован и доступен только для чтения.' },
+    fields: { projectName: 'Название проекта', description: 'Описание', documentType: 'Тип документа', unknownType: 'Неизвестный тип', documentTitle: 'Название документа', sourceSet: 'Набор источников' },
+    validation: { nameRequired: 'Введите название проекта.', nameTooLong: 'Название проекта может содержать не более 255 символов.' },
+    projectDialog: { title: 'Создать производственный проект', namePlaceholder: 'Например, стандарт оказания услуг', descriptionPlaceholder: 'Область, аудитория и ожидаемый результат' },
+    projects: {
+      title: 'Создание знаний', description: 'Организуйте управляемые наборы источников и документы по проектам.', create: 'Новый проект', count: 'Проектов: {count}',
+      emptyTitle: 'Нет производственных проектов', emptyEditable: 'Создайте проект, чтобы начать сбор управляемых источников.', emptyReadonly: 'Вам не предоставлено ни одного проекта.',
+      noDescription: 'Нет описания', notFoundTitle: 'Проект недоступен', notFound: 'Проект не существует или у вас больше нет доступа.'
+    },
+    metrics: { documents: 'Документы', sourceSets: 'Источники', activity: 'Активность', updated: 'Обновлено', inFlight: 'В работе: {count}' },
+    projectStatus: { active: 'Активен', archived: 'В архиве' },
+    tabs: { sources: 'Источники', documents: 'Документы', reviews: 'Проверки', releases: 'Публикации' },
+    sources: {
+      title: 'Наборы источников', description: 'Управляйте границами доказательств для создания документов.', create: 'Новый набор', dialogTitle: 'Создать набор источников',
+      typePlaceholder: 'Выберите активный тип документа', noActiveTypes: 'Нет активных типов документов.', emptyTitle: 'Нет наборов источников',
+      emptyEditable: 'Создайте набор источников, чтобы определить границы доказательств.', emptyReadonly: 'Для проекта нет доступных наборов источников.', allTime: 'Всё доступное время', range: '{start} - {end}', openRange: 'Без ограничения'
+    },
+    sourceStatus: { collecting: 'Сбор', ready: 'Готов', failed: 'Ошибка', frozen: 'Зафиксирован' },
+    documents: {
+      title: 'Производственные документы', description: 'Документы из зафиксированных управляемых источников.', create: 'Новый документ', dialogTitle: 'Создать документ',
+      titlePlaceholder: 'Введите название документа', typePlaceholder: 'Выберите тип документа', sourcePlaceholder: 'Выберите зафиксированный набор источников',
+      noActiveTypes: 'Нет активных типов документов.', noFrozenSources: 'Зафиксируйте набор источников перед созданием документа.', emptyTitle: 'Нет документов',
+      emptyEditable: 'Создайте документ после фиксации набора источников.', emptyReadonly: 'Для проекта нет доступных документов.'
+    },
+    documentStatus: { draft: 'Черновик', annotating: 'Аннотирование', in_review: 'На проверке', approved: 'Одобрен', publishing: 'Публикация', published: 'Опубликован', archived: 'В архиве' },
+    reviews: { emptyTitle: 'Нет записей проверки', empty: 'Записи появятся здесь, когда документы поступят на управляемую проверку.' },
+    releases: { emptyTitle: 'Нет записей публикации', empty: 'Записи появятся здесь после подготовки одобренного документа к публикации.' },
+    errors: {
+      createProject: 'Не удалось создать проект.', loadSourcesTitle: 'Не удалось загрузить источники', loadDocumentsTitle: 'Не удалось загрузить документы',
+      createSource: 'Не удалось создать набор источников.', createDocument: 'Не удалось создать документ.', loadProjectsTitle: 'Не удалось загрузить проекты',
+      loadProjects: 'Не удалось загрузить производственные проекты.', loadProjectSummary: 'Не удалось загрузить сводку проекта.', loadWorkbenchTitle: 'Не удалось загрузить рабочую область', loadWorkbench: 'Не удалось загрузить рабочую область проекта.'
+    },
+    messages: { projectCreated: 'Проект создан.', sourceCreated: 'Набор источников создан.', documentCreated: 'Документ создан.' },
+  },
   newUserGuide: {
     stepOf: '{current} / {total}',
     skip: 'Пропустить',

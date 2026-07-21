@@ -115,3 +115,15 @@ test('production document detail clients use the authorized detail routes', asyn
     ['get', '/api/v1/production/documents/document-1/versions/version-1'],
   ])
 })
+
+test('production project workbench clients use project-scoped list routes', async () => {
+  requests.length = 0
+
+  await production.listProductionSourceSets('project-1')
+  await production.listProductionDocuments('project-1')
+
+  assert.deepEqual(requests.map(request => [request.method, request.url]), [
+    ['get', '/api/v1/production/projects/project-1/source-sets'],
+    ['get', '/api/v1/production/projects/project-1/documents'],
+  ])
+})

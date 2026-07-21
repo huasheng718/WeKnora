@@ -95,6 +95,19 @@ func (r *productionDocumentRepository) CreateDocument(
 
 func productionDocumentStringPointer(value string) *string { return &value }
 
+func (r *productionDocumentRepository) ListDocuments(
+	ctx context.Context,
+	tenantID uint64,
+	projectID string,
+) ([]*types.ProductionDocument, error) {
+	documents := make([]*types.ProductionDocument, 0)
+	err := database.DBFromContext(ctx, r.db).WithContext(ctx).
+		Where("tenant_id = ? AND project_id = ?", tenantID, projectID).
+		Order("updated_at DESC, id DESC").
+		Find(&documents).Error
+	return documents, err
+}
+
 func (r *productionDocumentRepository) GetDocument(
 	ctx context.Context,
 	tenantID uint64,

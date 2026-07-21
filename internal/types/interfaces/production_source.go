@@ -43,6 +43,7 @@ type ProductionProjectAuthorizer interface {
 
 type ProductionSourceRepository interface {
 	CreateSet(ctx context.Context, sourceSet *types.ProductionSourceSet) error
+	ListSets(ctx context.Context, tenantID uint64, projectID string) ([]*types.ProductionSourceSet, error)
 	GetSet(ctx context.Context, tenantID uint64, sourceSetID string) (*types.ProductionSourceSet, error)
 	CreateItem(ctx context.Context, tenantID uint64, sourceSetID string, item *types.ProductionSourceItem) error
 	GetItem(ctx context.Context, tenantID uint64, itemID string) (*types.ProductionSourceItem, *types.ProductionSourceSet, error)
@@ -55,6 +56,7 @@ type ProductionSourceRepository interface {
 
 type ProductionSourceService interface {
 	CreateSet(ctx context.Context, input CreateProductionSourceSetInput) (*types.ProductionSourceSet, error)
+	ListSets(ctx context.Context, projectID string) ([]*types.ProductionSourceSet, error)
 	AddItem(ctx context.Context, sourceSetID string, input CreateProductionSourceItemInput) (*types.ProductionSourceItem, error)
 	DecideItem(ctx context.Context, itemID string, decision types.ProductionSourceItemStatus) error
 	AttachEvidence(ctx context.Context, itemID string, evidence CreateEvidenceSnapshotInput) (*types.ProductionEvidenceSnapshot, error)

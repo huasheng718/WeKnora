@@ -34,6 +34,10 @@ type productionAnnotationDocumentRepoStub struct {
 	versions map[string]*types.ProductionDocumentVersion
 }
 
+func (r *productionAnnotationDocumentRepoStub) ListDocuments(context.Context, uint64, string) ([]*types.ProductionDocument, error) {
+	return nil, nil
+}
+
 func (r *productionAnnotationDocumentRepoStub) CreateDocument(context.Context, *types.ProductionDocument, *types.ProductionDocumentVersion) error {
 	return errors.New("unexpected CreateDocument")
 }

@@ -44,6 +44,43 @@ export default {
     noSessions: "暂无对话",
     loadMoreSessions: "加载更多",
   },
+  production: {
+    workspace: "生产工作台",
+    actions: { create: "创建", cancel: "取消", retry: "重试", refresh: "刷新", open: "打开", backToProjects: "返回项目列表" },
+    permissions: { createDenied: "当前空间角色无权创建项目。", editDenied: "你对该项目只有只读权限。", archivedReadonly: "该项目已归档，当前为只读模式。" },
+    fields: { projectName: "项目名称", description: "描述", documentType: "文档类型", unknownType: "未知类型", documentTitle: "文档标题", sourceSet: "来源集" },
+    validation: { nameRequired: "请输入项目名称。", nameTooLong: "项目名称最多可包含 255 个字符。" },
+    projectDialog: { title: "创建生产项目", namePlaceholder: "例如：服务交付基线", descriptionPlaceholder: "说明范围、读者和预期产物" },
+    projects: {
+      title: "知识生产", description: "按项目组织受治理的来源集和生产文档。", create: "新建项目", count: "共 {count} 个项目",
+      emptyTitle: "暂无生产项目", emptyEditable: "创建项目后即可开始采集受治理的来源。", emptyReadonly: "当前没有向你开放的项目。",
+      noDescription: "暂无描述", notFoundTitle: "项目不可用", notFound: "项目不存在，或你已无权访问。"
+    },
+    metrics: { documents: "文档", sourceSets: "来源集", activity: "最近活动", updated: "更新时间", inFlight: "{count} 个运行中" },
+    projectStatus: { active: "进行中", archived: "已归档" },
+    tabs: { sources: "来源", documents: "文档", reviews: "审核", releases: "发布" },
+    sources: {
+      title: "来源集", description: "管理生产文档使用的证据边界。", create: "新建来源集", dialogTitle: "创建来源集",
+      typePlaceholder: "选择启用中的文档类型", noActiveTypes: "当前没有启用中的文档类型。", emptyTitle: "暂无来源集",
+      emptyEditable: "创建来源集以定义证据边界。", emptyReadonly: "该项目暂无可查看的来源集。", allTime: "全部可用时间", range: "{start} 至 {end}", openRange: "不限"
+    },
+    sourceStatus: { collecting: "采集中", ready: "就绪", failed: "失败", frozen: "已冻结" },
+    documents: {
+      title: "生产文档", description: "基于已冻结、受治理的来源集创建文档。", create: "新建文档", dialogTitle: "创建文档",
+      titlePlaceholder: "输入文档标题", typePlaceholder: "选择文档类型", sourcePlaceholder: "选择已冻结的来源集",
+      noActiveTypes: "当前没有启用中的文档类型。", noFrozenSources: "创建文档前需要先冻结来源集。", emptyTitle: "暂无文档",
+      emptyEditable: "来源集冻结后即可创建文档。", emptyReadonly: "该项目暂无可查看的文档。"
+    },
+    documentStatus: { draft: "草稿", annotating: "标注中", in_review: "审核中", approved: "已通过", publishing: "发布中", published: "已发布", archived: "已归档" },
+    reviews: { emptyTitle: "暂无审核记录", empty: "文档进入受治理审核后，审核记录会显示在这里。" },
+    releases: { emptyTitle: "暂无发布记录", empty: "已通过的文档准备发布后，发布记录会显示在这里。" },
+    errors: {
+      createProject: "创建项目失败。", loadSourcesTitle: "无法加载来源集", loadDocumentsTitle: "无法加载文档",
+      createSource: "创建来源集失败。", createDocument: "创建文档失败。", loadProjectsTitle: "无法加载项目",
+      loadProjects: "加载生产项目失败。", loadProjectSummary: "加载项目摘要失败。", loadWorkbenchTitle: "无法加载项目工作台", loadWorkbench: "加载项目工作台失败。"
+    },
+    messages: { projectCreated: "项目已创建。", sourceCreated: "来源集已创建。", documentCreated: "文档已创建。" },
+  },
   newUserGuide: {
     stepOf: "{current} / {total}",
     skip: "跳过引导",

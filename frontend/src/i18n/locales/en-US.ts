@@ -44,6 +44,43 @@ export default {
     noSessions: 'No conversations yet',
     loadMoreSessions: 'Load more',
   },
+  production: {
+    workspace: 'Production workspace',
+    actions: { create: 'Create', cancel: 'Cancel', retry: 'Retry', refresh: 'Refresh', open: 'Open', backToProjects: 'Back to projects' },
+    permissions: { createDenied: 'Your workspace role cannot create projects.', editDenied: 'You have read-only access to this project.', archivedReadonly: 'This project is archived and available in read-only mode.' },
+    fields: { projectName: 'Project name', description: 'Description', documentType: 'Document type', unknownType: 'Unknown type', documentTitle: 'Document title', sourceSet: 'Source set' },
+    validation: { nameRequired: 'Enter a project name.', nameTooLong: 'Project names can contain at most 255 characters.' },
+    projectDialog: { title: 'Create production project', namePlaceholder: 'e.g. Service delivery baseline', descriptionPlaceholder: 'Scope, audience, and expected output' },
+    projects: {
+      title: 'Knowledge production', description: 'Organize governed source sets and production documents by project.', create: 'New project', count: '{count} projects',
+      emptyTitle: 'No production projects', emptyEditable: 'Create a project to begin collecting governed sources.', emptyReadonly: 'No projects have been shared with you.',
+      noDescription: 'No description', notFoundTitle: 'Project unavailable', notFound: 'The project does not exist or you no longer have access.'
+    },
+    metrics: { documents: 'Documents', sourceSets: 'Source sets', activity: 'Activity', updated: 'Updated', inFlight: '{count} running' },
+    projectStatus: { active: 'Active', archived: 'Archived' },
+    tabs: { sources: 'Sources', documents: 'Documents', reviews: 'Reviews', releases: 'Releases' },
+    sources: {
+      title: 'Source sets', description: 'Govern the evidence boundary used to produce documents.', create: 'New source set', dialogTitle: 'Create source set',
+      typePlaceholder: 'Select an active document type', noActiveTypes: 'No active document types are available.', emptyTitle: 'No source sets',
+      emptyEditable: 'Create a source set to define the evidence boundary.', emptyReadonly: 'No source sets are available for this project.', allTime: 'All available time', range: '{start} to {end}', openRange: 'Open'
+    },
+    sourceStatus: { collecting: 'Collecting', ready: 'Ready', failed: 'Failed', frozen: 'Frozen' },
+    documents: {
+      title: 'Production documents', description: 'Documents created from frozen, governed source sets.', create: 'New document', dialogTitle: 'Create document',
+      titlePlaceholder: 'Enter a document title', typePlaceholder: 'Select a document type', sourcePlaceholder: 'Select a frozen source set',
+      noActiveTypes: 'No active document types are available.', noFrozenSources: 'Freeze a source set before creating a document.', emptyTitle: 'No documents',
+      emptyEditable: 'Create a document after a source set has been frozen.', emptyReadonly: 'No documents are available for this project.'
+    },
+    documentStatus: { draft: 'Draft', annotating: 'Annotating', in_review: 'In review', approved: 'Approved', publishing: 'Publishing', published: 'Published', archived: 'Archived' },
+    reviews: { emptyTitle: 'No review records', empty: 'Review records will appear here when documents enter governed review.' },
+    releases: { emptyTitle: 'No release records', empty: 'Release records will appear here after an approved document is prepared for publication.' },
+    errors: {
+      createProject: 'Failed to create the project.', loadSourcesTitle: 'Source sets could not be loaded', loadDocumentsTitle: 'Documents could not be loaded',
+      createSource: 'Failed to create the source set.', createDocument: 'Failed to create the document.', loadProjectsTitle: 'Projects could not be loaded',
+      loadProjects: 'Failed to load production projects.', loadProjectSummary: 'Failed to load project summary data.', loadWorkbenchTitle: 'Project workbench could not be loaded', loadWorkbench: 'Failed to load the project workbench.'
+    },
+    messages: { projectCreated: 'Project created.', sourceCreated: 'Source set created.', documentCreated: 'Document created.' },
+  },
   newUserGuide: {
     stepOf: '{current} / {total}',
     skip: 'Skip',

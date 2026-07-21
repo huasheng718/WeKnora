@@ -200,6 +200,23 @@ func (s *productionDocumentService) CreateDocument(
 	return document, nil
 }
 
+func (s *productionDocumentService) ListDocuments(
+	ctx context.Context,
+	projectID string,
+) ([]*types.ProductionDocument, error) {
+	tenantID, _, err := productionCaller(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireProductionSourceID(projectID, "project id"); err != nil {
+		return nil, err
+	}
+	if err := requireProductionDocumentReader(ctx, s.projects, projectID); err != nil {
+		return nil, err
+	}
+	return s.documents.ListDocuments(ctx, tenantID, projectID)
+}
+
 func canonicalProductionDocumentBlock(
 	input types.ProductionDocumentBlockInput,
 	position int,

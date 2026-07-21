@@ -47,6 +47,19 @@ func (r *productionSourceRepository) CreateSet(ctx context.Context, sourceSet *t
 	)
 }
 
+func (r *productionSourceRepository) ListSets(
+	ctx context.Context,
+	tenantID uint64,
+	projectID string,
+) ([]*types.ProductionSourceSet, error) {
+	sets := make([]*types.ProductionSourceSet, 0)
+	err := database.DBFromContext(ctx, r.db).WithContext(ctx).
+		Where("tenant_id = ? AND project_id = ?", tenantID, projectID).
+		Order("created_at DESC, id DESC").
+		Find(&sets).Error
+	return sets, err
+}
+
 func (r *productionSourceRepository) GetSet(ctx context.Context, tenantID uint64, sourceSetID string) (*types.ProductionSourceSet, error) {
 	var sourceSet types.ProductionSourceSet
 	err := database.DBFromContext(ctx, r.db).WithContext(ctx).

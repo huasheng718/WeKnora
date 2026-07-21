@@ -81,6 +81,10 @@ type productionRouterSourceService struct {
 	err         error
 }
 
+func (s *productionRouterSourceService) ListSets(context.Context, string) ([]*types.ProductionSourceSet, error) {
+	return []*types.ProductionSourceSet{}, s.err
+}
+
 func (s *productionRouterSourceService) CreateSet(context.Context, interfaces.CreateProductionSourceSetInput) (*types.ProductionSourceSet, error) {
 	return nil, s.err
 }
@@ -104,6 +108,10 @@ func (s *productionRouterSourceService) Freeze(context.Context, string) error {
 type productionRouterDocumentService struct {
 	listCalls int
 	err       error
+}
+
+func (s *productionRouterDocumentService) ListDocuments(context.Context, string) ([]*types.ProductionDocument, error) {
+	return []*types.ProductionDocument{}, s.err
 }
 
 type productionRouterRunService struct{}
@@ -445,9 +453,11 @@ func TestProductionFoundationRoutesAreRegistered(t *testing.T) {
 		{http.MethodGet, "/api/v1/production/document-types"},
 		{http.MethodPost, "/api/v1/production/document-types"},
 		{http.MethodPut, "/api/v1/production/document-types/:id/activate"},
+		{http.MethodGet, "/api/v1/production/projects/:id/source-sets"},
 		{http.MethodPost, "/api/v1/production/projects/:id/source-sets"},
 		{http.MethodPut, "/api/v1/production/source-items/:id/decision"},
 		{http.MethodPost, "/api/v1/production/source-sets/:id/freeze"},
+		{http.MethodGet, "/api/v1/production/projects/:id/documents"},
 		{http.MethodPost, "/api/v1/production/projects/:id/documents"},
 		{http.MethodGet, "/api/v1/production/documents/:id"},
 		{http.MethodGet, "/api/v1/production/documents/:id/versions"},

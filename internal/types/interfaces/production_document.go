@@ -29,6 +29,7 @@ type ProductionDocumentRepository interface {
 		document *types.ProductionDocument,
 		bootstrapVersion *types.ProductionDocumentVersion,
 	) error
+	ListDocuments(ctx context.Context, tenantID uint64, projectID string) ([]*types.ProductionDocument, error)
 	GetDocument(ctx context.Context, tenantID uint64, id string) (*types.ProductionDocument, error)
 	AppendVersion(
 		ctx context.Context,
@@ -42,6 +43,7 @@ type ProductionDocumentRepository interface {
 
 type ProductionDocumentService interface {
 	CreateDocument(ctx context.Context, input CreateProductionDocumentInput) (*types.ProductionDocument, error)
+	ListDocuments(ctx context.Context, projectID string) ([]*types.ProductionDocument, error)
 	AppendVersion(ctx context.Context, documentID string, input AppendProductionVersionInput) (*types.ProductionDocumentVersion, error)
 	GetDocument(ctx context.Context, documentID string) (*types.ProductionDocument, error)
 	GetVersion(ctx context.Context, versionID string) (*types.ProductionDocumentVersion, error)

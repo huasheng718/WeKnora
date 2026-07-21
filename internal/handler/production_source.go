@@ -30,6 +30,20 @@ type decideProductionSourceItemRequest struct {
 	Decision types.ProductionSourceItemStatus `json:"decision" binding:"required"`
 }
 
+func (h *ProductionSourceHandler) ListSets(c *gin.Context) {
+	projectID := strings.TrimSpace(c.Param("id"))
+	if !isProductionUUID(projectID) {
+		c.Error(apperrors.NewValidationError("project id must be a canonical UUID"))
+		return
+	}
+	sets, err := h.service.ListSets(c.Request.Context(), projectID)
+	if err != nil {
+		handleProductionServiceError(c, err, "failed to list production source sets")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": sets})
+}
+
 func (h *ProductionSourceHandler) CreateSet(c *gin.Context) {
 	projectID := strings.TrimSpace(c.Param("id"))
 	if !isProductionUUID(projectID) {

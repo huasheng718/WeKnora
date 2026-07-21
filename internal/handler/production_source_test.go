@@ -20,13 +20,20 @@ const (
 )
 
 type productionSourceServiceStub struct {
-	created interfaces.CreateProductionSourceSetInput
-	decided struct {
+	listedProjectID string
+	sets            []*types.ProductionSourceSet
+	created         interfaces.CreateProductionSourceSetInput
+	decided         struct {
 		itemID   string
 		decision types.ProductionSourceItemStatus
 	}
 	frozenID string
 	err      error
+}
+
+func (s *productionSourceServiceStub) ListSets(_ context.Context, projectID string) ([]*types.ProductionSourceSet, error) {
+	s.listedProjectID = projectID
+	return s.sets, s.err
 }
 
 func (s *productionSourceServiceStub) CreateSet(_ context.Context, input interfaces.CreateProductionSourceSetInput) (*types.ProductionSourceSet, error) {
@@ -97,6 +104,23 @@ func TestProductionSourceHandlerCreatesDecidesAndFreezes(t *testing.T) {
 	require.Equal(t, types.ProductionSourceItemAccepted, service.decided.decision)
 	require.Equal(t, http.StatusOK, freeze.Code)
 	require.Equal(t, productionSourceSetID, service.frozenID)
+}
+
+func TestProductionSourceHandlerListsProjectSets(t *testing.T) {
+	service := &productionSourceServiceStub{sets: []*types.ProductionSourceSet{{ID: productionSourceSetID}}}
+	h := NewProductionSourceHandler(service)
+
+	response := performProductionHandlerRequest(
+		http.MethodGet,
+		"/production/projects/:id/source-sets",
+		"/production/projects/"+productionProjectID+"/source-sets",
+		"",
+		h.ListSets,
+	)
+
+	require.Equal(t, http.StatusOK, response.Code)
+	require.Equal(t, productionProjectID, service.listedProjectID)
+	require.Contains(t, response.Body.String(), productionSourceSetID)
 }
 
 func TestProductionSourceHandlerRejectsCanonicalUUIDAndBodyViolations(t *testing.T) {

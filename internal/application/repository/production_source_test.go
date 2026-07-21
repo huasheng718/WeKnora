@@ -108,6 +108,23 @@ func TestProductionSourceRepositoryScopesEveryLookupByTenant(t *testing.T) {
 	require.ErrorIs(t, repo.DecideItem(context.Background(), 8, sourceItemID, types.ProductionSourceItemAccepted), gorm.ErrRecordNotFound)
 }
 
+func TestProductionSourceRepositoryListsSetsByTenantAndProject(t *testing.T) {
+	repo, _ := newProductionSourceRepoTestDB(t)
+	createProductionSourceSet(t, repo, types.ProductionSourceSetReady)
+
+	sets, err := repo.ListSets(context.Background(), 7, sourceProjectID)
+	require.NoError(t, err)
+	require.Len(t, sets, 1)
+	require.Equal(t, sourceSetID, sets[0].ID)
+
+	sets, err = repo.ListSets(context.Background(), 8, sourceProjectID)
+	require.NoError(t, err)
+	require.Empty(t, sets)
+	sets, err = repo.ListSets(context.Background(), 7, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+	require.NoError(t, err)
+	require.Empty(t, sets)
+}
+
 func TestProductionSourceRepositoryGetsEvidenceWithAuthoritativeTenantContext(t *testing.T) {
 	repo, _ := newProductionSourceRepoTestDB(t)
 	createProductionSourceSet(t, repo, types.ProductionSourceSetCollecting)

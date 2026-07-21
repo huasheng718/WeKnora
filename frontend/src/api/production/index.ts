@@ -483,6 +483,10 @@ export function createProductionSourceSet(projectId: string, command: Production
   return post<ProductionResponse<ProductionSourceSet>>(`/api/v1/production/projects/${projectId}/source-sets`, command.payload, productionCommandConfig(command))
 }
 
+export function listProductionSourceSets(projectId: string) {
+  return get<ProductionResponse<ProductionSourceSet[]>>(`/api/v1/production/projects/${projectId}/source-sets`)
+}
+
 export function decideProductionSourceItem(id: string, command: ProductionCommand<DecideProductionSourceItemInput>) {
   return put<ProductionResponse<void>>(`/api/v1/production/source-items/${id}/decision`, command.payload, productionCommandConfig(command))
 }
@@ -493,6 +497,10 @@ export function freezeProductionSourceSet(id: string, command: ProductionCommand
 
 export function createProductionDocument(projectId: string, command: ProductionCommand<CreateProductionDocumentInput>) {
   return post<ProductionResponse<ProductionDocument>>(`/api/v1/production/projects/${projectId}/documents`, command.payload, productionCommandConfig(command))
+}
+
+export function listProductionDocuments(projectId: string) {
+  return get<ProductionResponse<ProductionDocument[]>>(`/api/v1/production/projects/${projectId}/documents`)
 }
 
 export function getProductionDocument(id: string) {

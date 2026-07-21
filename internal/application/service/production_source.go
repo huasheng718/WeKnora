@@ -78,6 +78,26 @@ func canonicalProductionJSON(value types.JSON, defaultValue string) (types.JSON,
 	return types.CanonicalProductionJSON(value)
 }
 
+func (s *productionSourceService) ListSets(
+	ctx context.Context,
+	projectID string,
+) ([]*types.ProductionSourceSet, error) {
+	tenantID, _, err := productionCaller(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireProductionSourceID(projectID, "project id"); err != nil {
+		return nil, err
+	}
+	if s.projects == nil {
+		return nil, types.ErrProductionForbidden
+	}
+	if err := s.projects.RequireProjectRole(ctx, projectID, allProductionProjectRoles...); err != nil {
+		return nil, err
+	}
+	return s.repo.ListSets(ctx, tenantID, projectID)
+}
+
 func (s *productionSourceService) CreateSet(
 	ctx context.Context,
 	input interfaces.CreateProductionSourceSetInput,

@@ -138,6 +138,33 @@ func governedServiceParagraph(logicalID, content string) types.ProductionDocumen
 	}
 }
 
+func TestProductionDocumentServiceListsProjectDocumentsForAuthorizedReaders(t *testing.T) {
+	svc, _, _, authorizer := newProductionDocumentServiceFixture(t)
+	document, err := svc.CreateDocument(productionDocumentContext(7), interfaces.CreateProductionDocumentInput{
+		ProjectID: documentServiceProjectID, DocumentTypeID: documentServiceTypeID,
+		SourceSetID: documentServiceSetID, Title: "Baseline",
+	})
+	require.NoError(t, err)
+
+	rows, err := svc.ListDocuments(productionDocumentContext(7), documentServiceProjectID)
+
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.Equal(t, document.ID, rows[0].ID)
+	require.Equal(t, documentServiceProjectID, authorizer.project)
+	require.Equal(t, allProductionProjectRoles, authorizer.roles)
+}
+
+func TestProductionDocumentServiceDoesNotListBeforeAuthorization(t *testing.T) {
+	svc, _, _, authorizer := newProductionDocumentServiceFixture(t)
+	authorizer.err = types.ErrProductionForbidden
+
+	rows, err := svc.ListDocuments(productionDocumentContext(7), documentServiceProjectID)
+
+	require.Nil(t, rows)
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
+}
+
 func TestProductionDocumentServiceCreatesBootstrapVersionAndStrictlyAuditsEveryVersion(t *testing.T) {
 	svc, repo, _, _ := newProductionDocumentServiceFixture(t)
 	audit := svc.audit.(*productionAuditServiceStub)

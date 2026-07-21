@@ -57,6 +57,20 @@ type productionDocumentVersionDetailResponse struct {
 	Lineage []*types.ProductionBlockLineage  `json:"lineage"`
 }
 
+func (h *ProductionDocumentHandler) List(c *gin.Context) {
+	projectID := strings.TrimSpace(c.Param("id"))
+	if !isProductionUUID(projectID) {
+		c.Error(apperrors.NewValidationError("project id must be a canonical UUID"))
+		return
+	}
+	documents, err := h.service.ListDocuments(c.Request.Context(), projectID)
+	if err != nil {
+		handleProductionServiceError(c, err, "failed to list production documents")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": documents})
+}
+
 func (h *ProductionDocumentHandler) Create(c *gin.Context) {
 	projectID := strings.TrimSpace(c.Param("id"))
 	if !isProductionUUID(projectID) {

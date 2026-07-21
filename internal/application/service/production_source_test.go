@@ -134,6 +134,30 @@ func createServiceSourceItem(t *testing.T, repo interfaces.ProductionSourceRepos
 	}))
 }
 
+func TestProductionSourceServiceListsProjectSetsForAuthorizedReaders(t *testing.T) {
+	svc, repo, _, authorizer, _ := newProductionSourceServiceFixture(t)
+	createServiceSourceSet(t, repo, types.ProductionSourceSetReady)
+
+	sets, err := svc.ListSets(sourceServiceContext(7), serviceProjectID)
+
+	require.NoError(t, err)
+	require.Len(t, sets, 1)
+	require.Equal(t, serviceSetID, sets[0].ID)
+	require.Equal(t, serviceProjectID, authorizer.project)
+	require.Equal(t, allProductionProjectRoles, authorizer.roles)
+}
+
+func TestProductionSourceServiceDoesNotListBeforeAuthorization(t *testing.T) {
+	svc, repo, _, authorizer, _ := newProductionSourceServiceFixture(t)
+	createServiceSourceSet(t, repo, types.ProductionSourceSetReady)
+	authorizer.err = types.ErrProductionForbidden
+
+	sets, err := svc.ListSets(sourceServiceContext(7), serviceProjectID)
+
+	require.Nil(t, sets)
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
+}
+
 func TestProductionSourceWritesRequireProjectOwnerOrAuthor(t *testing.T) {
 	svc, repo, _, authorizer, _ := newProductionSourceServiceFixture(t)
 	authorizer.err = types.ErrProductionForbidden

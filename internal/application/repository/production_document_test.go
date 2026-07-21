@@ -116,6 +116,23 @@ func TestProductionDocumentRepositoryCreatesBootstrapVersionAndHeadAtomically(t 
 	require.Len(t, versions, 1)
 }
 
+func TestProductionDocumentRepositoryListsDocumentsByTenantAndProject(t *testing.T) {
+	repo, _, _ := newProductionDocumentRepoFixture(t)
+	require.NoError(t, repo.CreateDocument(context.Background(), productionDocumentFixture(), productionBootstrapVersion()))
+
+	documents, err := repo.ListDocuments(context.Background(), 7, sourceProjectID)
+	require.NoError(t, err)
+	require.Len(t, documents, 1)
+	require.Equal(t, documentID, documents[0].ID)
+
+	documents, err = repo.ListDocuments(context.Background(), 8, sourceProjectID)
+	require.NoError(t, err)
+	require.Empty(t, documents)
+	documents, err = repo.ListDocuments(context.Background(), 7, otherProjectID)
+	require.NoError(t, err)
+	require.Empty(t, documents)
+}
+
 func TestProductionDocumentRepositoryBootstrapFailuresRollBackDocumentAndVersion(t *testing.T) {
 	tests := []struct {
 		name    string

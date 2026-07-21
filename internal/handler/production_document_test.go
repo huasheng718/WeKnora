@@ -34,8 +34,10 @@ const (
 )
 
 type productionDocumentServiceStub struct {
-	created interfaces.CreateProductionDocumentInput
-	append  struct {
+	listedProjectID string
+	documents       []*types.ProductionDocument
+	created         interfaces.CreateProductionDocumentInput
+	append          struct {
 		documentID string
 		input      interfaces.AppendProductionVersionInput
 	}
@@ -47,6 +49,11 @@ type productionDocumentServiceStub struct {
 	version              *types.ProductionDocumentVersion
 	versions             []*types.ProductionDocumentVersion
 	err                  error
+}
+
+func (s *productionDocumentServiceStub) ListDocuments(_ context.Context, projectID string) ([]*types.ProductionDocument, error) {
+	s.listedProjectID = projectID
+	return s.documents, s.err
 }
 
 func (s *productionDocumentServiceStub) CreateDocument(_ context.Context, input interfaces.CreateProductionDocumentInput) (*types.ProductionDocument, error) {
@@ -126,6 +133,23 @@ func TestProductionDocumentHandlerCreatesAppendsAndLists(t *testing.T) {
 	require.Equal(t, types.JSON(`{"text":"Hello"}`), service.append.input.Blocks[0].Content)
 	require.Equal(t, http.StatusOK, list.Code)
 	require.Equal(t, productionDocumentID, service.listedID)
+}
+
+func TestProductionDocumentHandlerListsProjectDocuments(t *testing.T) {
+	service := &productionDocumentServiceStub{documents: []*types.ProductionDocument{{ID: productionDocumentID}}}
+	h := NewProductionDocumentHandler(service)
+
+	response := performProductionHandlerRequest(
+		http.MethodGet,
+		"/production/projects/:id/documents",
+		"/production/projects/"+productionProjectID+"/documents",
+		"",
+		h.List,
+	)
+
+	require.Equal(t, http.StatusOK, response.Code)
+	require.Equal(t, productionProjectID, service.listedProjectID)
+	require.Contains(t, response.Body.String(), productionDocumentID)
 }
 
 func TestProductionDocumentHandlerGetsDocumentAndImmutableVersionDetail(t *testing.T) {

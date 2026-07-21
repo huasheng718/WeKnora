@@ -44,6 +44,43 @@ export default {
     noSessions: "대화가 없습니다",
     loadMoreSessions: "더 보기",
   },
+  production: {
+    workspace: "프로덕션 워크스페이스",
+    actions: { create: "생성", cancel: "취소", retry: "다시 시도", refresh: "새로고침", open: "열기", backToProjects: "프로젝트로 돌아가기" },
+    permissions: { createDenied: "현재 워크스페이스 역할로는 프로젝트를 만들 수 없습니다.", editDenied: "이 프로젝트는 읽기 전용입니다.", archivedReadonly: "보관된 프로젝트이며 읽기 전용으로 제공됩니다." },
+    fields: { projectName: "프로젝트 이름", description: "설명", documentType: "문서 유형", unknownType: "알 수 없는 유형", documentTitle: "문서 제목", sourceSet: "소스 세트" },
+    validation: { nameRequired: "프로젝트 이름을 입력하세요.", nameTooLong: "프로젝트 이름은 최대 255자까지 입력할 수 있습니다." },
+    projectDialog: { title: "프로덕션 프로젝트 생성", namePlaceholder: "예: 서비스 제공 기준", descriptionPlaceholder: "범위, 대상 독자 및 예상 결과" },
+    projects: {
+      title: "지식 생산", description: "관리되는 소스 세트와 프로덕션 문서를 프로젝트별로 구성합니다.", create: "새 프로젝트", count: "프로젝트 {count}개",
+      emptyTitle: "프로덕션 프로젝트 없음", emptyEditable: "프로젝트를 만들어 관리되는 소스 수집을 시작하세요.", emptyReadonly: "공유된 프로젝트가 없습니다.",
+      noDescription: "설명 없음", notFoundTitle: "프로젝트를 사용할 수 없음", notFound: "프로젝트가 없거나 더 이상 접근 권한이 없습니다."
+    },
+    metrics: { documents: "문서", sourceSets: "소스 세트", activity: "최근 활동", updated: "업데이트", inFlight: "{count}개 실행 중" },
+    projectStatus: { active: "활성", archived: "보관됨" },
+    tabs: { sources: "소스", documents: "문서", reviews: "검토", releases: "릴리스" },
+    sources: {
+      title: "소스 세트", description: "문서 생성에 사용되는 증거 범위를 관리합니다.", create: "새 소스 세트", dialogTitle: "소스 세트 생성",
+      typePlaceholder: "활성 문서 유형 선택", noActiveTypes: "활성 문서 유형이 없습니다.", emptyTitle: "소스 세트 없음",
+      emptyEditable: "소스 세트를 만들어 증거 범위를 정의하세요.", emptyReadonly: "이 프로젝트에 사용할 수 있는 소스 세트가 없습니다.", allTime: "사용 가능한 전체 기간", range: "{start} ~ {end}", openRange: "제한 없음"
+    },
+    sourceStatus: { collecting: "수집 중", ready: "준비됨", failed: "실패", frozen: "고정됨" },
+    documents: {
+      title: "프로덕션 문서", description: "고정되고 관리되는 소스 세트에서 생성된 문서입니다.", create: "새 문서", dialogTitle: "문서 생성",
+      titlePlaceholder: "문서 제목 입력", typePlaceholder: "문서 유형 선택", sourcePlaceholder: "고정된 소스 세트 선택",
+      noActiveTypes: "활성 문서 유형이 없습니다.", noFrozenSources: "문서를 만들기 전에 소스 세트를 고정하세요.", emptyTitle: "문서 없음",
+      emptyEditable: "소스 세트를 고정한 후 문서를 만들 수 있습니다.", emptyReadonly: "이 프로젝트에 사용할 수 있는 문서가 없습니다."
+    },
+    documentStatus: { draft: "초안", annotating: "주석 작성 중", in_review: "검토 중", approved: "승인됨", publishing: "게시 중", published: "게시됨", archived: "보관됨" },
+    reviews: { emptyTitle: "검토 기록 없음", empty: "문서가 관리 검토에 들어가면 기록이 여기에 표시됩니다." },
+    releases: { emptyTitle: "릴리스 기록 없음", empty: "승인된 문서가 게시 준비되면 기록이 여기에 표시됩니다." },
+    errors: {
+      createProject: "프로젝트를 만들지 못했습니다.", loadSourcesTitle: "소스 세트를 불러올 수 없음", loadDocumentsTitle: "문서를 불러올 수 없음",
+      createSource: "소스 세트를 만들지 못했습니다.", createDocument: "문서를 만들지 못했습니다.", loadProjectsTitle: "프로젝트를 불러올 수 없음",
+      loadProjects: "프로덕션 프로젝트를 불러오지 못했습니다.", loadProjectSummary: "프로젝트 요약을 불러오지 못했습니다.", loadWorkbenchTitle: "프로젝트 워크벤치를 불러올 수 없음", loadWorkbench: "프로젝트 워크벤치를 불러오지 못했습니다."
+    },
+    messages: { projectCreated: "프로젝트가 생성되었습니다.", sourceCreated: "소스 세트가 생성되었습니다.", documentCreated: "문서가 생성되었습니다." },
+  },
   newUserGuide: {
     stepOf: "{current} / {total}",
     skip: "건너뛰기",
