@@ -51,6 +51,12 @@ type productionBlockLineageRequest struct {
 	Relation           types.ProductionBlockRelation `json:"relation" binding:"required"`
 }
 
+type productionDocumentVersionDetailResponse struct {
+	*types.ProductionDocumentVersion
+	Blocks  []*types.ProductionDocumentBlock `json:"blocks"`
+	Lineage []*types.ProductionBlockLineage  `json:"lineage"`
+}
+
 func (h *ProductionDocumentHandler) Create(c *gin.Context) {
 	projectID := strings.TrimSpace(c.Param("id"))
 	if !isProductionUUID(projectID) {
@@ -86,6 +92,47 @@ func (h *ProductionDocumentHandler) Create(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusCreated, gin.H{"success": true, "data": created})
+}
+
+func (h *ProductionDocumentHandler) Get(c *gin.Context) {
+	documentID := strings.TrimSpace(c.Param("id"))
+	if !isProductionUUID(documentID) {
+		c.Error(apperrors.NewValidationError("document id must be a canonical UUID"))
+		return
+	}
+	document, err := h.service.GetDocument(c.Request.Context(), documentID)
+	if err != nil {
+		handleProductionServiceError(c, err, "failed to get production document")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": document})
+}
+
+func (h *ProductionDocumentHandler) GetVersion(c *gin.Context) {
+	documentID := strings.TrimSpace(c.Param("id"))
+	versionID := strings.TrimSpace(c.Param("version_id"))
+	if !isProductionUUID(documentID) || !isProductionUUID(versionID) {
+		c.Error(apperrors.NewValidationError("document and version ids must be canonical UUIDs"))
+		return
+	}
+	version, err := h.service.GetVersionDetail(c.Request.Context(), documentID, versionID)
+	if err != nil {
+		handleProductionServiceError(c, err, "failed to get production document version")
+		return
+	}
+	blocks := version.Blocks
+	if blocks == nil {
+		blocks = []*types.ProductionDocumentBlock{}
+	}
+	lineage := version.Lineage
+	if lineage == nil {
+		lineage = []*types.ProductionBlockLineage{}
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": productionDocumentVersionDetailResponse{
+		ProductionDocumentVersion: version,
+		Blocks:                    blocks,
+		Lineage:                   lineage,
+	}})
 }
 
 func (h *ProductionDocumentHandler) AppendVersion(c *gin.Context) {

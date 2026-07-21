@@ -43,6 +43,8 @@ type ProductionDocumentRepository interface {
 type ProductionDocumentService interface {
 	CreateDocument(ctx context.Context, input CreateProductionDocumentInput) (*types.ProductionDocument, error)
 	AppendVersion(ctx context.Context, documentID string, input AppendProductionVersionInput) (*types.ProductionDocumentVersion, error)
+	GetDocument(ctx context.Context, documentID string) (*types.ProductionDocument, error)
 	GetVersion(ctx context.Context, versionID string) (*types.ProductionDocumentVersion, error)
+	GetVersionDetail(ctx context.Context, documentID, versionID string) (*types.ProductionDocumentVersion, error)
 	ListVersions(ctx context.Context, documentID string) ([]*types.ProductionDocumentVersion, error)
 }

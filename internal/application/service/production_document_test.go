@@ -806,3 +806,35 @@ func TestProductionDocumentServiceScopesReadsByTenantAndProjectAuthorization(t *
 	require.Nil(t, got)
 	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
 }
+
+func TestProductionDocumentServiceGetsAuthorizedDocumentAndBoundVersionDetail(t *testing.T) {
+	svc, _, _, authorizer := newProductionDocumentServiceFixture(t)
+	document := createServiceDocument(t, svc)
+	version, err := svc.AppendVersion(productionDocumentContext(7), document.ID, interfaces.AppendProductionVersionInput{
+		ParentVersionID: *document.CurrentVersionID, SourceSetID: documentServiceSetID,
+		Origin: types.ProductionDocumentOriginHuman,
+		Blocks: governedServiceBlocks(serviceParagraph("block-a", `"a"`)),
+	})
+	require.NoError(t, err)
+
+	gotDocument, err := svc.GetDocument(productionDocumentContext(7), document.ID)
+	require.NoError(t, err)
+	require.Equal(t, document.ID, gotDocument.ID)
+
+	gotVersion, err := svc.GetVersionDetail(productionDocumentContext(7), document.ID, version.ID)
+	require.NoError(t, err)
+	require.Equal(t, version.ID, gotVersion.ID)
+	require.NotEmpty(t, gotVersion.Blocks)
+
+	_, err = svc.GetVersionDetail(
+		productionDocumentContext(7),
+		"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+		version.ID,
+	)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+
+	authorizer.err = types.ErrProductionForbidden
+	gotDocument, err = svc.GetDocument(productionDocumentContext(7), document.ID)
+	require.Nil(t, gotDocument)
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
+}

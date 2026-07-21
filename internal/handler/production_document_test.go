@@ -39,9 +39,14 @@ type productionDocumentServiceStub struct {
 		documentID string
 		input      interfaces.AppendProductionVersionInput
 	}
-	listedID string
-	versions []*types.ProductionDocumentVersion
-	err      error
+	listedID             string
+	gotDocumentID        string
+	gotVersionDocumentID string
+	gotVersionID         string
+	document             *types.ProductionDocument
+	version              *types.ProductionDocumentVersion
+	versions             []*types.ProductionDocumentVersion
+	err                  error
 }
 
 func (s *productionDocumentServiceStub) CreateDocument(_ context.Context, input interfaces.CreateProductionDocumentInput) (*types.ProductionDocument, error) {
@@ -69,6 +74,17 @@ func (s *productionDocumentServiceStub) AppendVersion(_ context.Context, documen
 
 func (*productionDocumentServiceStub) GetVersion(context.Context, string) (*types.ProductionDocumentVersion, error) {
 	panic("unexpected GetVersion")
+}
+
+func (s *productionDocumentServiceStub) GetDocument(_ context.Context, documentID string) (*types.ProductionDocument, error) {
+	s.gotDocumentID = documentID
+	return s.document, s.err
+}
+
+func (s *productionDocumentServiceStub) GetVersionDetail(_ context.Context, documentID, versionID string) (*types.ProductionDocumentVersion, error) {
+	s.gotVersionDocumentID = documentID
+	s.gotVersionID = versionID
+	return s.version, s.err
 }
 
 func (s *productionDocumentServiceStub) ListVersions(_ context.Context, documentID string) ([]*types.ProductionDocumentVersion, error) {
@@ -110,6 +126,40 @@ func TestProductionDocumentHandlerCreatesAppendsAndLists(t *testing.T) {
 	require.Equal(t, types.JSON(`{"text":"Hello"}`), service.append.input.Blocks[0].Content)
 	require.Equal(t, http.StatusOK, list.Code)
 	require.Equal(t, productionDocumentID, service.listedID)
+}
+
+func TestProductionDocumentHandlerGetsDocumentAndImmutableVersionDetail(t *testing.T) {
+	service := &productionDocumentServiceStub{
+		document: &types.ProductionDocument{ID: productionDocumentID},
+		version: &types.ProductionDocumentVersion{
+			ID:         productionVersionID,
+			DocumentID: productionDocumentID,
+			Blocks:     []*types.ProductionDocumentBlock{{ID: "block-1", VersionID: productionVersionID}},
+			Lineage:    []*types.ProductionBlockLineage{{ID: "lineage-1", ToVersionID: productionVersionID}},
+		},
+	}
+	h := NewProductionDocumentHandler(service)
+
+	documentResponse := performProductionDocumentHandlerRequest(
+		http.MethodGet,
+		"/production/documents/:id",
+		"/production/documents/"+productionDocumentID,
+		"", "", h.Get,
+	)
+	versionResponse := performProductionDocumentHandlerRequest(
+		http.MethodGet,
+		"/production/documents/:id/versions/:version_id",
+		"/production/documents/"+productionDocumentID+"/versions/"+productionVersionID,
+		"", "", h.GetVersion,
+	)
+
+	require.Equal(t, http.StatusOK, documentResponse.Code, documentResponse.Body.String())
+	require.Equal(t, productionDocumentID, service.gotDocumentID)
+	require.Equal(t, http.StatusOK, versionResponse.Code, versionResponse.Body.String())
+	require.Equal(t, productionDocumentID, service.gotVersionDocumentID)
+	require.Equal(t, productionVersionID, service.gotVersionID)
+	require.Contains(t, versionResponse.Body.String(), `"blocks"`)
+	require.Contains(t, versionResponse.Body.String(), `"lineage"`)
 }
 
 func performProductionDocumentHandlerRequest(

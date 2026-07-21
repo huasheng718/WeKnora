@@ -178,6 +178,12 @@ func (s *productionRouterDocumentService) AppendVersion(context.Context, string,
 func (s *productionRouterDocumentService) GetVersion(context.Context, string) (*types.ProductionDocumentVersion, error) {
 	return nil, s.err
 }
+func (s *productionRouterDocumentService) GetDocument(context.Context, string) (*types.ProductionDocument, error) {
+	return &types.ProductionDocument{}, s.err
+}
+func (s *productionRouterDocumentService) GetVersionDetail(context.Context, string, string) (*types.ProductionDocumentVersion, error) {
+	return &types.ProductionDocumentVersion{}, s.err
+}
 func (s *productionRouterDocumentService) ListVersions(context.Context, string) ([]*types.ProductionDocumentVersion, error) {
 	s.listCalls++
 	return []*types.ProductionDocumentVersion{}, s.err
@@ -443,7 +449,9 @@ func TestProductionFoundationRoutesAreRegistered(t *testing.T) {
 		{http.MethodPut, "/api/v1/production/source-items/:id/decision"},
 		{http.MethodPost, "/api/v1/production/source-sets/:id/freeze"},
 		{http.MethodPost, "/api/v1/production/projects/:id/documents"},
+		{http.MethodGet, "/api/v1/production/documents/:id"},
 		{http.MethodGet, "/api/v1/production/documents/:id/versions"},
+		{http.MethodGet, "/api/v1/production/documents/:id/versions/:version_id"},
 		{http.MethodPost, "/api/v1/production/documents/:id/versions"},
 		{http.MethodPost, "/api/v1/production/documents/:id/runs"},
 		{http.MethodPost, "/api/v1/production/source-sets/:id/collect"},

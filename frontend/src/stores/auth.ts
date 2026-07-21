@@ -11,12 +11,14 @@ import { BUILTIN_QUICK_ANSWER_ID } from '@/api/agent'
 import { useChatResourcesStore } from '@/stores/chatResources'
 import { useEditorResourcesStore } from '@/stores/editorResources'
 import { useOrganizationStore } from '@/stores/organization'
+import { useProductionStore } from '@/stores/production'
 
 /** 登出时丢弃 Pinia 内的空间级资源缓存，避免 SPA 重登复用上一账号数据。 */
 function clearSessionResourceCaches() {
   useChatResourcesStore().invalidate()
   useEditorResourcesStore().invalidate()
   useOrganizationStore().clearState()
+  useProductionStore().reset()
 }
 
 // Per-user UI preferences are namespaced by user id in localStorage.
@@ -291,6 +293,7 @@ export const useAuthStore = defineStore('auth', () => {
     }
     if (tenantChanged) {
       clearTenantScopedClientState()
+      useProductionStore().reset()
     }
   }
 

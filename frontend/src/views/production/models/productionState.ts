@@ -8,7 +8,7 @@ export interface ProductionReleaseTargetGroups {
 }
 
 export function normalizeProductionCollection<T extends { id: string }>(items?: readonly T[] | null): Record<string, T> {
-  return Object.fromEntries((items ?? []).map(item => [item.id, item]))
+  return Object.fromEntries((items ?? []).map(item => [item.id, { ...item }]))
 }
 
 export function groupReleaseTargets(targets?: readonly ProductionReleaseTarget[] | null): ProductionReleaseTargetGroups {

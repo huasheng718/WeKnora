@@ -11,6 +11,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 type productionDocumentService struct {
@@ -502,6 +503,58 @@ func (s *productionDocumentService) GetVersion(
 	}
 	if err := requireProductionDocumentReader(ctx, s.projects, version.ProjectID); err != nil {
 		return nil, err
+	}
+	return version, nil
+}
+
+func (s *productionDocumentService) GetDocument(
+	ctx context.Context,
+	documentID string,
+) (*types.ProductionDocument, error) {
+	tenantID, _, err := productionCaller(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireProductionSourceID(documentID, "document id"); err != nil {
+		return nil, err
+	}
+	document, err := s.documents.GetDocument(ctx, tenantID, documentID)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireProductionDocumentReader(ctx, s.projects, document.ProjectID); err != nil {
+		return nil, err
+	}
+	return document, nil
+}
+
+func (s *productionDocumentService) GetVersionDetail(
+	ctx context.Context,
+	documentID, versionID string,
+) (*types.ProductionDocumentVersion, error) {
+	tenantID, _, err := productionCaller(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireProductionSourceID(documentID, "document id"); err != nil {
+		return nil, err
+	}
+	if err := requireProductionSourceID(versionID, "version id"); err != nil {
+		return nil, err
+	}
+	document, err := s.documents.GetDocument(ctx, tenantID, documentID)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireProductionDocumentReader(ctx, s.projects, document.ProjectID); err != nil {
+		return nil, err
+	}
+	version, err := s.documents.GetVersion(ctx, tenantID, versionID)
+	if err != nil {
+		return nil, err
+	}
+	if version.DocumentID != document.ID {
+		return nil, fmt.Errorf("production document version: %w", gorm.ErrRecordNotFound)
 	}
 	return version, nil
 }

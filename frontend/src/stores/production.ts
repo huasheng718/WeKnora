@@ -42,6 +42,7 @@ export const useProductionStore = defineStore('production', () => {
 
   function replaceProjects(projects?: readonly ProductionProject[] | null) {
     projectsById.value = normalizeProductionCollection(projects)
+    if (activeProjectId.value && !projectsById.value[activeProjectId.value]) activeProjectId.value = null
   }
 
   function replaceDocumentTypes(documentTypes?: readonly ProductionDocumentType[] | null) {
@@ -50,6 +51,32 @@ export const useProductionStore = defineStore('production', () => {
 
   function replaceVersions(versions?: readonly ProductionDocumentVersion[] | null) {
     versionsById.value = normalizeProductionCollection(versions)
+    if (activeVersionId.value && !versionsById.value[activeVersionId.value]) activeVersionId.value = null
+  }
+
+  function replaceSourceSets(sourceSets?: readonly ProductionSourceSet[] | null) {
+    sourceSetsById.value = normalizeProductionCollection(sourceSets)
+  }
+
+  function replaceSourceItems(sourceItems?: readonly ProductionSourceItem[] | null) {
+    sourceItemsById.value = normalizeProductionCollection(sourceItems)
+  }
+
+  function replaceDocuments(documents?: readonly ProductionDocument[] | null) {
+    documentsById.value = normalizeProductionCollection(documents)
+    if (activeDocumentId.value && !documentsById.value[activeDocumentId.value]) activeDocumentId.value = null
+  }
+
+  function replaceRuns(runs?: readonly ProductionRun[] | null) {
+    runsById.value = normalizeProductionCollection(runs)
+  }
+
+  function replaceReviews(reviews?: readonly ProductionReview[] | null) {
+    reviewsById.value = normalizeProductionCollection(reviews)
+  }
+
+  function replaceReleaseTargets(targets?: readonly ProductionReleaseTarget[] | null) {
+    releaseTargetsById.value = normalizeProductionCollection(targets)
   }
 
   function upsertProject(project: ProductionProject) { projectsById.value = upsertProductionEntity(projectsById.value, project) }
@@ -73,6 +100,23 @@ export const useProductionStore = defineStore('production', () => {
     lastError.value = null
   }
 
+  function reset() {
+    projectsById.value = {}
+    documentTypesById.value = {}
+    sourceSetsById.value = {}
+    sourceItemsById.value = {}
+    documentsById.value = {}
+    versionsById.value = {}
+    runsById.value = {}
+    reviewsById.value = {}
+    releaseTargetsById.value = {}
+    activeProjectId.value = null
+    activeDocumentId.value = null
+    activeVersionId.value = null
+    loadingByKey.value = {}
+    lastError.value = null
+  }
+
   return {
     projectsById,
     documentTypesById,
@@ -93,7 +137,13 @@ export const useProductionStore = defineStore('production', () => {
     activeVersion,
     replaceProjects,
     replaceDocumentTypes,
+    replaceSourceSets,
+    replaceSourceItems,
+    replaceDocuments,
     replaceVersions,
+    replaceRuns,
+    replaceReviews,
+    replaceReleaseTargets,
     upsertProject,
     upsertSourceSet,
     upsertSourceItem,
@@ -105,5 +155,6 @@ export const useProductionStore = defineStore('production', () => {
     setLoading,
     setError,
     clearError,
+    reset,
   }
 })

@@ -4,7 +4,7 @@ import {
   productionCommandConfig,
 } from './idempotency'
 
-export type ProductionJSON = Record<string, unknown>
+export type ProductionJSON = null | boolean | number | string | ProductionJSON[] | { [key: string]: ProductionJSON }
 export type ProductionTimestamp = string
 
 export interface ProductionResponse<T> {
@@ -33,6 +33,7 @@ export interface ProductionProject {
   status: ProductionProjectStatus
   created_at: ProductionTimestamp
   updated_at: ProductionTimestamp
+  deleted_at: ProductionTimestamp | null
 }
 
 export interface ProductionProjectMember {
@@ -41,6 +42,7 @@ export interface ProductionProjectMember {
   role: ProductionProjectRole
   assigned_by: string
   created_at: ProductionTimestamp
+  deleted_at: ProductionTimestamp | null
 }
 
 export interface CreateProductionProjectInput {
@@ -73,6 +75,7 @@ export interface ProductionDocumentType {
   created_by: string
   created_at: ProductionTimestamp
   updated_at: ProductionTimestamp
+  deleted_at: ProductionTimestamp | null
 }
 
 export interface CreateProductionDocumentTypeInput {
@@ -161,11 +164,20 @@ export interface ProductionDocumentBlock {
   logical_block_id: string
   block_type: string
   position: number
-  content: unknown
-  attributes: unknown
-  evidence_refs: unknown
-  ai_provenance: unknown
+  content: ProductionJSON
+  attributes: ProductionJSON
+  evidence_refs: ProductionJSON
+  ai_provenance: ProductionJSON
   content_digest: string
+}
+
+export interface ProductionBlockLineage {
+  id: string
+  from_version_id: string
+  from_logical_block_id: string
+  to_version_id: string
+  to_logical_block_id: string
+  relation: 'same' | 'split' | 'merged'
 }
 
 export interface ProductionDocumentVersion {
@@ -182,8 +194,13 @@ export interface ProductionDocumentVersion {
   created_by: string
   created_at: ProductionTimestamp
   frozen_at?: ProductionTimestamp
-  blocks?: ProductionDocumentBlock[]
+  blocks: ProductionDocumentBlock[]
+  lineage?: ProductionBlockLineage[]
+  document_type_code?: string
 }
+
+export type ProductionDocumentVersionSummary = Omit<ProductionDocumentVersion, 'blocks' | 'lineage'>
+export type ProductionDocumentVersionDetail = Omit<ProductionDocumentVersion, 'lineage'> & { lineage: ProductionBlockLineage[] }
 
 export interface CreateProductionDocumentInput {
   document_type_id: string
@@ -198,10 +215,10 @@ export interface AppendProductionVersionInput {
   blocks: Array<{
     logical_block_id?: string
     block_type: string
-    content?: unknown
-    attributes?: unknown
-    evidence_refs?: unknown
-    ai_provenance?: unknown
+    content?: ProductionJSON
+    attributes?: ProductionJSON
+    evidence_refs?: ProductionJSON
+    ai_provenance?: ProductionJSON
   }>
   lineage?: Array<{
     from_logical_block_id: string
@@ -223,10 +240,22 @@ export interface ProductionRun {
   status: ProductionRunStatus
   attempt: number
   current_step: number
+  wakeup_version: number
+  wakeup_enqueued_version: number
+  state_payload: ProductionJSON
   model_id: string
+  document_type_snapshot: ProductionJSON
+  workflow_plan_snapshot: ProductionJSON
+  workflow_plan_digest: string
+  input_version_id?: string
   output_version_id?: string
+  idempotency_key: string
+  raw_model_response?: ProductionJSON
+  raw_model_response_digest?: string
   error_code?: string
   error_message?: string
+  started_at?: ProductionTimestamp
+  completed_at?: ProductionTimestamp
   created_at: ProductionTimestamp
   updated_at: ProductionTimestamp
 }
@@ -234,11 +263,35 @@ export interface ProductionRun {
 export interface ProductionToolCall {
   id: string
   run_id: string
+  tenant_id: number
+  project_id: string
+  document_id?: string
+  source_set_id: string
+  attempt: number
+  current_step: number
+  idempotency_key: string
   status: 'planned' | 'pending_approval' | 'approved' | 'rejected' | 'executing' | 'completed' | 'failed'
   approval_status: 'not_required' | 'pending' | 'approved' | 'rejected'
   provider_type: 'skill' | 'mcp' | 'datasource'
   provider_id: string
   tool_name: string
+  request_snapshot: ProductionJSON
+  request_digest: string
+  response_snapshot?: ProductionJSON
+  response_digest?: string
+  response_evidence_id?: string
+  response_evidence_source_item_id?: string
+  approval_requested_at?: ProductionTimestamp
+  approved_by?: string
+  approved_at?: ProductionTimestamp
+  rejected_by?: string
+  rejected_at?: ProductionTimestamp
+  error_code?: string
+  error_message?: string
+  started_at?: ProductionTimestamp
+  completed_at?: ProductionTimestamp
+  created_at: ProductionTimestamp
+  updated_at: ProductionTimestamp
 }
 
 export interface StartProductionDocumentRunInput {
@@ -256,33 +309,88 @@ export interface DecideProductionToolCallInput {
 
 export interface ProductionAnnotation {
   id: string
+  tenant_id: number
+  project_id: string
   document_id: string
   version_id: string
   block_id: string
   annotation_type: 'comment' | 'suggestion' | 'quality_tag'
+  quality_tag?: 'missing_evidence' | 'factual_risk' | 'unclear' | 'incomplete' | 'conflict' | 'compliance_risk'
   severity: 'info' | 'warning' | 'blocking'
+  anchor: ProductionJSON
   status: 'open' | 'resolved' | 'dismissed'
   body: string
+  suggested_content?: string
+  created_by: string
+  resolved_by?: string
+  resolved_at?: ProductionTimestamp
+  created_at: ProductionTimestamp
+  updated_at: ProductionTimestamp
+}
+
+export interface CreateProductionAnnotationInput {
+  version_id: string
+  block_id: string
+  annotation_type: ProductionAnnotation['annotation_type']
+  quality_tag?: NonNullable<ProductionAnnotation['quality_tag']>
+  severity: ProductionAnnotation['severity']
+  anchor: ProductionJSON
+  body: string
+  suggested_content?: string
+}
+
+export interface ListProductionAnnotationsQuery {
+  version_id?: string
+  status?: ProductionAnnotation['status']
+  annotation_type?: ProductionAnnotation['annotation_type']
+  severity?: ProductionAnnotation['severity']
+  page?: number
+  page_size?: number
+}
+
+export interface ProductionAnnotationListResponse extends ProductionResponse<ProductionAnnotation[]> {
+  total: number
+  page: number
+  page_size: number
 }
 
 export interface ProductionReview {
   id: string
+  tenant_id: number
   project_id: string
   document_id: string
   version_id: string
+  policy_snapshot: ProductionJSON
+  policy_digest: string
   status: 'pending' | 'approved' | 'rejected' | 'obsolete' | 'cancelled' | 'changes_requested'
+  submitted_by: string
+  submitted_at: ProductionTimestamp
+  terminal_by?: string
+  terminal_reason?: string
+  completed_at?: ProductionTimestamp
+  created_at: ProductionTimestamp
+  updated_at: ProductionTimestamp
   steps?: ProductionReviewStep[]
 }
 
 export interface ProductionReviewStep {
   id: string
   review_request_id: string
+  tenant_id: number
+  project_id: string
+  document_id: string
+  version_id: string
   required_role: ProductionProjectRole
+  sequence: number
+  reviewer_user_id?: string
   decision: 'pending' | 'approved' | 'rejected' | 'cancelled' | 'changes_requested'
   comment: string
+  decided_at?: ProductionTimestamp
+  created_at: ProductionTimestamp
+  updated_at: ProductionTimestamp
 }
 
-export type ProductionReleaseTargetStatus =
+export type ProductionReleaseStatus =
   | 'building'
   | 'ready'
   | 'active'
@@ -291,25 +399,50 @@ export type ProductionReleaseTargetStatus =
   | 'cleanup_pending'
   | 'cleaned'
 
+export type ProductionReleaseTargetStatus = ProductionReleaseStatus
+
 export interface ProductionReleaseTarget {
   id: string
   release_id: string
+  tenant_id: number
+  project_id: string
   document_id: string
   version_id: string
   target_knowledge_base_id: string
+  knowledge_id: string
+  release_digest: string
+  config_snapshot: ProductionJSON
+  config_digest: string
   status: ProductionReleaseTargetStatus
   failure_code?: string
   failure_reason?: string
-  created_at?: ProductionTimestamp
-  updated_at?: ProductionTimestamp
+  recovery_attempted_at?: ProductionTimestamp
+  retention_days: number
+  retention_until?: ProductionTimestamp
+  activated_at?: ProductionTimestamp
+  failed_at?: ProductionTimestamp
+  rolled_back_at?: ProductionTimestamp
+  cleanup_requested_at?: ProductionTimestamp
+  cleaned_at?: ProductionTimestamp
+  created_at: ProductionTimestamp
+  updated_at: ProductionTimestamp
 }
 
 export interface ProductionRelease {
   id: string
+  tenant_id: number
   project_id: string
   document_id: string
   version_id: string
-  status: ProductionReleaseTargetStatus
+  review_request_id: string
+  release_digest: string
+  release_digest_version: number
+  supersedes_release_id?: string
+  status: ProductionReleaseStatus
+  retention_days: number
+  created_by: string
+  created_at: ProductionTimestamp
+  updated_at: ProductionTimestamp
   targets?: ProductionReleaseTarget[]
 }
 
@@ -357,8 +490,16 @@ export function createProductionDocument(projectId: string, command: ProductionC
   return post<ProductionResponse<ProductionDocument>>(`/api/v1/production/projects/${projectId}/documents`, command.payload, productionCommandConfig(command))
 }
 
+export function getProductionDocument(id: string) {
+  return get<ProductionResponse<ProductionDocument>>(`/api/v1/production/documents/${id}`)
+}
+
 export function listProductionDocumentVersions(id: string) {
-  return get<ProductionResponse<ProductionDocumentVersion[]>>(`/api/v1/production/documents/${id}/versions`)
+  return get<ProductionResponse<ProductionDocumentVersionSummary[]>>(`/api/v1/production/documents/${id}/versions`)
+}
+
+export function getProductionDocumentVersion(documentId: string, versionId: string) {
+  return get<ProductionResponse<ProductionDocumentVersionDetail>>(`/api/v1/production/documents/${documentId}/versions/${versionId}`)
 }
 
 export function appendProductionVersion(documentId: string, currentVersionId: string, command: ProductionCommand<AppendProductionVersionInput>) {
@@ -386,6 +527,18 @@ export function decideProductionToolCall(id: string, command: ProductionCommand<
   return post<ProductionResponse<ProductionToolCall>>(`/api/v1/production/tool-calls/${id}/decision`, command.payload, productionCommandConfig(command))
 }
 
+export function createProductionAnnotation(documentId: string, command: ProductionCommand<CreateProductionAnnotationInput>) {
+  return post<ProductionResponse<ProductionAnnotation>>(`/api/v1/production/documents/${documentId}/annotations`, command.payload, productionCommandConfig(command))
+}
+
+export function listProductionAnnotations(documentId: string, query: ListProductionAnnotationsQuery = {}) {
+  return get<ProductionAnnotationListResponse>(`/api/v1/production/documents/${documentId}/annotations`, { params: query })
+}
+
+export function updateProductionAnnotationStatus(id: string, command: ProductionCommand<{ status: Extract<ProductionAnnotation['status'], 'resolved' | 'dismissed'> }>) {
+  return put<ProductionResponse<void>>(`/api/v1/production/annotations/${id}/status`, command.payload, productionCommandConfig(command))
+}
+
 export function submitProductionReview(documentId: string, command: ProductionCommand<{ version_id: string }>) {
   return post<ProductionResponse<ProductionReview>>(`/api/v1/production/documents/${documentId}/reviews`, command.payload, productionCommandConfig(command))
 }
@@ -396,6 +549,14 @@ export function getProductionReview(id: string) {
 
 export function decideProductionReviewStep(reviewId: string, stepId: string, command: ProductionCommand<{ decision: 'approve' | 'reject' | 'changes_requested'; comment: string }>) {
   return post<ProductionResponse<void>>(`/api/v1/production/reviews/${reviewId}/steps/${stepId}/decision`, command.payload, productionCommandConfig(command))
+}
+
+export function rejectProductionReview(id: string, command: ProductionCommand<{ reason: string }>) {
+  return post<ProductionResponse<void>>(`/api/v1/production/reviews/${id}/reject`, command.payload, productionCommandConfig(command))
+}
+
+export function cancelProductionReview(id: string, command: ProductionCommand<{ reason: string }>) {
+  return post<ProductionResponse<void>>(`/api/v1/production/reviews/${id}/cancel`, command.payload, productionCommandConfig(command))
 }
 
 export function createProductionRelease(documentId: string, command: ProductionCommand<{ version_id: string; target_knowledge_base_ids: string[] }>) {

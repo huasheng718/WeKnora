@@ -23,3 +23,13 @@ test('separate production commands do not share an idempotency key', () => {
 
   assert.notEqual(first.idempotencyKey, second.idempotencyKey)
 })
+
+test('a production command snapshots its payload for stable retries', () => {
+  const payload = { name: 'Baseline', blocks: [{ text: 'Original' }] }
+  const command = createProductionCommand(payload, () => 'request-1')
+
+  payload.name = 'Mutated'
+  payload.blocks[0].text = 'Mutated'
+
+  assert.deepEqual(command.payload, { name: 'Baseline', blocks: [{ text: 'Original' }] })
+})

@@ -1,6 +1,6 @@
 export interface ProductionCommand<T> {
-  idempotencyKey: string
-  payload: T
+  readonly idempotencyKey: string
+  readonly payload: T
 }
 
 export interface ProductionCommandConfig {
@@ -13,7 +13,7 @@ export function createProductionCommand<T>(
 ): ProductionCommand<T> {
   return {
     idempotencyKey: createKey(),
-    payload,
+    payload: payload === undefined ? payload : JSON.parse(JSON.stringify(payload)) as T,
   }
 }
 
