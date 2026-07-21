@@ -253,6 +253,7 @@ func claimProductionProjectionRetry(
 				if !claimed {
 					return types.ErrProductionProjectionConflict
 				}
+				advanceGeneration = true
 			case types.ParseStatusPending, types.ParseStatusProcessing, types.ParseStatusFinalizing:
 				// A committed claim is replayed without allocating another generation.
 			case types.ParseStatusCompleted:

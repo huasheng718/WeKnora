@@ -756,7 +756,8 @@ func TestProductionReleaseConcurrentRetryWithoutKnowledgeUsesOneRealGeneration(t
 	require.NotEqual(t, firstIDs[0], secondIDs[1])
 }
 
-func TestProductionReleaseBuildingFailedKnowledgeClaimReusesRealGeneration(t *testing.T) {
+func TestProductionReleaseBuildingFailedKnowledgeClaimEscapesRetainedGenerationOnce(t *testing.T) {
+	const callers = 16
 	fixture, db, releaseRepo, knowledgeRepo, actorCtx := newProductionProjectionBuilderIntegrationFixture(t)
 	before, err := releaseRepo.GetTarget(actorCtx, projectionTenantID, projectionTargetID)
 	require.NoError(t, err)
@@ -765,6 +766,12 @@ func TestProductionReleaseBuildingFailedKnowledgeClaimReusesRealGeneration(t *te
 	knowledge.ErrorMessage = "sanitized worker failure"
 	require.NoError(t, knowledgeRepo.CreateKnowledge(actorCtx, knowledge))
 	tasks := &productionReleaseTaskEnqueuerStub{accepted: make(map[string]*asynq.Task)}
+	originalTaskID := productionProjectionTaskID(before.ID, before.KnowledgeID, "build-initial")
+	_, err = tasks.Enqueue(
+		asynq.NewTask(types.TypeProductionBuild, nil), asynq.TaskID(originalTaskID),
+	)
+	require.NoError(t, err)
+	realUOW := apprepository.NewProductionUnitOfWork(db)
 	svc := &ProductionReleaseService{
 		releases: releaseRepo, authorizer: productionReleaseAuthorizerStub{},
 		members: productionReleaseMembershipStub{role: types.TenantRoleContributor},
@@ -773,19 +780,39 @@ func TestProductionReleaseBuildingFailedKnowledgeClaimReusesRealGeneration(t *te
 			Type: types.KnowledgeBaseTypeDocument,
 		}},
 		knowledge: &knowledgeService{repo: knowledgeRepo},
-		uow:       apprepository.NewProductionUnitOfWork(db), tasks: tasks,
+		uow:       realUOW, tasks: tasks,
 	}
 
-	require.NoError(t, svc.Retry(actorCtx, projectionTargetID))
-	after, err := releaseRepo.GetTarget(actorCtx, projectionTenantID, projectionTargetID)
+	firstBarrier := newProductionRetryBarrierUOW(realUOW, callers)
+	svc.uow = firstBarrier
+	retryProductionProjectionConcurrently(t, svc, actorCtx, projectionTargetID, callers, firstBarrier)
+	afterClaim, err := releaseRepo.GetTarget(actorCtx, projectionTenantID, projectionTargetID)
 	require.NoError(t, err)
-	require.Equal(t, types.ReleaseTargetBuilding, after.Status)
-	require.True(t, after.UpdatedAt.Equal(before.UpdatedAt), "building target must retain its claimed generation")
+	require.Equal(t, types.ReleaseTargetBuilding, afterClaim.Status)
+	require.True(t, afterClaim.UpdatedAt.After(before.UpdatedAt), "claim winner must escape the retained task generation")
 	claimed, err := knowledgeRepo.GetKnowledgeByIDOnly(actorCtx, knowledge.ID)
 	require.NoError(t, err)
 	require.Equal(t, types.ParseStatusPending, claimed.ParseStatus)
 	require.Empty(t, claimed.ErrorMessage)
-	require.Len(t, acceptedProductionRetryTaskIDs(tasks), 1)
+	firstIDs := acceptedProductionRetryTaskIDs(tasks)
+	require.Len(t, firstIDs, 2)
+	require.Contains(t, firstIDs, originalTaskID)
+	var retryTaskID string
+	for _, taskID := range firstIDs {
+		if taskID != originalTaskID {
+			retryTaskID = taskID
+		}
+	}
+	require.NotEmpty(t, retryTaskID)
+	require.Contains(t, retryTaskID, fmt.Sprintf("build-retry-%d", afterClaim.UpdatedAt.UnixNano()))
+
+	secondBarrier := newProductionRetryBarrierUOW(realUOW, callers)
+	svc.uow = secondBarrier
+	retryProductionProjectionConcurrently(t, svc, actorCtx, projectionTargetID, callers, secondBarrier)
+	afterReplay, err := releaseRepo.GetTarget(actorCtx, projectionTenantID, projectionTargetID)
+	require.NoError(t, err)
+	require.True(t, afterReplay.UpdatedAt.Equal(afterClaim.UpdatedAt), "pending replay must retain the claimed generation")
+	require.Equal(t, firstIDs, acceptedProductionRetryTaskIDs(tasks))
 }
 
 type productionRetryBarrierUOW struct {
