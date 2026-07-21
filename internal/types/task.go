@@ -1,6 +1,9 @@
 package types
 
-import "strings"
+import (
+	"strings"
+	"time"
+)
 
 // Worker-pool names are part of the runtime observability API. Each pool is
 // backed by an independent asynq.Server, so concurrency is hard-isolated
@@ -501,13 +504,14 @@ type KnowledgeMoveProgress struct {
 // Used for both create (publish) and update operations.
 type ManualProcessPayload struct {
 	TracingContext
-	RequestId       string `json:"request_id"`
-	TenantID        uint64 `json:"tenant_id"`
-	KnowledgeID     string `json:"knowledge_id"`
-	KnowledgeBaseID string `json:"knowledge_base_id"`
-	Content         string `json:"content"`      // cleaned markdown content
-	NeedCleanup     bool   `json:"need_cleanup"` // true for update, false for create
-	Attempt         int    `json:"attempt,omitempty"`
+	RequestId       string    `json:"request_id"`
+	TenantID        uint64    `json:"tenant_id"`
+	KnowledgeID     string    `json:"knowledge_id"`
+	KnowledgeBaseID string    `json:"knowledge_base_id"`
+	Content         string    `json:"content"`      // cleaned markdown content
+	NeedCleanup     bool      `json:"need_cleanup"` // true for update, false for create
+	Attempt         int       `json:"attempt,omitempty"`
+	TargetUpdatedAt time.Time `json:"target_updated_at,omitempty"`
 }
 
 // ImageMultimodalPayload represents the image multimodal processing task payload.

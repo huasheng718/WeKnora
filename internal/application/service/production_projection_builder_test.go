@@ -264,7 +264,8 @@ func newProjectionBuilderFixture(t *testing.T) *projectionBuilderFixture {
 		ProjectID: projectionProjectID, DocumentID: projectionDocumentID, VersionID: projectionVersionID,
 		TargetKnowledgeBaseID: projectionKBID, KnowledgeID: projectionKnowledgeID,
 		ReleaseDigest: release.ReleaseDigest, ConfigSnapshot: config, ConfigDigest: configDigest,
-		Status: types.ReleaseTargetBuilding,
+		Status:    types.ReleaseTargetBuilding,
+		CreatedAt: projectionManualGeneration, UpdatedAt: projectionManualGeneration,
 	}
 	events := make([]string, 0)
 	releases := &projectionBuilderReleaseRepo{target: target, release: release, events: &events}

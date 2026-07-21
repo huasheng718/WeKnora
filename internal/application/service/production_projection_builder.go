@@ -146,6 +146,7 @@ func (b *ProductionProjectionBuilder) Build(ctx context.Context, targetID string
 			GraphModelID: graphModelID, SummaryModelID: summaryModelID, IndexingStrategy: indexingStrategy,
 		},
 	}
+	ctx = withProductionProjectionGeneration(ctx, target.UpdatedAt)
 	if existing, loadErr := b.knowledge.GetKnowledgeByIDForSystem(ctx, target.KnowledgeID); loadErr == nil {
 		if err := validateProductionProjectionKnowledge(existing, payload); err != nil {
 			return nil, err

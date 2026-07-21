@@ -63,6 +63,102 @@ func productionProjectionMetadata(knowledge *types.Knowledge) (*types.Production
 	return types.ValidateProductionProjectionIntegrity(knowledge)
 }
 
+type productionProjectionGenerationContextKey struct{}
+type productionProjectionRoutingContextKey struct{}
+
+type productionProjectionRoutingDescriptor struct {
+	projection       *types.ProductionProjectionMetadata
+	targetID         string
+	targetUpdatedAt  time.Time
+	indexingStrategy types.IndexingStrategy
+	vectorStoreID    *string
+	retrieverEngines []types.RetrieverEngineParams
+	storageBackendID *string
+	storageProvider  string
+}
+
+func projectionRoutingProjection(
+	routing *productionProjectionRoutingDescriptor,
+) *types.ProductionProjectionMetadata {
+	if routing == nil {
+		return nil
+	}
+	return routing.projection
+}
+
+func withProductionProjectionGeneration(ctx context.Context, generation time.Time) context.Context {
+	if generation.IsZero() {
+		return ctx
+	}
+	return context.WithValue(ctx, productionProjectionGenerationContextKey{}, generation.UTC())
+}
+
+func productionProjectionGenerationFromContext(ctx context.Context) (time.Time, bool) {
+	generation, ok := ctx.Value(productionProjectionGenerationContextKey{}).(time.Time)
+	return generation, ok && !generation.IsZero()
+}
+
+func productionProjectionRoutingFromContext(ctx context.Context) (*productionProjectionRoutingDescriptor, bool) {
+	routing, ok := ctx.Value(productionProjectionRoutingContextKey{}).(*productionProjectionRoutingDescriptor)
+	return routing, ok && routing != nil
+}
+
+func copyOptionalString(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	copyValue := *value
+	return &copyValue
+}
+
+func productionProjectionRoutingDescriptorFromTarget(
+	projection *types.ProductionProjectionMetadata,
+	target *types.ProductionReleaseTarget,
+) (*productionProjectionRoutingDescriptor, error) {
+	if projection == nil || target == nil || target.UpdatedAt.IsZero() {
+		return nil, types.ErrProductionProjectionConflict
+	}
+	canonical, digest, err := types.CanonicalProductionReleaseTargetConfig(target.ConfigSnapshot)
+	if err != nil || digest != target.ConfigDigest || string(canonical) != string(target.ConfigSnapshot) {
+		return nil, fmt.Errorf("%w: retained configuration authentication failed", types.ErrProductionReleaseConfigInvalid)
+	}
+	var snapshot struct {
+		IndexingStrategy *types.IndexingStrategy       `json:"indexing_strategy"`
+		VectorStoreID    *string                       `json:"vector_store_id"`
+		RetrieverEngines []types.RetrieverEngineParams `json:"retriever_engines"`
+		StorageBackendID *string                       `json:"storage_backend_id"`
+		StorageProvider  string                        `json:"storage_provider"`
+	}
+	if err := json.Unmarshal(canonical, &snapshot); err != nil || snapshot.IndexingStrategy == nil {
+		return nil, fmt.Errorf("%w: retained routing configuration is invalid", types.ErrProductionReleaseConfigInvalid)
+	}
+	projectionCopy := *projection
+	return &productionProjectionRoutingDescriptor{
+		projection: &projectionCopy, targetID: target.ID, targetUpdatedAt: target.UpdatedAt.UTC(),
+		indexingStrategy: *snapshot.IndexingStrategy,
+		vectorStoreID:    copyOptionalString(snapshot.VectorStoreID),
+		retrieverEngines: append([]types.RetrieverEngineParams(nil), snapshot.RetrieverEngines...),
+		storageBackendID: copyOptionalString(snapshot.StorageBackendID),
+		storageProvider:  strings.TrimSpace(snapshot.StorageProvider),
+	}, nil
+}
+
+func (d *productionProjectionRoutingDescriptor) knowledgeBase(knowledge *types.Knowledge) *types.KnowledgeBase {
+	if d == nil || knowledge == nil {
+		return nil
+	}
+	kb := &types.KnowledgeBase{
+		ID: knowledge.KnowledgeBaseID, TenantID: knowledge.TenantID,
+		IndexingStrategy: d.indexingStrategy,
+		VectorStoreID:    copyOptionalString(d.vectorStoreID),
+		StorageBackendID: copyOptionalString(d.storageBackendID),
+	}
+	if d.storageProvider != "" {
+		kb.StorageProviderConfig = &types.StorageProviderConfig{Provider: d.storageProvider}
+	}
+	return kb
+}
+
 func productionProjectionTargetForSubtask(
 	ctx context.Context,
 	knowledge *types.Knowledge,
@@ -139,6 +235,62 @@ func (s *knowledgeService) requireProductionProjectionSubtaskRouting(
 		return ctx, err
 	}
 	return ctx, nil
+}
+
+func (s *knowledgeService) claimProductionProjectionManualWorker(
+	ctx context.Context,
+	knowledge *types.Knowledge,
+	kb *types.KnowledgeBase,
+	expectedGeneration time.Time,
+) (context.Context, *productionProjectionRoutingDescriptor, error) {
+	projection, err := productionProjectionMetadata(knowledge)
+	if err != nil || projection == nil {
+		return ctx, nil, err
+	}
+	target, err := productionProjectionTargetForSubtask(ctx, knowledge, projection, s.productionReleaseRepo)
+	if err != nil {
+		return ctx, nil, err
+	}
+	if s.tenantRepo == nil {
+		return ctx, nil, errors.New("production projection tenant routing is unavailable")
+	}
+	tenant, err := s.tenantRepo.GetTenantByID(ctx, knowledge.TenantID)
+	if err != nil {
+		return ctx, nil, err
+	}
+	ctx = context.WithValue(ctx, types.TenantInfoContextKey, tenant)
+	if err := requireProductionProjectionRoutingUnchanged(ctx, target, kb); err != nil {
+		return ctx, nil, err
+	}
+	routing, err := productionProjectionRoutingDescriptorFromTarget(projection, target)
+	if err != nil {
+		return ctx, nil, err
+	}
+	if expectedGeneration.IsZero() || target.Status != types.ReleaseTargetBuilding ||
+		!target.UpdatedAt.Equal(expectedGeneration) {
+		return ctx, nil, asynq.SkipRetry
+	}
+	claimed, err := s.productionReleaseRepo.ClaimProjectionBuildGeneration(
+		ctx, target.ID, knowledge.ID, expectedGeneration,
+	)
+	if err != nil {
+		return ctx, nil, err
+	}
+	if !claimed {
+		return ctx, nil, asynq.SkipRetry
+	}
+	trustedTenant := *tenant
+	if len(routing.retrieverEngines) != 0 {
+		trustedTenant.RetrieverEngines = types.RetrieverEngines{
+			Engines: append([]types.RetrieverEngineParams(nil), routing.retrieverEngines...),
+		}
+	}
+	knowledge.ParseStatus = types.ParseStatusProcessing
+	knowledge.ErrorMessage = ""
+	ctx = context.WithValue(ctx, types.TenantInfoContextKey, &trustedTenant)
+	ctx = context.WithValue(ctx, types.UserIDContextKey, types.ProductionSystemActorID)
+	ctx = context.WithValue(ctx, productionProjectionRoutingContextKey{}, routing)
+	return ctx, routing, nil
 }
 
 func markProductionProjectionReady(

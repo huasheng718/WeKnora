@@ -525,7 +525,7 @@ func TestCreateKnowledgeFromFile_PersistsProcessOverrides(t *testing.T) {
 func newCreateKnowledgeFileContext() context.Context {
 	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(1))
 	ctx = context.WithValue(ctx, types.TenantInfoContextKey, &types.Tenant{})
-	return ctx
+	return withProductionProjectionGeneration(ctx, projectionManualGeneration)
 }
 
 func newMultipartFileHeader(t *testing.T, filename string, content string) *multipart.FileHeader {

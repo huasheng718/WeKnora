@@ -443,6 +443,94 @@ func TestProductionProjectionRetryClaimRollbackRestoresKnowledgeAndTarget(t *tes
 	require.Equal(t, types.ReleaseTargetFailed, persistedTarget.Status)
 }
 
+func TestProductionProjectionBuildGenerationClaimIsAtomicAndFenced(t *testing.T) {
+	repo, db := newProductionReleaseRepoFixture(t, nil)
+	require.NoError(t, db.Exec(`
+		CREATE TABLE knowledges (
+			id VARCHAR(36) PRIMARY KEY,
+			tenant_id INTEGER NOT NULL,
+			knowledge_base_id VARCHAR(36) NOT NULL,
+			type VARCHAR(50) NOT NULL,
+			parse_status VARCHAR(50) NOT NULL,
+			error_message TEXT,
+			updated_at DATETIME NOT NULL,
+			deleted_at DATETIME NULL
+		)
+	`).Error)
+	ctx := productionReleaseContext(reviewTenantID, reviewAuthorID)
+	target := productionReleaseTarget(releaseTarget1, releaseKBOne, releaseKnowledge1)
+	require.NoError(t, repo.CreateRelease(ctx,
+		productionRelease(releaseIDOne, reviewVersionOne, reviewID(700)),
+		[]*types.ProductionReleaseTarget{target},
+	))
+	persistedTarget, err := repo.GetTarget(ctx, reviewTenantID, target.ID)
+	require.NoError(t, err)
+	require.NoError(t, db.Table("knowledges").Create(map[string]any{
+		"id": target.KnowledgeID, "tenant_id": reviewTenantID,
+		"knowledge_base_id": target.TargetKnowledgeBaseID, "type": types.KnowledgeTypeManual,
+		"parse_status": types.ParseStatusPending, "error_message": "", "updated_at": time.Now().UTC(),
+	}).Error)
+
+	claimed, err := repo.ClaimProjectionBuildGeneration(
+		ctx, target.ID, target.KnowledgeID, persistedTarget.UpdatedAt.Add(-time.Second),
+	)
+	require.NoError(t, err)
+	require.False(t, claimed)
+
+	claimed, err = repo.ClaimProjectionBuildGeneration(
+		ctx, target.ID, target.KnowledgeID, persistedTarget.UpdatedAt,
+	)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	var status string
+	require.NoError(t, db.Table("knowledges").Select("parse_status").Where("id = ?", target.KnowledgeID).Scan(&status).Error)
+	require.Equal(t, types.ParseStatusProcessing, status)
+
+	changed, err := repo.TransitionTarget(ctx, target.ID, types.ReleaseTargetBuilding, types.ReleaseTargetFailed, nil)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.NoError(t, db.Table("knowledges").Where("id = ?", target.KnowledgeID).
+		Update("parse_status", types.ParseStatusFailed).Error)
+	claimed, err = repo.ClaimProjectionBuildGeneration(
+		ctx, target.ID, target.KnowledgeID, persistedTarget.UpdatedAt,
+	)
+	require.NoError(t, err)
+	require.False(t, claimed)
+	require.NoError(t, db.Table("knowledges").Select("parse_status").Where("id = ?", target.KnowledgeID).Scan(&status).Error)
+	require.Equal(t, types.ParseStatusFailed, status)
+}
+
+func TestProductionProjectionBuildGenerationClaimLocksTargetBeforeKnowledge(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err)
+	repo := NewProductionReleaseRepository(db)
+	generation := time.Date(2026, 7, 22, 2, 0, 0, 0, time.UTC)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT .* FROM "production_release_targets".*FOR UPDATE`).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "tenant_id", "knowledge_id", "target_knowledge_base_id", "status", "updated_at",
+		}).AddRow(
+			releaseTarget1, reviewTenantID, releaseKnowledge1, releaseKBOne,
+			types.ReleaseTargetBuilding, generation,
+		))
+	mock.ExpectExec(`UPDATE "knowledges" SET`).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	claimed, err := repo.ClaimProjectionBuildGeneration(
+		productionReleaseContext(reviewTenantID, reviewAuthorID),
+		releaseTarget1, releaseKnowledge1, generation,
+	)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestProductionReleasePostgresRecoveryQueryUsesPersistedFairOrder(t *testing.T) {
 	sqlDB, mock, err := sqlmock.New()
 	require.NoError(t, err)

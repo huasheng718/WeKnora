@@ -309,17 +309,42 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 	// 删除旧的chunks
 	if err := s.chunkService.DeleteChunksByKnowledgeID(ctx, knowledge.ID); err != nil {
 		logger.Warnf(ctx, "Failed to delete existing chunks (may not exist): %v", err)
-		// 不返回错误，继续处理（可能没有旧数据）
+		if projection != nil {
+			return s.recordChunkProcessingFailure(ctx, knowledge, projection, err)
+		}
 	}
 
 	// 删除旧的索引数据 — only when vector/keyword indexing is enabled
 	tenantInfo := ctx.Value(types.TenantInfoContextKey).(*types.Tenant)
-	retrieveEngine, err := retriever.CreateRetrieveEngineForKB(
-		ctx, s.retrieveEngine, s.ownership, tenantInfo.ID, kb.VectorStoreID)
+	var retrieveEngine *retriever.CompositeRetrieveEngine
+	var err error
+	if embeddingModel != nil {
+		if projection != nil {
+			routing, ok := productionProjectionRoutingFromContext(ctx)
+			if !ok {
+				return s.recordChunkProcessingFailure(
+					ctx, knowledge, projection, errors.New("production projection routing descriptor is unavailable"),
+				)
+			}
+			retrieveEngine, err = retriever.CreateRetrieveEngineFromPayload(
+				ctx, s.retrieveEngine, s.ownership, tenantInfo.ID,
+				routing.retrieverEngines, routing.vectorStoreID,
+			)
+		} else {
+			retrieveEngine, err = retriever.CreateRetrieveEngineForKB(
+				ctx, s.retrieveEngine, s.ownership, tenantInfo.ID, kb.VectorStoreID,
+			)
+		}
+		if err != nil && projection != nil {
+			return s.recordChunkProcessingFailure(ctx, knowledge, projection, err)
+		}
+	}
 	if err == nil && embeddingModel != nil {
 		if err := retrieveEngine.DeleteByKnowledgeIDList(ctx, []string{knowledge.ID}, embeddingModel.GetDimensions(), knowledge.Type); err != nil {
 			logger.Warnf(ctx, "Failed to delete existing index data (may not exist): %v", err)
-			// 不返回错误，继续处理（可能没有旧数据）
+			if projection != nil {
+				return s.recordChunkProcessingFailure(ctx, knowledge, projection, err)
+			}
 		} else {
 			logger.Infof(ctx, "Successfully deleted existing index data for knowledge: %s", knowledge.ID)
 		}
@@ -329,7 +354,9 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 	namespace := types.NameSpace{KnowledgeBase: knowledge.KnowledgeBaseID, Knowledge: knowledge.ID}
 	if err := s.graphEngine.DelGraph(ctx, []types.NameSpace{namespace}); err != nil {
 		logger.Warnf(ctx, "Failed to delete existing graph data (may not exist): %v", err)
-		// 不返回错误，继续处理
+		if projection != nil {
+			return s.recordChunkProcessingFailure(ctx, knowledge, projection, err)
+		}
 	}
 
 	logger.Infof(ctx, "Cleanup completed, starting to process new chunks")
@@ -584,6 +611,9 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 			if status == types.ParseStatusDeleting {
 				if err := s.chunkService.DeleteChunksByKnowledgeID(ctx, knowledge.ID); err != nil {
 					logger.Warnf(ctx, "Failed to cleanup chunks after deletion detected: %v", err)
+					if projection != nil {
+						return err
+					}
 				}
 			}
 			return nil
@@ -592,10 +622,12 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 		err = retrieveEngine.BatchIndex(ctx, embeddingModel, indexInfoList)
 		if err != nil {
 			retryErr := s.recordChunkProcessingFailure(ctx, knowledge, projection, err)
+			var cleanupErr error
 
 			// delete failed chunks
 			if err := s.chunkService.DeleteChunksByKnowledgeID(ctx, knowledge.ID); err != nil {
 				logger.Errorf(ctx, "Delete chunks failed: %v", err)
+				cleanupErr = errors.Join(cleanupErr, err)
 			}
 
 			// delete index
@@ -603,6 +635,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 				ctx, []string{knowledge.ID}, embeddingModel.GetDimensions(), kb.Type,
 			); err != nil {
 				logger.Errorf(ctx, "Delete index failed: %v", err)
+				cleanupErr = errors.Join(cleanupErr, err)
 			}
 			// Map vector store / embedding rate-limit errors to a
 			// stable code so the UI can offer "retry later" hints.
@@ -612,6 +645,9 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 			}
 			s.failStage(ctx, knowledge.ID, types.StageEmbedding,
 				code, "batch index failed", err)
+			if projection != nil {
+				return errors.Join(retryErr, cleanupErr)
+			}
 			return retryErr
 		}
 		logger.GetLogger(ctx).Infof("processChunks batch index successfully, with %d index", len(indexInfoList))
@@ -629,9 +665,15 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 			if status == types.ParseStatusDeleting {
 				if err := s.chunkService.DeleteChunksByKnowledgeID(ctx, knowledge.ID); err != nil {
 					logger.Warnf(ctx, "Failed to cleanup chunks after deletion detected: %v", err)
+					if projection != nil {
+						return err
+					}
 				}
 				if err := retrieveEngine.DeleteByKnowledgeIDList(ctx, []string{knowledge.ID}, embeddingModel.GetDimensions(), kb.Type); err != nil {
 					logger.Warnf(ctx, "Failed to cleanup index after deletion detected: %v", err)
+					if projection != nil {
+						return err
+					}
 				}
 			}
 			return nil
@@ -2729,23 +2771,26 @@ func (s *knowledgeService) ProcessManualUpdate(ctx context.Context, t *asynq.Tas
 		s.repo.UpdateKnowledge(ctx, knowledge)
 		return nil
 	}
-	ctx, err = s.requireProductionProjectionSubtaskRouting(ctx, knowledge, kb)
+	ctx, projectionRouting, err := s.claimProductionProjectionManualWorker(
+		ctx, knowledge, kb, payload.TargetUpdatedAt,
+	)
 	if err != nil {
 		return err
 	}
 
-	// Re-check abort status right before marking processing — see the same
-	// note in ProcessDocument for the cancel race this guards.
-	if aborted, status := s.isKnowledgeAborted(ctx, knowledge.TenantID, knowledge.ID); aborted {
-		logger.Infof(ctx, "ProcessManualUpdate: knowledge aborted (%s), skipping: %s", status, knowledge.ID)
-		return nil
-	}
-	// Update status to processing
-	knowledge.ParseStatus = "processing"
-	knowledge.UpdatedAt = time.Now()
-	if err := s.repo.UpdateKnowledge(ctx, knowledge); err != nil {
-		logger.Errorf(ctx, "ProcessManualUpdate: failed to update status to processing: %v", err)
-		return nil
+	if projectionRouting == nil {
+		// Re-check abort status right before marking processing — see the same
+		// note in ProcessDocument for the cancel race this guards.
+		if aborted, status := s.isKnowledgeAborted(ctx, knowledge.TenantID, knowledge.ID); aborted {
+			logger.Infof(ctx, "ProcessManualUpdate: knowledge aborted (%s), skipping: %s", status, knowledge.ID)
+			return nil
+		}
+		knowledge.ParseStatus = types.ParseStatusProcessing
+		knowledge.UpdatedAt = time.Now()
+		if err := s.repo.UpdateKnowledge(ctx, knowledge); err != nil {
+			logger.Errorf(ctx, "ProcessManualUpdate: failed to update status to processing: %v", err)
+			return nil
+		}
 	}
 
 	// New producers persist the attempt before enqueue so every Asynq retry of
@@ -2763,15 +2808,12 @@ func (s *knowledgeService) ProcessManualUpdate(ctx context.Context, t *asynq.Tas
 
 	// Cleanup old resources (indexes, chunks, graph) for update operations
 	if payload.NeedCleanup {
-		if err := s.cleanupKnowledgeResources(ctx, knowledge); err != nil {
+		if err := s.cleanupKnowledgeResourcesWithRouting(ctx, knowledge, projectionRouting); err != nil {
 			logger.ErrorWithFields(ctx, err, map[string]interface{}{
 				"knowledge_id": payload.KnowledgeID,
 			})
-			knowledge.ParseStatus = "failed"
-			knowledge.ErrorMessage = fmt.Sprintf("failed to cleanup old resources: %v", err)
-			knowledge.UpdatedAt = time.Now()
-			s.repo.UpdateKnowledge(ctx, knowledge)
-			return nil
+			cleanupErr := fmt.Errorf("failed to cleanup old resources: %w", err)
+			return s.recordChunkProcessingFailure(ctx, knowledge, projectionRoutingProjection(projectionRouting), cleanupErr)
 		}
 	}
 

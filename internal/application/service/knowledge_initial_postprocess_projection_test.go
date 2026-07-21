@@ -191,7 +191,12 @@ func initialPostProcessProjectionReleaseRepo(
 		KnowledgeID: knowledge.ID, TargetKnowledgeBaseID: knowledge.KnowledgeBaseID,
 		DocumentID: meta.ProductionProjection.DocumentID, VersionID: meta.ProductionProjection.VersionID,
 		Status: types.ReleaseTargetBuilding, ConfigSnapshot: snapshot, ConfigDigest: digest,
+		CreatedAt: projectionManualGeneration, UpdatedAt: projectionManualGeneration,
 	}}
+}
+
+func initialProjectionGenerationContext() context.Context {
+	return withProductionProjectionGeneration(context.Background(), projectionManualGeneration)
 }
 
 func initialPostProcessContext(attempt int) context.Context {
@@ -332,15 +337,16 @@ func TestProductionProjectionManualRetryReusesPersistedAttempt(t *testing.T) {
 		productionReleaseRepo: initialPostProcessProjectionReleaseRepo(t, knowledge),
 	}
 
-	require.NoError(t, service.enqueueManualProcessing(context.Background(), knowledge, "# governed projection", false))
+	require.NoError(t, service.enqueueManualProcessing(initialProjectionGenerationContext(), knowledge, "# governed projection", false))
 	manualTaskID := "production-projection-build-target-1-projection-knowledge-1"
 	manualTask := tasks.accepted[manualTaskID]
 	require.NotNil(t, manualTask)
 	var payload types.ManualProcessPayload
 	require.NoError(t, json.Unmarshal(manualTask.Payload(), &payload))
 	require.Equal(t, 1, payload.Attempt)
+	require.Equal(t, projectionManualGeneration, payload.TargetUpdatedAt)
 
-	require.NoError(t, service.enqueueManualProcessing(context.Background(), knowledge, "# governed projection", false))
+	require.NoError(t, service.enqueueManualProcessing(initialProjectionGenerationContext(), knowledge, "# governed projection", false))
 	require.Equal(t, 1, tracker.LatestAttempt(context.Background(), knowledge.ID),
 		"pending replay must reuse the attempt persisted before the first enqueue")
 
@@ -361,8 +367,8 @@ func TestProductionProjectionFailedRetryAllocatesFreshPersistedAttempt(t *testin
 	tasks := &initialPostProcessEnqueuer{}
 	service := &knowledgeService{task: tasks, spanTracker: tracker}
 
-	require.NoError(t, service.enqueueManualProcessing(context.Background(), knowledge, "# governed projection", false))
-	require.NoError(t, service.enqueueManualProcessing(context.Background(), knowledge, "# governed projection", true))
+	require.NoError(t, service.enqueueManualProcessing(initialProjectionGenerationContext(), knowledge, "# governed projection", false))
+	require.NoError(t, service.enqueueManualProcessing(initialProjectionGenerationContext(), knowledge, "# governed projection", true))
 	require.Len(t, tasks.payloads, 2)
 
 	var initialPayload, retryPayload types.ManualProcessPayload
@@ -380,14 +386,14 @@ func TestProductionProjectionFailedRetryEscapesArchivedPriorAttemptTaskID(t *tes
 	tasks := &manualAttemptRetryEnqueuer{accepted: make(map[string]*asynq.Task)}
 	service := &knowledgeService{task: tasks, spanTracker: tracker}
 
-	require.NoError(t, service.enqueueManualProcessing(context.Background(), knowledge, "# governed projection", true))
+	require.NoError(t, service.enqueueManualProcessing(initialProjectionGenerationContext(), knowledge, "# governed projection", true))
 	firstRetryID := productionProjectionAttemptTaskID("target-1", knowledge.ID, "retry", 1)
 	firstTask := tasks.accepted[firstRetryID]
 	require.NotNil(t, firstTask)
 	tracker.FinalizeAttempt(context.Background(), knowledge.ID, 1, types.SpanStatusFailed, nil,
 		"MANUAL_TASK_DEAD_LETTERED", "manual retry exhausted")
 
-	require.NoError(t, service.enqueueManualProcessing(context.Background(), knowledge, "# governed projection", true))
+	require.NoError(t, service.enqueueManualProcessing(initialProjectionGenerationContext(), knowledge, "# governed projection", true))
 	secondRetryID := productionProjectionAttemptTaskID("target-1", knowledge.ID, "retry", 2)
 	secondTask := tasks.accepted[secondRetryID]
 	require.NotNil(t, secondTask, "an archived attempt-1 task ID must not block attempt 2")
@@ -398,7 +404,7 @@ func TestProductionProjectionFailedRetryEscapesArchivedPriorAttemptTaskID(t *tes
 	require.Len(t, tasks.accepted, 2)
 
 	require.NoError(t, service.enqueueManualProcessing(
-		context.Background(), knowledge, "# governed projection", true, secondPayload.Attempt,
+		initialProjectionGenerationContext(), knowledge, "# governed projection", true, secondPayload.Attempt,
 	))
 	require.Equal(t, 2, tracker.LatestAttempt(context.Background(), knowledge.ID),
 		"same-attempt replay must not open another root")
@@ -419,8 +425,8 @@ func TestProductionProjectionClaimedRetryAllocatesOnceAndReplaysSameAttempt(t *t
 	tracker.FinalizeAttempt(context.Background(), knowledge.ID, attempt,
 		types.SpanStatusFailed, nil, "MANUAL_TASK_DEAD_LETTERED", "prior attempt failed")
 
-	require.NoError(t, service.enqueueClaimedProjectionRetry(context.Background(), knowledge, "# governed projection"))
-	require.NoError(t, service.enqueueClaimedProjectionRetry(context.Background(), knowledge, "# governed projection"))
+	require.NoError(t, service.enqueueClaimedProjectionRetry(initialProjectionGenerationContext(), knowledge, "# governed projection"))
+	require.NoError(t, service.enqueueClaimedProjectionRetry(initialProjectionGenerationContext(), knowledge, "# governed projection"))
 	require.Equal(t, attempt+1, tracker.LatestAttempt(context.Background(), knowledge.ID))
 	retryID := productionProjectionAttemptTaskID("target-1", knowledge.ID, "retry", attempt+1)
 	require.NotNil(t, tasks.accepted[retryID])
@@ -492,7 +498,7 @@ func TestProductionProjectionConcurrentPendingBuildEnqueueClaimsOneAttempt(t *te
 		IndexingStrategy: meta.ProductionProjection.IndexingStrategy, ProcessOverrides: overrides,
 		ProductionProjection: meta.ProductionProjection,
 	}
-	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, knowledge.TenantID)
+	ctx := context.WithValue(initialProjectionGenerationContext(), types.TenantIDContextKey, knowledge.TenantID)
 
 	const builders = 16
 	start := make(chan struct{})
@@ -559,7 +565,7 @@ func TestProductionProjectionManualMarshalFailureFinalizesClaimedAttempt(t *test
 	marshalErr := errors.New("manual payload cannot be encoded")
 
 	err := service.enqueueManualProcessingWithEncoder(
-		context.Background(), knowledge, "# governed projection", false,
+		initialProjectionGenerationContext(), knowledge, "# governed projection", false,
 		func(types.ManualProcessPayload) ([]byte, error) { return nil, marshalErr },
 	)
 	require.ErrorIs(t, err, marshalErr)
@@ -605,6 +611,6 @@ func TestProductionProjectionTaskIDConflictPreservesClaimedAttempt(t *testing.T)
 		task: &initialPostProcessEnqueuer{errors: []error{asynq.ErrTaskIDConflict}}, spanTracker: tracker,
 	}
 
-	require.NoError(t, service.enqueueManualProcessing(context.Background(), knowledge, "# governed projection", false))
+	require.NoError(t, service.enqueueManualProcessing(initialProjectionGenerationContext(), knowledge, "# governed projection", false))
 	requireManualAttemptRootState(t, spanDB, knowledge.ID, 1, types.SpanStatusRunning, "")
 }

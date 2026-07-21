@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/models/embedding"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -12,6 +13,8 @@ import (
 	"github.com/hibiken/asynq"
 	"github.com/stretchr/testify/require"
 )
+
+var projectionManualGeneration = time.Date(2026, 7, 22, 0, 30, 0, 0, time.UTC)
 
 type projectionManualKnowledgeRepo struct {
 	interfaces.KnowledgeRepository
@@ -127,6 +130,13 @@ func (r *projectionManualReleaseRepo) GetTarget(context.Context, uint64, string)
 	return r.target, nil
 }
 
+func (r *projectionManualReleaseRepo) ClaimProjectionBuildGeneration(
+	_ context.Context, targetID, knowledgeID string, expectedUpdatedAt time.Time,
+) (bool, error) {
+	return r.target != nil && r.target.ID == targetID && r.target.KnowledgeID == knowledgeID &&
+		r.target.Status == types.ReleaseTargetBuilding && r.target.UpdatedAt.Equal(expectedUpdatedAt), nil
+}
+
 type projectionManualFixture struct {
 	service   *knowledgeService
 	knowledge *types.Knowledge
@@ -167,6 +177,7 @@ func newProjectionManualFixture(t *testing.T, snapshotStore, liveStore string, m
 		KnowledgeID: knowledge.ID, TargetKnowledgeBaseID: knowledge.KnowledgeBaseID,
 		DocumentID: meta.ProductionProjection.DocumentID, VersionID: meta.ProductionProjection.VersionID,
 		Status: types.ReleaseTargetBuilding, ConfigSnapshot: snapshot, ConfigDigest: digest,
+		CreatedAt: projectionManualGeneration, UpdatedAt: projectionManualGeneration,
 	}
 	return &projectionManualFixture{
 		service: &knowledgeService{
@@ -184,6 +195,7 @@ func projectionManualTask(t *testing.T, knowledge *types.Knowledge, needCleanup 
 	payload, err := json.Marshal(types.ManualProcessPayload{
 		TenantID: knowledge.TenantID, KnowledgeID: knowledge.ID,
 		KnowledgeBaseID: knowledge.KnowledgeBaseID, Content: "# governed projection", NeedCleanup: needCleanup,
+		TargetUpdatedAt: projectionManualGeneration,
 	})
 	require.NoError(t, err)
 	return asynq.NewTask(types.TypeManualProcess, payload)
@@ -223,8 +235,7 @@ func TestProductionProjectionManualUpdateEmbeddingLookupFailureIsRetryable(t *te
 	require.Equal(t, types.ParseStatusFailed, fixture.knowledge.ParseStatus)
 	require.Equal(t, 2, fixture.model.calls, "a failed projection remains reachable by Asynq retry")
 	require.Equal(t, []string{
-		types.ParseStatusProcessing, types.ParseStatusFailed,
-		types.ParseStatusProcessing, types.ParseStatusFailed,
+		types.ParseStatusFailed, types.ParseStatusFailed,
 	}, fixture.repo.statuses)
 	require.Zero(t, fixture.chunks.deleteCalls)
 	require.Zero(t, fixture.chunks.createCalls)

@@ -1282,6 +1282,13 @@ func (s *knowledgeService) enqueueManualProcessingWithMode(
 		Content:         content,
 		NeedCleanup:     needCleanup,
 	}
+	if projection != nil {
+		generation, ok := productionProjectionGenerationFromContext(ctx)
+		if !ok {
+			return errors.New("production projection target generation is required")
+		}
+		payload.TargetUpdatedAt = generation
+	}
 	langfuse.InjectTracing(ctx, &payload)
 	finalizeAttemptOnFailure := false
 	if len(presetAttempt) > 0 && presetAttempt[0] > 0 {
@@ -1391,7 +1398,11 @@ func (s *knowledgeService) triggerManualProcessing(ctx context.Context,
 	// Runs before chunking so chunks contain stable provider:// URLs.
 	var resolvedImages []docparser.StoredImage
 	if s.imageResolver != nil {
-		fileSvc := s.resolveFileService(ctx, kb)
+		storageKB := kb
+		if routing, ok := productionProjectionRoutingFromContext(ctx); ok {
+			storageKB = routing.knowledgeBase(knowledge)
+		}
+		fileSvc := s.resolveFileService(ctx, storageKB)
 		afterDataURI, fromDataURI, _ := s.imageResolver.ResolveDataURIImages(ctx, clean, fileSvc, knowledge.TenantID)
 		if len(fromDataURI) > 0 {
 			logger.Infof(ctx, "Resolved %d data-URI images for manual knowledge %s", len(fromDataURI), knowledge.ID)

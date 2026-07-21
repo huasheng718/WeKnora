@@ -318,6 +318,61 @@ func (r *productionReleaseRepository) GetTargetForUpdate(
 	return &target, nil
 }
 
+// ClaimProjectionBuildGeneration is the first write of a projection build
+// worker. Locking target before Knowledge matches retry/recovery lock order, so
+// a stale generation can never race a lifecycle transition into mutating data.
+func (r *productionReleaseRepository) ClaimProjectionBuildGeneration(
+	ctx context.Context,
+	targetID string,
+	knowledgeID string,
+	expectedUpdatedAt time.Time,
+) (bool, error) {
+	tenantID, ok := types.TenantIDFromContext(ctx)
+	if !ok || tenantID == 0 || expectedUpdatedAt.IsZero() {
+		return false, types.ErrProductionForbidden
+	}
+	if err := requireProductionReleaseIdentity("target_id", targetID); err != nil {
+		return false, err
+	}
+	if err := requireProductionReleaseIdentity("knowledge_id", knowledgeID); err != nil {
+		return false, err
+	}
+	claimed := false
+	err := database.WithTransactionContext(ctx, r.db, func(txCtx context.Context) error {
+		db := database.DBFromContext(txCtx, r.db).WithContext(txCtx)
+		var target types.ProductionReleaseTarget
+		loadErr := db.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where(
+				"tenant_id = ? AND id = ? AND knowledge_id = ? AND status = ? AND updated_at = ?",
+				tenantID, targetID, knowledgeID, types.ReleaseTargetBuilding, expectedUpdatedAt,
+			).
+			Take(&target).Error
+		if errors.Is(loadErr, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		if loadErr != nil {
+			return translateProductionReleaseTargetReadError(loadErr)
+		}
+		result := db.Model(&types.Knowledge{}).
+			Where(
+				"tenant_id = ? AND id = ? AND knowledge_base_id = ? AND parse_status IN ?",
+				tenantID, knowledgeID, target.TargetKnowledgeBaseID,
+				[]string{types.ParseStatusPending, types.ParseStatusProcessing, types.ParseStatusFailed},
+			).
+			Updates(map[string]any{
+				"parse_status":  types.ParseStatusProcessing,
+				"error_message": "",
+				"updated_at":    r.nowUTC(),
+			})
+		if result.Error != nil {
+			return translateProductionReleaseError(result.Error)
+		}
+		claimed = result.RowsAffected == 1
+		return nil
+	})
+	return claimed, err
+}
+
 func (r *productionReleaseRepository) GetRelease(
 	ctx context.Context, tenantID uint64, releaseID string,
 ) (*types.ProductionRelease, error) {

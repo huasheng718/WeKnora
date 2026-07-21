@@ -13,6 +13,7 @@ type ProductionReleaseRepository interface {
 	GetLatestReleaseForVersion(ctx context.Context, tenantID uint64, documentID, versionID string) (*types.ProductionRelease, error)
 	GetTarget(ctx context.Context, tenantID uint64, targetID string) (*types.ProductionReleaseTarget, error)
 	GetTargetForUpdate(ctx context.Context, tenantID uint64, targetID string) (*types.ProductionReleaseTarget, error)
+	ClaimProjectionBuildGeneration(ctx context.Context, targetID, knowledgeID string, expectedUpdatedAt time.Time) (bool, error)
 	TransitionTarget(ctx context.Context, targetID string, from, to types.ProductionReleaseTargetStatus, patch types.JSONMap) (bool, error)
 	TransitionTargetForRetry(ctx context.Context, targetID string, from types.ProductionReleaseTargetStatus, expectedUpdatedAt time.Time) (*types.ProductionReleaseTarget, bool, error)
 	ResolveScopes(ctx context.Context, tenantID uint64, kbIDs []string) (map[string]types.ProductionKnowledgeScope, error)
