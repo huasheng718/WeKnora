@@ -17,6 +17,32 @@ type Neo4jRepository struct {
 	nodePrefix string
 }
 
+const relationshipImportQuery = `
+	UNWIND $data AS row
+	CALL apoc.merge.node(row.source_labels, {name: row.source, kg: row.knowledge_id}, {}, {}) YIELD node as source
+	CALL apoc.merge.node(row.target_labels, {name: row.target, kg: row.knowledge_id}, {}, {}) YIELD node as target
+	CALL apoc.merge.relationship(source, row.type, {knowledge_id: row.knowledge_id}, {kg: row.kg}, target) YIELD rel
+	RETURN distinct 'done'
+`
+
+func relationshipImportRows(namespace types.NameSpace, labels []string, relations []*types.GraphRelation) []map[string]interface{} {
+	if strings.TrimSpace(namespace.Knowledge) == "" {
+		return nil
+	}
+	rows := make([]map[string]interface{}, 0, len(relations))
+	for _, rel := range relations {
+		if rel == nil {
+			continue
+		}
+		rows = append(rows, map[string]interface{}{
+			"source": rel.Node1, "target": rel.Node2, "knowledge_id": namespace.Knowledge,
+			"kg": []string{namespace.Knowledge}, "type": rel.Type,
+			"source_labels": labels, "target_labels": labels,
+		})
+	}
+	return rows
+}
+
 // NewNeo4jRepository creates a new Neo4j repository
 func NewNeo4jRepository(driver neo4j.Driver) interfaces.RetrieveGraphRepository {
 	return &Neo4jRepository{driver: driver, nodePrefix: "ENTITY"}
@@ -84,25 +110,8 @@ func (n *Neo4jRepository) addGraph(ctx context.Context, namespace types.NameSpac
 		}
 
 		// Relationship import query
-		rel_import_query := `
-			UNWIND $data AS row
-			CALL apoc.merge.node(row.source_labels, {name: row.source, kg: row.knowledge_id}, {}, {}) YIELD node as source
-			CALL apoc.merge.node(row.target_labels, {name: row.target, kg: row.knowledge_id}, {}, {}) YIELD node as target
-			CALL apoc.merge.relationship(source, row.type, {}, row.attributes, target) YIELD rel
-			RETURN distinct 'done'
-		`
-		relData := []map[string]interface{}{}
-		for _, rel := range graph.Relation {
-			relData = append(relData, map[string]interface{}{
-				"source":        rel.Node1,
-				"target":        rel.Node2,
-				"knowledge_id":  namespace.Knowledge,
-				"type":          rel.Type,
-				"source_labels": n.Labels(namespace),
-				"target_labels": n.Labels(namespace),
-			})
-		}
-		if _, err := tx.Run(ctx, rel_import_query, map[string]interface{}{"data": relData}); err != nil {
+		relData := relationshipImportRows(namespace, n.Labels(namespace), graph.Relation)
+		if _, err := tx.Run(ctx, relationshipImportQuery, map[string]interface{}{"data": relData}); err != nil {
 			return nil, fmt.Errorf("failed to create relationships: %v", err)
 		}
 		return nil, nil
@@ -229,11 +238,34 @@ func (n *Neo4jRepository) SearchNode(
 }
 
 func graphPropertyStrings(properties map[string]any, key string) []string {
-	raw, ok := properties[key].([]interface{})
-	if !ok {
+	switch raw := properties[key].(type) {
+	case string:
+		if strings.TrimSpace(raw) == "" {
+			return nil
+		}
+		return []string{raw}
+	case []string:
+		result := make([]string, len(raw))
+		for i, value := range raw {
+			if strings.TrimSpace(value) == "" {
+				return nil
+			}
+			result[i] = value
+		}
+		return result
+	case []interface{}:
+		result := make([]string, len(raw))
+		for i, value := range raw {
+			text, ok := value.(string)
+			if !ok || strings.TrimSpace(text) == "" {
+				return nil
+			}
+			result[i] = text
+		}
+		return result
+	default:
 		return nil
 	}
-	return listI2listS(raw)
 }
 
 func listI2listS(list []any) []string {

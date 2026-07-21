@@ -78,7 +78,7 @@ func TestScopeClause_EmptyWhenNoUsableScope(t *testing.T) {
 	}
 }
 
-func TestResolveGrepScopeCarriesFullKBExclusions(t *testing.T) {
+func TestResolveGrepScopeDoesNotBindProductionHistoryExclusions(t *testing.T) {
 	tool := NewGrepChunksTool(nil, types.SearchTargets{&types.SearchTarget{
 		Type:                types.SearchTargetTypeKnowledgeBase,
 		KnowledgeBaseID:     "kb-1",
@@ -88,12 +88,12 @@ func TestResolveGrepScopeCarriesFullKBExclusions(t *testing.T) {
 	if len(kbIDs) != 1 || kbIDs[0] != "kb-1" {
 		t.Fatalf("full KB scope = %v, want kb-1", kbIDs)
 	}
-	if len(excluded) != 1 || excluded[0] != "knowledge-old" {
-		t.Fatalf("excluded knowledge IDs = %v, want knowledge-old", excluded)
+	if len(excluded) != 0 {
+		t.Fatalf("production exclusions must use anti-join, got binds %v", excluded)
 	}
 }
 
-func TestResolveGrepScopeCarriesTagTargetExclusions(t *testing.T) {
+func TestResolveGrepScopeDoesNotBindTagProductionHistoryExclusions(t *testing.T) {
 	tool := NewGrepChunksTool(nil, types.SearchTargets{&types.SearchTarget{
 		Type:                types.SearchTargetTypeKnowledgeBase,
 		KnowledgeBaseID:     "kb-1",
@@ -102,10 +102,10 @@ func TestResolveGrepScopeCarriesTagTargetExclusions(t *testing.T) {
 		ExcludeKnowledgeIDs: []string{"knowledge-old"},
 	}})
 	_, _, excluded, targets := tool.resolveGrepScope()
-	if len(excluded) != 1 || excluded[0] != "knowledge-old" {
-		t.Fatalf("excluded knowledge IDs = %v, want knowledge-old", excluded)
+	if len(excluded) != 0 {
+		t.Fatalf("production exclusions must use anti-join, got binds %v", excluded)
 	}
-	if len(targets) != 1 || len(targets[0].ExcludeKnowledgeIDs) != 1 {
+	if len(targets) != 1 || len(targets[0].ExcludeKnowledgeIDs) != 0 {
 		t.Fatalf("tag target exclusions = %#v", targets)
 	}
 }

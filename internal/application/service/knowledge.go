@@ -557,7 +557,6 @@ func (s *knowledgeService) ListPagedKnowledgeByKnowledgeBaseID(ctx context.Conte
 			return nil, err
 		}
 		scope := scopes[kbID]
-		filter.ExcludeKnowledgeIDs = mergeUniqueKnowledgeIDs(filter.ExcludeKnowledgeIDs, scope.InactiveKnowledgeIDs)
 		filter.ExcludeInactiveProductionProjections = true
 		activeKnowledgeIDs = scope.ActiveKnowledgeIDs
 	}

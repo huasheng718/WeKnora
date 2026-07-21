@@ -21,6 +21,10 @@ func (r *projectionListKnowledgeRepo) ListPagedKnowledgeByKnowledgeBaseID(_ cont
 	for _, id := range filter.ExcludeKnowledgeIDs {
 		excluded[id] = struct{}{}
 	}
+	if filter.ExcludeInactiveProductionProjections {
+		excluded["knowledge-old"] = struct{}{}
+		excluded["knowledge-building"] = struct{}{}
+	}
 	result := make([]*types.Knowledge, 0, len(r.rows))
 	for _, row := range r.rows {
 		if _, ok := excluded[row.ID]; !ok {
@@ -39,6 +43,7 @@ func TestKnowledgeListOmitsInactiveProductionProjectionsAndMarksActiveResponse(t
 		{ID: "knowledge-active", Source: "manual"},
 		{ID: "knowledge-old", Source: "manual"},
 		{ID: "knowledge-building", Source: "manual"},
+		{ID: "caller-hidden", Source: "manual"},
 	}}
 	svc := &knowledgeService{
 		repo: repo,
@@ -48,11 +53,12 @@ func TestKnowledgeListOmitsInactiveProductionProjectionsAndMarksActiveResponse(t
 	}
 	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(7))
 
-	result, err := svc.ListPagedKnowledgeByKnowledgeBaseID(ctx, "kb-1", &types.Pagination{Page: 1, PageSize: 20}, types.KnowledgeListFilter{})
+	result, err := svc.ListPagedKnowledgeByKnowledgeBaseID(ctx, "kb-1", &types.Pagination{Page: 1, PageSize: 20}, types.KnowledgeListFilter{ExcludeKnowledgeIDs: []string{"caller-hidden"}})
 	require.NoError(t, err)
 	rows := result.Data.([]*types.Knowledge)
 	require.Equal(t, []string{"knowledge-active"}, projectionKnowledgeIDs(rows))
-	require.ElementsMatch(t, []string{"knowledge-old", "knowledge-building"}, repo.lastFilter.ExcludeKnowledgeIDs)
+	require.Equal(t, []string{"caller-hidden"}, repo.lastFilter.ExcludeKnowledgeIDs)
+	require.True(t, repo.lastFilter.ExcludeInactiveProductionProjections)
 	require.Equal(t, "production", rows[0].Source)
 	require.True(t, rows[0].ReadOnly)
 	require.Equal(t, "manual", repo.rows[0].Source)

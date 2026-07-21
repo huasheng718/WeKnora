@@ -263,7 +263,6 @@ func (t *GrepChunksTool) resolveGrepScope() (fullKBIDs, knowledgeIDs, excludeKno
 		if target == nil || target.KnowledgeBaseID == "" {
 			continue
 		}
-		excludeKnowledgeIDs = appendUniqueKnowledgeIDs(excludeKnowledgeIDs, target.ExcludeKnowledgeIDs)
 		switch {
 		case len(target.KnowledgeIDs) > 0:
 			for _, kid := range target.KnowledgeIDs {
@@ -287,11 +286,10 @@ func (t *GrepChunksTool) resolveGrepScope() (fullKBIDs, knowledgeIDs, excludeKno
 			}
 			seenTagScope[scopeKey] = true
 			tagTargets = append(tagTargets, &types.SearchTarget{
-				Type:                types.SearchTargetTypeKnowledgeBase,
-				KnowledgeBaseID:     target.KnowledgeBaseID,
-				TenantID:            tenantID,
-				TagIDs:              tagIDs,
-				ExcludeKnowledgeIDs: target.ExcludeKnowledgeIDs,
+				Type:            types.SearchTargetTypeKnowledgeBase,
+				KnowledgeBaseID: target.KnowledgeBaseID,
+				TenantID:        tenantID,
+				TagIDs:          tagIDs,
 			})
 		default:
 			if !seenKB[target.KnowledgeBaseID] {

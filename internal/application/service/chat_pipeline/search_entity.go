@@ -65,6 +65,7 @@ func (p *PluginSearchEntity) OnEvent(ctx context.Context,
 	var allNodes []*types.GraphNode
 	var allRelations []*types.GraphRelation
 	chunkTenants := make(map[string]uint64)
+	chunkKnowledgeBases := make(map[string]string)
 	ownerTenantByKB := entityOwnerTenants(chatManage.SearchTargets, chatManage.TenantID)
 
 	// If specific KnowledgeIDs are provided, search by individual files
@@ -98,6 +99,7 @@ func (p *PluginSearchEntity) OnEvent(ctx context.Context,
 				for _, node := range graph.Node {
 					for _, chunkID := range node.Chunks {
 						chunkTenants[chunkID] = ownerTenantByKB[knowledgeBaseID]
+						chunkKnowledgeBases[chunkID] = knowledgeBaseID
 					}
 				}
 				mu.Unlock()
@@ -131,6 +133,7 @@ func (p *PluginSearchEntity) OnEvent(ctx context.Context,
 				for _, node := range graph.Node {
 					for _, chunkID := range node.Chunks {
 						chunkTenants[chunkID] = ownerTenantByKB[knowledgeBaseID]
+						chunkKnowledgeBases[chunkID] = knowledgeBaseID
 					}
 				}
 				mu.Unlock()
@@ -147,10 +150,10 @@ func (p *PluginSearchEntity) OnEvent(ctx context.Context,
 	excludedKnowledgeIDs := excludedEntityKnowledgeIDs(chatManage.SearchTargets)
 	if len(excludedKnowledgeIDs) > 0 {
 		var err error
-		graph, err = p.pruneExcludedProjectionGraph(ctx, chunkTenants, graph, excludedKnowledgeIDs)
+		graph, err = p.pruneExcludedProjectionGraph(ctx, chunkTenants, chunkKnowledgeBases, graph, excludedKnowledgeIDs)
 		if err != nil {
 			logger.Errorf(ctx, "Failed to prune excluded production projections from entity graph: %v", err)
-			chatManage.GraphResult = &types.GraphData{}
+			clearEntitySearchResults(chatManage)
 			return next()
 		}
 	}
@@ -162,9 +165,10 @@ func (p *PluginSearchEntity) OnEvent(ctx context.Context,
 		logger.Infof(ctx, "No new chunk found")
 		return next()
 	}
-	chunks, err := p.listEntityChunks(ctx, chunkTenants, chunkIDs)
+	chunks, err := p.listEntityChunks(ctx, chunkTenants, chunkKnowledgeBases, chunkIDs)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to list chunks, session_id: %s, error: %v", chatManage.SessionID, err)
+		clearEntitySearchResults(chatManage)
 		return next()
 	}
 	knowledgeIDs := []string{}
@@ -174,6 +178,7 @@ func (p *PluginSearchEntity) OnEvent(ctx context.Context,
 	knowledges, err := p.listEntityKnowledges(ctx, chunks, knowledgeIDs)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to list knowledge, session_id: %s, error: %v", chatManage.SessionID, err)
+		clearEntitySearchResults(chatManage)
 		return next()
 	}
 
@@ -238,13 +243,27 @@ func entityOwnerTenants(targets types.SearchTargets, fallback uint64) map[string
 	return owners
 }
 
-func (p *PluginSearchEntity) listEntityChunks(ctx context.Context, chunkTenants map[string]uint64, ids []string) ([]*types.Chunk, error) {
+func clearEntitySearchResults(chatManage *types.ChatManage) {
+	chatManage.GraphResult = &types.GraphData{}
+	chatManage.SearchResult = nil
+}
+
+func (p *PluginSearchEntity) listEntityChunks(ctx context.Context, chunkTenants map[string]uint64, chunkKnowledgeBases map[string]string, ids []string) ([]*types.Chunk, error) {
 	byTenant := make(map[uint64][]string)
+	expectedKBByChunk := make(map[string]string, len(ids))
 	for _, id := range ids {
 		tenant, ok := chunkTenants[id]
 		if !ok || tenant == 0 {
 			return nil, fmt.Errorf("entity chunk %s has no authorized owner", id)
 		}
+		expectedKB := chunkKnowledgeBases[id]
+		if expectedKB == "" {
+			return nil, fmt.Errorf("entity chunk %s has no authorized knowledge base", id)
+		}
+		if _, duplicate := expectedKBByChunk[id]; duplicate {
+			continue
+		}
+		expectedKBByChunk[id] = expectedKB
 		byTenant[tenant] = append(byTenant[tenant], id)
 	}
 	var out []*types.Chunk
@@ -253,32 +272,65 @@ func (p *PluginSearchEntity) listEntityChunks(ctx context.Context, chunkTenants 
 		if err != nil {
 			return nil, err
 		}
+		seen := make(map[string]struct{}, len(rows))
 		for _, row := range rows {
-			if row.TenantID != tenant {
-				return nil, fmt.Errorf("entity chunk tenant mismatch")
+			if row == nil {
+				return nil, fmt.Errorf("entity chunk dependency returned nil row")
 			}
+			expectedKB, requested := expectedKBByChunk[row.ID]
+			_, duplicate := seen[row.ID]
+			if !requested || duplicate || row.TenantID != tenant || row.KnowledgeBaseID != expectedKB {
+				return nil, fmt.Errorf("entity chunk scope mismatch")
+			}
+			seen[row.ID] = struct{}{}
 			out = append(out, row)
+		}
+		if len(seen) != len(chunkIDs) {
+			return nil, fmt.Errorf("entity chunk dependency returned incomplete rows")
 		}
 	}
 	return out, nil
 }
 
 func (p *PluginSearchEntity) listEntityKnowledges(ctx context.Context, chunks []*types.Chunk, _ []string) ([]*types.Knowledge, error) {
-	byTenant := make(map[uint64][]string)
+	byTenant := make(map[uint64]map[string]string)
 	for _, chunk := range chunks {
-		byTenant[chunk.TenantID] = append(byTenant[chunk.TenantID], chunk.KnowledgeID)
+		if chunk == nil || chunk.TenantID == 0 || chunk.KnowledgeID == "" || chunk.KnowledgeBaseID == "" {
+			return nil, fmt.Errorf("entity knowledge has incomplete chunk provenance")
+		}
+		if byTenant[chunk.TenantID] == nil {
+			byTenant[chunk.TenantID] = make(map[string]string)
+		}
+		if expectedKB, exists := byTenant[chunk.TenantID][chunk.KnowledgeID]; exists && expectedKB != chunk.KnowledgeBaseID {
+			return nil, fmt.Errorf("entity knowledge has conflicting knowledge base provenance")
+		}
+		byTenant[chunk.TenantID][chunk.KnowledgeID] = chunk.KnowledgeBaseID
 	}
 	var out []*types.Knowledge
-	for tenant, ids := range byTenant {
+	for tenant, expected := range byTenant {
+		ids := make([]string, 0, len(expected))
+		for id := range expected {
+			ids = append(ids, id)
+		}
 		rows, err := p.knowledgeRepo.GetKnowledgeBatch(ctx, tenant, ids)
 		if err != nil {
 			return nil, err
 		}
+		seen := make(map[string]struct{}, len(rows))
 		for _, row := range rows {
-			if row.TenantID != tenant {
-				return nil, fmt.Errorf("entity knowledge tenant mismatch")
+			if row == nil {
+				return nil, fmt.Errorf("entity knowledge dependency returned nil row")
 			}
+			expectedKB, requested := expected[row.ID]
+			_, duplicate := seen[row.ID]
+			if !requested || duplicate || row.TenantID != tenant || row.KnowledgeBaseID != expectedKB {
+				return nil, fmt.Errorf("entity knowledge scope mismatch")
+			}
+			seen[row.ID] = struct{}{}
 			out = append(out, row)
+		}
+		if len(seen) != len(expected) {
+			return nil, fmt.Errorf("entity knowledge dependency returned incomplete rows")
 		}
 	}
 	return out, nil
@@ -287,6 +339,7 @@ func (p *PluginSearchEntity) listEntityKnowledges(ctx context.Context, chunks []
 func (p *PluginSearchEntity) pruneExcludedProjectionGraph(
 	ctx context.Context,
 	chunkTenants map[string]uint64,
+	chunkKnowledgeBases map[string]string,
 	graph *types.GraphData,
 	excluded map[string]struct{},
 ) (*types.GraphData, error) {
@@ -306,7 +359,7 @@ func (p *PluginSearchEntity) pruneExcludedProjectionGraph(
 			}
 		}
 	}
-	chunks, err := p.listEntityChunks(ctx, chunkTenants, chunkIDs)
+	chunks, err := p.listEntityChunks(ctx, chunkTenants, chunkKnowledgeBases, chunkIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -343,7 +396,7 @@ func (p *PluginSearchEntity) pruneExcludedProjectionGraph(
 		if relation == nil {
 			continue
 		}
-		blocked := false
+		blocked := len(relation.KnowledgeIDs) == 0
 		for _, knowledgeID := range relation.KnowledgeIDs {
 			if _, excluded := excluded[knowledgeID]; excluded {
 				blocked = true
