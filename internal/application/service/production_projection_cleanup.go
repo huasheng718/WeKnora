@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/application/service/retriever"
@@ -196,6 +197,17 @@ func (u *ProductionProjectionRetrieveIndexUpdater) DisableChunks(ctx context.Con
 	if u == nil || u.kbs == nil || u.registry == nil || target == nil {
 		return errors.New("production index updater dependencies are unavailable")
 	}
+	kb, err := u.kbs.GetKnowledgeBaseByIDOnly(ctx, target.TargetKnowledgeBaseID)
+	if err != nil {
+		return err
+	}
+	if kb == nil || kb.ID != target.TargetKnowledgeBaseID || kb.TenantID != target.TenantID {
+		return types.ErrProductionForbidden
+	}
+	vectorStoreID, retrieverEngines, err := authenticatedProductionProjectionRetrievalSnapshot(target)
+	if err != nil {
+		return err
+	}
 	status := make(map[string]bool, len(chunks))
 	for _, chunk := range chunks {
 		if chunk != nil {
@@ -205,39 +217,48 @@ func (u *ProductionProjectionRetrieveIndexUpdater) DisableChunks(ctx context.Con
 	if len(status) == 0 {
 		return nil
 	}
-	kb, err := u.kbs.GetKnowledgeBaseByIDOnly(ctx, target.TargetKnowledgeBaseID)
-	if err != nil {
-		return err
-	}
-	if kb == nil || kb.ID != target.TargetKnowledgeBaseID || kb.TenantID != target.TenantID {
-		return types.ErrProductionForbidden
-	}
-	if kb.VectorStoreID != nil && *kb.VectorStoreID != "" {
+	if vectorStoreID != "" {
 		if u.ownership == nil {
 			return errors.New("production vector store ownership is unavailable")
 		}
-		owned, err := u.ownership.StoreOwnedBy(ctx, *kb.VectorStoreID, target.TenantID)
+		owned, err := u.ownership.StoreOwnedBy(ctx, vectorStoreID, target.TenantID)
 		if err != nil {
 			return err
 		}
 		if !owned {
 			return types.ErrProductionForbidden
 		}
-		engine, err := u.registry.GetByStoreID(*kb.VectorStoreID)
+		engine, err := u.registry.GetByStoreID(vectorStoreID)
 		if err != nil {
 			return err
 		}
 		return engine.BatchUpdateChunkEnabledStatus(ctx, status)
 	}
-	var snapshot struct {
-		RetrieverEngines []types.RetrieverEngineParams `json:"retriever_engines"`
-	}
-	if err := json.Unmarshal(target.ConfigSnapshot, &snapshot); err != nil || len(snapshot.RetrieverEngines) == 0 {
-		return fmt.Errorf("%w: retained retrieval configuration is unavailable", types.ErrProductionReleaseConfigInvalid)
-	}
-	engine, err := retriever.NewCompositeRetrieveEngine(u.registry, snapshot.RetrieverEngines)
+	engine, err := retriever.NewCompositeRetrieveEngine(u.registry, retrieverEngines)
 	if err != nil {
 		return err
 	}
 	return engine.BatchUpdateChunkEnabledStatus(ctx, status)
+}
+
+func authenticatedProductionProjectionRetrievalSnapshot(target *types.ProductionReleaseTarget) (string, []types.RetrieverEngineParams, error) {
+	if target == nil {
+		return "", nil, fmt.Errorf("%w: retained target is unavailable", types.ErrProductionReleaseConfigInvalid)
+	}
+	canonical, digest, err := types.CanonicalProductionReleaseTargetConfig(target.ConfigSnapshot)
+	if err != nil || digest != target.ConfigDigest || string(canonical) != string(target.ConfigSnapshot) {
+		return "", nil, fmt.Errorf("%w: retained configuration authentication failed", types.ErrProductionReleaseConfigInvalid)
+	}
+	var snapshot struct {
+		VectorStoreID    *string                       `json:"vector_store_id"`
+		RetrieverEngines []types.RetrieverEngineParams `json:"retriever_engines"`
+	}
+	if err := json.Unmarshal(canonical, &snapshot); err != nil {
+		return "", nil, fmt.Errorf("%w: retained retrieval configuration cannot be decoded", types.ErrProductionReleaseConfigInvalid)
+	}
+	vectorStoreID := strings.TrimSpace(valueOrEmpty(snapshot.VectorStoreID))
+	if (vectorStoreID == "") == (len(snapshot.RetrieverEngines) == 0) {
+		return "", nil, fmt.Errorf("%w: retained retrieval configuration is ambiguous", types.ErrProductionReleaseConfigInvalid)
+	}
+	return vectorStoreID, snapshot.RetrieverEngines, nil
 }

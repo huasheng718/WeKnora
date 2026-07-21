@@ -33,6 +33,9 @@ func (h *ProductionProjectionTaskHandler) Handle(ctx context.Context, task *asyn
 	if err := payload.Validate(); err != nil {
 		return err
 	}
+	if !productionProjectionOperationMatchesTaskType(payload.Operation, task.Type()) {
+		return types.ErrProductionReleaseInvalid
+	}
 	ctx = context.WithValue(ctx, types.TenantIDContextKey, payload.TenantID)
 	actorID := payload.ActorUserID
 	if actorID == "" {
@@ -54,11 +57,27 @@ func (h *ProductionProjectionTaskHandler) Handle(ctx context.Context, task *asyn
 		_, err = h.releases.builder.Build(ctx, target.ID)
 		return err
 	case types.TypeProductionActivate:
-		return h.releases.activateAuthorized(ctx, target, payload.ExpectedLock, false)
+		if payload.Operation == types.ProductionProjectionOperationRollback {
+			return h.releases.rollbackAuthorized(ctx, target, payload.ExpectedLock)
+		}
+		return h.releases.activateAuthorized(ctx, target, payload.ExpectedLock)
 	case types.TypeProductionCleanup:
 		return h.cleanup.Cleanup(ctx, target.ID)
 	default:
 		return errors.New("unsupported production projection task type")
+	}
+}
+
+func productionProjectionOperationMatchesTaskType(operation types.ProductionProjectionOperation, taskType string) bool {
+	switch taskType {
+	case types.TypeProductionBuild:
+		return operation == types.ProductionProjectionOperationBuild
+	case types.TypeProductionActivate:
+		return operation == types.ProductionProjectionOperationActivate || operation == types.ProductionProjectionOperationRollback
+	case types.TypeProductionCleanup:
+		return operation == types.ProductionProjectionOperationCleanup
+	default:
+		return false
 	}
 }
 

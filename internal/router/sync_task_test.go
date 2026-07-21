@@ -18,6 +18,20 @@ type syncTaskTestClock struct {
 	now time.Time
 }
 
+type syncTaskTestTimer struct {
+	durations chan time.Duration
+	fire      chan time.Time
+}
+
+func newSyncTaskTestTimer() *syncTaskTestTimer {
+	return &syncTaskTestTimer{durations: make(chan time.Duration, 1), fire: make(chan time.Time, 1)}
+}
+
+func (t *syncTaskTestTimer) After(delay time.Duration) <-chan time.Time {
+	t.durations <- delay
+	return t.fire
+}
+
 func (c *syncTaskTestClock) Now() time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -237,4 +251,57 @@ func TestSyncTaskExecutorConcurrentEnqueueAndPrune(t *testing.T) {
 	remaining := len(executor.taskIDs)
 	executor.mu.RUnlock()
 	require.Zero(t, remaining)
+}
+
+func TestSyncTaskExecutorProcessAtUsesInjectedClockAndTimer(t *testing.T) {
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	clock := &syncTaskTestClock{now: now}
+	timer := newSyncTaskTestTimer()
+	executor := newSyncTaskExecutor(clock.Now, timer.After)
+	executed := make(chan struct{}, 1)
+	executor.RegisterHandler("scheduled", func(context.Context, *asynq.Task) error {
+		executed <- struct{}{}
+		return nil
+	})
+
+	_, err := executor.Enqueue(asynq.NewTask("scheduled", nil), asynq.ProcessAt(now.Add(90*time.Minute)), asynq.MaxRetry(0))
+	require.NoError(t, err)
+	require.Equal(t, 90*time.Minute, <-timer.durations)
+	select {
+	case <-executed:
+		t.Fatal("ProcessAt task executed before its timer fired")
+	default:
+	}
+	timer.fire <- now.Add(90 * time.Minute)
+	require.Eventually(t, func() bool { return len(executed) == 1 }, time.Second, time.Millisecond)
+}
+
+func TestSyncTaskExecutorLastSchedulingOptionWins(t *testing.T) {
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name string
+		opts []asynq.Option
+		want time.Duration
+	}{
+		{name: "ProcessAt wins", opts: []asynq.Option{asynq.ProcessIn(5 * time.Minute), asynq.ProcessAt(now.Add(2 * time.Hour))}, want: 2 * time.Hour},
+		{name: "ProcessIn wins", opts: []asynq.Option{asynq.ProcessAt(now.Add(2 * time.Hour)), asynq.ProcessIn(5 * time.Minute)}, want: 5 * time.Minute},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			clock := &syncTaskTestClock{now: now}
+			timer := newSyncTaskTestTimer()
+			executor := newSyncTaskExecutor(clock.Now, timer.After)
+			executed := make(chan struct{}, 1)
+			executor.RegisterHandler("scheduled", func(context.Context, *asynq.Task) error {
+				executed <- struct{}{}
+				return nil
+			})
+
+			_, err := executor.Enqueue(asynq.NewTask("scheduled", nil), append(tc.opts, asynq.MaxRetry(0))...)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, <-timer.durations)
+			timer.fire <- now.Add(tc.want)
+			require.Eventually(t, func() bool { return len(executed) == 1 }, time.Second, time.Millisecond)
+		})
+	}
 }

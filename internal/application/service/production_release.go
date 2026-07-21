@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -46,6 +47,7 @@ type ProductionReleaseService struct {
 	authorizer interfaces.ProductionProjectAuthorizer
 	members    interfaces.TenantMemberService
 	kbs        interfaces.KnowledgeBaseService
+	storage    interfaces.StorageBackendResolver
 	models     interfaces.ModelService
 	registry   interfaces.RetrieveEngineRegistry
 	ownership  retriever.TenantStoreOwnership
@@ -67,6 +69,7 @@ func NewProductionReleaseService(
 	authorizer interfaces.ProductionProjectAuthorizer,
 	members interfaces.TenantMemberService,
 	kbs interfaces.KnowledgeBaseService,
+	storage interfaces.StorageBackendResolver,
 	models interfaces.ModelService,
 	registry interfaces.RetrieveEngineRegistry,
 	ownership retriever.TenantStoreOwnership,
@@ -81,7 +84,7 @@ func NewProductionReleaseService(
 ) *ProductionReleaseService {
 	return &ProductionReleaseService{
 		releases: releases, documents: documents, reviews: reviews, authorizer: authorizer,
-		members: members, kbs: kbs, models: models, registry: registry, ownership: ownership,
+		members: members, kbs: kbs, storage: storage, models: models, registry: registry, ownership: ownership,
 		builder: builder, knowledge: knowledge, graph: graph, wiki: wiki, cleanup: cleanup,
 		tasks: tasks, uow: uow, audit: audit, now: time.Now,
 	}
@@ -90,7 +93,7 @@ func NewProductionReleaseService(
 func (s *ProductionReleaseService) Prepare(ctx context.Context, documentID, versionID string, kbIDs []string) (*types.ProductionRelease, error) {
 	tenantID, actorID, err := productionCaller(ctx)
 	if err != nil || s == nil || s.releases == nil || s.documents == nil || s.reviews == nil ||
-		s.authorizer == nil || s.members == nil || s.kbs == nil || s.models == nil || s.uow == nil || s.audit == nil {
+		s.authorizer == nil || s.members == nil || s.kbs == nil || s.storage == nil || s.models == nil || s.uow == nil || s.audit == nil {
 		if err != nil {
 			return nil, err
 		}
@@ -190,14 +193,10 @@ func (s *ProductionReleaseService) Retry(ctx context.Context, targetID string) e
 	if target.Status != types.ReleaseTargetFailed && target.Status != types.ReleaseTargetRolledBack && target.Status != types.ReleaseTargetBuilding {
 		return types.ErrProductionReleaseLifecycle
 	}
-	if s.builder == nil {
-		return errors.New("production projection builder is unavailable")
+	if s.tasks == nil {
+		return errors.New("production projection task queue is unavailable")
 	}
-	if err := s.enqueueProjectionTask(ctx, types.TypeProductionBuild, target, 0); err != nil {
-		return err
-	}
-	_, err = s.builder.Build(ctx, target.ID)
-	return err
+	return s.enqueueProjectionTask(ctx, types.TypeProductionBuild, types.ProductionProjectionOperationBuild, target, 0)
 }
 
 func (s *ProductionReleaseService) Activate(ctx context.Context, targetID string, expectedLock int) error {
@@ -205,10 +204,10 @@ func (s *ProductionReleaseService) Activate(ctx context.Context, targetID string
 	if err != nil {
 		return err
 	}
-	if err := s.enqueueProjectionTask(ctx, types.TypeProductionActivate, target, expectedLock); err != nil {
+	if err := s.enqueueProjectionTask(ctx, types.TypeProductionActivate, types.ProductionProjectionOperationActivate, target, expectedLock); err != nil {
 		return err
 	}
-	return s.activateAuthorized(ctx, target, expectedLock, false)
+	return s.activateAuthorized(ctx, target, expectedLock)
 }
 
 func (s *ProductionReleaseService) Rollback(ctx context.Context, targetID string, expectedLock int) error {
@@ -216,53 +215,37 @@ func (s *ProductionReleaseService) Rollback(ctx context.Context, targetID string
 	if err != nil {
 		return err
 	}
-	if target.Status == types.ReleaseTargetCleaned || target.Status == types.ReleaseTargetCleanupPending ||
-		target.RetentionUntil == nil || !target.RetentionUntil.After(s.clockNow()) {
+	if target.Status != types.ReleaseTargetActive && (target.Status != types.ReleaseTargetRolledBack ||
+		target.RetentionUntil == nil || !target.RetentionUntil.After(s.clockNow())) {
 		return types.ErrProductionReleaseLifecycle
 	}
-	if target.Status == types.ReleaseTargetRolledBack || target.Status == types.ReleaseTargetFailed {
-		changed, err := s.releases.TransitionTarget(ctx, target.ID, target.Status, types.ReleaseTargetBuilding, nil)
-		if err != nil || !changed {
-			if err != nil {
-				return err
-			}
-			return types.ErrProductionProjectionConflict
-		}
-		knowledge, err := s.requireProjectionReady(ctx, target)
-		if err != nil {
-			return err
-		}
-		changed, err = s.releases.TransitionTarget(ctx, target.ID, types.ReleaseTargetBuilding, types.ReleaseTargetReady, nil)
-		if err != nil || !changed {
-			if err != nil {
-				return err
-			}
-			return types.ErrProductionProjectionConflict
-		}
-		target.Status = types.ReleaseTargetReady
-		_ = knowledge
-	}
-	if err := s.enqueueProjectionTask(ctx, types.TypeProductionActivate, target, expectedLock); err != nil {
+	if err := s.enqueueProjectionTask(ctx, types.TypeProductionActivate, types.ProductionProjectionOperationRollback, target, expectedLock); err != nil {
 		return err
 	}
-	return s.activateAuthorized(ctx, target, expectedLock, true)
+	return s.rollbackAuthorized(ctx, target, expectedLock)
 }
 
-func (s *ProductionReleaseService) enqueueProjectionTask(ctx context.Context, taskType string, target *types.ProductionReleaseTarget, expectedLock int) error {
+func (s *ProductionReleaseService) enqueueProjectionTask(
+	ctx context.Context,
+	taskType string,
+	operation types.ProductionProjectionOperation,
+	target *types.ProductionReleaseTarget,
+	expectedLock int,
+) error {
 	// Unit tests and in-process callers can exercise the state machine without
 	// a queue. Runtime construction always supplies the enqueuer.
 	if s.tasks == nil {
 		return nil
 	}
 	actorID, _ := types.UserIDFromContext(ctx)
-	payload, err := json.Marshal(types.ProductionProjectionTaskPayload{TenantID: target.TenantID,
+	payload, err := json.Marshal(types.ProductionProjectionTaskPayload{Operation: operation, TenantID: target.TenantID,
 		ProjectID: target.ProjectID, TargetID: target.ID, ActorUserID: actorID, ExpectedLock: expectedLock})
 	if err != nil {
 		return err
 	}
-	phase := strings.TrimPrefix(taskType, "production:")
-	if taskType == types.TypeProductionActivate {
-		phase = fmt.Sprintf("activate-lock-%d", expectedLock)
+	phase := string(operation)
+	if operation == types.ProductionProjectionOperationActivate || operation == types.ProductionProjectionOperationRollback {
+		phase = fmt.Sprintf("%s-lock-%d", operation, expectedLock)
 	}
 	taskOptions := []asynq.Option{asynq.Queue(types.QueueProduction), asynq.MaxRetry(8)}
 	if taskType == types.TypeProductionActivate {
@@ -282,7 +265,7 @@ func (s *ProductionReleaseService) enqueueProjectionTask(ctx context.Context, ta
 	return err
 }
 
-func (s *ProductionReleaseService) activateAuthorized(ctx context.Context, target *types.ProductionReleaseTarget, expectedLock int, rollback bool) error {
+func (s *ProductionReleaseService) activateAuthorized(ctx context.Context, target *types.ProductionReleaseTarget, expectedLock int) error {
 	if target == nil || expectedLock < 0 {
 		return types.ErrProductionProjectionConflict
 	}
@@ -301,10 +284,6 @@ func (s *ProductionReleaseService) activateAuthorized(ctx context.Context, targe
 	}
 	previous := activeProjectionTarget(history, target.ID)
 	actorID, _ := types.UserIDFromContext(ctx)
-	action := types.AuditActionProductionProjectionActivated
-	if rollback {
-		action = types.AuditActionProductionProjectionRolledBack
-	}
 	if s.uow == nil || s.audit == nil {
 		return errors.New("production activation transaction dependencies are unavailable")
 	}
@@ -317,7 +296,7 @@ func (s *ProductionReleaseService) activateAuthorized(ctx context.Context, targe
 		details, _ := json.Marshal(map[string]any{"lock_version": head.LockVersion, "previous_target_id": targetID(previous)})
 		return emitRequiredProductionAudit(txCtx, s.audit, &types.AuditLog{
 			TenantID: target.TenantID, ActorUserID: actorID, ActorRole: string(types.ProductionRolePublisher),
-			Action: action, TargetType: "production_release_target", TargetID: target.ID,
+			Action: types.AuditActionProductionProjectionActivated, TargetType: "production_release_target", TargetID: target.ID,
 			Outcome: types.AuditOutcomeSuccess, Details: details,
 		})
 	})
@@ -334,6 +313,77 @@ func (s *ProductionReleaseService) activateAuthorized(ctx context.Context, targe
 		return err
 	}
 	target.Status = types.ReleaseTargetActive
+	return s.enqueueActivationFollowupsWithPrevious(ctx, target, previous)
+}
+
+func (s *ProductionReleaseService) rollbackAuthorized(ctx context.Context, target *types.ProductionReleaseTarget, expectedLock int) error {
+	if target == nil || expectedLock < 0 {
+		return types.ErrProductionProjectionConflict
+	}
+	if target.Status == types.ReleaseTargetActive {
+		return s.enqueueActivationFollowups(ctx, target)
+	}
+	if target.Status != types.ReleaseTargetRolledBack || target.RetentionUntil == nil || !target.RetentionUntil.After(s.clockNow()) {
+		return types.ErrProductionReleaseLifecycle
+	}
+	if _, err := s.requireProjectionReady(ctx, target); err != nil {
+		return err
+	}
+	history, err := s.releases.ListProjectionHistory(ctx, target.TenantID, target.DocumentID, target.TargetKnowledgeBaseID)
+	if err != nil {
+		return err
+	}
+	previous := activeProjectionTarget(history, target.ID)
+	actorID, _ := types.UserIDFromContext(ctx)
+	if s.uow == nil || s.audit == nil {
+		return errors.New("production rollback transaction dependencies are unavailable")
+	}
+	err = s.uow.WithinTransaction(ctx, func(txCtx context.Context) error {
+		changed, transitionErr := s.releases.TransitionTarget(
+			txCtx, target.ID, types.ReleaseTargetRolledBack, types.ReleaseTargetBuilding, nil,
+		)
+		if transitionErr != nil {
+			return transitionErr
+		}
+		if !changed {
+			return types.ErrProductionProjectionConflict
+		}
+		changed, transitionErr = s.releases.TransitionTarget(
+			txCtx, target.ID, types.ReleaseTargetBuilding, types.ReleaseTargetReady, nil,
+		)
+		if transitionErr != nil {
+			return transitionErr
+		}
+		if !changed {
+			return types.ErrProductionProjectionConflict
+		}
+		head, switchErr := s.releases.SwitchHead(
+			txCtx, target.TenantID, target.DocumentID, target.TargetKnowledgeBaseID, target.ID, expectedLock,
+		)
+		if switchErr != nil {
+			return switchErr
+		}
+		details, _ := json.Marshal(map[string]any{"lock_version": head.LockVersion, "previous_target_id": targetID(previous)})
+		return emitRequiredProductionAudit(txCtx, s.audit, &types.AuditLog{
+			TenantID: target.TenantID, ActorUserID: actorID, ActorRole: string(types.ProductionRolePublisher),
+			Action: types.AuditActionProductionProjectionRolledBack, TargetType: "production_release_target", TargetID: target.ID,
+			Outcome: types.AuditOutcomeSuccess, Details: details,
+		})
+	})
+	if err != nil {
+		if errors.Is(err, types.ErrProductionProjectionConflict) {
+			current, loadErr := s.releases.GetTarget(ctx, target.TenantID, target.ID)
+			if loadErr == nil && current != nil && current.Status == types.ReleaseTargetActive {
+				return s.enqueueActivationFollowups(ctx, current)
+			}
+			if loadErr != nil {
+				return loadErr
+			}
+		}
+		return err
+	}
+	target.Status = types.ReleaseTargetActive
+	target.RetentionUntil = nil
 	return s.enqueueActivationFollowupsWithPrevious(ctx, target, previous)
 }
 
@@ -437,8 +487,35 @@ func (s *ProductionReleaseService) requireWritableTargetKB(ctx context.Context, 
 
 func (s *ProductionReleaseService) snapshotTargetProcessingConfig(ctx context.Context, tenantID uint64, kb *types.KnowledgeBase) (types.JSON, error) {
 	kb.EnsureDefaults()
-	if kb.GetStorageProvider() == "" && (kb.StorageBackendID == nil || strings.TrimSpace(*kb.StorageBackendID) == "") {
-		return nil, fmt.Errorf("%w: target storage is unavailable", types.ErrProductionReleaseConfigInvalid)
+	tenant, ok := types.TenantInfoFromContext(ctx)
+	if !ok || tenant == nil || tenant.ID != tenantID || s.storage == nil {
+		return nil, fmt.Errorf("%w: target storage context is unavailable", types.ErrProductionReleaseConfigInvalid)
+	}
+	requestedBackendID := strings.TrimSpace(valueOrEmpty(kb.StorageBackendID))
+	requestedProvider := strings.ToLower(strings.TrimSpace(kb.GetStorageProvider()))
+	backend, err := s.storage.ResolveBackend(ctx, tenant, requestedBackendID, requestedProvider)
+	if err != nil {
+		return nil, fmt.Errorf("%w: resolve target storage: %v", types.ErrProductionReleaseConfigInvalid, err)
+	}
+	if backend == nil || strings.TrimSpace(backend.ID) == "" || backend.TenantID != tenantID ||
+		backend.Status != types.StorageBackendStatusActive || strings.TrimSpace(backend.Provider) == "" ||
+		(requestedBackendID != "" && backend.ID != requestedBackendID) ||
+		(requestedBackendID == "" && requestedProvider != "" && !strings.EqualFold(backend.Provider, requestedProvider)) {
+		return nil, fmt.Errorf("%w: target storage backend is unavailable", types.ErrProductionReleaseConfigInvalid)
+	}
+	resolvedBackendID := strings.TrimSpace(backend.ID)
+	resolvedProvider := strings.ToLower(strings.TrimSpace(backend.Provider))
+	fileService, fileProvider, err := s.storage.ResolveFileService(
+		ctx, tenant, resolvedBackendID, resolvedProvider, strings.TrimSpace(os.Getenv("LOCAL_STORAGE_BASE_DIR")),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("%w: resolve target file service: %v", types.ErrProductionReleaseConfigInvalid, err)
+	}
+	if fileService == nil || !strings.EqualFold(strings.TrimSpace(fileProvider), resolvedProvider) {
+		return nil, fmt.Errorf("%w: target file service identity is unavailable", types.ErrProductionReleaseConfigInvalid)
+	}
+	if err := fileService.CheckConnectivity(ctx); err != nil {
+		return nil, fmt.Errorf("%w: target storage connectivity failed: %v", types.ErrProductionReleaseConfigInvalid, err)
 	}
 	if !kb.IndexingStrategy.HasAnyIndexing() || kb.ChunkingConfig.ChunkSize <= 0 || strings.TrimSpace(kb.ChunkingConfig.Strategy) == "" ||
 		strings.TrimSpace(kb.SummaryModelID) == "" || (kb.IndexingStrategy.NeedsEmbedding() && strings.TrimSpace(kb.EmbeddingModelID) == "") ||
@@ -475,10 +552,6 @@ func (s *ProductionReleaseService) snapshotTargetProcessingConfig(ctx context.Co
 	}
 	var retrieverEngines []types.RetrieverEngineParams
 	if strings.TrimSpace(valueOrEmpty(kb.VectorStoreID)) == "" {
-		tenant, ok := types.TenantInfoFromContext(ctx)
-		if !ok || tenant.ID != tenantID {
-			return nil, fmt.Errorf("%w: target retrieval configuration is unavailable", types.ErrProductionReleaseConfigInvalid)
-		}
 		retrieverEngines = append(retrieverEngines, tenant.GetEffectiveEngines()...)
 		if kb.IndexingStrategy.NeedsEmbedding() && len(retrieverEngines) == 0 {
 			return nil, fmt.Errorf("%w: target retrieval engines are unavailable", types.ErrProductionReleaseConfigInvalid)
@@ -515,7 +588,7 @@ func (s *ProductionReleaseService) snapshotTargetProcessingConfig(ctx context.Co
 		ParserEngineRules: append([]types.ParserEngineRule(nil), kb.ChunkingConfig.ParserEngineRules...),
 		EmbeddingModelID:  kb.EmbeddingModelID, SummaryModelID: kb.SummaryModelID,
 		QuestionGenerationConfig: kb.QuestionGenerationConfig,
-		StorageBackendID:         kb.StorageBackendID, StorageProvider: kb.GetStorageProvider(), VectorStoreID: kb.VectorStoreID,
+		StorageBackendID:         &resolvedBackendID, StorageProvider: resolvedProvider, VectorStoreID: kb.VectorStoreID,
 		RetrieverEngines: retrieverEngines,
 	}
 	snapshot.Graph.Enabled = kb.IndexingStrategy.GraphEnabled
@@ -673,7 +746,7 @@ func (s *ProductionCleanupTaskScheduler) EnqueueCleanup(_ context.Context, targe
 	if s == nil || s.tasks == nil || target == nil {
 		return errors.New("production cleanup scheduler is unavailable")
 	}
-	payload, err := json.Marshal(types.ProductionProjectionTaskPayload{TenantID: target.TenantID,
+	payload, err := json.Marshal(types.ProductionProjectionTaskPayload{Operation: types.ProductionProjectionOperationCleanup, TenantID: target.TenantID,
 		ProjectID: target.ProjectID, TargetID: target.ID})
 	if err != nil {
 		return err

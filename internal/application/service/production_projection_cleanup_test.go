@@ -32,6 +32,41 @@ func (s *productionCleanupIndexStub) DisableChunks(context.Context, *types.Produ
 	return nil
 }
 
+type productionCleanupEngineStub struct {
+	interfaces.RetrieveEngineService
+	calls  int
+	status map[string]bool
+}
+
+func (s *productionCleanupEngineStub) BatchUpdateChunkEnabledStatus(_ context.Context, status map[string]bool) error {
+	s.calls++
+	s.status = status
+	return nil
+}
+
+type productionCleanupRegistryStub struct {
+	interfaces.RetrieveEngineRegistry
+	engine    interfaces.RetrieveEngineService
+	requested []string
+}
+
+func (s *productionCleanupRegistryStub) GetByStoreID(storeID string) (interfaces.RetrieveEngineService, error) {
+	s.requested = append(s.requested, storeID)
+	return s.engine, nil
+}
+
+type productionCleanupOwnershipStub struct {
+	owned    bool
+	storeID  string
+	tenantID uint64
+}
+
+func (s *productionCleanupOwnershipStub) StoreOwnedBy(_ context.Context, storeID string, tenantID uint64) (bool, error) {
+	s.storeID = storeID
+	s.tenantID = tenantID
+	return s.owned, nil
+}
+
 func TestProjectionCleanupNeverTouchesActiveHeadAndIsIdempotent(t *testing.T) {
 	_, repo, _ := newProductionReleaseServiceFixture(t)
 	chunks := &productionCleanupChunksStub{chunks: []*types.Chunk{{ID: "chunk-1", KnowledgeID: "knowledge-old", IsEnabled: true}}}
@@ -75,4 +110,61 @@ func TestProjectionRetentionSweepIsBoundedAndSkipsActiveHead(t *testing.T) {
 	require.NoError(t, cleanup.CleanupExpired(productionReleaseContext(), 10))
 	require.Equal(t, types.ReleaseTargetCleaned, repo.targets["target-old"].Status)
 	require.Equal(t, types.ReleaseTargetActive, repo.targets["target-new"].Status)
+}
+
+func TestProjectionCleanupUsesAuthenticatedSnapshotVectorStoreDespiteLiveKBDrift(t *testing.T) {
+	snapshot, digest, err := types.CanonicalProductionReleaseTargetConfig(types.JSON(`{"version":1,"vector_store_id":"snapshot-store"}`))
+	require.NoError(t, err)
+	liveStore := "live-store"
+	target := &types.ProductionReleaseTarget{
+		ID: "target-old", TenantID: 7, TargetKnowledgeBaseID: "kb-1",
+		ConfigSnapshot: snapshot, ConfigDigest: digest,
+	}
+	engine := &productionCleanupEngineStub{}
+	registry := &productionCleanupRegistryStub{engine: engine}
+	ownership := &productionCleanupOwnershipStub{owned: true}
+	updater := NewProductionProjectionRetrieveIndexUpdater(
+		productionReleaseKBStub{kb: &types.KnowledgeBase{ID: "kb-1", TenantID: 7, VectorStoreID: &liveStore}},
+		registry,
+		ownership,
+	)
+
+	require.NoError(t, updater.DisableChunks(productionReleaseContext(), target, []*types.Chunk{{ID: "chunk-1"}}))
+	require.Equal(t, "snapshot-store", ownership.storeID)
+	require.Equal(t, uint64(7), ownership.tenantID)
+	require.Equal(t, []string{"snapshot-store"}, registry.requested)
+	require.Equal(t, map[string]bool{"chunk-1": false}, engine.status)
+}
+
+func TestProjectionCleanupRejectsTamperedOrIncompleteSnapshot(t *testing.T) {
+	valid, digest, err := types.CanonicalProductionReleaseTargetConfig(types.JSON(`{"version":1,"vector_store_id":"snapshot-store"}`))
+	require.NoError(t, err)
+	incomplete, incompleteDigest, err := types.CanonicalProductionReleaseTargetConfig(types.JSON(`{"version":1}`))
+	require.NoError(t, err)
+	tests := []struct {
+		name     string
+		snapshot types.JSON
+		digest   string
+	}{
+		{name: "digest mismatch", snapshot: valid, digest: incompleteDigest},
+		{name: "noncanonical", snapshot: types.JSON(`{ "version": 1, "vector_store_id": "snapshot-store" }`), digest: digest},
+		{name: "missing retrieval configuration", snapshot: incomplete, digest: incompleteDigest},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			engine := &productionCleanupEngineStub{}
+			registry := &productionCleanupRegistryStub{engine: engine}
+			ownership := &productionCleanupOwnershipStub{owned: true}
+			updater := NewProductionProjectionRetrieveIndexUpdater(
+				productionReleaseKBStub{kb: &types.KnowledgeBase{ID: "kb-1", TenantID: 7}}, registry, ownership,
+			)
+			target := &types.ProductionReleaseTarget{ID: "target-old", TenantID: 7, TargetKnowledgeBaseID: "kb-1", ConfigSnapshot: tc.snapshot, ConfigDigest: tc.digest}
+
+			err := updater.DisableChunks(productionReleaseContext(), target, []*types.Chunk{{ID: "chunk-1"}})
+
+			require.ErrorIs(t, err, types.ErrProductionReleaseConfigInvalid)
+			require.Empty(t, registry.requested)
+			require.Zero(t, engine.calls)
+		})
+	}
 }

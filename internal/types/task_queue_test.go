@@ -115,6 +115,32 @@ func TestProductionTaskTypesUseProductionQueue(t *testing.T) {
 	}
 }
 
+func TestProductionProjectionTaskOperationsAreStrictAndStable(t *testing.T) {
+	for _, operation := range []ProductionProjectionOperation{
+		ProductionProjectionOperationBuild,
+		ProductionProjectionOperationActivate,
+		ProductionProjectionOperationRollback,
+		ProductionProjectionOperationCleanup,
+	} {
+		payload := ProductionProjectionTaskPayload{
+			Operation: operation,
+			TenantID:  7, ProjectID: "project-1", TargetID: "target-1",
+		}
+		if err := payload.Validate(); err != nil {
+			t.Fatalf("operation %q should validate: %v", operation, err)
+		}
+	}
+	for _, operation := range []ProductionProjectionOperation{"", "retry", "ROLLBACK"} {
+		payload := ProductionProjectionTaskPayload{
+			Operation: operation,
+			TenantID:  7, ProjectID: "project-1", TargetID: "target-1",
+		}
+		if err := payload.Validate(); err == nil {
+			t.Fatalf("operation %q must fail closed", operation)
+		}
+	}
+}
+
 func TestResolveWorkerPoolConcurrencyKeepsProductionIndependent(t *testing.T) {
 	allocation := ResolveWorkerPoolConcurrency(func(key, _ string, fallback int) int {
 		if key == "asynq.production_concurrency" {

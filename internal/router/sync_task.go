@@ -48,20 +48,26 @@ type SyncTaskExecutor struct {
 	taskIDs        map[string]time.Time
 	taskIDExpiries syncTaskIDExpiryHeap
 	now            func() time.Time
+	after          func(time.Duration) <-chan time.Time
 }
 
 func NewSyncTaskExecutor() *SyncTaskExecutor {
-	return newSyncTaskExecutor(time.Now)
+	return newSyncTaskExecutor(time.Now, time.After)
 }
 
-func newSyncTaskExecutor(now func() time.Time) *SyncTaskExecutor {
+func newSyncTaskExecutor(now func() time.Time, timers ...func(time.Duration) <-chan time.Time) *SyncTaskExecutor {
 	if now == nil {
 		now = time.Now
+	}
+	after := time.After
+	if len(timers) != 0 && timers[0] != nil {
+		after = timers[0]
 	}
 	return &SyncTaskExecutor{
 		handlers: make(map[string]func(context.Context, *asynq.Task) error),
 		taskIDs:  make(map[string]time.Time),
 		now:      now,
+		after:    after,
 	}
 }
 
@@ -74,9 +80,10 @@ func (e *SyncTaskExecutor) RegisterHandler(pattern string, handler func(context.
 
 // Enqueue satisfies interfaces.TaskEnqueuer.
 // Instead of queuing to Redis, it dispatches the task to a goroutine.
-// Supports ProcessIn (delay) and MaxRetry options for parity with asynq.
+// Supports ProcessAt/ProcessIn scheduling and MaxRetry options for parity with asynq.
 func (e *SyncTaskExecutor) Enqueue(task *asynq.Task, opts ...asynq.Option) (*asynq.TaskInfo, error) {
-	var delay time.Duration
+	enqueuedAt := e.now()
+	var scheduledAt time.Time
 	var retention time.Duration
 	var requestedTaskID string
 	hasTaskID := false
@@ -84,9 +91,13 @@ func (e *SyncTaskExecutor) Enqueue(task *asynq.Task, opts ...asynq.Option) (*asy
 	maxRetrySet := false
 	for _, opt := range opts {
 		switch opt.Type() {
+		case asynq.ProcessAtOpt:
+			if at, ok := opt.Value().(time.Time); ok {
+				scheduledAt = at
+			}
 		case asynq.ProcessInOpt:
 			if d, ok := opt.Value().(time.Duration); ok {
-				delay = d
+				scheduledAt = enqueuedAt.Add(d)
 			}
 		case asynq.MaxRetryOpt:
 			if n, ok := opt.Value().(int); ok {
@@ -120,7 +131,7 @@ func (e *SyncTaskExecutor) Enqueue(task *asynq.Task, opts ...asynq.Option) (*asy
 		e.mu.Unlock()
 		return nil, fmt.Errorf("sync task executor: no handler registered for type %q", task.Type())
 	}
-	now := e.now()
+	now := enqueuedAt
 	e.pruneExpiredTaskIDsLocked(now)
 	if hasTaskID {
 		if expiresAt, exists := e.taskIDs[requestedTaskID]; exists &&
@@ -137,17 +148,19 @@ func (e *SyncTaskExecutor) Enqueue(task *asynq.Task, opts ...asynq.Option) (*asy
 		taskID = uuid.New().String()
 	}
 	info := &asynq.TaskInfo{
-		ID:    taskID,
-		Queue: "sync",
-		Type:  task.Type(),
+		ID:            taskID,
+		Queue:         "sync",
+		Type:          task.Type(),
+		NextProcessAt: scheduledAt,
 	}
+	delay := scheduledAt.Sub(enqueuedAt)
 
 	go func() {
 		if hasTaskID {
 			defer e.finishTaskID(taskID, retention)
 		}
 		if delay > 0 {
-			time.Sleep(delay)
+			<-e.after(delay)
 		}
 
 		// Tag as a background worker execution so the per-model concurrency
@@ -166,7 +179,7 @@ func (e *SyncTaskExecutor) Enqueue(task *asynq.Task, opts ...asynq.Option) (*asy
 				}
 				logger.Infof(ctx, "[SyncTask] Retrying task type=%s id=%s attempt=%d/%d backoff=%s",
 					task.Type(), taskID, attempt, maxRetry, backoff)
-				time.Sleep(backoff)
+				<-e.after(backoff)
 			}
 
 			lastErr = handler(ctx, task)
