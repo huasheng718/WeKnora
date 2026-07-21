@@ -450,7 +450,7 @@ func (r *productionReleaseRepository) ResolveScopes(ctx context.Context, tenantI
 			uniqueKBs = append(uniqueKBs, kbID)
 		}
 	}
-	if len(uniqueKBs) == 0 && kbIDs != nil {
+	if len(uniqueKBs) == 0 {
 		return result, nil
 	}
 
@@ -464,12 +464,65 @@ func (r *productionReleaseRepository) ResolveScopes(ctx context.Context, tenantI
 			AND head.document_id = target.document_id
 			AND head.target_knowledge_base_id = target.target_knowledge_base_id
 			AND head.active_release_target_id = target.id`)
-	if kbIDs == nil {
-		query = query.Where("target.tenant_id = ?", tenantID)
-	} else {
-		query = query.Where("target.tenant_id = ? AND target.target_knowledge_base_id IN ?", tenantID, uniqueKBs)
-	}
+	query = query.Where("target.tenant_id = ? AND target.target_knowledge_base_id IN ?", tenantID, uniqueKBs)
 	err := query.Order("target.target_knowledge_base_id ASC, target.knowledge_id ASC").Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		scope := result[row.TargetKnowledgeBaseID]
+		scope.AllProductionKnowledgeIDs = append(scope.AllProductionKnowledgeIDs, row.KnowledgeID)
+		if row.IsActive {
+			scope.ActiveKnowledgeIDs = append(scope.ActiveKnowledgeIDs, row.KnowledgeID)
+		} else {
+			scope.InactiveKnowledgeIDs = append(scope.InactiveKnowledgeIDs, row.KnowledgeID)
+		}
+		result[row.TargetKnowledgeBaseID] = scope
+	}
+	for kbID, scope := range result {
+		sort.Strings(scope.ActiveKnowledgeIDs)
+		sort.Strings(scope.InactiveKnowledgeIDs)
+		sort.Strings(scope.AllProductionKnowledgeIDs)
+		result[kbID] = scope
+	}
+	return result, nil
+}
+
+// ResolveScopesForKnowledgeIDs resolves only the requested production
+// projections. Explicit-ID authorization must never scan a tenant's complete
+// projection history just to reject one stale ID.
+func (r *productionReleaseRepository) ResolveScopesForKnowledgeIDs(ctx context.Context, tenantID uint64, knowledgeIDs []string) (map[string]types.ProductionKnowledgeScope, error) {
+	if err := requireProductionReleaseTenantContext(ctx, tenantID); err != nil {
+		return nil, err
+	}
+	uniqueIDs := make([]string, 0, len(knowledgeIDs))
+	seen := make(map[string]struct{}, len(knowledgeIDs))
+	for _, knowledgeID := range knowledgeIDs {
+		if strings.TrimSpace(knowledgeID) == "" || knowledgeID != strings.TrimSpace(knowledgeID) {
+			return nil, fmt.Errorf("%w: knowledge id is required", types.ErrProductionReleaseInvalid)
+		}
+		if _, ok := seen[knowledgeID]; !ok {
+			seen[knowledgeID] = struct{}{}
+			uniqueIDs = append(uniqueIDs, knowledgeID)
+		}
+	}
+	result := make(map[string]types.ProductionKnowledgeScope)
+	if len(uniqueIDs) == 0 {
+		return result, nil
+	}
+	var rows []productionScopeRow
+	err := database.DBFromContext(ctx, r.db).WithContext(ctx).
+		Table("production_release_targets AS target").
+		Select(`target.target_knowledge_base_id, target.knowledge_id,
+			CASE WHEN head.active_release_target_id = target.id AND target.status = ? THEN TRUE ELSE FALSE END AS is_active`, types.ReleaseTargetActive).
+		Joins(`LEFT JOIN production_projection_heads AS head
+			ON head.tenant_id = target.tenant_id
+			AND head.document_id = target.document_id
+			AND head.target_knowledge_base_id = target.target_knowledge_base_id
+			AND head.active_release_target_id = target.id`).
+		Where("target.tenant_id = ? AND target.knowledge_id IN ?", tenantID, uniqueIDs).
+		Order("target.target_knowledge_base_id ASC, target.knowledge_id ASC").
+		Scan(&rows).Error
 	if err != nil {
 		return nil, err
 	}

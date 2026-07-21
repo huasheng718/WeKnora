@@ -48,6 +48,21 @@ func TestSearchTargetsAllowKnowledgeIDRejectsInactiveProductionProjection(t *tes
 	}
 }
 
+func TestSearchTargetsAllowKnowledgeIDRejectsInactiveTagScopedProjection(t *testing.T) {
+	allowed, err := searchTargetsAllowKnowledgeID(context.Background(), types.SearchTargets{&types.SearchTarget{
+		Type:                types.SearchTargetTypeKnowledgeBase,
+		KnowledgeBaseID:     "kb-1",
+		TagIDs:              []string{"tag-production"},
+		ExcludeKnowledgeIDs: []string{"knowledge-old"},
+	}}, "knowledge-old", "kb-1", nil)
+	if err != nil {
+		t.Fatalf("searchTargetsAllowKnowledgeID() error = %v", err)
+	}
+	if allowed {
+		t.Fatal("inactive production projection must not be authorized by a tag-scoped target")
+	}
+}
+
 func TestPagePassesWikiScope_TagScope(t *testing.T) {
 	page := &types.WikiPage{
 		Slug:       "entity/acme",

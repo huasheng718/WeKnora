@@ -14,12 +14,16 @@ import (
 type tagTargetKnowledgeBaseService struct {
 	interfaces.KnowledgeBaseService
 	kbs map[string]*types.KnowledgeBase
+	err error
 }
 
 func (s *tagTargetKnowledgeBaseService) GetKnowledgeBasesByIDsOnly(
 	_ context.Context,
 	ids []string,
 ) ([]*types.KnowledgeBase, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
 	out := make([]*types.KnowledgeBase, 0, len(ids))
 	for _, id := range ids {
 		if kb := s.kbs[id]; kb != nil {
@@ -33,6 +37,16 @@ type tagTargetKnowledgeService struct {
 	interfaces.KnowledgeService
 	knowledges []*types.Knowledge
 	tagIDs     map[string][]string
+	batchErr   error
+}
+
+type tagTargetKBShareService struct {
+	interfaces.KBShareService
+	err error
+}
+
+func (s *tagTargetKBShareService) HasTenantKBPermission(context.Context, string, uint64, types.TenantRole, types.OrgMemberRole) (bool, error) {
+	return false, s.err
 }
 
 func (*tagTargetKnowledgeService) ApplyProductionProjectionScope(context.Context, uint64, types.SearchTargets) error {
@@ -44,6 +58,9 @@ func (s *tagTargetKnowledgeService) GetKnowledgeBatchWithSharedAccess(
 	_ uint64,
 	ids []string,
 ) ([]*types.Knowledge, error) {
+	if s.batchErr != nil {
+		return nil, s.batchErr
+	}
 	allowed := make(map[string]bool, len(ids))
 	for _, id := range ids {
 		allowed[id] = true
@@ -55,6 +72,38 @@ func (s *tagTargetKnowledgeService) GetKnowledgeBatchWithSharedAccess(
 		}
 	}
 	return out, nil
+}
+
+func TestBuildSearchTargetsFailsClosedWhenKnowledgeBaseResolutionFails(t *testing.T) {
+	svc := newTagTargetSessionService()
+	svc.knowledgeBaseService = &tagTargetKnowledgeBaseService{err: fmt.Errorf("knowledge base lookup unavailable")}
+
+	targets, err := svc.buildSearchTargets(tagTargetContext(), 100, []string{"doc-kb"}, nil, nil)
+	require.Error(t, err)
+	require.Nil(t, targets)
+}
+
+func TestBuildSearchTargetsFailsClosedWhenKnowledgeBatchResolutionFails(t *testing.T) {
+	svc := newTagTargetSessionService()
+	stub := svc.knowledgeService.(*tagTargetKnowledgeService)
+	stub.batchErr = fmt.Errorf("knowledge batch unavailable")
+
+	targets, err := svc.buildSearchTargets(tagTargetContext(), 100, nil, []string{"doc-1"}, nil)
+	require.Error(t, err)
+	require.Nil(t, targets)
+}
+
+func TestBuildSearchTargetsFailsClosedWhenSharedKBOwnerAuthorizationFails(t *testing.T) {
+	svc := newTagTargetSessionService()
+	svc.knowledgeBaseService = &tagTargetKnowledgeBaseService{kbs: map[string]*types.KnowledgeBase{
+		"shared-kb": {ID: "shared-kb", TenantID: 200, Type: types.KnowledgeBaseTypeDocument},
+	}}
+	svc.kbShareService = &tagTargetKBShareService{err: fmt.Errorf("share lookup unavailable")}
+	ctx := context.WithValue(tagTargetContext(), types.UserIDContextKey, "user-1")
+
+	targets, err := svc.buildSearchTargets(ctx, 100, []string{"shared-kb"}, nil, nil)
+	require.Error(t, err)
+	require.Nil(t, targets)
 }
 
 func (s *tagTargetKnowledgeService) ListKnowledgeIDsByTagIDs(
@@ -215,11 +264,8 @@ func TestBuildSearchTargets_DocumentTagScopeWithMissingKBMetadata(t *testing.T) 
 		[]types.TagScope{{KnowledgeBaseID: "doc-kb", TagIDs: []string{"tag-a"}}},
 	)
 
-	require.NoError(t, err)
-	require.Len(t, targets, 1)
-	assert.Equal(t, types.SearchTargetTypeKnowledge, targets[0].Type)
-	assert.ElementsMatch(t, []string{"doc-1", "doc-3"}, targets[0].KnowledgeIDs)
-	assert.True(t, targets[0].DisableDirectLoad)
+	require.Error(t, err)
+	require.Nil(t, targets)
 }
 
 type tagTargetKnowledgeServiceWithError struct {

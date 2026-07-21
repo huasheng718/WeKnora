@@ -15,12 +15,23 @@ type projectionResolverReleaseRepo struct {
 }
 
 func (r *projectionResolverReleaseRepo) ResolveScopes(_ context.Context, _ uint64, kbIDs []string) (map[string]types.ProductionKnowledgeScope, error) {
-	if kbIDs == nil {
-		return r.scopes, nil
-	}
 	result := make(map[string]types.ProductionKnowledgeScope, len(kbIDs))
 	for _, kbID := range kbIDs {
 		result[kbID] = r.scopes[kbID]
+	}
+	return result, nil
+}
+
+func (r *projectionResolverReleaseRepo) ResolveScopesForKnowledgeIDs(_ context.Context, _ uint64, knowledgeIDs []string) (map[string]types.ProductionKnowledgeScope, error) {
+	result := make(map[string]types.ProductionKnowledgeScope)
+	for kbID, scope := range r.scopes {
+		for _, requestedID := range knowledgeIDs {
+			if intersectsKnowledgeIDs([]string{requestedID}, scope.AllProductionKnowledgeIDs) ||
+				intersectsKnowledgeIDs([]string{requestedID}, scope.ActiveKnowledgeIDs) ||
+				intersectsKnowledgeIDs([]string{requestedID}, scope.InactiveKnowledgeIDs) {
+				result[kbID] = scope
+			}
+		}
 	}
 	return result, nil
 }

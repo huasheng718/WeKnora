@@ -94,6 +94,9 @@ const (
 type KnowledgeListFilter struct {
 	// ExcludeKnowledgeIDs removes known records from both the count and page query.
 	ExcludeKnowledgeIDs []string
+	// ExcludeInactiveProductionProjections uses the release-target anti-join
+	// rather than expanding inactive IDs into a large relational NOT IN clause.
+	ExcludeInactiveProductionProjections bool
 	// TagIDs filters by multiple tags (OR semantics: match any of the given tags).
 	TagIDs []string
 	// Keyword performs a LIKE match on file_name / title when non-empty.

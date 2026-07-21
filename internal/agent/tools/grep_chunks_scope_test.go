@@ -92,3 +92,20 @@ func TestResolveGrepScopeCarriesFullKBExclusions(t *testing.T) {
 		t.Fatalf("excluded knowledge IDs = %v, want knowledge-old", excluded)
 	}
 }
+
+func TestResolveGrepScopeCarriesTagTargetExclusions(t *testing.T) {
+	tool := NewGrepChunksTool(nil, types.SearchTargets{&types.SearchTarget{
+		Type:                types.SearchTargetTypeKnowledgeBase,
+		KnowledgeBaseID:     "kb-1",
+		TenantID:            7,
+		TagIDs:              []string{"tag-production"},
+		ExcludeKnowledgeIDs: []string{"knowledge-old"},
+	}})
+	_, _, excluded, targets := tool.resolveGrepScope()
+	if len(excluded) != 1 || excluded[0] != "knowledge-old" {
+		t.Fatalf("excluded knowledge IDs = %v, want knowledge-old", excluded)
+	}
+	if len(targets) != 1 || len(targets[0].ExcludeKnowledgeIDs) != 1 {
+		t.Fatalf("tag target exclusions = %#v", targets)
+	}
+}

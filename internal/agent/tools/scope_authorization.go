@@ -27,12 +27,12 @@ func searchTargetsAllowKnowledgeID(
 			continue
 		}
 		matchedKB = true
-		if target.Type == types.SearchTargetTypeKnowledgeBase && len(target.TagIDs) == 0 {
-			for _, excludedID := range target.ExcludeKnowledgeIDs {
-				if excludedID == knowledgeID {
-					return false, nil
-				}
+		for _, excludedID := range target.ExcludeKnowledgeIDs {
+			if excludedID == knowledgeID {
+				return false, nil
 			}
+		}
+		if target.Type == types.SearchTargetTypeKnowledgeBase && len(target.TagIDs) == 0 {
 			return true, nil
 		}
 		for _, allowedID := range target.KnowledgeIDs {

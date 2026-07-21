@@ -98,7 +98,20 @@ func (r *knowledgeRepository) ListKnowledgeByKnowledgeBaseID(
 // KnowledgeListFilter to a GORM query. Tenant / knowledge base scoping must be
 // applied by the caller before invoking this helper.
 func applyKnowledgeListFilter(query *gorm.DB, filter types.KnowledgeListFilter) *gorm.DB {
-	if len(filter.ExcludeKnowledgeIDs) > 0 {
+	if filter.ExcludeInactiveProductionProjections {
+		query = query.Where(`NOT EXISTS (
+			SELECT 1 FROM production_release_targets AS target
+			LEFT JOIN production_projection_heads AS head
+				ON head.tenant_id = target.tenant_id
+				AND head.document_id = target.document_id
+				AND head.target_knowledge_base_id = target.target_knowledge_base_id
+				AND head.active_release_target_id = target.id
+			WHERE target.tenant_id = knowledges.tenant_id
+				AND target.target_knowledge_base_id = knowledges.knowledge_base_id
+				AND target.knowledge_id = knowledges.id
+				AND (head.active_release_target_id IS NULL OR target.status <> ?)
+		)`, types.ReleaseTargetActive)
+	} else if len(filter.ExcludeKnowledgeIDs) > 0 {
 		query = query.Where("id NOT IN ?", filter.ExcludeKnowledgeIDs)
 	}
 	if len(filter.TagIDs) > 0 {

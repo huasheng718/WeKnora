@@ -700,6 +700,19 @@ func TestProductionReleaseResolveScopesClassifiesRequestedKBsDeterministically(t
 	require.Empty(t, scopes["missing-kb"].AllProductionKnowledgeIDs)
 }
 
+func TestProductionReleaseResolveScopesForKnowledgeIDsIsBounded(t *testing.T) {
+	repo, _ := newProductionReleaseRepoFixture(t, nil)
+	release := productionRelease(releaseIDOne, reviewVersionOne, reviewID(700))
+	require.NoError(t, repo.CreateRelease(productionReleaseContext(reviewTenantID, reviewAuthorID), release,
+		[]*types.ProductionReleaseTarget{productionReleaseTarget(releaseTarget1, releaseKBOne, releaseKnowledge1), productionReleaseTarget(releaseTarget2, releaseKBTwo, releaseKnowledge2)}))
+
+	scopes, err := repo.ResolveScopesForKnowledgeIDs(productionReleaseContext(reviewTenantID, reviewAuthorID), reviewTenantID, []string{releaseKnowledge1})
+	require.NoError(t, err)
+	require.Len(t, scopes, 1)
+	require.NotContains(t, scopes, releaseKBTwo)
+	require.Equal(t, []string{releaseKnowledge1}, scopes[releaseKBOne].InactiveKnowledgeIDs)
+}
+
 func TestProductionReleaseHistoryIsTenantScopedAndDeterministic(t *testing.T) {
 	clock := &productionReleaseTestClock{current: time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)}
 	repo, _ := newProductionReleaseRepoFixture(t, clock)

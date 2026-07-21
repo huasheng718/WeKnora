@@ -457,7 +457,7 @@ func (s *sessionService) buildSearchTargets(
 	if len(kbIDsToFetch) > 0 {
 		kbs, kbFetchErr := s.knowledgeBaseService.GetKnowledgeBasesByIDsOnly(ctx, kbIDsToFetch)
 		if kbFetchErr != nil {
-			logger.Warnf(ctx, "Failed to fetch knowledge bases for search targets: %v", kbFetchErr)
+			return nil, fmt.Errorf("resolve knowledge bases for search targets: %w", kbFetchErr)
 		}
 		for _, kb := range kbs {
 			if kb != nil {
@@ -466,32 +466,37 @@ func (s *sessionService) buildSearchTargets(
 		}
 	}
 	userID, _ := types.UserIDFromContext(ctx)
-	resolveKBTenant := func(kbID string) uint64 {
+	resolveKBTenant := func(kbID string) (uint64, error) {
 		if kbTenantMap[kbID] != 0 {
-			return kbTenantMap[kbID]
+			return kbTenantMap[kbID], nil
 		}
 		kb := kbByID[kbID]
 		if kb == nil {
-			kbTenantMap[kbID] = tenantID
+			return 0, fmt.Errorf("knowledge base %s could not be resolved", kbID)
 		} else if kb.TenantID == tenantID {
 			kbTenantMap[kbID] = tenantID
 		} else if s.kbShareService != nil && userID != "" {
-			hasAccess, _ := s.kbShareService.HasTenantKBPermission(ctx, kbID, tenantID, callerTenantRole, types.OrgRoleViewer)
-			if hasAccess {
-				kbTenantMap[kbID] = kb.TenantID
-			} else {
-				kbTenantMap[kbID] = tenantID
+			hasAccess, err := s.kbShareService.HasTenantKBPermission(ctx, kbID, tenantID, callerTenantRole, types.OrgRoleViewer)
+			if err != nil {
+				return 0, fmt.Errorf("authorize shared knowledge base %s: %w", kbID, err)
 			}
+			if !hasAccess {
+				return 0, fmt.Errorf("shared knowledge base %s is not authorized", kbID)
+			}
+			kbTenantMap[kbID] = kb.TenantID
 		} else {
-			kbTenantMap[kbID] = tenantID
+			return 0, fmt.Errorf("shared knowledge base %s owner authorization is unavailable", kbID)
 		}
-		return kbTenantMap[kbID]
+		return kbTenantMap[kbID], nil
 	}
 
 	if len(knowledgeBaseIDs) > 0 {
 		for _, kbID := range knowledgeBaseIDs {
 			fullKBSet[kbID] = true
-			kbTenant := resolveKBTenant(kbID)
+			kbTenant, err := resolveKBTenant(kbID)
+			if err != nil {
+				return nil, err
+			}
 			if len(tagIDsByKB[kbID]) > 0 {
 				continue
 			}
@@ -509,8 +514,7 @@ func (s *sessionService) buildSearchTargets(
 	if len(knowledgeIDs) > 0 {
 		knowledgeList, err := s.knowledgeService.GetKnowledgeBatchWithSharedAccess(ctx, tenantID, knowledgeIDs)
 		if err != nil {
-			logger.Warnf(ctx, "Failed to get knowledge batch for search targets: %v", err)
-			return targets, nil // Return what we have, don't fail
+			return nil, fmt.Errorf("resolve explicit knowledge targets: %w", err)
 		}
 
 		// Group knowledge IDs by their KB, excluding those already covered by full KB search
@@ -552,7 +556,10 @@ func (s *sessionService) buildSearchTargets(
 		if kbID == "" || len(tagIDs) == 0 {
 			continue
 		}
-		kbTenant := resolveKBTenant(kbID)
+		kbTenant, err := resolveKBTenant(kbID)
+		if err != nil {
+			return nil, err
+		}
 		kb := kbByID[kbID]
 		explicitKnowledgeIDs := uniqueNonEmptyStrings(kbToKnowledgeIDs[kbID])
 

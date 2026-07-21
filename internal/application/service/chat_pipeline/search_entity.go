@@ -127,11 +127,21 @@ func (p *PluginSearchEntity) OnEvent(ctx context.Context,
 
 	wg.Wait()
 
-	// Merge graph data
-	chatManage.GraphResult = &types.GraphData{
+	graph := &types.GraphData{
 		Node:     allNodes,
 		Relation: allRelations,
 	}
+	excludedKnowledgeIDs := excludedEntityKnowledgeIDs(chatManage.SearchTargets)
+	if len(excludedKnowledgeIDs) > 0 {
+		var err error
+		graph, err = p.pruneExcludedProjectionGraph(ctx, types.MustTenantIDFromContext(ctx), graph, excludedKnowledgeIDs)
+		if err != nil {
+			logger.Errorf(ctx, "Failed to prune excluded production projections from entity graph: %v", err)
+			chatManage.GraphResult = &types.GraphData{}
+			return next()
+		}
+	}
+	chatManage.GraphResult = graph
 	logger.Infof(ctx, "Total entity search result: %d nodes, %d relations", len(allNodes), len(allRelations))
 
 	chunkIDs := filterSeenChunk(ctx, chatManage.GraphResult, chatManage.SearchResult)
@@ -164,6 +174,12 @@ func (p *PluginSearchEntity) OnEvent(ctx context.Context,
 	}
 	var entityResults []*types.SearchResult
 	for _, chunk := range chunks {
+		if _, excluded := excludedKnowledgeIDs[chunk.KnowledgeID]; excluded {
+			continue
+		}
+		if knowledgeMap[chunk.KnowledgeID] == nil {
+			continue
+		}
 		searchResult := chunk2SearchResult(chunk, knowledgeMap[chunk.KnowledgeID])
 		entityResults = append(entityResults, searchResult)
 	}
@@ -182,6 +198,90 @@ func (p *PluginSearchEntity) OnEvent(ctx context.Context,
 		chatManage.SessionID,
 	)
 	return next()
+}
+
+func excludedEntityKnowledgeIDs(targets types.SearchTargets) map[string]struct{} {
+	excluded := make(map[string]struct{})
+	for _, target := range targets {
+		if target == nil {
+			continue
+		}
+		for _, id := range target.ExcludeKnowledgeIDs {
+			if id != "" {
+				excluded[id] = struct{}{}
+			}
+		}
+	}
+	return excluded
+}
+
+func (p *PluginSearchEntity) pruneExcludedProjectionGraph(
+	ctx context.Context,
+	tenantID uint64,
+	graph *types.GraphData,
+	excluded map[string]struct{},
+) (*types.GraphData, error) {
+	if graph == nil || len(graph.Node) == 0 || len(excluded) == 0 {
+		return graph, nil
+	}
+	chunkIDs := make([]string, 0)
+	seen := make(map[string]struct{})
+	for _, node := range graph.Node {
+		if node == nil {
+			continue
+		}
+		for _, chunkID := range node.Chunks {
+			if _, ok := seen[chunkID]; !ok && chunkID != "" {
+				seen[chunkID] = struct{}{}
+				chunkIDs = append(chunkIDs, chunkID)
+			}
+		}
+	}
+	chunks, err := p.chunkRepo.ListChunksByID(ctx, tenantID, chunkIDs)
+	if err != nil {
+		return nil, err
+	}
+	allowedChunks := make(map[string]struct{}, len(chunks))
+	for _, chunk := range chunks {
+		if chunk == nil {
+			continue
+		}
+		if _, excluded := excluded[chunk.KnowledgeID]; !excluded {
+			allowedChunks[chunk.ID] = struct{}{}
+		}
+	}
+	pruned := &types.GraphData{Text: graph.Text}
+	allowedNodes := make(map[string]struct{})
+	for _, node := range graph.Node {
+		if node == nil {
+			continue
+		}
+		chunks := make([]string, 0, len(node.Chunks))
+		for _, chunkID := range node.Chunks {
+			if _, ok := allowedChunks[chunkID]; ok {
+				chunks = append(chunks, chunkID)
+			}
+		}
+		if len(chunks) == 0 {
+			continue
+		}
+		copy := *node
+		copy.Chunks = chunks
+		pruned.Node = append(pruned.Node, &copy)
+		allowedNodes[node.Name] = struct{}{}
+	}
+	for _, relation := range graph.Relation {
+		if relation == nil {
+			continue
+		}
+		if _, left := allowedNodes[relation.Node1]; !left {
+			continue
+		}
+		if _, right := allowedNodes[relation.Node2]; right {
+			pruned.Relation = append(pruned.Relation, relation)
+		}
+	}
+	return pruned, nil
 }
 
 // filterSeenChunk filters seen chunks from the graph

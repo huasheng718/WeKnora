@@ -70,9 +70,7 @@ func (r *productionProjectionResolver) AuthorizeExplicitKnowledgeIDs(ctx context
 	if r == nil || r.releases == nil || len(knowledgeIDs) == 0 {
 		return nil
 	}
-	// A nil KB list deliberately resolves all tenant production targets. This
-	// makes the guard fail closed even when an older caller only has document IDs.
-	scopes, err := r.releases.ResolveScopes(ctx, tenantID, nil)
+	scopes, err := r.releases.ResolveScopesForKnowledgeIDs(ctx, tenantID, knowledgeIDs)
 	if err != nil {
 		return err
 	}
