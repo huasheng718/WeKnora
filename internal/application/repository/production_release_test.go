@@ -138,6 +138,50 @@ func TestProductionReleaseRepositoryCreatesReleaseAndTargetsAtomicallyWithTruste
 	require.EqualValues(t, 2, targetCount)
 }
 
+func TestProductionApprovedReviewLookupIsTenantAndVersionScoped(t *testing.T) {
+	_, db := newProductionReleaseRepoFixture(t, nil)
+	reviews := NewProductionReviewRepository(db)
+	ctx := productionReleaseContext(reviewTenantID, reviewAuthorID)
+	review, err := reviews.(*productionReviewRepository).GetApprovedReviewForVersion(
+		ctx, reviewTenantID, reviewDocumentID, reviewVersionOne,
+	)
+	require.NoError(t, err)
+	require.Equal(t, reviewID(700), review.ID)
+	require.Equal(t, types.ProductionReviewStatus(types.ProductionReviewApproved), review.Status)
+	require.NotEmpty(t, review.Steps)
+
+	_, err = reviews.(*productionReviewRepository).GetApprovedReviewForVersion(
+		productionReleaseContext(reviewTenantID+1, reviewAuthorID), reviewTenantID,
+		reviewDocumentID, reviewVersionOne,
+	)
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
+}
+
+func TestProductionReleaseRepositoryListsOnlyExpiredCleanupTargets(t *testing.T) {
+	clock := &productionReleaseTestClock{current: time.Date(2026, 7, 21, 3, 0, 0, 0, time.UTC)}
+	repo, _ := newProductionReleaseRepoFixture(t, clock)
+	release := productionRelease(releaseIDOne, reviewVersionOne, reviewID(700))
+	target := productionReleaseTarget(releaseTarget1, releaseKBOne, releaseKnowledge1)
+	ctx := productionReleaseContext(reviewTenantID, reviewAuthorID)
+	require.NoError(t, repo.CreateRelease(ctx, release, []*types.ProductionReleaseTarget{target}))
+	changed, err := repo.TransitionTarget(ctx, target.ID, types.ReleaseTargetBuilding, types.ReleaseTargetFailed, nil)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	lister := repo.(interface {
+		ListCleanupEligible(context.Context, uint64, int) ([]*types.ProductionReleaseTarget, error)
+	})
+	eligible, err := lister.ListCleanupEligible(ctx, reviewTenantID, 10)
+	require.NoError(t, err)
+	require.Empty(t, eligible)
+
+	clock.current = clock.current.Add(31 * 24 * time.Hour)
+	eligible, err = lister.ListCleanupEligible(ctx, reviewTenantID, 10)
+	require.NoError(t, err)
+	require.Len(t, eligible, 1)
+	require.Equal(t, target.ID, eligible[0].ID)
+}
+
 func TestProductionReleaseRepositoryComputesAuthoritativeDigest(t *testing.T) {
 	repo, db := newProductionReleaseRepoFixture(t, nil)
 	release := productionRelease(releaseIDOne, reviewVersionOne, reviewID(700))

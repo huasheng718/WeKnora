@@ -1,5 +1,7 @@
 package types
 
+import "strings"
+
 // Worker-pool names are part of the runtime observability API. Each pool is
 // backed by an independent asynq.Server, so concurrency is hard-isolated
 // between pools instead of being only a weighted dequeue preference.
@@ -75,6 +77,7 @@ var queueDefinitions = []QueueDefinition{
 	}},
 	{Name: QueueProduction, Pool: WorkerPoolProduction, Weight: 1, TaskTypes: []string{
 		TypeProductionCollect, TypeProductionWrite, TypeProductionValidate,
+		TypeProductionBuild, TypeProductionActivate, TypeProductionCleanup,
 	}},
 	{Name: QueueWiki, Pool: WorkerPoolWiki, Weight: 1, TaskTypes: []string{TypeWikiIngest, TypeWikiFinalize}},
 }
@@ -246,9 +249,31 @@ const (
 	TypeProductionCollect    = "production:collect"
 	TypeProductionWrite      = "production:write"
 	TypeProductionValidate   = "production:validate"
+	TypeProductionBuild      = "production:build"
+	TypeProductionActivate   = "production:activate"
+	TypeProductionCleanup    = "production:cleanup"
 	TypeWikiIngest           = "wiki:ingest"   // Wiki 页面同步任务
 	TypeWikiFinalize         = "wiki:finalize" // Wiki KB 级收尾任务（防抖：索引重建/死链清理/交叉链接）
 )
+
+// ProductionProjectionTaskPayload carries only immutable scope and the CAS
+// expectation needed by publication workers. ActorUserID is copied from the
+// authorized API request so the eventual activation audit preserves authorship.
+type ProductionProjectionTaskPayload struct {
+	TenantID     uint64 `json:"tenant_id"`
+	ProjectID    string `json:"project_id"`
+	TargetID     string `json:"target_id"`
+	ActorUserID  string `json:"actor_user_id,omitempty"`
+	ExpectedLock int    `json:"expected_lock,omitempty"`
+}
+
+func (p ProductionProjectionTaskPayload) Validate() error {
+	if p.TenantID == 0 || strings.TrimSpace(p.ProjectID) == "" || p.ProjectID != strings.TrimSpace(p.ProjectID) ||
+		strings.TrimSpace(p.TargetID) == "" || p.TargetID != strings.TrimSpace(p.TargetID) || p.ExpectedLock < 0 {
+		return ErrProductionReleaseInvalid
+	}
+	return nil
+}
 
 // ExtractChunkPayload represents the extract chunk task payload
 type ExtractChunkPayload struct {

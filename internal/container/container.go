@@ -325,6 +325,19 @@ func BuildContainer(container *dig.Container) *dig.Container {
 		must(container.Invoke(registerLiteModelConcurrencyLimiter))
 	}
 
+	// Publication projection workers share one deterministic handler in Redis
+	// and Lite modes. Activation replay reconciles post-head-switch Wiki and
+	// cleanup work without changing the already-visible projection head.
+	must(container.Provide(service.NewProductionProjectionBuilder))
+	must(container.Provide(service.NewProductionGraphSpanReadiness))
+	must(container.Provide(service.NewProductionWikiLifecycleQueue))
+	must(container.Provide(service.NewProductionCleanupTaskScheduler))
+	must(container.Provide(service.NewProductionProjectionRetrieveIndexUpdater))
+	must(container.Provide(service.NewProductionProjectionCleanup))
+	must(container.Provide(service.NewProductionReleaseService))
+	must(container.Provide(service.NewProductionProjectionTaskHandler,
+		dig.Name("productionProjection"), dig.As(new(interfaces.TaskHandler))))
+
 	// Chat pipeline components for processing chat requests
 	logger.Debugf(ctx, "[Container] Registering chat pipeline plugins...")
 

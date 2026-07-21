@@ -936,6 +936,32 @@ func (r *productionReviewRepository) GetReview(ctx context.Context, tenantID uin
 	return &request, nil
 }
 
+func (r *productionReviewRepository) GetApprovedReviewForVersion(
+	ctx context.Context,
+	tenantID uint64,
+	documentID, versionID string,
+) (*types.ProductionReviewRequest, error) {
+	if err := requireProductionReviewTenantContext(ctx, tenantID); err != nil {
+		return nil, err
+	}
+	if err := requireProductionReviewUUID("document id", documentID); err != nil {
+		return nil, err
+	}
+	if err := requireProductionReviewUUID("version id", versionID); err != nil {
+		return nil, err
+	}
+	var request types.ProductionReviewRequest
+	err := database.DBFromContext(ctx, r.db).WithContext(ctx).
+		Preload("Steps", func(db *gorm.DB) *gorm.DB { return db.Order("sequence ASC") }).
+		Where("tenant_id = ? AND document_id = ? AND version_id = ? AND status = ?",
+			tenantID, documentID, versionID, types.ProductionReviewApproved).
+		Order("completed_at DESC, id DESC").First(&request).Error
+	if err != nil {
+		return nil, err
+	}
+	return &request, nil
+}
+
 func (r *productionReviewRepository) DecideStep(
 	ctx context.Context,
 	tenantID uint64,

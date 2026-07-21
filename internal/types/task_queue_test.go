@@ -72,7 +72,8 @@ func TestEveryAsynqTaskTypeHasADeclaredQueue(t *testing.T) {
 		TypeKnowledgeListReparse, TypeKnowledgeMove, TypeDataTableSummary,
 		TypeImageMultimodal, TypeKnowledgePostProcess, TypeManualProcess,
 		TypeDataSourceSync, TypeProductionCollect, TypeProductionWrite,
-		TypeProductionValidate, TypeWikiIngest, TypeWikiFinalize,
+		TypeProductionValidate, TypeProductionBuild, TypeProductionActivate,
+		TypeProductionCleanup, TypeWikiIngest, TypeWikiFinalize,
 	}
 	for _, taskType := range taskTypes {
 		if _, ok := QueueForTaskType(taskType); !ok {
@@ -93,7 +94,10 @@ func TestDefaultWorkerPoolConcurrencyIsExplicitBudget(t *testing.T) {
 }
 
 func TestProductionTaskTypesUseProductionQueue(t *testing.T) {
-	for _, taskType := range []string{TypeProductionCollect, TypeProductionWrite, TypeProductionValidate} {
+	for _, taskType := range []string{
+		TypeProductionCollect, TypeProductionWrite, TypeProductionValidate,
+		TypeProductionBuild, TypeProductionActivate, TypeProductionCleanup,
+	} {
 		queue, ok := QueueForTaskType(taskType)
 		if !ok {
 			t.Fatalf("task type %q has no queue", taskType)

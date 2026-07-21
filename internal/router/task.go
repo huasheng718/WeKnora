@@ -45,6 +45,7 @@ type AsynqTaskParams struct {
 	KnowledgePostProcess interfaces.TaskHandler `name:"knowledgePostProcess"`
 	WikiIngest           interfaces.TaskHandler `name:"wikiIngest"`
 	ProductionRun        interfaces.TaskHandler `name:"productionRun"`
+	ProductionProjection interfaces.TaskHandler `name:"productionProjection"`
 	DeadLetterRepo       interfaces.TaskDeadLetterRepository
 	SpanTracker          service.SpanTracker
 	ResourceCleaner      interfaces.ResourceCleaner
@@ -355,6 +356,7 @@ func RunAsynqServer(params AsynqTaskParams) *asynq.ServeMux {
 	mux.HandleFunc(types.TypeProductionCollect, params.ProductionRun.Handle)
 	mux.HandleFunc(types.TypeProductionWrite, params.ProductionRun.Handle)
 	mux.HandleFunc(types.TypeProductionValidate, params.ProductionRun.Handle)
+	registerProductionProjectionHandlers(mux, params.ProductionProjection)
 
 	// Run the same mux on every pool. Shared and dedicated servers intentionally
 	// overlap, but Redis dequeue is atomic, so each task still executes once.
@@ -373,6 +375,12 @@ func RunAsynqServer(params AsynqTaskParams) *asynq.ServeMux {
 	runPool("wiki-pool", params.WikiServer)
 	startManagedProductionAsynqServer(params.ProductionServer, mux, params.ResourceCleaner)
 	return mux
+}
+
+func registerProductionProjectionHandlers(mux *asynq.ServeMux, handler interfaces.TaskHandler) {
+	mux.HandleFunc(types.TypeProductionBuild, handler.Handle)
+	mux.HandleFunc(types.TypeProductionActivate, handler.Handle)
+	mux.HandleFunc(types.TypeProductionCleanup, handler.Handle)
 }
 
 // deadLetterKnowledgePayload extracts only the field we need from any

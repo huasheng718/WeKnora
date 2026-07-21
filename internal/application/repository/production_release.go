@@ -638,6 +638,40 @@ func (r *productionReleaseRepository) ListProjectionHistory(
 	return targets, nil
 }
 
+func (r *productionReleaseRepository) ListCleanupEligible(
+	ctx context.Context,
+	tenantID uint64,
+	limit int,
+) ([]*types.ProductionReleaseTarget, error) {
+	if err := requireProductionReleaseTenantContext(ctx, tenantID); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 200 {
+		limit = 100
+	}
+	var targets []*types.ProductionReleaseTarget
+	err := database.DBFromContext(ctx, r.db).WithContext(ctx).
+		Where("tenant_id = ? AND status IN ? AND retention_until IS NOT NULL AND retention_until <= ?",
+			tenantID, []types.ProductionReleaseTargetStatus{types.ReleaseTargetFailed, types.ReleaseTargetRolledBack}, r.nowUTC()).
+		Where(`NOT EXISTS (
+			SELECT 1 FROM production_projection_heads AS head
+			WHERE head.tenant_id = production_release_targets.tenant_id
+			  AND head.document_id = production_release_targets.document_id
+			  AND head.target_knowledge_base_id = production_release_targets.target_knowledge_base_id
+			  AND head.active_release_target_id = production_release_targets.id
+		)`).
+		Order("retention_until ASC, id ASC").Limit(limit).Find(&targets).Error
+	if err != nil {
+		return nil, translateProductionReleaseTargetReadError(err)
+	}
+	for _, target := range targets {
+		if err := normalizeProductionReleaseTargetConfig(target); err != nil {
+			return nil, err
+		}
+	}
+	return targets, nil
+}
+
 func translateProductionReleaseError(err error) error {
 	if err == nil {
 		return nil

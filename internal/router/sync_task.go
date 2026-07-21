@@ -223,6 +223,7 @@ type SyncTaskParams struct {
 	KnowledgePostProcess interfaces.TaskHandler `name:"knowledgePostProcess"`
 	WikiIngest           interfaces.TaskHandler `name:"wikiIngest"`
 	ProductionRun        interfaces.TaskHandler `name:"productionRun"`
+	ProductionProjection interfaces.TaskHandler `name:"productionProjection"`
 }
 
 // RegisterSyncHandlers registers all task handlers on the SyncTaskExecutor.
@@ -249,5 +250,12 @@ func RegisterSyncHandlers(params SyncTaskParams) {
 	params.Executor.RegisterHandler(types.TypeProductionCollect, params.ProductionRun.Handle)
 	params.Executor.RegisterHandler(types.TypeProductionWrite, params.ProductionRun.Handle)
 	params.Executor.RegisterHandler(types.TypeProductionValidate, params.ProductionRun.Handle)
+	registerSyncProductionProjectionHandlers(params.Executor, params.ProductionProjection)
 	logger.Infof(context.Background(), "[SyncTask] All task handlers registered (Lite mode, no Redis)")
+}
+
+func registerSyncProductionProjectionHandlers(executor *SyncTaskExecutor, handler interfaces.TaskHandler) {
+	executor.RegisterHandler(types.TypeProductionBuild, handler.Handle)
+	executor.RegisterHandler(types.TypeProductionActivate, handler.Handle)
+	executor.RegisterHandler(types.TypeProductionCleanup, handler.Handle)
 }

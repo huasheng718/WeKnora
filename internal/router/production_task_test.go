@@ -4,13 +4,25 @@ import (
 	"context"
 	"encoding/json"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/hibiken/asynq"
 	"github.com/stretchr/testify/require"
 )
+
+type productionProjectionTaskStub struct {
+	interfaces.TaskHandler
+	calls atomic.Int32
+}
+
+func (s *productionProjectionTaskStub) Handle(context.Context, *asynq.Task) error {
+	s.calls.Add(1)
+	return nil
+}
 
 type productionLifecycleServerStub struct {
 	started  chan struct{}
@@ -107,4 +119,25 @@ func TestProductionAsynqServerLifecycleIsOwnedAndGracefullyStopped(t *testing.T)
 	require.NotNil(t, cleaner.cleanup)
 	require.Empty(t, cleaner.Cleanup(context.Background()))
 	<-done
+}
+
+func TestProductionProjectionTasksRegisterInRedisAndLiteRuntimes(t *testing.T) {
+	taskTypes := []string{types.TypeProductionBuild, types.TypeProductionActivate, types.TypeProductionCleanup}
+
+	redisHandler := &productionProjectionTaskStub{}
+	mux := asynq.NewServeMux()
+	registerProductionProjectionHandlers(mux, redisHandler)
+	for _, taskType := range taskTypes {
+		require.NoError(t, mux.ProcessTask(context.Background(), asynq.NewTask(taskType, nil)))
+	}
+	require.EqualValues(t, len(taskTypes), redisHandler.calls.Load())
+
+	liteHandler := &productionProjectionTaskStub{}
+	executor := NewSyncTaskExecutor()
+	registerSyncProductionProjectionHandlers(executor, liteHandler)
+	for _, taskType := range taskTypes {
+		_, err := executor.Enqueue(asynq.NewTask(taskType, nil), asynq.MaxRetry(0))
+		require.NoError(t, err)
+	}
+	require.Eventually(t, func() bool { return liteHandler.calls.Load() == int32(len(taskTypes)) }, time.Second, time.Millisecond)
 }
