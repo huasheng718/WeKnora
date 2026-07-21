@@ -1841,6 +1841,16 @@ func (h *KnowledgeHandler) UpdateKnowledgeTagBatch(c *gin.Context) {
 		}
 		authorizedKBID = kbID
 		ctx = context.WithValue(ctx, types.TenantIDContextKey, effID)
+	} else {
+		// Use a stable first ID only to resolve shared-KB access. All IDs are
+		// subsequently read in that effective tenant and validated as one set.
+		knowledge, effCtx, err := h.resolveKnowledgeAndValidateKBAccess(c, knowledgeIDs[0], types.OrgRoleEditor)
+		if err != nil {
+			c.Error(errors.NewBadRequestError("some knowledge entries were not found"))
+			return
+		}
+		authorizedKBID = knowledge.KnowledgeBaseID
+		ctx = effCtx
 	}
 	effectiveTenantID, ok := types.TenantIDFromContext(ctx)
 	if !ok || effectiveTenantID == 0 {

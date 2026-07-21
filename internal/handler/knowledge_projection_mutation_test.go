@@ -120,6 +120,14 @@ type projectionMutationKBService struct {
 	interfaces.KnowledgeBaseService
 }
 
+type projectionMutationKBShareService struct {
+	interfaces.KBShareService
+}
+
+func (*projectionMutationKBShareService) CheckTenantKBPermission(context.Context, string, uint64, types.TenantRole) (types.OrgMemberRole, bool, error) {
+	return types.OrgRoleEditor, true, nil
+}
+
 func (s *projectionMutationKBService) GetKnowledgeBaseByID(_ context.Context, id string) (*types.KnowledgeBase, error) {
 	return &types.KnowledgeBase{ID: id, TenantID: 1, CreatorID: "user-1"}, nil
 }
@@ -152,6 +160,12 @@ func projectionMutationKnowledge(t *testing.T, id, kbID string) *types.Knowledge
 func newProjectionMutationRouter(
 	kg interfaces.KnowledgeService, tasks interfaces.TaskEnqueuer,
 ) *gin.Engine {
+	return newProjectionMutationRouterWithShare(kg, tasks, nil)
+}
+
+func newProjectionMutationRouterWithShare(
+	kg interfaces.KnowledgeService, tasks interfaces.TaskEnqueuer, share interfaces.KBShareService,
+) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.Use(middleware.ErrorHandler())
@@ -165,7 +179,7 @@ func newProjectionMutationRouter(
 		c.Next()
 	})
 	handler := &KnowledgeHandler{
-		kgService: kg, kbService: &projectionMutationKBService{}, asynqClient: tasks,
+		kgService: kg, kbService: &projectionMutationKBService{}, kbShareService: share, asynqClient: tasks,
 	}
 	router.DELETE("/knowledge/:id", handler.DeleteKnowledge)
 	router.PUT("/knowledge/:id", handler.UpdateKnowledge)
@@ -365,4 +379,18 @@ func TestDirectKnowledgeMutationsPermitOrdinaryKnowledgeAndRejectMixedOrUnauthor
 			require.Zero(t, tasks.calls.Load())
 		})
 	}
+}
+
+func TestTagBatchWithoutKBIDAllowsSharedKBEditorAfterDeterministicResolution(t *testing.T) {
+	first := &types.Knowledge{ID: "a-shared", TenantID: 2, KnowledgeBaseID: "shared-kb"}
+	second := &types.Knowledge{ID: "z-shared", TenantID: 2, KnowledgeBaseID: "shared-kb"}
+	service := &projectionMutationKnowledgeService{byID: map[string]*types.Knowledge{first.ID: first, second.ID: second}}
+	tasks := &projectionMutationTaskEnqueuer{}
+	response := performProjectionMutationRequest(t,
+		newProjectionMutationRouterWithShare(service, tasks, &projectionMutationKBShareService{}),
+		http.MethodPut, "/knowledge/tags", map[string]any{"updates": map[string][]string{second.ID: {}, first.ID: {}}},
+	)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assertOnlyProjectionMutationCall(t, service, "tags")
+	require.Zero(t, tasks.calls.Load())
 }
