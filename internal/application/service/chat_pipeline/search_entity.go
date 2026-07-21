@@ -420,10 +420,30 @@ func (p *PluginSearchEntity) pruneExcludedProjectionGraph(
 		if node == nil {
 			continue
 		}
-		chunks := make([]string, 0, len(node.Chunks))
-		for _, chunkID := range node.Chunks {
-			if _, ok := allowedChunks[chunkID]; ok {
-				chunks = append(chunks, chunkID)
+		var chunks []string
+		var attributes []string
+		if len(node.ProjectionVariants) > 0 {
+			for _, variant := range node.ProjectionVariants {
+				if variant == nil || graphKnowledgeProvenanceBlocked(variant.KnowledgeIDs, excluded) {
+					continue
+				}
+				var variantChunks []string
+				for _, chunkID := range variant.Chunks {
+					if _, ok := allowedChunks[chunkID]; ok {
+						variantChunks = append(variantChunks, chunkID)
+					}
+				}
+				if len(variantChunks) == 0 {
+					continue
+				}
+				chunks = appendUniqueStrings(chunks, variantChunks)
+				attributes = appendUniqueStrings(attributes, variant.Attributes)
+			}
+		} else {
+			for _, chunkID := range node.Chunks {
+				if _, ok := allowedChunks[chunkID]; ok {
+					chunks = append(chunks, chunkID)
+				}
 			}
 		}
 		if len(chunks) == 0 {
@@ -431,6 +451,8 @@ func (p *PluginSearchEntity) pruneExcludedProjectionGraph(
 		}
 		copy := *node
 		copy.Chunks = chunks
+		copy.Attributes = attributes
+		copy.ProjectionVariants = nil
 		pruned.Node = append(pruned.Node, &copy)
 		allowedNodes[node.Name] = struct{}{}
 	}
@@ -456,6 +478,18 @@ func (p *PluginSearchEntity) pruneExcludedProjectionGraph(
 		}
 	}
 	return pruned, nil
+}
+
+func graphKnowledgeProvenanceBlocked(knowledgeIDs []string, excluded map[string]struct{}) bool {
+	if len(knowledgeIDs) == 0 {
+		return true
+	}
+	for _, knowledgeID := range knowledgeIDs {
+		if _, blocked := excluded[knowledgeID]; blocked {
+			return true
+		}
+	}
+	return false
 }
 
 // filterSeenChunk filters seen chunks from the graph

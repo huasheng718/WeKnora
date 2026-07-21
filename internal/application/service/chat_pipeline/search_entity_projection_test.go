@@ -187,6 +187,103 @@ func TestEntitySearchPreservesActiveSameNameRelationAndEvidence(t *testing.T) {
 	require.Equal(t, "knowledge-active", chat.SearchResult[0].KnowledgeID)
 }
 
+type variantProjectionEntityGraphRepo struct {
+	interfaces.RetrieveGraphRepository
+	inactiveFirst bool
+}
+
+func (r *variantProjectionEntityGraphRepo) SearchNode(context.Context, types.NameSpace, []string) (*types.GraphData, error) {
+	active := &types.GraphNodeVariant{KnowledgeIDs: []string{"knowledge-active"}, Chunks: []string{"chunk-active"}, Attributes: []string{"active-attribute"}}
+	old := &types.GraphNodeVariant{KnowledgeIDs: []string{"knowledge-old"}, Chunks: []string{"chunk-old"}, Attributes: []string{"old-attribute"}}
+	building := &types.GraphNodeVariant{KnowledgeIDs: []string{"knowledge-building"}, Chunks: []string{"chunk-building"}, Attributes: []string{"building-attribute"}}
+	malformed := &types.GraphNodeVariant{Chunks: []string{"chunk-malformed"}, Attributes: []string{"malformed-attribute"}}
+	variants := []*types.GraphNodeVariant{active, old, building, malformed}
+	relations := []*types.GraphRelation{
+		{Node1: "shared", Node2: "shared", Type: "related", KnowledgeIDs: []string{"knowledge-active"}},
+		{Node1: "shared", Node2: "shared", Type: "related", KnowledgeIDs: []string{"knowledge-old"}},
+		{Node1: "shared", Node2: "shared", Type: "related", KnowledgeIDs: []string{"knowledge-building"}},
+		{Node1: "shared", Node2: "shared", Type: "related"},
+	}
+	if r.inactiveFirst {
+		variants = []*types.GraphNodeVariant{old, building, malformed, active}
+		relations = []*types.GraphRelation{relations[1], relations[2], relations[3], relations[0]}
+	}
+	return &types.GraphData{
+		Node: []*types.GraphNode{{
+			Name: "shared", Chunks: []string{"chunk-active", "chunk-old", "chunk-building", "chunk-malformed"},
+			Attributes:         []string{"active-attribute", "old-attribute", "building-attribute", "malformed-attribute"},
+			ProjectionVariants: variants,
+		}},
+		Relation: relations,
+	}, nil
+}
+
+func projectionVariantChunks() []*types.Chunk {
+	return []*types.Chunk{
+		{ID: "chunk-active", TenantID: 7, KnowledgeID: "knowledge-active", KnowledgeBaseID: "kb-1", ImageInfo: "[]"},
+		{ID: "chunk-old", TenantID: 7, KnowledgeID: "knowledge-old", KnowledgeBaseID: "kb-1", ImageInfo: "[]"},
+		{ID: "chunk-building", TenantID: 7, KnowledgeID: "knowledge-building", KnowledgeBaseID: "kb-1", ImageInfo: "[]"},
+		{ID: "chunk-malformed", TenantID: 7, KnowledgeID: "knowledge-malformed", KnowledgeBaseID: "kb-1", ImageInfo: "[]"},
+	}
+}
+
+func TestEntitySearchPrunesSameNameVariantAttributesRegardlessOfOrder(t *testing.T) {
+	for _, inactiveFirst := range []bool{false, true} {
+		name := "active first"
+		if inactiveFirst {
+			name = "inactive first"
+		}
+		t.Run(name, func(t *testing.T) {
+			p := &PluginSearchEntity{
+				graphRepo: &variantProjectionEntityGraphRepo{inactiveFirst: inactiveFirst},
+				chunkRepo: &projectionEntityChunkRepo{chunks: projectionVariantChunks()},
+				knowledgeRepo: &projectionEntityKnowledgeRepo{rows: []*types.Knowledge{
+					{ID: "knowledge-active", TenantID: 7, KnowledgeBaseID: "kb-1"},
+				}},
+			}
+			chat := &types.ChatManage{
+				PipelineRequest: types.PipelineRequest{TenantID: 7, SearchTargets: types.SearchTargets{&types.SearchTarget{
+					Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-1", TenantID: 7,
+					ExcludeKnowledgeIDs: []string{"knowledge-old", "knowledge-building"},
+				}}},
+				PipelineState: types.PipelineState{Entity: []string{"term"}, EntityKBIDs: []string{"kb-1"}},
+			}
+			ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(7))
+			require.Nil(t, p.OnEvent(ctx, types.ENTITY_SEARCH, chat, func() *PluginError { return nil }))
+			require.Len(t, chat.GraphResult.Node, 1)
+			require.Equal(t, []string{"chunk-active"}, chat.GraphResult.Node[0].Chunks)
+			require.Equal(t, []string{"active-attribute"}, chat.GraphResult.Node[0].Attributes)
+			require.Empty(t, chat.GraphResult.Node[0].ProjectionVariants)
+			require.Len(t, chat.GraphResult.Relation, 1)
+			require.Equal(t, []string{"knowledge-active"}, chat.GraphResult.Relation[0].KnowledgeIDs)
+			require.Len(t, chat.SearchResult, 1)
+			require.Equal(t, "knowledge-active", chat.SearchResult[0].KnowledgeID)
+		})
+	}
+}
+
+func TestEntitySearchKeepsOrdinaryMergedMultiVariantGraphWithoutExclusions(t *testing.T) {
+	p := &PluginSearchEntity{
+		graphRepo: &variantProjectionEntityGraphRepo{inactiveFirst: true},
+		chunkRepo: &projectionEntityChunkRepo{chunks: projectionVariantChunks()},
+		knowledgeRepo: &projectionEntityKnowledgeRepo{rows: []*types.Knowledge{
+			{ID: "knowledge-active", TenantID: 7, KnowledgeBaseID: "kb-1"},
+			{ID: "knowledge-old", TenantID: 7, KnowledgeBaseID: "kb-1"},
+			{ID: "knowledge-building", TenantID: 7, KnowledgeBaseID: "kb-1"},
+			{ID: "knowledge-malformed", TenantID: 7, KnowledgeBaseID: "kb-1"},
+		}},
+	}
+	chat := &types.ChatManage{
+		PipelineRequest: types.PipelineRequest{TenantID: 7, SearchTargets: types.SearchTargets{&types.SearchTarget{Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-1", TenantID: 7}}},
+		PipelineState:   types.PipelineState{Entity: []string{"term"}, EntityKBIDs: []string{"kb-1"}},
+	}
+	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(7))
+	require.Nil(t, p.OnEvent(ctx, types.ENTITY_SEARCH, chat, func() *PluginError { return nil }))
+	require.Len(t, chat.GraphResult.Node, 1)
+	require.ElementsMatch(t, []string{"active-attribute", "old-attribute", "building-attribute", "malformed-attribute"}, chat.GraphResult.Node[0].Attributes)
+	require.Len(t, chat.SearchResult, 4)
+}
+
 func TestEntitySearchPreservesAuthorizedCrossTenantSharedKnowledgeBase(t *testing.T) {
 	chunks := []*types.Chunk{
 		{ID: "chunk-active", TenantID: 200, KnowledgeID: "knowledge-active", KnowledgeBaseID: "kb-shared", ImageInfo: "[]"},

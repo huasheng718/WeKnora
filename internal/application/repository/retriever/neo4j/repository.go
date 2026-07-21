@@ -170,15 +170,18 @@ func (n *Neo4jRepository) DelGraph(ctx context.Context, namespaces []types.NameS
 }
 
 type graphSearchRow struct {
-	Source   *types.GraphNode
-	Target   *types.GraphNode
-	Relation *types.GraphRelation
+	Source             *types.GraphNode
+	SourceKnowledgeIDs []string
+	Target             *types.GraphNode
+	TargetKnowledgeIDs []string
+	Relation           *types.GraphRelation
 }
 
 func graphDataFromSearchRows(rows []graphSearchRow) *types.GraphData {
 	graph := &types.GraphData{}
 	nodesByName := make(map[string]*types.GraphNode)
-	mergeNode := func(node *types.GraphNode) {
+	variantsByNode := make(map[string]map[string]*types.GraphNodeVariant)
+	mergeNode := func(node *types.GraphNode, knowledgeIDs []string) {
 		if node == nil || node.Name == "" {
 			return
 		}
@@ -187,16 +190,35 @@ func graphDataFromSearchRows(rows []graphSearchRow) *types.GraphData {
 			copy := *node
 			copy.Chunks = appendUniqueGraphStrings(nil, node.Chunks)
 			copy.Attributes = appendUniqueGraphStrings(nil, node.Attributes)
+			copy.ProjectionVariants = nil
 			nodesByName[node.Name] = &copy
 			graph.Node = append(graph.Node, &copy)
+			existing = &copy
+		} else {
+			existing.Chunks = appendUniqueGraphStrings(existing.Chunks, node.Chunks)
+			existing.Attributes = appendUniqueGraphStrings(existing.Attributes, node.Attributes)
+		}
+		if variantsByNode[node.Name] == nil {
+			variantsByNode[node.Name] = make(map[string]*types.GraphNodeVariant)
+		}
+		variantKey := strings.Join(knowledgeIDs, "\x00")
+		variant := variantsByNode[node.Name][variantKey]
+		if variant == nil {
+			variant = &types.GraphNodeVariant{
+				KnowledgeIDs: append([]string(nil), knowledgeIDs...),
+				Chunks:       appendUniqueGraphStrings(nil, node.Chunks),
+				Attributes:   appendUniqueGraphStrings(nil, node.Attributes),
+			}
+			variantsByNode[node.Name][variantKey] = variant
+			existing.ProjectionVariants = append(existing.ProjectionVariants, variant)
 			return
 		}
-		existing.Chunks = appendUniqueGraphStrings(existing.Chunks, node.Chunks)
-		existing.Attributes = appendUniqueGraphStrings(existing.Attributes, node.Attributes)
+		variant.Chunks = appendUniqueGraphStrings(variant.Chunks, node.Chunks)
+		variant.Attributes = appendUniqueGraphStrings(variant.Attributes, node.Attributes)
 	}
 	for _, row := range rows {
-		mergeNode(row.Source)
-		mergeNode(row.Target)
+		mergeNode(row.Source, row.SourceKnowledgeIDs)
+		mergeNode(row.Target, row.TargetKnowledgeIDs)
 		if row.Relation != nil {
 			copy := *row.Relation
 			copy.KnowledgeIDs = append([]string(nil), row.Relation.KnowledgeIDs...)
@@ -264,11 +286,13 @@ func (n *Neo4jRepository) SearchNode(
 					Chunks:     listI2listS(nodeData.Props["chunks"].([]interface{})),
 					Attributes: listI2listS(nodeData.Props["attributes"].([]interface{})),
 				},
+				SourceKnowledgeIDs: graphPropertyStrings(nodeData.Props, "kg"),
 				Target: &types.GraphNode{
 					Name:       targetNodeData.Props["name"].(string),
 					Chunks:     listI2listS(targetNodeData.Props["chunks"].([]interface{})),
 					Attributes: listI2listS(targetNodeData.Props["attributes"].([]interface{})),
 				},
+				TargetKnowledgeIDs: graphPropertyStrings(targetNodeData.Props, "kg"),
 				Relation: &types.GraphRelation{
 					Node1:        nodeData.Props["name"].(string),
 					Node2:        targetNodeData.Props["name"].(string),

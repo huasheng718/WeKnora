@@ -16,9 +16,18 @@ type PromptTemplateStructured struct {
 }
 
 type GraphNode struct {
-	Name       string   `json:"name,omitempty"`
-	Chunks     []string `json:"chunks,omitempty"`
-	Attributes []string `json:"attributes,omitempty"`
+	Name               string              `json:"name,omitempty"`
+	Chunks             []string            `json:"chunks,omitempty"`
+	Attributes         []string            `json:"attributes,omitempty"`
+	ProjectionVariants []*GraphNodeVariant `json:"-"`
+}
+
+// GraphNodeVariant keeps projection provenance until visibility pruning.
+// It is internal graph-processing metadata and is never serialized.
+type GraphNodeVariant struct {
+	KnowledgeIDs []string `json:"-"`
+	Chunks       []string `json:"-"`
+	Attributes   []string `json:"-"`
 }
 
 // GraphRelation represents the relation of the graph

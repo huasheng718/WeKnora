@@ -1,6 +1,7 @@
 package neo4j
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -37,14 +38,18 @@ func TestGraphPropertyStringsRejectsMalformedKnowledgeProvenance(t *testing.T) {
 
 func TestGraphDataFromSearchRowsAggregatesSameNameEvidenceRegardlessOfOrder(t *testing.T) {
 	active := graphSearchRow{
-		Source:   &types.GraphNode{Name: "shared", Chunks: []string{"chunk-active", "chunk-active"}, Attributes: []string{"active-attribute"}},
-		Target:   &types.GraphNode{Name: "peer", Chunks: []string{"chunk-peer-active"}},
-		Relation: &types.GraphRelation{Node1: "shared", Node2: "peer", Type: "related", KnowledgeIDs: []string{"knowledge-active"}},
+		Source:             &types.GraphNode{Name: "shared", Chunks: []string{"chunk-active", "chunk-active"}, Attributes: []string{"active-attribute"}},
+		SourceKnowledgeIDs: []string{"knowledge-active"},
+		Target:             &types.GraphNode{Name: "peer", Chunks: []string{"chunk-peer-active"}},
+		TargetKnowledgeIDs: []string{"knowledge-active"},
+		Relation:           &types.GraphRelation{Node1: "shared", Node2: "peer", Type: "related", KnowledgeIDs: []string{"knowledge-active"}},
 	}
 	inactive := graphSearchRow{
-		Source:   &types.GraphNode{Name: "shared", Chunks: []string{"chunk-old"}, Attributes: []string{"old-attribute"}},
-		Target:   &types.GraphNode{Name: "peer", Chunks: []string{"chunk-peer-old"}},
-		Relation: &types.GraphRelation{Node1: "shared", Node2: "peer", Type: "related", KnowledgeIDs: []string{"knowledge-old"}},
+		Source:             &types.GraphNode{Name: "shared", Chunks: []string{"chunk-old"}, Attributes: []string{"old-attribute"}},
+		SourceKnowledgeIDs: []string{"knowledge-old"},
+		Target:             &types.GraphNode{Name: "peer", Chunks: []string{"chunk-peer-old"}},
+		TargetKnowledgeIDs: []string{"knowledge-old"},
+		Relation:           &types.GraphRelation{Node1: "shared", Node2: "peer", Type: "related", KnowledgeIDs: []string{"knowledge-old"}},
 	}
 	for _, tc := range []struct {
 		name string
@@ -63,10 +68,23 @@ func TestGraphDataFromSearchRowsAggregatesSameNameEvidenceRegardlessOfOrder(t *t
 			require.ElementsMatch(t, []string{"chunk-active", "chunk-old"}, nodes["shared"].Chunks)
 			require.ElementsMatch(t, []string{"active-attribute", "old-attribute"}, nodes["shared"].Attributes)
 			require.ElementsMatch(t, []string{"chunk-peer-active", "chunk-peer-old"}, nodes["peer"].Chunks)
+			require.Len(t, nodes["shared"].ProjectionVariants, 2)
+			variants := map[string]*types.GraphNodeVariant{}
+			for _, variant := range nodes["shared"].ProjectionVariants {
+				variants[variant.KnowledgeIDs[0]] = variant
+			}
+			require.Equal(t, []string{"chunk-active"}, variants["knowledge-active"].Chunks)
+			require.Equal(t, []string{"active-attribute"}, variants["knowledge-active"].Attributes)
+			require.Equal(t, []string{"chunk-old"}, variants["knowledge-old"].Chunks)
+			require.Equal(t, []string{"old-attribute"}, variants["knowledge-old"].Attributes)
 			require.Len(t, graph.Relation, 2)
 			require.ElementsMatch(t, []string{"knowledge-active", "knowledge-old"}, []string{
 				graph.Relation[0].KnowledgeIDs[0], graph.Relation[1].KnowledgeIDs[0],
 			})
+			encoded, err := json.Marshal(nodes["shared"])
+			require.NoError(t, err)
+			require.NotContains(t, string(encoded), "projection_variants")
+			require.NotContains(t, string(encoded), "knowledge_ids")
 		})
 	}
 }
