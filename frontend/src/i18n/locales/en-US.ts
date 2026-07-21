@@ -1,6 +1,7 @@
 export default {
   menu: {
     knowledgeBase: 'Knowledge Base',
+    knowledgeProduction: 'Knowledge Production',
     agents: 'Agents',
     integrations: 'Publish & Integrations',
     organizations: 'Shared Spaces',

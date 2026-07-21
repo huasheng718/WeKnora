@@ -2,12 +2,15 @@ import { reactive, ref, computed, watch } from 'vue'
 import { defineStore } from 'pinia'
 import i18n from '@/i18n'
 import { useAuthStore } from '@/stores/auth'
+import type { TenantRole } from '@/api/tenant/members'
+import { canViewProduction } from '@/views/production/models/productionAccess'
 
 type MenuChild = Record<string, any>
 
 interface MenuItem {
   title: string
   titleKey?: string
+  iconType: 'image' | 'tdesign'
   icon: string
   path: string
   childrenPath?: string
@@ -21,16 +24,18 @@ export const useMenuStore = defineStore('menuStore', () => {
     {
       title: '',
       titleKey: 'menu.newChat',
+      iconType: 'image',
       icon: 'prefixIcon',
       path: 'creatChat',
       childrenPath: 'chat',
       children: createMenuChildren()
     },
-    { title: '', titleKey: 'menu.knowledgeBase', icon: 'zhishiku', path: 'knowledge-bases' },
-    { title: '', titleKey: 'menu.agents', icon: 'agent', path: 'agents' },
-    { title: '', titleKey: 'menu.organizations', icon: 'organization', path: 'organizations' },
-    { title: '', titleKey: 'menu.settings', icon: 'setting', path: 'settings' },
-    { title: '', titleKey: 'menu.logout', icon: 'logout', path: 'logout' }
+    { title: '', titleKey: 'menu.knowledgeBase', iconType: 'image', icon: 'zhishiku', path: 'knowledge-bases' },
+    { title: '', titleKey: 'menu.knowledgeProduction', iconType: 'tdesign', icon: 'file-copy', path: 'knowledge-production' },
+    { title: '', titleKey: 'menu.agents', iconType: 'image', icon: 'agent', path: 'agents' },
+    { title: '', titleKey: 'menu.organizations', iconType: 'image', icon: 'organization', path: 'organizations' },
+    { title: '', titleKey: 'menu.settings', iconType: 'image', icon: 'setting', path: 'settings' },
+    { title: '', titleKey: 'menu.logout', iconType: 'image', icon: 'logout', path: 'logout' }
   ])
 
   const isFirstSession = ref(false)
@@ -70,6 +75,12 @@ export const useMenuStore = defineStore('menuStore', () => {
         return false
       }
       if (item.path === 'organizations' && !authStore.hasRole('admin')) {
+        return false
+      }
+      if (
+        item.path === 'knowledge-production'
+        && !canViewProduction(authStore.currentTenantRole as TenantRole | '')
+      ) {
         return false
       }
       return true

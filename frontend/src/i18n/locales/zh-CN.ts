@@ -1,6 +1,7 @@
 export default {
   menu: {
     knowledgeBase: "知识库",
+    knowledgeProduction: "知识生产",
     agents: "智能体",
     integrations: "发布集成",
     organizations: "共享空间",

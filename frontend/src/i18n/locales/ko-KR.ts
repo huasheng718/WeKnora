@@ -1,6 +1,7 @@
 export default {
   menu: {
     knowledgeBase: "지식베이스",
+    knowledgeProduction: "지식 생산",
     agents: "에이전트",
     integrations: "게시 및 통합",
     organizations: "공유 스페이스",

@@ -111,6 +111,23 @@ const router = createRouter({
           component: () => import("../views/knowledge/KnowledgeBaseList.vue"),
           meta: { requiresInit: true, requiresAuth: true }
         },
+        // Task 3/4 replace this route-compatible shell placeholder with the
+        // production project and document workbenches.
+        {
+          path: "knowledge-production",
+          name: "productionProjects",
+          component: () => import("../views/platform/RoutePlaceholder.vue"),
+        },
+        {
+          path: "knowledge-production/projects/:projectId",
+          name: "productionProject",
+          component: () => import("../views/platform/RoutePlaceholder.vue"),
+        },
+        {
+          path: "knowledge-production/documents/:documentId",
+          name: "productionDocument",
+          component: () => import("../views/platform/RoutePlaceholder.vue"),
+        },
         {
           path: "knowledge-bases/:kbId",
           name: "knowledgeBaseDetail",
