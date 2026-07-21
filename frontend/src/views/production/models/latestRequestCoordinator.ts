@@ -8,6 +8,9 @@ export function createLatestRequestCoordinator() {
   let generation = 0
 
   return {
+    invalidate(): void {
+      generation++
+    },
     async run<T>(operation: () => Promise<T>, handlers: LatestRequestHandlers<T> = {}): Promise<void> {
       const requestGeneration = ++generation
       try {

@@ -19,7 +19,6 @@
           v-model="form.name"
           :placeholder="t('production.projectDialog.namePlaceholder')"
           :disabled="submitting || !canCreate"
-          autofocus
           @enter="submit"
         />
       </t-form-item>
@@ -37,12 +36,12 @@
 </template>
 
 <script setup lang="ts">
-import { reactive, ref, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { MessagePlugin, type FormInstanceFunctions, type FormRule } from 'tdesign-vue-next'
+import { MessagePlugin, type FormInstanceFunctions } from 'tdesign-vue-next'
 import { createProductionProject, type ProductionProject } from '@/api/production'
 import { createProductionCommand } from '@/api/production/idempotency'
-import { validateProductionProjectName } from '../models/productionViewModel'
+import { productionProjectNameRules } from '../models/productionViewModel'
 
 const props = defineProps<{ visible: boolean; canCreate: boolean }>()
 const emit = defineEmits<{
@@ -56,20 +55,7 @@ const submitting = ref(false)
 const error = ref('')
 const form = reactive({ name: '', description: '' })
 
-const rules: Record<string, FormRule[]> = {
-  name: [
-    {
-      validator: (value: string) => validateProductionProjectName(value) !== 'required',
-      message: t('production.validation.nameRequired'),
-      trigger: 'blur',
-    },
-    {
-      validator: (value: string) => validateProductionProjectName(value) !== 'too_long',
-      message: t('production.validation.nameTooLong'),
-      trigger: 'change',
-    },
-  ],
-}
+const rules = computed(() => productionProjectNameRules(t))
 
 watch(() => props.visible, (visible) => {
   if (!visible) return

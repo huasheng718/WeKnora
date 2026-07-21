@@ -1,5 +1,6 @@
 import type { TenantRole } from '@/api/tenant/members'
 import type { ProductionProject, ProductionProjectRole } from '@/api/production'
+import type { FormRule } from 'tdesign-vue-next'
 import { productionAccess } from './productionAccess'
 import type { ProjectSummary } from './projectSummary'
 
@@ -58,6 +59,23 @@ export function validateProductionProjectName(value: string): 'required' | 'too_
   if (length === 0) return 'required'
   if (length > 255) return 'too_long'
   return null
+}
+
+export function productionProjectNameRules(t: (key: string) => string): Record<string, FormRule[]> {
+  return {
+    name: [
+      {
+        validator: (value: string) => validateProductionProjectName(value) !== 'required',
+        message: t('production.validation.nameRequired'),
+        trigger: 'blur',
+      },
+      {
+        validator: (value: string) => validateProductionProjectName(value) !== 'too_long',
+        message: t('production.validation.nameTooLong'),
+        trigger: 'change',
+      },
+    ],
+  }
 }
 
 export function productionProjectLocation(projectId: string) {

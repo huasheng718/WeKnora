@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { computed, ref } from 'vue'
 
 import {
   canEditProductionProject,
   productionDocumentLocation,
   productionProjectLocation,
+  productionProjectNameRules,
   projectListViewState,
   projectSummaryFromResponse,
   validateProductionProjectName,
@@ -44,6 +46,17 @@ test('project dialog validation counts trimmed Unicode code points', () => {
   assert.equal(validateProductionProjectName('   '), 'required')
   assert.equal(validateProductionProjectName('😀'.repeat(255)), null)
   assert.equal(validateProductionProjectName('😀'.repeat(256)), 'too_long')
+})
+
+test('project dialog rules recompute translated messages after locale changes', () => {
+  const locale = ref('en-US')
+  const t = (key: string) => `${locale.value}:${key}`
+  const rules = computed(() => productionProjectNameRules(t))
+
+  assert.equal(rules.value.name[0].message, 'en-US:production.validation.nameRequired')
+  locale.value = 'zh-CN'
+  assert.equal(rules.value.name[0].message, 'zh-CN:production.validation.nameRequired')
+  assert.equal(rules.value.name[1].message, 'zh-CN:production.validation.nameTooLong')
 })
 
 test('production navigation uses named project and document routes', () => {
