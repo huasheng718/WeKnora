@@ -88,7 +88,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import type { TenantRole } from '@/api/tenant/members'
@@ -99,6 +99,7 @@ import {
 import { useAuthStore } from '@/stores/auth'
 import { useProductionStore } from '@/stores/production'
 import { productionAccess } from './models/productionAccess'
+import { createLatestRequestCoordinator } from './models/latestRequestCoordinator'
 import {
   productionProjectLocation,
   projectListViewState,
@@ -114,6 +115,7 @@ const loading = ref(false)
 const loaded = ref(false)
 const error = ref('')
 const dialogVisible = ref(false)
+const loadCoordinator = createLatestRequestCoordinator()
 
 const projects = computed(() => Object.values(store.projectsById).sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at)))
 const canCreate = computed(() => productionAccess(auth.currentTenantRole as TenantRole | '', ['project_owner']).edit)
@@ -142,22 +144,28 @@ function onProjectCreated(project: ProductionProject) {
 }
 
 async function loadProjects() {
-  if (loading.value) return
   loading.value = true
   error.value = ''
-  try {
+  await loadCoordinator.run(async () => {
     const projectResponse = await listProductionProjects()
     if (!projectResponse.success) throw new Error(projectResponse.message || t('production.errors.loadProjects'))
-    store.replaceProjects(projectResponse.data ?? [])
-    loaded.value = true
-  } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : t('production.errors.loadProjects')
-  } finally {
-    loading.value = false
-  }
+    return projectResponse.data ?? []
+  }, {
+    success: projects => {
+      store.replaceProjects(projects)
+      loaded.value = true
+    },
+    error: cause => {
+      error.value = cause instanceof Error ? cause.message : t('production.errors.loadProjects')
+    },
+    settled: () => {
+      loading.value = false
+    },
+  })
 }
 
 onMounted(loadProjects)
+onBeforeUnmount(() => loadCoordinator.invalidate())
 </script>
 
 <style scoped>
