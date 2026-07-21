@@ -40,3 +40,16 @@ func TestStartProductionCleanupRecoveryLifecycleStartsAndRegistersShutdown(t *te
 	require.NoError(t, cleaner.cleanup())
 	require.Equal(t, 1, runner.stops)
 }
+
+func TestStartProductionFailureRecoveryLifecycleStartsAndRegistersShutdown(t *testing.T) {
+	runner := &productionCleanupRecoveryLifecycleStub{}
+	cleaner := &productionCleanupRecoveryCleanerStub{}
+
+	startProductionFailureRecoveryLifecycle(runner, cleaner)
+
+	require.Equal(t, 1, runner.starts)
+	require.Equal(t, "ProductionFailureRecoveryRunner", cleaner.name)
+	require.NotNil(t, cleaner.cleanup)
+	require.NoError(t, cleaner.cleanup())
+	require.Equal(t, 1, runner.stops)
+}

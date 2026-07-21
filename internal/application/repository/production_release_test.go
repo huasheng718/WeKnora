@@ -203,6 +203,61 @@ func TestProductionReleaseRepositoryListsOnlyExpiredCleanupTargets(t *testing.T)
 	require.Empty(t, eligible, "even cleanup_pending recovery must anti-join active heads")
 }
 
+func TestProductionReleaseRepositoryListsBoundedBuildingTargetsWithFailedKnowledge(t *testing.T) {
+	repo, db := newProductionReleaseRepoFixture(t, nil)
+	require.NoError(t, db.Exec(`
+		CREATE TABLE knowledges (
+			id VARCHAR(36) PRIMARY KEY,
+			tenant_id INTEGER NOT NULL,
+			knowledge_base_id VARCHAR(36) NOT NULL,
+			parse_status VARCHAR(50) NOT NULL,
+			deleted_at DATETIME NULL
+		)
+	`).Error)
+	ctx := productionReleaseContext(reviewTenantID, reviewAuthorID)
+	first := productionReleaseTarget(releaseTarget1, releaseKBOne, releaseKnowledge1)
+	completed := productionReleaseTarget(releaseTarget2, releaseKBTwo, releaseKnowledge2)
+	require.NoError(t, repo.CreateRelease(ctx,
+		productionRelease(releaseIDOne, reviewVersionOne, reviewID(700)),
+		[]*types.ProductionReleaseTarget{first, completed},
+	))
+	secondFailed := productionReleaseTarget(releaseTarget3, releaseKBOne, releaseKnowledge3)
+	require.NoError(t, repo.CreateRelease(ctx,
+		productionRelease(releaseIDTwo, reviewVersionTwo, reviewID(710)),
+		[]*types.ProductionReleaseTarget{secondFailed},
+	))
+	require.NoError(t, db.Exec(`
+		INSERT INTO knowledges (id, tenant_id, knowledge_base_id, parse_status)
+		VALUES (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?)
+	`,
+		first.KnowledgeID, reviewTenantID, first.TargetKnowledgeBaseID, types.ParseStatusFailed,
+		completed.KnowledgeID, reviewTenantID, completed.TargetKnowledgeBaseID, types.ParseStatusCompleted,
+		secondFailed.KnowledgeID, reviewTenantID, secondFailed.TargetKnowledgeBaseID, types.ParseStatusFailed,
+	).Error)
+
+	candidates, err := repo.ListBuildingTargetsWithFailedKnowledge(ctx, reviewTenantID, 1)
+	require.NoError(t, err)
+	require.Len(t, candidates, 1)
+	require.Equal(t, first.ID, candidates[0].ID, "candidate order must be stable before applying the limit")
+
+	candidates, err = repo.ListBuildingTargetsWithFailedKnowledge(ctx, reviewTenantID, 200)
+	require.NoError(t, err)
+	require.Equal(t, []string{first.ID, secondFailed.ID}, []string{candidates[0].ID, candidates[1].ID})
+
+	changed, err := repo.TransitionTarget(ctx, first.ID, types.ReleaseTargetBuilding, types.ReleaseTargetFailed, nil)
+	require.NoError(t, err)
+	require.True(t, changed)
+	candidates, err = repo.ListBuildingTargetsWithFailedKnowledge(ctx, reviewTenantID, 0)
+	require.NoError(t, err)
+	require.Len(t, candidates, 1)
+	require.Equal(t, secondFailed.ID, candidates[0].ID)
+
+	_, err = repo.ListBuildingTargetsWithFailedKnowledge(
+		productionReleaseContext(reviewTenantID+1, reviewAuthorID), reviewTenantID, 10,
+	)
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
+}
+
 func TestProductionReleaseRepositoryComputesAuthoritativeDigest(t *testing.T) {
 	repo, db := newProductionReleaseRepoFixture(t, nil)
 	release := productionRelease(releaseIDOne, reviewVersionOne, reviewID(700))

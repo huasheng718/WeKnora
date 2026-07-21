@@ -306,6 +306,39 @@ func (s *ProductionReleaseService) RecordProjectionKnowledgeFailure(
 	return true, s.recordProjectionTargetFailure(ctx, target.ID, taskType)
 }
 
+// ReconcileFailedProjectionKnowledge closes the durable gap where Knowledge
+// reached failed but its bound release target remained building.
+func (s *ProductionReleaseService) ReconcileFailedProjectionKnowledge(ctx context.Context, limit int) error {
+	if s == nil || s.releases == nil {
+		return errors.New("production projection failure recovery dependencies are unavailable")
+	}
+	tenantID, ok := types.TenantIDFromContext(ctx)
+	if !ok || tenantID == 0 {
+		return types.ErrProductionForbidden
+	}
+	targets, err := s.releases.ListBuildingTargetsWithFailedKnowledge(ctx, tenantID, limit)
+	if err != nil {
+		return err
+	}
+	failures := make([]error, 0)
+	for _, target := range targets {
+		if target == nil || target.KnowledgeID == "" {
+			continue
+		}
+		projection, recoveryErr := s.RecordProjectionKnowledgeFailure(
+			ctx, target.KnowledgeID, types.TypeProductionBuild,
+		)
+		if recoveryErr != nil {
+			failures = append(failures, fmt.Errorf("recover projection target %s: %w", target.ID, recoveryErr))
+			continue
+		}
+		if !projection {
+			failures = append(failures, fmt.Errorf("recover projection target %s: %w", target.ID, types.ErrProductionProjectionConflict))
+		}
+	}
+	return errors.Join(failures...)
+}
+
 func (s *ProductionReleaseService) Activate(ctx context.Context, targetID string, expectedLock int) error {
 	target, err := s.authorizeTarget(ctx, targetID)
 	if err != nil {

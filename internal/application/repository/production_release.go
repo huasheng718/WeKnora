@@ -676,6 +676,41 @@ func (r *productionReleaseRepository) ListCleanupEligible(
 	return targets, nil
 }
 
+func (r *productionReleaseRepository) ListBuildingTargetsWithFailedKnowledge(
+	ctx context.Context,
+	tenantID uint64,
+	limit int,
+) ([]*types.ProductionReleaseTarget, error) {
+	if err := requireProductionReleaseTenantContext(ctx, tenantID); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 200 {
+		limit = 100
+	}
+	var targets []*types.ProductionReleaseTarget
+	err := database.DBFromContext(ctx, r.db).WithContext(ctx).
+		Table("production_release_targets AS target").
+		Select("target.*").
+		Joins(`JOIN knowledges AS knowledge
+			ON knowledge.id = target.knowledge_id
+			AND knowledge.tenant_id = target.tenant_id
+			AND knowledge.knowledge_base_id = target.target_knowledge_base_id`).
+		Where("target.tenant_id = ? AND target.status = ?", tenantID, types.ReleaseTargetBuilding).
+		Where("knowledge.parse_status = ? AND knowledge.deleted_at IS NULL", types.ParseStatusFailed).
+		Order("target.id ASC").
+		Limit(limit).
+		Find(&targets).Error
+	if err != nil {
+		return nil, translateProductionReleaseTargetReadError(err)
+	}
+	for _, target := range targets {
+		if err := normalizeProductionReleaseTargetConfig(target); err != nil {
+			return nil, err
+		}
+	}
+	return targets, nil
+}
+
 func translateProductionReleaseError(err error) error {
 	if err == nil {
 		return nil

@@ -7,7 +7,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/application/service"
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/middleware/asynqdl"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/google/uuid"
@@ -43,12 +45,13 @@ func (h *syncTaskIDExpiryHeap) Pop() interface{} {
 // SyncTaskExecutor executes tasks synchronously (in a goroutine) without Redis.
 // Used in Lite mode as a drop-in replacement for *asynq.Client.
 type SyncTaskExecutor struct {
-	mu             sync.RWMutex
-	handlers       map[string]func(context.Context, *asynq.Task) error
-	taskIDs        map[string]time.Time
-	taskIDExpiries syncTaskIDExpiryHeap
-	now            func() time.Time
-	after          func(time.Duration) <-chan time.Time
+	mu              sync.RWMutex
+	handlers        map[string]func(context.Context, *asynq.Task) error
+	terminalFailure asynqdl.OnDeadLetter
+	taskIDs         map[string]time.Time
+	taskIDExpiries  syncTaskIDExpiryHeap
+	now             func() time.Time
+	after           func(time.Duration) <-chan time.Time
 }
 
 func NewSyncTaskExecutor() *SyncTaskExecutor {
@@ -76,6 +79,14 @@ func (e *SyncTaskExecutor) RegisterHandler(pattern string, handler func(context.
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.handlers[pattern] = handler
+}
+
+// SetTerminalFailureHandler installs the shared terminal-failure callback used
+// after a Lite task exhausts its retry budget.
+func (e *SyncTaskExecutor) SetTerminalFailureHandler(handler asynqdl.OnDeadLetter) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.terminalFailure = handler
 }
 
 // Enqueue satisfies interfaces.TaskEnqueuer.
@@ -141,6 +152,7 @@ func (e *SyncTaskExecutor) Enqueue(task *asynq.Task, opts ...asynq.Option) (*asy
 		}
 		e.taskIDs[requestedTaskID] = time.Time{}
 	}
+	terminalFailure := e.terminalFailure
 	e.mu.Unlock()
 
 	taskID := requestedTaskID
@@ -192,6 +204,9 @@ func (e *SyncTaskExecutor) Enqueue(task *asynq.Task, opts ...asynq.Option) (*asy
 
 		logger.Errorf(ctx, "[SyncTask] Task failed (exhausted retries) type=%s id=%s elapsed=%v err=%v",
 			task.Type(), taskID, time.Since(start), lastErr)
+		if terminalFailure != nil {
+			terminalFailure(ctx, task, lastErr)
+		}
 	}()
 
 	return info, nil
@@ -237,11 +252,16 @@ type SyncTaskParams struct {
 	WikiIngest           interfaces.TaskHandler `name:"wikiIngest"`
 	ProductionRun        interfaces.TaskHandler `name:"productionRun"`
 	ProductionProjection interfaces.TaskHandler `name:"productionProjection"`
+	ProductionRelease    *service.ProductionReleaseService
+	SpanTracker          service.SpanTracker
 }
 
 // RegisterSyncHandlers registers all task handlers on the SyncTaskExecutor.
 // Used in Lite mode instead of RunAsynqServer.
 func RegisterSyncHandlers(params SyncTaskParams) {
+	params.Executor.SetTerminalFailureHandler(newDeadLetterKnowledgeFailer(
+		params.KnowledgeService, params.SpanTracker, params.ProductionRelease,
+	))
 	params.Executor.RegisterHandler(types.TypeChunkExtract, params.ChunkExtractor.Handle)
 	params.Executor.RegisterHandler(types.TypeDataTableSummary, params.DataTableSummary.Handle)
 	params.Executor.RegisterHandler(types.TypeDocumentProcess, params.KnowledgeService.ProcessDocument)

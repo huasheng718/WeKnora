@@ -28,6 +28,7 @@ type productionReleaseRepoStub struct {
 	transitionErr    error
 	switchErr        error
 	cleanupListCalls int
+	failureListCalls int
 	now              func() time.Time
 }
 
@@ -71,6 +72,27 @@ func (r *productionReleaseRepoStub) ListCleanupEligible(_ context.Context, _ uin
 		}
 		if (target.Status == types.ReleaseTargetRolledBack || target.Status == types.ReleaseTargetFailed || target.Status == types.ReleaseTargetCleanupPending) &&
 			target.RetentionUntil != nil && !target.RetentionUntil.After(now) {
+			copy := *target
+			out = append(out, &copy)
+		}
+	}
+	return out, nil
+}
+
+func (r *productionReleaseRepoStub) ListBuildingTargetsWithFailedKnowledge(
+	_ context.Context,
+	_ uint64,
+	limit int,
+) ([]*types.ProductionReleaseTarget, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.failureListCalls++
+	out := make([]*types.ProductionReleaseTarget, 0, limit)
+	for _, target := range r.targets {
+		if len(out) == limit {
+			break
+		}
+		if target.Status == types.ReleaseTargetBuilding {
 			copy := *target
 			out = append(out, &copy)
 		}
@@ -802,6 +824,71 @@ func TestProductionProjectionDeadLetterRejectsTamperedKnowledgeMetadata(t *testi
 	require.ErrorIs(t, err, types.ErrProductionContentDigestMismatch)
 	require.True(t, isProjection, "tampered projection envelopes must still suppress raw task errors")
 	require.Equal(t, types.ReleaseTargetBuilding, target.Status)
+}
+
+func TestProductionFailureReconciliationConvergesAndIsIdempotent(t *testing.T) {
+	svc, repo, _ := newProductionReleaseServiceFixture(t)
+	target := repo.targets["target-new"]
+	target.Status = types.ReleaseTargetBuilding
+	target.RetentionDays = 30
+	content := "# governed projection"
+	knowledge := &types.Knowledge{
+		ID: target.KnowledgeID, TenantID: target.TenantID,
+		KnowledgeBaseID: target.TargetKnowledgeBaseID, Type: types.KnowledgeTypeManual,
+		ParseStatus: types.ParseStatusFailed,
+	}
+	meta := types.NewManualKnowledgeMetadata(content, types.ManualKnowledgeStatusPublish, 1)
+	meta.ProductionProjection = &types.ProductionProjectionMetadata{
+		DocumentID: target.DocumentID, VersionID: target.VersionID, ReleaseTargetID: target.ID,
+		ContentDigest: projectionKnowledgeContentDigest(content), SummaryModelID: "summary-1",
+		IndexingStrategy: types.IndexingStrategy{WikiEnabled: true},
+	}
+	require.NoError(t, knowledge.SetManualMetadata(meta))
+	svc.knowledge = productionReleaseKnowledgeStub{knowledge: knowledge}
+
+	require.NoError(t, svc.ReconcileFailedProjectionKnowledge(productionReleaseContext(), 100))
+	failed, err := repo.GetTarget(context.Background(), target.TenantID, target.ID)
+	require.NoError(t, err)
+	require.Equal(t, types.ReleaseTargetFailed, failed.Status)
+	audit := svc.audit.(*productionReleaseAuditStub)
+	require.Len(t, audit.entries, 1)
+	require.Contains(t, string(audit.entries[0].Details), `"failure_stage":"build"`)
+
+	require.NoError(t, svc.ReconcileFailedProjectionKnowledge(productionReleaseContext(), 100))
+	require.Len(t, audit.entries, 1, "a terminal target must not emit duplicate failure audit")
+	require.Equal(t, 2, repo.failureListCalls)
+}
+
+func TestProductionFailureReconciliationRetriesAfterRequiredAuditFailure(t *testing.T) {
+	svc, repo, _ := newProductionReleaseServiceFixture(t)
+	target := repo.targets["target-new"]
+	target.Status = types.ReleaseTargetBuilding
+	target.RetentionDays = 30
+	content := "# governed projection"
+	knowledge := &types.Knowledge{
+		ID: target.KnowledgeID, TenantID: target.TenantID,
+		KnowledgeBaseID: target.TargetKnowledgeBaseID, Type: types.KnowledgeTypeManual,
+		ParseStatus: types.ParseStatusFailed,
+	}
+	meta := types.NewManualKnowledgeMetadata(content, types.ManualKnowledgeStatusPublish, 1)
+	meta.ProductionProjection = &types.ProductionProjectionMetadata{
+		DocumentID: target.DocumentID, VersionID: target.VersionID, ReleaseTargetID: target.ID,
+		ContentDigest: projectionKnowledgeContentDigest(content), SummaryModelID: "summary-1",
+		IndexingStrategy: types.IndexingStrategy{WikiEnabled: true},
+	}
+	require.NoError(t, knowledge.SetManualMetadata(meta))
+	svc.knowledge = productionReleaseKnowledgeStub{knowledge: knowledge}
+	audit := svc.audit.(*productionReleaseAuditStub)
+	audit.err = errors.New("audit database unavailable")
+
+	err := svc.ReconcileFailedProjectionKnowledge(productionReleaseContext(), 100)
+	require.ErrorContains(t, err, "audit database unavailable")
+	require.Equal(t, types.ReleaseTargetBuilding, repo.targets[target.ID].Status)
+
+	audit.err = nil
+	require.NoError(t, svc.ReconcileFailedProjectionKnowledge(productionReleaseContext(), 100))
+	require.Equal(t, types.ReleaseTargetFailed, repo.targets[target.ID].Status)
+	require.Len(t, audit.entries, 1)
 }
 
 func TestProductionReleaseRetryFailsClosedWithoutTaskQueue(t *testing.T) {

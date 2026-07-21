@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/hibiken/asynq"
 	"github.com/stretchr/testify/require"
 )
@@ -353,4 +355,106 @@ func TestSyncTaskExecutorRetainsOneIDPerFailureGeneration(t *testing.T) {
 	enqueueGeneration("production-build-failed-1721548860000000000")
 	waitForRetainedTaskIDs(t, executor, 2)
 	require.EqualValues(t, 2, executions.Load())
+}
+
+func TestSyncTaskExecutorCallsTerminalFailureOnceBeforeRetainingFailedTaskID(t *testing.T) {
+	clock := &syncTaskTestClock{now: time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)}
+	executor := newSyncTaskExecutor(clock.Now, func(time.Duration) <-chan time.Time {
+		ready := make(chan time.Time, 1)
+		ready <- clock.Now()
+		return ready
+	})
+	var attempts atomic.Int32
+	expectedErr := errors.New("permanent parse failure")
+	executor.RegisterHandler(types.TypeDocumentProcess, func(context.Context, *asynq.Task) error {
+		attempts.Add(1)
+		return expectedErr
+	})
+
+	type callbackResult struct {
+		taskType string
+		err      error
+	}
+	callbackStarted := make(chan callbackResult, 1)
+	releaseCallback := make(chan struct{})
+	var callbacks atomic.Int32
+	executor.SetTerminalFailureHandler(func(_ context.Context, task *asynq.Task, taskErr error) {
+		callbacks.Add(1)
+		callbackStarted <- callbackResult{taskType: task.Type(), err: taskErr}
+		<-releaseCallback
+	})
+
+	const taskID = "failed-document-generation-1"
+	_, err := executor.Enqueue(
+		asynq.NewTask(types.TypeDocumentProcess, []byte(`{"knowledge_id":"knowledge-1"}`)),
+		asynq.TaskID(taskID), asynq.Retention(time.Minute), asynq.MaxRetry(2),
+	)
+	require.NoError(t, err)
+	var result callbackResult
+	select {
+	case result = <-callbackStarted:
+	case <-time.After(time.Second):
+		t.Fatal("terminal failure callback did not run")
+	}
+	require.Equal(t, types.TypeDocumentProcess, result.taskType)
+	require.ErrorIs(t, result.err, expectedErr)
+
+	executor.mu.RLock()
+	activeExpiry, exists := executor.taskIDs[taskID]
+	executor.mu.RUnlock()
+	require.True(t, exists)
+	require.True(t, activeExpiry.IsZero(), "task ID retention must begin only after terminal failure handling finishes")
+	require.EqualValues(t, 3, attempts.Load())
+	require.EqualValues(t, 1, callbacks.Load())
+
+	close(releaseCallback)
+	waitForRetainedTaskIDs(t, executor, 1)
+	info, err := executor.Enqueue(
+		asynq.NewTask(types.TypeDocumentProcess, nil),
+		asynq.TaskID(taskID), asynq.Retention(time.Minute), asynq.MaxRetry(0),
+	)
+	require.Nil(t, info)
+	require.ErrorIs(t, err, asynq.ErrTaskIDConflict)
+	require.EqualValues(t, 1, callbacks.Load())
+}
+
+func TestSyncTaskExecutorUsesProjectionFailureCallbackForKnowledgeTerminalFailures(t *testing.T) {
+	for _, taskType := range []string{
+		types.TypeDocumentProcess,
+		types.TypeManualProcess,
+		types.TypeKnowledgePostProcess,
+	} {
+		t.Run(taskType, func(t *testing.T) {
+			executor := NewSyncTaskExecutor()
+			repo := &projectionDeadLetterKnowledgeRepoStub{}
+			recorder := &projectionDeadLetterFailureRecorderStub{projection: true}
+			callback := newDeadLetterKnowledgeFailer(
+				projectionDeadLetterKnowledgeServiceStub{repo: repo}, nil, recorder,
+			)
+			callbackDone := make(chan struct{})
+			executor.SetTerminalFailureHandler(func(ctx context.Context, task *asynq.Task, taskErr error) {
+				callback(ctx, task, taskErr)
+				close(callbackDone)
+			})
+			executor.RegisterHandler(taskType, func(context.Context, *asynq.Task) error {
+				return errors.New("provider token=super-secret host=10.0.0.7")
+			})
+			payload, err := json.Marshal(map[string]any{"knowledge_id": "knowledge-1", "tenant_id": 7})
+			require.NoError(t, err)
+
+			_, err = executor.Enqueue(asynq.NewTask(taskType, payload), asynq.MaxRetry(0))
+			require.NoError(t, err)
+			select {
+			case <-callbackDone:
+			case <-time.After(time.Second):
+				t.Fatal("projection terminal failure callback did not finish")
+			}
+
+			require.Equal(t, "knowledge-1", recorder.knowledgeID)
+			require.Equal(t, taskType, recorder.taskType)
+			require.Equal(t, types.ParseStatusFailed, repo.values["parse_status"])
+			require.Equal(t, types.ProductionProjectionFailureReasonBuildFailed, repo.values["error_message"])
+			require.NotContains(t, repo.values["error_message"], "super-secret")
+		})
+	}
 }

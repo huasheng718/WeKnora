@@ -15,4 +15,5 @@ type ProductionReleaseRepository interface {
 	ResolveScopesForKnowledgeIDs(ctx context.Context, tenantID uint64, knowledgeIDs []string) (map[string]types.ProductionKnowledgeScope, error)
 	SwitchHead(ctx context.Context, tenantID uint64, documentID, kbID, targetID string, expectedLock int) (*types.ProductionProjectionHead, error)
 	ListProjectionHistory(ctx context.Context, tenantID uint64, documentID, kbID string) ([]*types.ProductionReleaseTarget, error)
+	ListBuildingTargetsWithFailedKnowledge(ctx context.Context, tenantID uint64, limit int) ([]*types.ProductionReleaseTarget, error)
 }
