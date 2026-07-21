@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -562,6 +563,16 @@ func buildFilterWhere(params types.RetrieveParams) []whereClause {
 		parts = append(parts, whereClause{
 			clause: "e.knowledge_id IN (" + placeholders(len(params.KnowledgeIDs)) + ")",
 			args:   toInterfaceSlice(params.KnowledgeIDs),
+		})
+	}
+	if len(params.ExcludeKnowledgeIDs) > 0 {
+		encoded, _ := json.Marshal(params.ExcludeKnowledgeIDs) // []string cannot fail to marshal.
+		parts = append(parts, whereClause{
+			// One JSON host parameter avoids SQLite's total variable limit while
+			// json_each exposes every exclusion value to the anti-subquery.
+			clause: "NOT EXISTS (SELECT 1 FROM json_each(?) AS excluded " +
+				"WHERE CAST(excluded.value AS TEXT) = e.knowledge_id)",
+			args: []interface{}{string(encoded)},
 		})
 	}
 	if len(params.TagIDs) > 0 {

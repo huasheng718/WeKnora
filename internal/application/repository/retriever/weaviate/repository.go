@@ -8,6 +8,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/Tencent/WeKnora/internal/application/repository/retriever/filterutil"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -501,10 +502,12 @@ func (w *weaviateRepository) getBaseFilter(params types.RetrieveParams) *filters
 			WithValueText(params.TagIDs...))
 	}
 	if len(params.ExcludeKnowledgeIDs) > 0 {
-		operands = append(operands, filters.Where().
-			WithPath([]string{fieldKnowledgeID}).
-			WithOperator(filters.NotEqual).
-			WithValueText(params.ExcludeKnowledgeIDs...))
+		for _, ids := range filterutil.ChunkStrings(params.ExcludeKnowledgeIDs) {
+			operands = append(operands, filters.Where().
+				WithPath([]string{fieldKnowledgeID}).
+				WithOperator(filters.ContainsNone).
+				WithValueText(ids...))
+		}
 	}
 	if len(params.ExcludeChunkIDs) > 0 {
 		operands = append(operands, filters.Where().

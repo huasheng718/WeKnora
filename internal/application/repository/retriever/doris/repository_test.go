@@ -128,7 +128,7 @@ func TestWhereBuilder(t *testing.T) {
 		assert.Contains(t, clause, "knowledge_base_id IN (?)")
 		assert.Contains(t, clause, "knowledge_id IN (?, ?)")
 		assert.Contains(t, clause, "tag_id IN (?)")
-		assert.Contains(t, clause, "knowledge_id NOT IN (?)")
+		assert.Contains(t, clause, "knowledge_id NOT IN (FROM_BASE64('azk='))")
 		assert.Contains(t, clause, "chunk_id NOT IN (?)")
 	})
 }

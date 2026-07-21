@@ -13,6 +13,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/Tencent/WeKnora/internal/application/repository/retriever/filterutil"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -518,7 +519,9 @@ func (r *repository) baseFilter(params types.RetrieveParams) *tcvectordb.Filter 
 		conditions = append(conditions, tcvectordb.In(fieldTagID, params.TagIDs))
 	}
 	if len(params.ExcludeKnowledgeIDs) > 0 {
-		conditions = append(conditions, tcvectordb.NotIn(fieldKnowledgeID, params.ExcludeKnowledgeIDs))
+		for _, ids := range filterutil.ChunkStrings(params.ExcludeKnowledgeIDs) {
+			conditions = append(conditions, tcvectordb.NotIn(fieldKnowledgeID, ids))
+		}
 	}
 	if len(params.ExcludeChunkIDs) > 0 {
 		conditions = append(conditions, tcvectordb.NotIn(fieldChunkID, params.ExcludeChunkIDs))

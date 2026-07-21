@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/Tencent/WeKnora/internal/application/repository/retriever/filterutil"
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
@@ -78,13 +79,15 @@ func (f *retrieveFilters) toBoolMust() []map[string]any {
 		})
 	}
 	if len(f.ExcludeKnowledgeIDs) > 0 {
-		must = append(must, map[string]any{
-			"bool": map[string]any{
-				"must_not": map[string]any{
-					"terms": map[string]any{"knowledge_id": f.ExcludeKnowledgeIDs},
+		for _, ids := range filterutil.ChunkStrings(f.ExcludeKnowledgeIDs) {
+			must = append(must, map[string]any{
+				"bool": map[string]any{
+					"must_not": map[string]any{
+						"terms": map[string]any{"knowledge_id": ids},
+					},
 				},
-			},
-		})
+			})
+		}
 	}
 	if !f.IncludeDisabled {
 		must = append(must, map[string]any{

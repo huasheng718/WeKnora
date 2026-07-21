@@ -14,6 +14,7 @@ import (
 	"github.com/milvus-io/milvus/client/v2/index"
 	client "github.com/milvus-io/milvus/client/v2/milvusclient"
 
+	"github.com/Tencent/WeKnora/internal/application/repository/retriever/filterutil"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -599,11 +600,13 @@ func (m *milvusRepository) getBaseFilterForQuery(params types.RetrieveParams) (s
 		})
 	}
 	if len(params.ExcludeKnowledgeIDs) > 0 {
-		filters = append(filters, &universalFilterCondition{
-			Field:    fieldKnowledgeID,
-			Operator: operatorNotIn,
-			Value:    params.ExcludeKnowledgeIDs,
-		})
+		for _, ids := range filterutil.ChunkStrings(params.ExcludeKnowledgeIDs) {
+			filters = append(filters, &universalFilterCondition{
+				Field:    fieldKnowledgeID,
+				Operator: operatorNotIn,
+				Value:    ids,
+			})
+		}
 	}
 	if len(params.ExcludeChunkIDs) > 0 {
 		filters = append(filters, &universalFilterCondition{

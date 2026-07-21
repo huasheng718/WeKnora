@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -19,6 +20,21 @@ import (
 // pgRepository implements PostgreSQL-based retrieval operations
 type pgRepository struct {
 	db *gorm.DB // Database connection
+}
+
+// postgresExcludeKnowledgeIDsClause binds every ID through one JSON parameter.
+// Expanding a slice into placeholders would eventually exceed PostgreSQL's
+// 65,535 bind-parameter ceiling; jsonb_array_elements_text keeps that count at
+// one for both keyword and vector query builders.
+func postgresExcludeKnowledgeIDsClause(ids []string, placeholder string) (string, string) {
+	if len(ids) == 0 {
+		return "", ""
+	}
+	encoded, _ := json.Marshal(ids) // []string is always JSON-marshalable.
+	return fmt.Sprintf(
+		"knowledge_id <> ALL(ARRAY(SELECT jsonb_array_elements_text(%s::jsonb)))",
+		placeholder,
+	), string(encoded)
 }
 
 // NewPostgresRetrieveEngineRepository creates a new PostgreSQL retriever repository
@@ -193,6 +209,9 @@ func (g *pgRepository) KeywordsRetrieve(ctx context.Context,
 			Values: common.ToInterfaceSlice(params.TagIDs),
 		})
 	}
+	if exclusionSQL, exclusionArg := postgresExcludeKnowledgeIDsClause(params.ExcludeKnowledgeIDs, "?"); exclusionSQL != "" {
+		conds = append(conds, clause.Expr{SQL: exclusionSQL, Vars: []interface{}{exclusionArg}})
+	}
 
 	// Use ParadeDB's ||| operator for matching any token
 	conds = append(conds, clause.Expr{
@@ -328,6 +347,13 @@ func (g *pgRepository) VectorRetrieve(ctx context.Context,
 		}
 		whereParts = append(whereParts, fmt.Sprintf("tag_id IN (%s)",
 			strings.Join(placeholders, ", ")))
+	}
+	if exclusionSQL, exclusionArg := postgresExcludeKnowledgeIDsClause(
+		params.ExcludeKnowledgeIDs,
+		fmt.Sprintf("$%d", len(allVars)+1),
+	); exclusionSQL != "" {
+		whereParts = append(whereParts, exclusionSQL)
+		allVars = append(allVars, exclusionArg)
 	}
 
 	// is_enabled filter

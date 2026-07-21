@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	elasticsearchRetriever "github.com/Tencent/WeKnora/internal/application/repository/retriever/elasticsearch"
+	"github.com/Tencent/WeKnora/internal/application/repository/retriever/filterutil"
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/logger"
 	typesLocal "github.com/Tencent/WeKnora/internal/types"
@@ -327,9 +328,11 @@ func (e *elasticsearchRepository) getBaseConds(params typesLocal.RetrieveParams)
 		"is_enabled": {Value: false},
 	}})
 	if len(params.ExcludeKnowledgeIDs) > 0 {
-		mustNot = append(mustNot, types.Query{Terms: &types.TermsQuery{
-			TermsQuery: map[string]types.TermsQueryField{e.idField("knowledge_id"): params.ExcludeKnowledgeIDs},
-		}})
+		for _, ids := range filterutil.ChunkStrings(params.ExcludeKnowledgeIDs) {
+			mustNot = append(mustNot, types.Query{Terms: &types.TermsQuery{
+				TermsQuery: map[string]types.TermsQueryField{e.idField("knowledge_id"): ids},
+			}})
+		}
 	}
 	if len(params.ExcludeChunkIDs) > 0 {
 		mustNot = append(mustNot, types.Query{Terms: &types.TermsQuery{

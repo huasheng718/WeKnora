@@ -1,10 +1,12 @@
 package doris
 
 import (
+	"encoding/base64"
 	"math"
 	"strconv"
 	"strings"
 
+	"github.com/Tencent/WeKnora/internal/application/repository/retriever/filterutil"
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
@@ -103,6 +105,28 @@ func (w *whereBuilder) addNotIn(field string, values []string) {
 	})
 }
 
+// addNotInExpressions avoids Doris/MySQL's 65,535 total prepared-statement
+// placeholder ceiling. Chunking placeholder clauses would not lower that total,
+// so exclusions use documented VARCHAR expressions and remain joined by AND.
+func (w *whereBuilder) addNotInExpressions(field string, values []string) {
+	for _, chunk := range filterutil.ChunkStrings(values) {
+		literals := make([]string, len(chunk))
+		for i, value := range chunk {
+			literals[i] = dorisStringExpression(value)
+		}
+		w.conds = append(w.conds, whereCond{
+			clause: field + " NOT IN (" + strings.Join(literals, ", ") + ")",
+		})
+	}
+}
+
+// dorisStringExpression avoids SQL-mode-dependent quoting by using Doris's
+// documented RFC 4648 decoder, whose output type is VARCHAR.
+// https://doris.apache.org/docs/dev/sql-manual/sql-functions/scalar-functions/string-functions/from-base64/
+func dorisStringExpression(value string) string {
+	return "FROM_BASE64('" + base64.StdEncoding.EncodeToString([]byte(value)) + "')"
+}
+
 // build 返回 WHERE 子句（不含 "WHERE " 前缀）和参数数组。
 // 没有任何条件时返回 ("1 = 1", nil)，方便调用方无脑拼接。
 func (w *whereBuilder) build() (string, []any) {
@@ -135,7 +159,7 @@ func buildBaseFilter(params types.RetrieveParams) *whereBuilder {
 		w.addIn(fieldTagID, params.TagIDs)
 	}
 	if len(params.ExcludeKnowledgeIDs) > 0 {
-		w.addNotIn(fieldKnowledgeID, params.ExcludeKnowledgeIDs)
+		w.addNotInExpressions(fieldKnowledgeID, params.ExcludeKnowledgeIDs)
 	}
 	if len(params.ExcludeChunkIDs) > 0 {
 		w.addNotIn(fieldChunkID, params.ExcludeChunkIDs)

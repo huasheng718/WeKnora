@@ -6,6 +6,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/Tencent/WeKnora/internal/application/repository/retriever/filterutil"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -509,7 +510,9 @@ func (q *qdrantRepository) getBaseFilter(params types.RetrieveParams) *qdrant.Fi
 	}
 
 	if len(params.ExcludeKnowledgeIDs) > 0 {
-		mustNot = append(mustNot, qdrant.NewMatchKeywords(fieldKnowledgeID, params.ExcludeKnowledgeIDs...))
+		for _, ids := range filterutil.ChunkStrings(params.ExcludeKnowledgeIDs) {
+			mustNot = append(mustNot, qdrant.NewMatchKeywords(fieldKnowledgeID, ids...))
+		}
 	}
 
 	if len(params.ExcludeChunkIDs) > 0 {
