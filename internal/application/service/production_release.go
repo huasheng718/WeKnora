@@ -15,6 +15,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
+	"gorm.io/gorm"
 )
 
 const productionProjectionTaskRetention = 24 * time.Hour
@@ -46,6 +47,7 @@ type ProductionReleaseService struct {
 	reviews    interfaces.ProductionReviewRepository
 	authorizer interfaces.ProductionProjectAuthorizer
 	members    interfaces.TenantMemberService
+	tenants    interfaces.TenantRepository
 	kbs        interfaces.KnowledgeBaseService
 	storage    interfaces.StorageBackendResolver
 	models     interfaces.ModelService
@@ -68,6 +70,7 @@ func NewProductionReleaseService(
 	reviews interfaces.ProductionReviewRepository,
 	authorizer interfaces.ProductionProjectAuthorizer,
 	members interfaces.TenantMemberService,
+	tenants interfaces.TenantRepository,
 	kbs interfaces.KnowledgeBaseService,
 	storage interfaces.StorageBackendResolver,
 	models interfaces.ModelService,
@@ -84,7 +87,7 @@ func NewProductionReleaseService(
 ) *ProductionReleaseService {
 	return &ProductionReleaseService{
 		releases: releases, documents: documents, reviews: reviews, authorizer: authorizer,
-		members: members, kbs: kbs, storage: storage, models: models, registry: registry, ownership: ownership,
+		members: members, tenants: tenants, kbs: kbs, storage: storage, models: models, registry: registry, ownership: ownership,
 		builder: builder, knowledge: knowledge, graph: graph, wiki: wiki, cleanup: cleanup,
 		tasks: tasks, uow: uow, audit: audit, now: time.Now,
 	}
@@ -99,7 +102,8 @@ func (s *ProductionReleaseService) Prepare(ctx context.Context, documentID, vers
 		}
 		return nil, errors.New("production release dependencies are unavailable")
 	}
-	if strings.TrimSpace(documentID) == "" || strings.TrimSpace(versionID) == "" || len(kbIDs) == 0 {
+	if strings.TrimSpace(documentID) == "" || strings.TrimSpace(versionID) == "" || len(kbIDs) == 0 ||
+		len(kbIDs) > types.ProductionReleaseMaxTargets {
 		return nil, types.ErrProductionReleaseInvalid
 	}
 	document, err := s.documents.GetDocument(ctx, tenantID, documentID)
@@ -167,7 +171,23 @@ func (s *ProductionReleaseService) Prepare(ctx context.Context, documentID, vers
 			RetentionDays: release.RetentionDays,
 		})
 	}
+	release.Targets = targets
+	var selected *types.ProductionRelease
 	err = s.uow.WithinTransaction(ctx, func(txCtx context.Context) error {
+		latest, latestErr := s.releases.GetLatestReleaseForVersion(txCtx, tenantID, documentID, versionID)
+		switch {
+		case latestErr == nil:
+			if equivalentPreparedProductionRelease(latest, release) {
+				selected = latest
+				return nil
+			}
+			supersedesID := latest.ID
+			release.SupersedesReleaseID = &supersedesID
+		case errors.Is(latestErr, gorm.ErrRecordNotFound):
+			release.SupersedesReleaseID = nil
+		default:
+			return latestErr
+		}
 		if err := s.releases.CreateRelease(txCtx, release, targets); err != nil {
 			return err
 		}
@@ -179,10 +199,46 @@ func (s *ProductionReleaseService) Prepare(ctx context.Context, documentID, vers
 		})
 	})
 	if err != nil {
+		if errors.Is(err, types.ErrProductionConflict) {
+			latest, latestErr := s.releases.GetLatestReleaseForVersion(ctx, tenantID, documentID, versionID)
+			if latestErr == nil && equivalentPreparedProductionRelease(latest, release) {
+				return latest, nil
+			}
+			if latestErr != nil && !errors.Is(latestErr, gorm.ErrRecordNotFound) {
+				return nil, latestErr
+			}
+		}
 		return nil, err
 	}
-	release.Targets = targets
+	if selected != nil {
+		return selected, nil
+	}
 	return release, nil
+}
+
+func equivalentPreparedProductionRelease(existing, candidate *types.ProductionRelease) bool {
+	if existing == nil || candidate == nil ||
+		existing.ReleaseDigestVersion != candidate.ReleaseDigestVersion ||
+		existing.ReleaseDigest != candidate.ReleaseDigest ||
+		len(existing.Targets) != len(candidate.Targets) {
+		return false
+	}
+	targetsByKB := make(map[string]string, len(existing.Targets))
+	for _, target := range existing.Targets {
+		if target == nil {
+			return false
+		}
+		targetsByKB[target.TargetKnowledgeBaseID] = target.ConfigDigest
+	}
+	if len(targetsByKB) != len(existing.Targets) {
+		return false
+	}
+	for _, target := range candidate.Targets {
+		if target == nil || targetsByKB[target.TargetKnowledgeBaseID] != target.ConfigDigest {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *ProductionReleaseService) Retry(ctx context.Context, targetID string) error {
@@ -405,7 +461,7 @@ func (s *ProductionReleaseService) RecordProjectionKnowledgeFailure(
 	if s == nil || s.knowledge == nil || s.releases == nil || strings.TrimSpace(knowledgeID) == "" {
 		return false, errors.New("production projection knowledge failure dependencies are unavailable")
 	}
-	knowledge, err := s.knowledge.GetKnowledgeByIDOnly(ctx, knowledgeID)
+	knowledge, err := s.knowledge.GetKnowledgeByIDOnlyForSystem(ctx, knowledgeID)
 	if err != nil {
 		return false, err
 	}
@@ -640,6 +696,9 @@ func (s *ProductionReleaseService) activateAuthorized(ctx context.Context, targe
 		return errors.New("production activation transaction dependencies are unavailable")
 	}
 	err = s.uow.WithinTransaction(ctx, func(txCtx context.Context) error {
+		if err := s.reauthorizeTargetForHeadMutation(txCtx, target); err != nil {
+			return err
+		}
 		head, switchErr := s.releases.SwitchHead(txCtx, target.TenantID, target.DocumentID,
 			target.TargetKnowledgeBaseID, target.ID, expectedLock)
 		if switchErr != nil {
@@ -691,6 +750,9 @@ func (s *ProductionReleaseService) rollbackAuthorized(ctx context.Context, targe
 		return errors.New("production rollback transaction dependencies are unavailable")
 	}
 	err = s.uow.WithinTransaction(ctx, func(txCtx context.Context) error {
+		if err := s.reauthorizeTargetForHeadMutation(txCtx, target); err != nil {
+			return err
+		}
 		changed, transitionErr := s.releases.TransitionTarget(
 			txCtx, target.ID, types.ReleaseTargetRolledBack, types.ReleaseTargetBuilding, nil,
 		)
@@ -743,7 +805,7 @@ func (s *ProductionReleaseService) requireProjectionReady(ctx context.Context, t
 	if s.knowledge == nil {
 		return nil, errors.New("production knowledge service is unavailable")
 	}
-	knowledge, err := s.knowledge.GetKnowledgeByID(ctx, target.KnowledgeID)
+	knowledge, err := s.knowledge.GetKnowledgeByIDForSystem(ctx, target.KnowledgeID)
 	if err != nil {
 		return nil, err
 	}
@@ -751,6 +813,23 @@ func (s *ProductionReleaseService) requireProjectionReady(ctx context.Context, t
 		knowledge.KnowledgeBaseID != target.TargetKnowledgeBaseID || knowledge.ParseStatus != types.ParseStatusCompleted ||
 		knowledge.PendingSubtasksCount != 0 {
 		return nil, types.ErrProductionReleaseLifecycle
+	}
+	kb, err := s.kbs.GetKnowledgeBaseByIDOnly(ctx, target.TargetKnowledgeBaseID)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := types.TenantInfoFromContext(ctx); !ok {
+		if s.tenants == nil {
+			return nil, errors.New("production tenant routing repository is unavailable")
+		}
+		tenant, tenantErr := s.tenants.GetTenantByID(ctx, target.TenantID)
+		if tenantErr != nil {
+			return nil, tenantErr
+		}
+		ctx = context.WithValue(ctx, types.TenantInfoContextKey, tenant)
+	}
+	if err := requireProductionProjectionRoutingUnchanged(ctx, target, kb); err != nil {
+		return nil, err
 	}
 	if s.graph == nil {
 		return nil, errors.New("production graph readiness checker is unavailable")
@@ -813,6 +892,22 @@ func (s *ProductionReleaseService) authorizeTarget(ctx context.Context, targetID
 		return nil, err
 	}
 	return target, nil
+}
+
+func (s *ProductionReleaseService) reauthorizeTargetForHeadMutation(
+	ctx context.Context,
+	target *types.ProductionReleaseTarget,
+) error {
+	tenantID, actorID, err := productionCaller(ctx)
+	if err != nil || target == nil || tenantID != target.TenantID || strings.TrimSpace(actorID) == "" ||
+		actorID == types.ProductionSystemActorID {
+		return types.ErrProductionForbidden
+	}
+	if err := s.authorizer.RequireProjectRole(ctx, target.ProjectID, types.ProductionRolePublisher); err != nil {
+		return err
+	}
+	_, err = s.requireWritableTargetKB(ctx, target.TenantID, actorID, target.TargetKnowledgeBaseID)
+	return err
 }
 
 func (s *ProductionReleaseService) requireWritableTargetKB(ctx context.Context, tenantID uint64, actorID, kbID string) (*types.KnowledgeBase, error) {
@@ -1014,7 +1109,12 @@ func (r *ProductionGraphSpanReadiness) RequireSuccessfulGraphSubtasks(ctx contex
 	if strings.TrimSpace(graphModelID) == "" || r == nil || r.spans == nil || r.chunks == nil {
 		return errors.New("production graph readiness dependencies are unavailable")
 	}
-	chunks, err := r.chunks.ListChunksByKnowledgeID(ctx, knowledge.ID)
+	if target == nil || knowledge == nil || target.TenantID == 0 || knowledge.TenantID != target.TenantID {
+		return types.ErrProductionProjectionConflict
+	}
+	chunks, err := listChunksByKnowledgeIDForProductionWorker(
+		ctx, r.chunks, target.TenantID, knowledge.ID,
+	)
 	if err != nil {
 		return err
 	}

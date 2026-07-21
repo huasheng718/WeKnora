@@ -14,6 +14,9 @@ type RetrieveGraphRepository interface {
 	DelGraph(ctx context.Context, namespace []types.NameSpace) error
 	// SearchNode searches for nodes in the repository
 	SearchNode(ctx context.Context, namespace types.NameSpace, nodes []string) (*types.GraphData, error)
+	// SearchNodeInNamespaces searches an explicit allowed namespace set in one
+	// repository operation. Implementations must enforce Knowledge provenance.
+	SearchNodeInNamespaces(ctx context.Context, namespaces []types.NameSpace, nodes []string) (*types.GraphData, error)
 }
 
 // KnowledgeGraphQueryService scopes graph reads to visible Knowledge documents

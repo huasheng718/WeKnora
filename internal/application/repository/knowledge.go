@@ -114,18 +114,7 @@ func (r *knowledgeRepository) ListKnowledgeByKnowledgeBaseID(
 // applied by the caller before invoking this helper.
 func applyKnowledgeListFilter(query *gorm.DB, filter types.KnowledgeListFilter) *gorm.DB {
 	if filter.ExcludeInactiveProductionProjections {
-		query = query.Where(`NOT EXISTS (
-			SELECT 1 FROM production_release_targets AS target
-			LEFT JOIN production_projection_heads AS head
-				ON head.tenant_id = target.tenant_id
-				AND head.document_id = target.document_id
-				AND head.target_knowledge_base_id = target.target_knowledge_base_id
-				AND head.active_release_target_id = target.id
-			WHERE target.tenant_id = knowledges.tenant_id
-				AND target.target_knowledge_base_id = knowledges.knowledge_base_id
-				AND target.knowledge_id = knowledges.id
-				AND (head.active_release_target_id IS NULL OR target.status <> ?)
-		)`, types.ReleaseTargetActive)
+		query = excludeInactiveProductionProjections(query)
 	}
 	if len(filter.ExcludeKnowledgeIDs) > 0 {
 		query = query.Where("id NOT IN ?", filter.ExcludeKnowledgeIDs)
@@ -176,6 +165,21 @@ func applyKnowledgeListFilter(query *gorm.DB, filter types.KnowledgeListFilter) 
 		query = query.Where("updated_at <= ?", filter.UpdatedTo)
 	}
 	return query
+}
+
+func excludeInactiveProductionProjections(query *gorm.DB) *gorm.DB {
+	return query.Where(`NOT EXISTS (
+			SELECT 1 FROM production_release_targets AS target
+			LEFT JOIN production_projection_heads AS head
+				ON head.tenant_id = target.tenant_id
+				AND head.document_id = target.document_id
+				AND head.target_knowledge_base_id = target.target_knowledge_base_id
+				AND head.active_release_target_id = target.id
+			WHERE target.tenant_id = knowledges.tenant_id
+				AND target.target_knowledge_base_id = knowledges.knowledge_base_id
+				AND target.knowledge_id = knowledges.id
+				AND (head.active_release_target_id IS NULL OR target.status <> ?)
+		)`, types.ReleaseTargetActive)
 }
 
 // ListPagedKnowledgeByKnowledgeBaseID lists all knowledge in a knowledge base with pagination
@@ -581,6 +585,7 @@ func (r *knowledgeRepository) SearchKnowledge(
 		Where("knowledges.tenant_id = ?", tenantID).
 		Where("knowledge_bases.type = ?", types.KnowledgeBaseTypeDocument).
 		Where("knowledges.deleted_at IS NULL")
+	query = excludeInactiveProductionProjections(query)
 
 	// If keyword is provided, filter by file_name or title (case-insensitive).
 	if keyword != "" {
@@ -701,6 +706,7 @@ func (r *knowledgeRepository) SearchKnowledgeInScopes(
 		Where(scopeCondition, args...).
 		Where("knowledge_bases.type = ?", types.KnowledgeBaseTypeDocument).
 		Where("knowledges.deleted_at IS NULL")
+	query = excludeInactiveProductionProjections(query)
 
 	if keyword != "" {
 		escaped := strings.ToLower(escapeLikeKeyword(keyword))

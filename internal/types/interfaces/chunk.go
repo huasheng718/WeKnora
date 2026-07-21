@@ -119,6 +119,9 @@ type ChunkService interface {
 	GetChunkByIDOnly(ctx context.Context, id string) (*types.Chunk, error)
 	// ListChunksByKnowledgeID lists chunks by knowledge id
 	ListChunksByKnowledgeID(ctx context.Context, knowledgeID string) ([]*types.Chunk, error)
+	// ListChunksByKnowledgeIDForSystem includes inactive production projections
+	// and is reserved for trusted workers and lifecycle reconciliation.
+	ListChunksByKnowledgeIDForSystem(ctx context.Context, knowledgeID string) ([]*types.Chunk, error)
 	// ListPagedChunksByKnowledgeID lists paged chunks by knowledge id
 	ListPagedChunksByKnowledgeID(
 		ctx context.Context,

@@ -2,7 +2,9 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 
@@ -11,6 +13,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
+
+const productionReleaseHTTPBodyMaxBytes int64 = 64 << 10
 
 // ProductionReleaseService is the governed publication surface exposed over HTTP.
 type ProductionReleaseService interface {
@@ -46,13 +50,17 @@ func (h *ProductionReleaseHandler) Create(c *gin.Context) {
 		return
 	}
 	var request createProductionReleaseRequest
-	if err := c.ShouldBindJSON(&request); err != nil {
+	if err := decodeStrictProductionReleaseJSON(c, &request); err != nil {
 		c.Error(apperrors.NewValidationError("invalid production release request"))
 		return
 	}
 	request.VersionID = strings.TrimSpace(request.VersionID)
 	if !isProductionUUID(request.VersionID) {
 		c.Error(apperrors.NewValidationError("version_id must be a canonical UUID"))
+		return
+	}
+	if len(request.TargetKnowledgeBaseIDs) == 0 || len(request.TargetKnowledgeBaseIDs) > types.ProductionReleaseMaxTargets {
+		c.Error(apperrors.NewValidationError("target_knowledge_base_ids count is invalid"))
 		return
 	}
 	seen := make(map[string]struct{}, len(request.TargetKnowledgeBaseIDs))
@@ -107,6 +115,10 @@ func (h *ProductionReleaseHandler) Retry(c *gin.Context) {
 	if !ok {
 		return
 	}
+	if !productionReleaseRequestBodyIsEmpty(c) {
+		c.Error(apperrors.NewValidationError("retry request body must be empty"))
+		return
+	}
 	if err := h.service.Retry(c.Request.Context(), targetID); err != nil {
 		handleProductionReleaseServiceError(c, err, "failed to retry production release target")
 		return
@@ -141,11 +153,40 @@ func productionReleaseTargetCommand(c *gin.Context) (string, int, bool) {
 		return "", 0, false
 	}
 	var request productionReleaseTargetCommandRequest
-	if err := c.ShouldBindJSON(&request); err != nil || request.ExpectedLock == nil || *request.ExpectedLock < 0 {
+	if err := decodeStrictProductionReleaseJSON(c, &request); err != nil || request.ExpectedLock == nil || *request.ExpectedLock < 0 {
 		c.Error(apperrors.NewValidationError("expected_lock must be a non-negative integer"))
 		return "", 0, false
 	}
 	return targetID, *request.ExpectedLock, true
+}
+
+func decodeStrictProductionReleaseJSON(c *gin.Context, destination any) error {
+	if c == nil || c.Request == nil || c.Request.Body == nil {
+		return io.EOF
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, productionReleaseHTTPBodyMaxBytes)
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("production release request must contain one JSON object")
+		}
+		return err
+	}
+	return nil
+}
+
+func productionReleaseRequestBodyIsEmpty(c *gin.Context) bool {
+	if c == nil || c.Request == nil || c.Request.Body == nil {
+		return true
+	}
+	var oneByte [1]byte
+	count, err := c.Request.Body.Read(oneByte[:])
+	return count == 0 && errors.Is(err, io.EOF)
 }
 
 func handleProductionReleaseServiceError(c *gin.Context, err error, message string) {

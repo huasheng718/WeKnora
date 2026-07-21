@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -68,8 +69,25 @@ type graphScopeGraphRepo struct {
 	interfaces.RetrieveGraphRepository
 	mu         sync.Mutex
 	namespaces []types.NameSpace
+	bulkCalls  int
+	bulkScopes []types.NameSpace
 	graphs     map[string]*types.GraphData
 	err        error
+}
+
+func (r *graphScopeGraphRepo) SearchNodeInNamespaces(_ context.Context, namespaces []types.NameSpace, _ []string) (*types.GraphData, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.bulkCalls++
+	r.bulkScopes = append(r.bulkScopes, namespaces...)
+	if r.err != nil {
+		return nil, r.err
+	}
+	merged := &types.GraphData{}
+	for _, namespace := range namespaces {
+		merged = types.MergeGraphData(merged, r.graphs[namespace.Knowledge])
+	}
+	return merged, nil
 }
 
 func (r *graphScopeGraphRepo) SearchNode(_ context.Context, namespace types.NameSpace, _ []string) (*types.GraphData, error) {
@@ -99,10 +117,36 @@ func TestSearchKnowledgeGraphScopesProductionAndDeduplicatesDeterministically(t 
 
 	graph, err := SearchActiveProductionGraph(context.Background(), 7, "kb-1", []string{"common"}, releases, knowledgeRepo, graphRepo)
 	require.NoError(t, err)
-	require.Equal(t, []types.NameSpace{{KnowledgeBase: "kb-1", Knowledge: "ordinary"}, {KnowledgeBase: "kb-1", Knowledge: "prod-active"}}, graphRepo.namespaces)
+	require.Equal(t, 1, graphRepo.bulkCalls)
+	require.Equal(t, []types.NameSpace{{KnowledgeBase: "kb-1", Knowledge: "ordinary"}, {KnowledgeBase: "kb-1", Knowledge: "prod-active"}}, graphRepo.bulkScopes)
 	require.Equal(t, []string{"active", "common", "ordinary"}, graphNodeNames(graph.Node))
 	require.Equal(t, []string{"active-chunk", "ordinary-chunk"}, graph.Node[1].Chunks)
 	require.Len(t, graph.Relation, 2)
+}
+
+func TestSearchKnowledgeGraphUsesOneBulkRepositoryCallForHighNamespaceCount(t *testing.T) {
+	const knowledgeCount = 1000
+	rows := make([]*types.Knowledge, 0, knowledgeCount)
+	active := make([]string, 0, knowledgeCount/2)
+	for index := range knowledgeCount {
+		id := fmt.Sprintf("knowledge-%04d", index)
+		rows = append(rows, &types.Knowledge{ID: id, KnowledgeBaseID: "kb-high", TenantID: 7})
+		if index%2 == 0 {
+			active = append(active, id)
+		}
+	}
+	graphRepo := &graphScopeGraphRepo{graphs: map[string]*types.GraphData{}}
+	_, err := SearchActiveProductionGraph(
+		context.Background(), 7, "kb-high", []string{"term"},
+		&graphScopeReleaseRepo{scopes: map[string]types.ProductionKnowledgeScope{
+			"kb-high": {ActiveKnowledgeIDs: active, AllProductionKnowledgeIDs: active},
+		}},
+		&graphScopeKnowledgeRepo{rows: rows}, graphRepo,
+	)
+	require.NoError(t, err)
+	require.Equal(t, 1, graphRepo.bulkCalls)
+	require.Empty(t, graphRepo.namespaces, "bulk scope must replace serial per-namespace calls")
+	require.Len(t, graphRepo.bulkScopes, knowledgeCount)
 }
 
 func TestSearchKnowledgeGraphUsesUnscopedNamespaceForOrdinaryKnowledgeBase(t *testing.T) {
@@ -112,7 +156,8 @@ func TestSearchKnowledgeGraphUsesUnscopedNamespaceForOrdinaryKnowledgeBase(t *te
 	graph, err := SearchActiveProductionGraph(context.Background(), 7, "kb-1", []string{"ordinary"}, &graphScopeReleaseRepo{}, knowledgeRepo, graphRepo)
 	require.NoError(t, err)
 	require.Len(t, graph.Node, 1)
-	require.Equal(t, []types.NameSpace{{KnowledgeBase: "kb-1"}}, graphRepo.namespaces)
+	require.Equal(t, 1, graphRepo.bulkCalls)
+	require.Equal(t, []types.NameSpace{{KnowledgeBase: "kb-1"}}, graphRepo.bulkScopes)
 }
 
 func TestSearchKnowledgeGraphFailsClosedForInactiveExplicitKnowledge(t *testing.T) {
@@ -186,7 +231,8 @@ func TestSearchKnowledgeGraphUsesSharedOwnerScopeForActiveProjectionNamespaces(t
 
 	_, err := SearchActiveProductionGraph(callerCtx, 200, "kb-shared", []string{"term"}, releases, knowledgeRepo, graphRepo)
 	require.NoError(t, err)
-	require.Equal(t, []types.NameSpace{{KnowledgeBase: "kb-shared", Knowledge: "ordinary"}, {KnowledgeBase: "kb-shared", Knowledge: "prod-active"}}, graphRepo.namespaces)
+	require.Equal(t, 1, graphRepo.bulkCalls)
+	require.Equal(t, []types.NameSpace{{KnowledgeBase: "kb-shared", Knowledge: "ordinary"}, {KnowledgeBase: "kb-shared", Knowledge: "prod-active"}}, graphRepo.bulkScopes)
 	require.Equal(t, []uint64{200}, releases.contextTenants)
 	require.Equal(t, []uint64{200}, knowledgeRepo.contextTenants)
 }

@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
@@ -141,6 +143,48 @@ func TestProductionReleaseCreateMapsStaleReviewScopeToConflict(t *testing.T) {
 		h.Create,
 	)
 	require.Equal(t, http.StatusConflict, response.Code, response.Body.String())
+}
+
+func TestProductionReleaseHandlerRejectsNonStrictAndOversizedJSON(t *testing.T) {
+	tests := []struct {
+		name, body string
+		handler    func(*ProductionReleaseHandler) func(*gin.Context)
+	}{
+		{name: "create unknown field", body: `{"version_id":"` + productionDocumentTypeID + `","target_knowledge_base_ids":["` + productionReviewerID + `"],"unknown":true}`, handler: func(h *ProductionReleaseHandler) func(*gin.Context) { return h.Create }},
+		{name: "create trailing object", body: `{"version_id":"` + productionDocumentTypeID + `","target_knowledge_base_ids":["` + productionReviewerID + `"]}{}`, handler: func(h *ProductionReleaseHandler) func(*gin.Context) { return h.Create }},
+		{name: "create oversized", body: `{"version_id":"` + productionDocumentTypeID + `","target_knowledge_base_ids":["` + productionReviewerID + `"]}` + strings.Repeat(" ", 70<<10), handler: func(h *ProductionReleaseHandler) func(*gin.Context) { return h.Create }},
+		{name: "activate unknown field", body: `{"expected_lock":1,"unknown":true}`, handler: func(h *ProductionReleaseHandler) func(*gin.Context) { return h.Activate }},
+		{name: "activate trailing object", body: `{"expected_lock":1}{}`, handler: func(h *ProductionReleaseHandler) func(*gin.Context) { return h.Activate }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			service := &productionReleaseServiceStub{}
+			h := NewProductionReleaseHandler(service)
+			path := "/production/release-targets/" + productionReleaseTargetID + "/activate"
+			pattern := "/production/release-targets/:id/activate"
+			if strings.HasPrefix(tc.name, "create") {
+				path = "/production/documents/" + productionProjectID + "/releases"
+				pattern = "/production/documents/:id/releases"
+			}
+			response := performProductionHandlerRequest(http.MethodPost, pattern, path, tc.body, tc.handler(h))
+			require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+			require.Empty(t, service.targetID)
+			require.Empty(t, service.prepared.documentID)
+		})
+	}
+}
+
+func TestProductionReleaseRetryAcceptsEmptyBodyOnly(t *testing.T) {
+	for _, body := range []string{`{}`, ` `, `null`} {
+		service := &productionReleaseServiceStub{}
+		h := NewProductionReleaseHandler(service)
+		response := performProductionHandlerRequest(
+			http.MethodPost, "/production/release-targets/:id/retry",
+			"/production/release-targets/"+productionReleaseTargetID+"/retry", body, h.Retry,
+		)
+		require.Equal(t, http.StatusBadRequest, response.Code, "body=%q response=%s", body, response.Body.String())
+		require.Empty(t, service.targetID)
+	}
 }
 
 var _ ProductionReleaseService = (*productionReleaseServiceStub)(nil)

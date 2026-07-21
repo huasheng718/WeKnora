@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -38,7 +39,9 @@ func (h *ProductionProjectionTaskHandler) Handle(ctx context.Context, task *asyn
 	}
 	ctx = context.WithValue(ctx, types.TenantIDContextKey, payload.TenantID)
 	actorID := payload.ActorUserID
-	if actorID == "" {
+	isUserHeadMutation := payload.Operation == types.ProductionProjectionOperationActivate ||
+		payload.Operation == types.ProductionProjectionOperationRollback
+	if !isUserHeadMutation && actorID == "" {
 		actorID = types.ProductionSystemActorID
 	}
 	ctx = context.WithValue(ctx, types.UserIDContextKey, actorID)
@@ -48,6 +51,19 @@ func (h *ProductionProjectionTaskHandler) Handle(ctx context.Context, task *asyn
 	}
 	if target == nil || target.TenantID != payload.TenantID || target.ProjectID != payload.ProjectID || target.ID != payload.TargetID {
 		return types.ErrProductionForbidden
+	}
+	if isUserHeadMutation {
+		if target.Status == types.ReleaseTargetActive {
+			ctx = context.WithValue(ctx, types.UserIDContextKey, types.ProductionSystemActorID)
+		} else {
+			if strings.TrimSpace(actorID) == "" || actorID == types.ProductionSystemActorID {
+				return types.ErrProductionForbidden
+			}
+			target, err = h.releases.authorizeTarget(ctx, target.ID)
+			if err != nil {
+				return err
+			}
+		}
 	}
 	switch task.Type() {
 	case types.TypeProductionBuild:

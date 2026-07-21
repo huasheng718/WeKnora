@@ -169,13 +169,12 @@ func contextWithGraphOwnerTenant(ctx context.Context, tenantID uint64) context.C
 }
 
 func searchGraphNamespaces(ctx context.Context, graphs interfaces.RetrieveGraphRepository, namespaces []types.NameSpace, nodes []string) (*types.GraphData, error) {
-	merged := &types.GraphData{}
-	for _, namespace := range namespaces {
-		graph, err := graphs.SearchNode(ctx, namespace, nodes)
-		if err != nil {
-			return nil, err
-		}
-		merged = types.MergeGraphData(merged, graph)
+	merged, err := graphs.SearchNodeInNamespaces(ctx, namespaces, nodes)
+	if err != nil {
+		return nil, err
+	}
+	if merged == nil {
+		merged = &types.GraphData{}
 	}
 	sortGraphData(merged)
 	return merged, nil

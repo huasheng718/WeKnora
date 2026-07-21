@@ -1,3 +1,5 @@
+DROP TRIGGER IF EXISTS trg_production_release_targets_guard_recovery_attempt ON production_release_targets;
+DROP FUNCTION IF EXISTS guard_production_release_target_recovery_attempt();
 DROP TRIGGER IF EXISTS trg_production_projection_heads_guard ON production_projection_heads;
 DROP FUNCTION IF EXISTS guard_production_projection_head();
 DROP TRIGGER IF EXISTS trg_production_projection_heads_activate_target ON production_projection_heads;
@@ -32,4 +34,6 @@ DROP INDEX IF EXISTS uq_production_release_targets_active_projection;
 DROP INDEX IF EXISTS idx_production_release_targets_scope_status;
 DROP INDEX IF EXISTS idx_production_release_targets_cleanup_eligibility;
 DROP INDEX IF EXISTS idx_production_releases_document_status;
+DROP INDEX IF EXISTS uq_production_releases_version_root;
+DROP INDEX IF EXISTS uq_production_releases_successor;
 DROP INDEX IF EXISTS uq_knowledge_bases_id_tenant;

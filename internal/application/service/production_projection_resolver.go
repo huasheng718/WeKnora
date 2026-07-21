@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 
+	apprepository "github.com/Tencent/WeKnora/internal/application/repository"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
@@ -77,6 +78,112 @@ func (r *productionProjectionResolver) AuthorizeExplicitKnowledgeIDs(ctx context
 	for _, scope := range scopes {
 		if intersectsKnowledgeIDs(knowledgeIDs, scope.InactiveKnowledgeIDs) {
 			return types.ErrProductionProjectionInactive
+		}
+	}
+	return nil
+}
+
+// ProjectVisibleKnowledge is the single user-facing projection boundary for
+// direct and non-hybrid Knowledge reads. Inactive release history is omitted;
+// active projections are returned as response copies so repository-owned rows
+// are never mutated while being marked read-only.
+func (r *productionProjectionResolver) ProjectVisibleKnowledge(
+	ctx context.Context,
+	rows []*types.Knowledge,
+	rejectInactive bool,
+) ([]*types.Knowledge, error) {
+	if len(rows) == 0 || r == nil || r.releases == nil {
+		return rows, nil
+	}
+	rowsByTenant := make(map[uint64][]*types.Knowledge)
+	for _, row := range rows {
+		if row != nil && row.ID != "" && row.TenantID != 0 {
+			rowsByTenant[row.TenantID] = append(rowsByTenant[row.TenantID], row)
+		}
+	}
+	active := make(map[string]struct{})
+	inactive := make(map[string]struct{})
+	for tenantID, tenantRows := range rowsByTenant {
+		ids := make([]string, 0, len(tenantRows))
+		for _, row := range tenantRows {
+			ids = append(ids, row.ID)
+		}
+		scopeCtx := context.WithValue(ctx, types.TenantIDContextKey, tenantID)
+		scopes, err := r.releases.ResolveScopesForKnowledgeIDs(scopeCtx, tenantID, ids)
+		if err != nil {
+			return nil, err
+		}
+		for _, scope := range scopes {
+			for _, id := range scope.ActiveKnowledgeIDs {
+				active[id] = struct{}{}
+			}
+			for _, id := range scope.InactiveKnowledgeIDs {
+				inactive[id] = struct{}{}
+			}
+		}
+	}
+
+	visible := make([]*types.Knowledge, 0, len(rows))
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		if _, hidden := inactive[row.ID]; hidden {
+			if rejectInactive {
+				return nil, apprepository.ErrKnowledgeNotFound
+			}
+			continue
+		}
+		if _, isActive := active[row.ID]; isActive {
+			response := *row
+			response.Source = "production"
+			response.ReadOnly = true
+			visible = append(visible, &response)
+			continue
+		}
+		visible = append(visible, row)
+	}
+	return visible, nil
+}
+
+// RejectGovernedKnowledgeBaseMutation protects KB-wide operations that could
+// copy or destroy release-managed projection history. The guard is intentionally
+// repository-backed so handler and worker entry points share the same rule.
+func (r *productionProjectionResolver) RejectGovernedKnowledgeBaseMutation(
+	ctx context.Context,
+	tenantID uint64,
+	kbIDs ...string,
+) error {
+	if r == nil || r.releases == nil || len(kbIDs) == 0 {
+		return nil
+	}
+	scopes, err := r.releases.ResolveScopes(ctx, tenantID, kbIDs)
+	if err != nil {
+		return err
+	}
+	for _, kbID := range kbIDs {
+		if len(scopes[kbID].AllProductionKnowledgeIDs) > 0 {
+			return types.ErrProductionProjectionImmutable
+		}
+	}
+	return nil
+}
+
+func (r *productionProjectionResolver) RejectKnowledgeMutation(
+	ctx context.Context,
+	tenantID uint64,
+	knowledgeIDs []string,
+) error {
+	if r == nil || r.releases == nil || len(knowledgeIDs) == 0 {
+		return nil
+	}
+	scopes, err := r.releases.ResolveScopesForKnowledgeIDs(ctx, tenantID, knowledgeIDs)
+	if err != nil {
+		return err
+	}
+	for _, scope := range scopes {
+		if intersectsKnowledgeIDs(knowledgeIDs, scope.AllProductionKnowledgeIDs) {
+			return types.ErrProductionProjectionImmutable
 		}
 	}
 	return nil

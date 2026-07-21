@@ -18,11 +18,12 @@ import (
 // It provides operations for managing document chunks in the knowledge base
 // Chunks are segments of documents that have been processed and prepared for indexing
 type chunkService struct {
-	chunkRepository interfaces.ChunkRepository // Repository for chunk data persistence
-	kbRepository    interfaces.KnowledgeBaseRepository
-	modelService    interfaces.ModelService
-	retrieveEngine  interfaces.RetrieveEngineRegistry
-	ownership       retriever.TenantStoreOwnership
+	chunkRepository       interfaces.ChunkRepository // Repository for chunk data persistence
+	kbRepository          interfaces.KnowledgeBaseRepository
+	modelService          interfaces.ModelService
+	retrieveEngine        interfaces.RetrieveEngineRegistry
+	ownership             retriever.TenantStoreOwnership
+	productionReleaseRepo interfaces.ProductionReleaseRepository
 }
 
 // NewChunkService creates a new chunk service
@@ -38,14 +39,54 @@ func NewChunkService(
 	modelService interfaces.ModelService,
 	retrieveEngine interfaces.RetrieveEngineRegistry,
 	ownership retriever.TenantStoreOwnership,
+	productionReleaseRepo interfaces.ProductionReleaseRepository,
 ) interfaces.ChunkService {
 	return &chunkService{
-		chunkRepository: chunkRepository,
-		kbRepository:    kbRepository,
-		modelService:    modelService,
-		retrieveEngine:  retrieveEngine,
-		ownership:       ownership,
+		chunkRepository:       chunkRepository,
+		kbRepository:          kbRepository,
+		modelService:          modelService,
+		retrieveEngine:        retrieveEngine,
+		ownership:             ownership,
+		productionReleaseRepo: productionReleaseRepo,
 	}
+}
+
+func (s *chunkService) requireVisibleKnowledgeIDs(ctx context.Context, tenantID uint64, knowledgeIDs []string) error {
+	if len(knowledgeIDs) == 0 || s.productionReleaseRepo == nil {
+		return nil
+	}
+	rows := make([]*types.Knowledge, 0, len(knowledgeIDs))
+	for _, knowledgeID := range knowledgeIDs {
+		if knowledgeID != "" {
+			rows = append(rows, &types.Knowledge{ID: knowledgeID, TenantID: tenantID})
+		}
+	}
+	_, err := newProductionProjectionResolver(s.productionReleaseRepo).
+		ProjectVisibleKnowledge(ctx, rows, true)
+	return err
+}
+
+func (s *chunkService) requireVisibleChunks(ctx context.Context, chunks []*types.Chunk) error {
+	byTenant := make(map[uint64][]string)
+	for _, chunk := range chunks {
+		if chunk != nil && chunk.KnowledgeID != "" && chunk.TenantID != 0 {
+			byTenant[chunk.TenantID] = append(byTenant[chunk.TenantID], chunk.KnowledgeID)
+		}
+	}
+	for tenantID, ids := range byTenant {
+		if err := s.requireVisibleKnowledgeIDs(ctx, tenantID, ids); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *chunkService) rejectProjectionChunkMutation(ctx context.Context, tenantID uint64, knowledgeIDs []string) error {
+	if actorID, ok := types.UserIDFromContext(ctx); ok && actorID == types.ProductionSystemActorID {
+		return nil
+	}
+	return newProductionProjectionResolver(s.productionReleaseRepo).
+		RejectKnowledgeMutation(ctx, tenantID, knowledgeIDs)
 }
 
 // GetRepository gets the chunk repository
@@ -99,6 +140,9 @@ func (s *chunkService) GetChunkByID(ctx context.Context, id string) (*types.Chun
 		})
 		return nil, err
 	}
+	if err := s.requireVisibleChunks(ctx, []*types.Chunk{chunk}); err != nil {
+		return nil, err
+	}
 
 	logger.Info(ctx, "Chunk retrieved successfully")
 	return chunk, nil
@@ -114,6 +158,9 @@ func (s *chunkService) GetChunkByIDOnly(ctx context.Context, id string) (*types.
 			return nil, ErrChunkNotFound
 		}
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{"chunk_id": id})
+		return nil, err
+	}
+	if err := s.requireVisibleChunks(ctx, []*types.Chunk{chunk}); err != nil {
 		return nil, err
 	}
 	return chunk, nil
@@ -134,6 +181,9 @@ func (s *chunkService) ListChunksByKnowledgeID(ctx context.Context, knowledgeID 
 
 	tenantID := types.MustTenantIDFromContext(ctx)
 	logger.Infof(ctx, "Tenant ID: %d", tenantID)
+	if err := s.requireVisibleKnowledgeIDs(ctx, tenantID, []string{knowledgeID}); err != nil {
+		return nil, err
+	}
 
 	chunks, err := s.chunkRepository.ListChunksByKnowledgeID(ctx, tenantID, knowledgeID)
 	if err != nil {
@@ -146,6 +196,31 @@ func (s *chunkService) ListChunksByKnowledgeID(ctx context.Context, knowledgeID 
 
 	logger.Infof(ctx, "Retrieved %d chunks successfully", len(chunks))
 	return chunks, nil
+}
+
+// ListChunksByKnowledgeIDForSystem performs the tenant-scoped repository read
+// without user-facing projection visibility filtering.
+func (s *chunkService) ListChunksByKnowledgeIDForSystem(ctx context.Context, knowledgeID string) ([]*types.Chunk, error) {
+	actorID, actorOK := types.UserIDFromContext(ctx)
+	tenantID, tenantOK := types.TenantIDFromContext(ctx)
+	if !actorOK || actorID != types.ProductionSystemActorID || !tenantOK || tenantID == 0 {
+		return nil, types.ErrProductionForbidden
+	}
+	return s.chunkRepository.ListChunksByKnowledgeID(ctx, tenantID, knowledgeID)
+}
+
+func listChunksByKnowledgeIDForProductionWorker(
+	ctx context.Context,
+	chunks interfaces.ChunkService,
+	tenantID uint64,
+	knowledgeID string,
+) ([]*types.Chunk, error) {
+	if chunks == nil || tenantID == 0 || knowledgeID == "" {
+		return nil, types.ErrProductionForbidden
+	}
+	systemCtx := context.WithValue(ctx, types.TenantIDContextKey, tenantID)
+	systemCtx = context.WithValue(systemCtx, types.UserIDContextKey, types.ProductionSystemActorID)
+	return chunks.ListChunksByKnowledgeIDForSystem(systemCtx, knowledgeID)
 }
 
 // ListPagedChunksByKnowledgeID lists chunks for a knowledge ID with pagination
@@ -162,6 +237,9 @@ func (s *chunkService) ListPagedChunksByKnowledgeID(ctx context.Context,
 	knowledgeID string, page *types.Pagination, chunkType []types.ChunkType,
 ) (*types.PageResult, error) {
 	tenantID := types.MustTenantIDFromContext(ctx)
+	if err := s.requireVisibleKnowledgeIDs(ctx, tenantID, []string{knowledgeID}); err != nil {
+		return nil, err
+	}
 	chunks, total, err := s.chunkRepository.ListPagedChunksByKnowledgeID(
 		ctx,
 		tenantID,
@@ -198,6 +276,9 @@ func (s *chunkService) ListPagedChunksByKnowledgeID(ctx context.Context,
 // This method handles the actual update logic for a chunk, including updating the vector database representation
 func (s *chunkService) UpdateChunk(ctx context.Context, chunk *types.Chunk) error {
 	logger.Infof(ctx, "Updating chunk, ID: %s, knowledge ID: %s", chunk.ID, chunk.KnowledgeID)
+	if err := s.rejectProjectionChunkMutation(ctx, chunk.TenantID, []string{chunk.KnowledgeID}); err != nil {
+		return err
+	}
 
 	// Update the chunk in the repository
 	err := s.chunkRepository.UpdateChunk(ctx, chunk)
@@ -219,6 +300,17 @@ func (s *chunkService) UpdateChunks(ctx context.Context, chunks []*types.Chunk) 
 		return nil
 	}
 	logger.Infof(ctx, "Updating %d chunks in batch", len(chunks))
+	byTenant := make(map[uint64][]string)
+	for _, chunk := range chunks {
+		if chunk != nil {
+			byTenant[chunk.TenantID] = append(byTenant[chunk.TenantID], chunk.KnowledgeID)
+		}
+	}
+	for tenantID, ids := range byTenant {
+		if err := s.rejectProjectionChunkMutation(ctx, tenantID, ids); err != nil {
+			return err
+		}
+	}
 
 	// Update the chunks in the repository
 	err := s.chunkRepository.UpdateChunks(ctx, chunks)
@@ -243,7 +335,14 @@ func (s *chunkService) UpdateChunks(ctx context.Context, chunks []*types.Chunk) 
 //   - error: Any error encountered during deletion
 func (s *chunkService) DeleteChunk(ctx context.Context, id string) error {
 	tenantID := types.MustTenantIDFromContext(ctx)
-	err := s.chunkRepository.DeleteChunk(ctx, tenantID, id)
+	chunk, err := s.chunkRepository.GetChunkByID(ctx, tenantID, id)
+	if err != nil {
+		return err
+	}
+	if err := s.rejectProjectionChunkMutation(ctx, tenantID, []string{chunk.KnowledgeID}); err != nil {
+		return err
+	}
+	err = s.chunkRepository.DeleteChunk(ctx, tenantID, id)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"tenant_id": tenantID,
@@ -271,8 +370,21 @@ func (s *chunkService) DeleteChunks(ctx context.Context, ids []string) error {
 
 	tenantID := types.MustTenantIDFromContext(ctx)
 	logger.Infof(ctx, "Tenant ID: %d", tenantID)
+	chunks, err := s.chunkRepository.ListChunksByID(ctx, tenantID, ids)
+	if err != nil {
+		return err
+	}
+	knowledgeIDs := make([]string, 0, len(chunks))
+	for _, chunk := range chunks {
+		if chunk != nil {
+			knowledgeIDs = append(knowledgeIDs, chunk.KnowledgeID)
+		}
+	}
+	if err := s.rejectProjectionChunkMutation(ctx, tenantID, knowledgeIDs); err != nil {
+		return err
+	}
 
-	err := s.chunkRepository.DeleteChunks(ctx, tenantID, ids)
+	err = s.chunkRepository.DeleteChunks(ctx, tenantID, ids)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"chunk_ids": ids,
@@ -299,6 +411,9 @@ func (s *chunkService) DeleteChunksByKnowledgeID(ctx context.Context, knowledgeI
 
 	tenantID := types.MustTenantIDFromContext(ctx)
 	logger.Infof(ctx, "Tenant ID: %d", tenantID)
+	if err := s.rejectProjectionChunkMutation(ctx, tenantID, []string{knowledgeID}); err != nil {
+		return err
+	}
 
 	err := s.chunkRepository.DeleteChunksByKnowledgeID(ctx, tenantID, knowledgeID)
 	if err != nil {
@@ -319,6 +434,9 @@ func (s *chunkService) DeleteByKnowledgeList(ctx context.Context, ids []string) 
 
 	tenantID := types.MustTenantIDFromContext(ctx)
 	logger.Infof(ctx, "Tenant ID: %d", tenantID)
+	if err := s.rejectProjectionChunkMutation(ctx, tenantID, ids); err != nil {
+		return err
+	}
 
 	err := s.chunkRepository.DeleteByKnowledgeList(ctx, tenantID, ids)
 	if err != nil {

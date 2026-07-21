@@ -480,9 +480,8 @@ func defaultChannel(ch string) string {
 
 // GetKnowledgeByID retrieves a knowledge entry by its ID
 func (s *knowledgeService) GetKnowledgeByID(ctx context.Context, id string) (*types.Knowledge, error) {
-	tenantID := ctx.Value(types.TenantIDContextKey).(uint64)
-
-	knowledge, err := s.repo.GetKnowledgeByID(ctx, tenantID, id)
+	tenantID := types.MustTenantIDFromContext(ctx)
+	knowledge, err := s.GetKnowledgeByIDForSystem(ctx, id)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"knowledge_id": id,
@@ -490,6 +489,13 @@ func (s *knowledgeService) GetKnowledgeByID(ctx context.Context, id string) (*ty
 		})
 		return nil, err
 	}
+
+	visible, err := newProductionProjectionResolver(s.productionReleaseRepo).
+		ProjectVisibleKnowledge(ctx, []*types.Knowledge{knowledge}, true)
+	if err != nil {
+		return nil, err
+	}
+	knowledge = visible[0]
 
 	// Load tags for this knowledge
 	tagMap, err := s.repo.GetKnowledgeTags(ctx, []string{knowledge.ID})
@@ -503,8 +509,25 @@ func (s *knowledgeService) GetKnowledgeByID(ctx context.Context, id string) (*ty
 	return knowledge, nil
 }
 
+func (s *knowledgeService) GetKnowledgeByIDForSystem(ctx context.Context, id string) (*types.Knowledge, error) {
+	return s.repo.GetKnowledgeByID(ctx, types.MustTenantIDFromContext(ctx), id)
+}
+
 // GetKnowledgeByIDOnly retrieves knowledge by ID without tenant filter (for permission resolution).
 func (s *knowledgeService) GetKnowledgeByIDOnly(ctx context.Context, id string) (*types.Knowledge, error) {
+	knowledge, err := s.GetKnowledgeByIDOnlyForSystem(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	visible, err := newProductionProjectionResolver(s.productionReleaseRepo).
+		ProjectVisibleKnowledge(ctx, []*types.Knowledge{knowledge}, true)
+	if err != nil {
+		return nil, err
+	}
+	return visible[0], nil
+}
+
+func (s *knowledgeService) GetKnowledgeByIDOnlyForSystem(ctx context.Context, id string) (*types.Knowledge, error) {
 	return s.repo.GetKnowledgeByIDOnly(ctx, id)
 }
 
@@ -543,7 +566,18 @@ func (s *knowledgeService) GetOwningKBCreatorID(ctx context.Context, knowledgeID
 func (s *knowledgeService) ListKnowledgeByKnowledgeBaseID(ctx context.Context,
 	kbID string,
 ) ([]*types.Knowledge, error) {
-	return s.repo.ListKnowledgeByKnowledgeBaseID(ctx, ctx.Value(types.TenantIDContextKey).(uint64), kbID)
+	rows, err := s.ListKnowledgeByKnowledgeBaseIDForSystem(ctx, kbID)
+	if err != nil {
+		return nil, err
+	}
+	return newProductionProjectionResolver(s.productionReleaseRepo).
+		ProjectVisibleKnowledge(ctx, rows, false)
+}
+
+func (s *knowledgeService) ListKnowledgeByKnowledgeBaseIDForSystem(ctx context.Context,
+	kbID string,
+) ([]*types.Knowledge, error) {
+	return s.repo.ListKnowledgeByKnowledgeBaseID(ctx, types.MustTenantIDFromContext(ctx), kbID)
 }
 
 // ListPagedKnowledgeByKnowledgeBaseID returns paginated knowledge entries in a knowledge base
@@ -613,8 +647,7 @@ func (s *knowledgeService) ApplyProductionProjectionScope(ctx context.Context, t
 // GetKnowledgeFile retrieves the physical file associated with a knowledge entry
 func (s *knowledgeService) GetKnowledgeFile(ctx context.Context, id string) (io.ReadCloser, string, error) {
 	// Get knowledge record
-	tenantID := ctx.Value(types.TenantIDContextKey).(uint64)
-	knowledge, err := s.repo.GetKnowledgeByID(ctx, tenantID, id)
+	knowledge, err := s.GetKnowledgeByID(ctx, id)
 	if err != nil {
 		return nil, "", err
 	}
@@ -677,6 +710,20 @@ func (s *knowledgeService) GetKnowledgeBatch(ctx context.Context,
 	if len(ids) == 0 {
 		return nil, nil
 	}
+	rows, err := s.GetKnowledgeBatchForSystem(ctx, tenantID, ids)
+	if err != nil {
+		return nil, err
+	}
+	return newProductionProjectionResolver(s.productionReleaseRepo).
+		ProjectVisibleKnowledge(ctx, rows, false)
+}
+
+func (s *knowledgeService) GetKnowledgeBatchForSystem(ctx context.Context,
+	tenantID uint64, ids []string,
+) ([]*types.Knowledge, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
 	return s.repo.GetKnowledgeBatch(ctx, tenantID, ids)
 }
 
@@ -688,7 +735,7 @@ func (s *knowledgeService) GetKnowledgeBatchWithSharedAccess(ctx context.Context
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	ownList, err := s.repo.GetKnowledgeBatch(ctx, tenantID, ids)
+	ownList, err := s.GetKnowledgeBatchForSystem(ctx, tenantID, ids)
 	if err != nil {
 		return nil, err
 	}
@@ -698,13 +745,17 @@ func (s *knowledgeService) GetKnowledgeBatchWithSharedAccess(ctx context.Context
 			foundSet[k.ID] = true
 		}
 	}
+	projectVisible := func(rows []*types.Knowledge) ([]*types.Knowledge, error) {
+		return newProductionProjectionResolver(s.productionReleaseRepo).
+			ProjectVisibleKnowledge(ctx, rows, false)
+	}
 	userIDVal := ctx.Value(types.UserIDContextKey)
 	if userIDVal == nil {
-		return ownList, nil
+		return projectVisible(ownList)
 	}
 	userID, ok := userIDVal.(string)
 	if !ok || userID == "" {
-		return ownList, nil
+		return projectVisible(ownList)
 	}
 	// Plan 3: shared-KB permission is keyed on (tenant, tenant_role)
 	// rather than user. callerTenantRole drives the 3-D cap.
@@ -713,7 +764,7 @@ func (s *knowledgeService) GetKnowledgeBatchWithSharedAccess(ctx context.Context
 		if foundSet[id] {
 			continue
 		}
-		k, err := s.repo.GetKnowledgeByIDOnly(ctx, id)
+		k, err := s.GetKnowledgeByIDOnlyForSystem(ctx, id)
 		if err != nil || k == nil || k.KnowledgeBaseID == "" {
 			continue
 		}
@@ -724,7 +775,7 @@ func (s *knowledgeService) GetKnowledgeBatchWithSharedAccess(ctx context.Context
 		foundSet[k.ID] = true
 		ownList = append(ownList, k)
 	}
-	return ownList, nil
+	return projectVisible(ownList)
 }
 
 // SetKnowledgeTags replaces all tags for a single knowledge entry.
@@ -740,7 +791,24 @@ func (s *knowledgeService) ListKnowledgeIDsByTagIDs(
 	kbID string,
 	tagIDs []string,
 ) ([]string, error) {
-	return s.repo.ListIDsByTagIDs(ctx, tenantID, kbID, tagIDs)
+	ids, err := s.repo.ListIDsByTagIDs(ctx, tenantID, kbID, tagIDs)
+	if err != nil || len(ids) == 0 {
+		return ids, err
+	}
+	rows := make([]*types.Knowledge, 0, len(ids))
+	for _, id := range ids {
+		rows = append(rows, &types.Knowledge{ID: id, TenantID: tenantID, KnowledgeBaseID: kbID})
+	}
+	visible, err := newProductionProjectionResolver(s.productionReleaseRepo).
+		ProjectVisibleKnowledge(ctx, rows, false)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]string, 0, len(visible))
+	for _, row := range visible {
+		result = append(result, row.ID)
+	}
+	return result, nil
 }
 
 // validateKnowledgeTagIDs ensures every tag exists and belongs to the given knowledge base.

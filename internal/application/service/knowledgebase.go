@@ -669,6 +669,10 @@ func (s *knowledgeBaseService) DeleteKnowledgeBase(ctx context.Context, id strin
 	// Get tenant ID from context
 	tenantID := types.MustTenantIDFromContext(ctx)
 	tenantInfo, _ := types.TenantInfoFromContext(ctx)
+	if err := newProductionProjectionResolver(s.productionReleaseRepo).
+		RejectGovernedKnowledgeBaseMutation(ctx, tenantID, id); err != nil {
+		return err
+	}
 
 	// Load the KB before soft-delete so we can snapshot its VectorStoreID
 	// into the async cleanup payload. GORM's soft-delete filter hides the
@@ -750,6 +754,10 @@ func (s *knowledgeBaseService) ProcessKBDelete(ctx context.Context, t *asynq.Tas
 
 	// Set tenant context for downstream services
 	ctx = context.WithValue(ctx, types.TenantIDContextKey, tenantID)
+	if err := newProductionProjectionResolver(s.productionReleaseRepo).
+		RejectGovernedKnowledgeBaseMutation(ctx, tenantID, kbID); err != nil {
+		return err
+	}
 
 	logger.Infof(ctx, "Processing KB delete task for knowledge base: %s", kbID)
 
@@ -986,6 +994,14 @@ func (s *knowledgeBaseService) CopyKnowledgeBase(ctx context.Context,
 	srcKB string, dstKB string,
 ) (*types.KnowledgeBase, *types.KnowledgeBase, error) {
 	tenantID := types.MustTenantIDFromContext(ctx)
+	guardedKBs := []string{srcKB}
+	if dstKB != "" {
+		guardedKBs = append(guardedKBs, dstKB)
+	}
+	if err := newProductionProjectionResolver(s.productionReleaseRepo).
+		RejectGovernedKnowledgeBaseMutation(ctx, tenantID, guardedKBs...); err != nil {
+		return nil, nil, err
+	}
 	// Load source KB with tenant scope to prevent cross-tenant cloning
 	sourceKB, err := s.repo.GetKnowledgeBaseByIDAndTenant(ctx, srcKB, tenantID)
 	if err != nil {

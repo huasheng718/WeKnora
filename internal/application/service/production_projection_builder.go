@@ -130,6 +130,9 @@ func (b *ProductionProjectionBuilder) Build(ctx context.Context, targetID string
 		kb.Type != types.KnowledgeBaseTypeDocument {
 		return nil, types.ErrProductionForbidden
 	}
+	if err := requireProductionProjectionRoutingUnchanged(ctx, target, kb); err != nil {
+		return nil, err
+	}
 
 	payload := &types.ProductionProjectionKnowledgePayload{
 		KnowledgeID: target.KnowledgeID, KnowledgeBaseID: target.TargetKnowledgeBaseID,
@@ -143,7 +146,7 @@ func (b *ProductionProjectionBuilder) Build(ctx context.Context, targetID string
 			GraphModelID: graphModelID, SummaryModelID: summaryModelID, IndexingStrategy: indexingStrategy,
 		},
 	}
-	if existing, loadErr := b.knowledge.GetKnowledgeByID(ctx, target.KnowledgeID); loadErr == nil {
+	if existing, loadErr := b.knowledge.GetKnowledgeByIDForSystem(ctx, target.KnowledgeID); loadErr == nil {
 		if err := validateProductionProjectionKnowledge(existing, payload); err != nil {
 			return nil, err
 		}

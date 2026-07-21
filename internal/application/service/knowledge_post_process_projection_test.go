@@ -69,10 +69,23 @@ func (s *projectionPostProcessKBService) GetKnowledgeBaseByIDOnly(context.Contex
 
 type projectionPostProcessChunkService struct {
 	interfaces.ChunkService
-	chunks []*types.Chunk
+	chunks      []*types.Chunk
+	userCalls   int
+	systemCalls int
 }
 
 func (s *projectionPostProcessChunkService) ListChunksByKnowledgeID(context.Context, string) ([]*types.Chunk, error) {
+	s.userCalls++
+	return nil, errors.New("projection worker used user-facing chunk read")
+}
+
+func (s *projectionPostProcessChunkService) ListChunksByKnowledgeIDForSystem(ctx context.Context, _ string) ([]*types.Chunk, error) {
+	s.systemCalls++
+	actorID, _ := types.UserIDFromContext(ctx)
+	tenantID, _ := types.TenantIDFromContext(ctx)
+	if actorID != types.ProductionSystemActorID || tenantID != projectionTenantID {
+		return nil, types.ErrProductionForbidden
+	}
 	return s.chunks, nil
 }
 
@@ -125,6 +138,8 @@ type projectionPostProcessReleaseRepo struct {
 	status           types.ProductionReleaseTargetStatus
 	mu               sync.Mutex
 	transitionErr    error
+	configSnapshot   types.JSON
+	configDigest     string
 }
 
 func (r *projectionPostProcessReleaseRepo) GetTarget(
@@ -136,11 +151,28 @@ func (r *projectionPostProcessReleaseRepo) GetTarget(
 	if status == "" {
 		status = types.ReleaseTargetBuilding
 	}
+	configSnapshot := r.configSnapshot
+	configDigest := r.configDigest
+	if len(configSnapshot) == 0 {
+		configSnapshot, configDigest, _ = types.CanonicalProductionReleaseTargetConfig(
+			types.JSON(`{"version":1,"indexing_strategy":{"keyword_enabled":true}}`),
+		)
+	}
 	return &types.ProductionReleaseTarget{
 		ID: targetID, TenantID: projectionTenantID, KnowledgeID: projectionKnowledgeID,
 		DocumentID: projectionDocumentID, VersionID: projectionVersionID,
 		TargetKnowledgeBaseID: projectionKBID, Status: status,
+		ConfigSnapshot: configSnapshot, ConfigDigest: configDigest,
 	}, nil
+}
+
+type projectionPostProcessTenantRepo struct {
+	interfaces.TenantRepository
+	tenant *types.Tenant
+}
+
+func (r *projectionPostProcessTenantRepo) GetTenantByID(context.Context, uint64) (*types.Tenant, error) {
+	return r.tenant, nil
 }
 
 func (r *projectionPostProcessReleaseRepo) TransitionTarget(
@@ -237,26 +269,81 @@ func TestProductionProjectionPostProcessAttemptCanRecoverWithRetainedFanoutIDs(t
 		"the recovered attempt must wait for its newly accepted fan-out tasks")
 }
 
+func TestProductionProjectionPostProcessRejectsDelayedVectorStoreMutation(t *testing.T) {
+	knowledgeRepo := &projectionPostProcessKnowledgeRepo{
+		knowledge: productionProjectionKnowledgeForPostProcess(t), updates: map[string]interface{}{},
+	}
+	snapshot, digest, err := types.CanonicalProductionReleaseTargetConfig(types.JSON(
+		`{"version":1,"indexing_strategy":{"vector_enabled":true},"vector_store_id":"snapshot-store"}`,
+	))
+	require.NoError(t, err)
+	currentStore := "current-store"
+	enqueuer := &projectionPostProcessEnqueuer{}
+	handler := NewKnowledgePostProcessService(
+		knowledgeRepo,
+		&projectionPostProcessKBService{kb: &types.KnowledgeBase{
+			ID: projectionKBID, TenantID: projectionTenantID, VectorStoreID: &currentStore,
+		}},
+		&projectionPostProcessChunkService{chunks: []*types.Chunk{{
+			ID: "chunk-1", KnowledgeID: projectionKnowledgeID, ChunkType: types.ChunkTypeText,
+		}}},
+		enqueuer, nil, nil, nil,
+		&projectionPostProcessReleaseRepo{configSnapshot: snapshot, configDigest: digest},
+	)
+
+	err = handler.Handle(context.Background(), projectionPostProcessTask(t))
+	require.ErrorIs(t, err, types.ErrProductionReleaseReprepareRequired)
+	require.Empty(t, enqueuer.tasks)
+	require.Equal(t, types.ParseStatusProcessing, knowledgeRepo.knowledge.ParseStatus)
+}
+
+func TestProductionProjectionSubtaskRoutingRejectsRetrieverEngineMutation(t *testing.T) {
+	knowledge := productionProjectionKnowledgeForPostProcess(t)
+	snapshot, digest, err := types.CanonicalProductionReleaseTargetConfig(types.JSON(
+		`{"version":1,"indexing_strategy":{"vector_enabled":true},"retriever_engines":[{"retriever_type":"vector","retriever_engine_type":"postgres"}]}`,
+	))
+	require.NoError(t, err)
+	releases := &projectionPostProcessReleaseRepo{configSnapshot: snapshot, configDigest: digest}
+	service := &knowledgeService{
+		productionReleaseRepo: releases,
+		tenantRepo: &projectionPostProcessTenantRepo{tenant: &types.Tenant{
+			ID: projectionTenantID,
+			RetrieverEngines: types.RetrieverEngines{Engines: []types.RetrieverEngineParams{{
+				RetrieverType: types.VectorRetrieverType, RetrieverEngineType: types.ElasticsearchRetrieverEngineType,
+			}}},
+		}},
+	}
+	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, projectionTenantID)
+
+	_, err = service.requireProductionProjectionSubtaskRouting(ctx, knowledge, &types.KnowledgeBase{
+		ID: projectionKBID, TenantID: projectionTenantID,
+	})
+	require.ErrorIs(t, err, types.ErrProductionReleaseReprepareRequired)
+}
+
 func TestProductionProjectionBuildDoesNotEnqueueWikiBeforeActivation(t *testing.T) {
 	knowledgeRepo := &projectionPostProcessKnowledgeRepo{
 		knowledge: productionProjectionKnowledgeForPostProcess(t), updates: map[string]interface{}{},
 	}
 	enqueuer := &projectionPostProcessEnqueuer{}
 	releases := &projectionPostProcessReleaseRepo{}
+	chunks := &projectionPostProcessChunkService{chunks: []*types.Chunk{{
+		ID: "chunk-1", KnowledgeID: projectionKnowledgeID, ChunkType: types.ChunkTypeText,
+	}}}
 	handler := NewKnowledgePostProcessService(
 		knowledgeRepo,
 		&projectionPostProcessKBService{kb: &types.KnowledgeBase{
 			ID: projectionKBID, TenantID: projectionTenantID,
 			IndexingStrategy: types.IndexingStrategy{WikiEnabled: true},
 		}},
-		&projectionPostProcessChunkService{chunks: []*types.Chunk{{
-			ID: "chunk-1", KnowledgeID: projectionKnowledgeID, ChunkType: types.ChunkTypeText,
-		}}},
+		chunks,
 		enqueuer, nil, nil, nil, releases,
 	)
 
 	require.NoError(t, handler.Handle(context.Background(), projectionPostProcessTask(t)))
 	require.NotContains(t, enqueuer.taskTypes, types.TypeWikiIngest)
+	require.Zero(t, chunks.userCalls)
+	require.Equal(t, 1, chunks.systemCalls)
 	require.Equal(t, 1, knowledgeRepo.knowledge.PendingSubtasksCount,
 		"only summary remains; suppressed Wiki must not reserve a completion slot")
 	require.Zero(t, releases.readyTransitions, "summary work has not completed")

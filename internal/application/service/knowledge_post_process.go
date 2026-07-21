@@ -63,6 +63,84 @@ func productionProjectionMetadata(knowledge *types.Knowledge) (*types.Production
 	return types.ValidateProductionProjectionIntegrity(knowledge)
 }
 
+func productionProjectionTargetForSubtask(
+	ctx context.Context,
+	knowledge *types.Knowledge,
+	projection *types.ProductionProjectionMetadata,
+	releaseRepo interfaces.ProductionReleaseRepository,
+) (*types.ProductionReleaseTarget, error) {
+	if projection == nil {
+		return nil, nil
+	}
+	if knowledge == nil || releaseRepo == nil {
+		return nil, errors.New("production projection subtask dependencies are unavailable")
+	}
+	target, err := releaseRepo.GetTarget(ctx, knowledge.TenantID, projection.ReleaseTargetID)
+	if err != nil {
+		return nil, err
+	}
+	if target == nil || target.ID != projection.ReleaseTargetID || target.TenantID != knowledge.TenantID ||
+		target.KnowledgeID != knowledge.ID || target.TargetKnowledgeBaseID != knowledge.KnowledgeBaseID ||
+		target.DocumentID != projection.DocumentID || target.VersionID != projection.VersionID {
+		return nil, types.ErrProductionProjectionConflict
+	}
+	return target, nil
+}
+
+func requireProductionProjectionSubtaskVectorStoreUnchanged(
+	ctx context.Context,
+	knowledge *types.Knowledge,
+	projection *types.ProductionProjectionMetadata,
+	kb *types.KnowledgeBase,
+	releaseRepo interfaces.ProductionReleaseRepository,
+) error {
+	target, err := productionProjectionTargetForSubtask(ctx, knowledge, projection, releaseRepo)
+	if err != nil || target == nil {
+		return err
+	}
+	canonical, digest, err := types.CanonicalProductionReleaseTargetConfig(target.ConfigSnapshot)
+	if err != nil || digest != target.ConfigDigest || string(canonical) != string(target.ConfigSnapshot) {
+		return fmt.Errorf("%w: retained configuration authentication failed", types.ErrProductionReleaseConfigInvalid)
+	}
+	var snapshot struct {
+		VectorStoreID *string `json:"vector_store_id"`
+	}
+	if err := json.Unmarshal(canonical, &snapshot); err != nil {
+		return fmt.Errorf("%w: retained routing configuration is invalid", types.ErrProductionReleaseConfigInvalid)
+	}
+	if strings.TrimSpace(valueOrEmpty(snapshot.VectorStoreID)) != strings.TrimSpace(valueOrEmpty(kb.VectorStoreID)) {
+		return types.ErrProductionReleaseReprepareRequired
+	}
+	return nil
+}
+
+func (s *knowledgeService) requireProductionProjectionSubtaskRouting(
+	ctx context.Context,
+	knowledge *types.Knowledge,
+	kb *types.KnowledgeBase,
+) (context.Context, error) {
+	projection, err := productionProjectionMetadata(knowledge)
+	if err != nil || projection == nil {
+		return ctx, err
+	}
+	target, err := productionProjectionTargetForSubtask(ctx, knowledge, projection, s.productionReleaseRepo)
+	if err != nil {
+		return ctx, err
+	}
+	if s.tenantRepo == nil {
+		return ctx, errors.New("production projection tenant routing is unavailable")
+	}
+	tenant, err := s.tenantRepo.GetTenantByID(ctx, knowledge.TenantID)
+	if err != nil {
+		return ctx, err
+	}
+	ctx = context.WithValue(ctx, types.TenantInfoContextKey, tenant)
+	if err := requireProductionProjectionRoutingUnchanged(ctx, target, kb); err != nil {
+		return ctx, err
+	}
+	return ctx, nil
+}
+
 func markProductionProjectionReady(
 	ctx context.Context,
 	knowledgeRepo interfaces.KnowledgeRepository,
@@ -211,6 +289,11 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 	if err != nil || kb == nil {
 		return fmt.Errorf("get knowledge base %s: %w", payload.KnowledgeBaseID, err)
 	}
+	if err := requireProductionProjectionSubtaskVectorStoreUnchanged(
+		ctx, knowledge, projection, kb, s.productionReleaseRepo,
+	); err != nil {
+		return err
+	}
 
 	processOverrides, _ := knowledge.ProcessOverrides()
 	eff := ResolveProcessConfig(kb, processOverrides)
@@ -221,7 +304,9 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 	}
 
 	// 2. Fetch all chunks
-	chunks, err := s.chunkService.ListChunksByKnowledgeID(ctx, payload.KnowledgeID)
+	chunks, err := listChunksByKnowledgeIDForProductionWorker(
+		ctx, s.chunkService, knowledge.TenantID, payload.KnowledgeID,
+	)
 	if err != nil {
 		return fmt.Errorf("list chunks for knowledge %s: %w", payload.KnowledgeID, err)
 	}

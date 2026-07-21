@@ -61,8 +61,13 @@ type KnowledgeService interface {
 	) (*types.Knowledge, error)
 	// GetKnowledgeByID retrieves knowledge by ID (uses tenant from context).
 	GetKnowledgeByID(ctx context.Context, id string) (*types.Knowledge, error)
+	// GetKnowledgeByIDForSystem includes inactive production projections and is
+	// reserved for trusted workers and lifecycle reconciliation.
+	GetKnowledgeByIDForSystem(ctx context.Context, id string) (*types.Knowledge, error)
 	// GetKnowledgeByIDOnly retrieves knowledge by ID without tenant filter (for permission resolution).
 	GetKnowledgeByIDOnly(ctx context.Context, id string) (*types.Knowledge, error)
+	// GetKnowledgeByIDOnlyForSystem is the unscoped trusted-worker equivalent.
+	GetKnowledgeByIDOnlyForSystem(ctx context.Context, id string) (*types.Knowledge, error)
 	// GetOwningKBCreatorID resolves a knowledge ID to the CreatorID of its
 	// owning KnowledgeBase, scoped to the caller's tenant. Used by the
 	// per-KB ownership lookups in handler/rbac_lookups.go (PR 5, #1303) so
@@ -73,6 +78,8 @@ type KnowledgeService interface {
 	GetOwningKBCreatorID(ctx context.Context, knowledgeID string) (string, error)
 	// GetKnowledgeBatch retrieves a batch of knowledge by IDs.
 	GetKnowledgeBatch(ctx context.Context, tenantID uint64, ids []string) ([]*types.Knowledge, error)
+	// GetKnowledgeBatchForSystem includes inactive production projections.
+	GetKnowledgeBatchForSystem(ctx context.Context, tenantID uint64, ids []string) ([]*types.Knowledge, error)
 	// GetKnowledgeBatchWithSharedAccess retrieves knowledge by IDs including items from shared KBs the user has access to.
 	GetKnowledgeBatchWithSharedAccess(ctx context.Context, tenantID uint64, ids []string) ([]*types.Knowledge, error)
 	// ApplyProductionProjectionScope annotates full KB targets with inactive
@@ -83,6 +90,8 @@ type KnowledgeService interface {
 	ListKnowledgeIDsByTagIDs(ctx context.Context, tenantID uint64, kbID string, tagIDs []string) ([]string, error)
 	// ListKnowledgeByKnowledgeBaseID lists all knowledge under a knowledge base.
 	ListKnowledgeByKnowledgeBaseID(ctx context.Context, kbID string) ([]*types.Knowledge, error)
+	// ListKnowledgeByKnowledgeBaseIDForSystem includes inactive release history.
+	ListKnowledgeByKnowledgeBaseIDForSystem(ctx context.Context, kbID string) ([]*types.Knowledge, error)
 	// ListPagedKnowledgeByKnowledgeBaseID lists all knowledge under a knowledge base
 	// with pagination. The filter struct controls optional dimensions (tag, keyword,
 	// file type, parse status, source channel, updated time range); pass a zero

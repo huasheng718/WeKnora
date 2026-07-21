@@ -16,6 +16,7 @@ const (
 	ProductionReleaseTargetConfigMaxBytes      = 256 * 1024
 	ProductionReleaseTargetConfigMaxDepth      = 32
 	ProductionReleaseDefaultRetentionDays      = 30
+	ProductionReleaseMaxTargets                = 100
 	ProductionProjectionFailureCodeMaxLength   = 64
 	ProductionProjectionFailureReasonMaxLength = 256
 )
@@ -127,6 +128,7 @@ type ProductionRelease struct {
 	ReviewRequestID      string                     `json:"review_request_id" gorm:"type:varchar(36);not null"`
 	ReleaseDigest        string                     `json:"release_digest" gorm:"type:varchar(64);not null"`
 	ReleaseDigestVersion int                        `json:"release_digest_version" gorm:"not null;default:0"`
+	SupersedesReleaseID  *string                    `json:"supersedes_release_id,omitempty" gorm:"type:varchar(36)"`
 	Status               ProductionReleaseStatus    `json:"status" gorm:"type:varchar(20);not null;default:'building'"`
 	RetentionDays        int                        `json:"retention_days" gorm:"not null;default:30"`
 	CreatedBy            string                     `json:"created_by" gorm:"type:varchar(36);not null"`

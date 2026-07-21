@@ -23,6 +23,8 @@ type productionReleaseRepoStub struct {
 	mu                sync.Mutex
 	txMu              sync.Mutex
 	release           *types.ProductionRelease
+	releases          []*types.ProductionRelease
+	createCalls       int
 	targets           map[string]*types.ProductionReleaseTarget
 	history           []*types.ProductionReleaseTarget
 	lock              int
@@ -39,9 +41,46 @@ type productionReleaseRepoStub struct {
 }
 
 func (r *productionReleaseRepoStub) CreateRelease(_ context.Context, release *types.ProductionRelease, targets []*types.ProductionReleaseTarget) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, existing := range r.releases {
+		if existing.TenantID != release.TenantID || existing.ProjectID != release.ProjectID ||
+			existing.DocumentID != release.DocumentID || existing.VersionID != release.VersionID {
+			continue
+		}
+		if existing.SupersedesReleaseID == nil && release.SupersedesReleaseID == nil {
+			return types.ErrProductionConflict
+		}
+		if existing.SupersedesReleaseID != nil && release.SupersedesReleaseID != nil &&
+			*existing.SupersedesReleaseID == *release.SupersedesReleaseID {
+			return types.ErrProductionConflict
+		}
+	}
 	r.release = release
 	r.release.Targets = targets
+	r.releases = append(r.releases, release)
+	r.createCalls++
 	return nil
+}
+
+func (r *productionReleaseRepoStub) GetLatestReleaseForVersion(
+	_ context.Context, tenantID uint64, documentID, versionID string,
+) (*types.ProductionRelease, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for index := len(r.releases) - 1; index >= 0; index-- {
+		release := r.releases[index]
+		if release.TenantID == tenantID && release.DocumentID == documentID && release.VersionID == versionID {
+			copy := *release
+			copy.Targets = make([]*types.ProductionReleaseTarget, 0, len(release.Targets))
+			for _, target := range release.Targets {
+				targetCopy := *target
+				copy.Targets = append(copy.Targets, &targetCopy)
+			}
+			return &copy, nil
+		}
+	}
+	return nil, gorm.ErrRecordNotFound
 }
 
 func (r *productionReleaseRepoStub) GetTarget(_ context.Context, _ uint64, id string) (*types.ProductionReleaseTarget, error) {
@@ -292,10 +331,31 @@ func (s productionReleaseMembershipStub) GetMembership(context.Context, string, 
 	return &types.TenantMember{Role: s.role, Status: types.TenantMemberStatusActive}, nil
 }
 
+type productionReleaseTenantRepoStub struct {
+	interfaces.TenantRepository
+	tenant *types.Tenant
+}
+
+func (s productionReleaseTenantRepoStub) GetTenantByID(context.Context, uint64) (*types.Tenant, error) {
+	return s.tenant, nil
+}
+
 type productionReleaseKBStub struct {
 	interfaces.KnowledgeBaseService
 	kb  *types.KnowledgeBase
 	err error
+}
+
+type productionReleaseCountingKBStub struct {
+	interfaces.KnowledgeBaseService
+	kb    *types.KnowledgeBase
+	calls int
+}
+
+func (s *productionReleaseCountingKBStub) GetKnowledgeBaseByIDOnly(context.Context, string) (*types.KnowledgeBase, error) {
+	s.calls++
+	copy := *s.kb
+	return &copy, nil
 }
 
 func (s productionReleaseKBStub) GetKnowledgeBaseByIDOnly(context.Context, string) (*types.KnowledgeBase, error) {
@@ -336,9 +396,17 @@ func (s productionReleaseKnowledgeStub) GetKnowledgeByID(context.Context, string
 	return &copy, nil
 }
 
+func (s productionReleaseKnowledgeStub) GetKnowledgeByIDForSystem(ctx context.Context, id string) (*types.Knowledge, error) {
+	return s.GetKnowledgeByID(ctx, id)
+}
+
 func (s productionReleaseKnowledgeStub) GetKnowledgeByIDOnly(context.Context, string) (*types.Knowledge, error) {
 	copy := *s.knowledge
 	return &copy, nil
+}
+
+func (s productionReleaseKnowledgeStub) GetKnowledgeByIDOnlyForSystem(ctx context.Context, id string) (*types.Knowledge, error) {
+	return s.GetKnowledgeByIDOnly(ctx, id)
 }
 
 func (s productionReleaseKnowledgeStub) GetRepository() interfaces.KnowledgeRepository {
@@ -428,6 +496,7 @@ func (s productionReleaseFileServiceStub) CheckConnectivity(context.Context) err
 
 type productionReleaseStorageResolverStub struct {
 	interfaces.StorageBackendResolver
+	mu               sync.Mutex
 	backend          *types.StorageBackend
 	resolveErr       error
 	fileErr          error
@@ -442,6 +511,8 @@ type productionReleaseStorageResolverStub struct {
 }
 
 func (s *productionReleaseStorageResolverStub) ResolveBackend(_ context.Context, tenant *types.Tenant, backendID, provider string) (*types.StorageBackend, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.resolvedID = backendID
 	s.resolvedProvider = provider
 	if tenant != nil {
@@ -451,6 +522,8 @@ func (s *productionReleaseStorageResolverStub) ResolveBackend(_ context.Context,
 }
 
 func (s *productionReleaseStorageResolverStub) ResolveFileService(_ context.Context, tenant *types.Tenant, backendID, provider, _ string) (interfaces.FileService, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.fileID = backendID
 	s.fileProvider = provider
 	if tenant != nil {
@@ -619,10 +692,13 @@ func newProductionReleaseServiceFixture(t *testing.T) (*ProductionReleaseService
 	t.Helper()
 	events := make([]string, 0)
 	old := &types.ProductionReleaseTarget{ID: "target-old", TenantID: 7, ProjectID: "project-1", DocumentID: "document-1",
-		VersionID: "version-2", TargetKnowledgeBaseID: "kb-1", KnowledgeID: "knowledge-old", Status: types.ReleaseTargetActive}
+		VersionID: "version-2", TargetKnowledgeBaseID: "kb-1", KnowledgeID: "knowledge-old", Status: types.ReleaseTargetActive,
+		ConfigSnapshot: types.JSON(`{"version":1,"indexing_strategy":{"vector_enabled":true,"keyword_enabled":true},"retriever_engines":[{"retriever_engine_type":"postgres","retriever_type":"vector"}]}`)}
+	old.ConfigSnapshot, old.ConfigDigest, _ = types.CanonicalProductionReleaseTargetConfig(old.ConfigSnapshot)
 	ready := &types.ProductionReleaseTarget{ID: "target-new", TenantID: 7, ProjectID: "project-1", DocumentID: "document-1",
 		VersionID: "version-3", TargetKnowledgeBaseID: "kb-1", KnowledgeID: "knowledge-new", Status: types.ReleaseTargetReady,
-		ConfigSnapshot: types.JSON(`{"version":1,"indexing_strategy":{"vector_enabled":true,"keyword_enabled":true,"wiki_enabled":true,"graph_enabled":true},"chunking":{"strategy":"recursive","chunk_size":256},"embedding_model_id":"embedding-1","summary_model_id":"summary-1","graph":{"enabled":true,"model_id":"summary-1","extract_config":{"enabled":true}}}`)}
+		ConfigSnapshot: types.JSON(`{"version":1,"indexing_strategy":{"vector_enabled":true,"keyword_enabled":true,"wiki_enabled":true,"graph_enabled":true},"chunking":{"strategy":"recursive","chunk_size":256},"embedding_model_id":"embedding-1","summary_model_id":"summary-1","retriever_engines":[{"retriever_engine_type":"postgres","retriever_type":"vector"}],"graph":{"enabled":true,"model_id":"summary-1","extract_config":{"enabled":true}}}`)}
+	ready.ConfigSnapshot, ready.ConfigDigest, _ = types.CanonicalProductionReleaseTargetConfig(ready.ConfigSnapshot)
 	repo := &productionReleaseRepoStub{targets: map[string]*types.ProductionReleaseTarget{old.ID: old, ready.ID: ready}, history: []*types.ProductionReleaseTarget{ready, old}, lock: 1, events: &events}
 	storage := &productionReleaseStorageResolverStub{backend: &types.StorageBackend{
 		ID: "storage-1", TenantID: 7, Provider: "local", Status: types.StorageBackendStatusActive,
@@ -634,13 +710,33 @@ func newProductionReleaseServiceFixture(t *testing.T) (*ProductionReleaseService
 		documents: &productionReleaseDocumentsStub{document: &types.ProductionDocument{ID: "document-1", TenantID: 7, ProjectID: "project-1", LatestApprovedVersionID: productionStringPtr("version-3")},
 			version: &types.ProductionDocumentVersion{ID: "version-3", DocumentID: "document-1", TenantID: 7, ProjectID: "project-1", FrozenAt: productionTimePtr(time.Now())}},
 		reviews:    &productionReleaseReviewsStub{review: &types.ProductionReviewRequest{ID: "review-1", TenantID: 7, ProjectID: "project-1", DocumentID: "document-1", VersionID: "version-3", Status: types.ProductionReviewApproved}},
-		authorizer: productionReleaseAuthorizerStub{}, members: productionReleaseMembershipStub{role: types.TenantRoleContributor}, models: productionReleaseModelStub{}, storage: storage,
+		authorizer: productionReleaseAuthorizerStub{}, members: productionReleaseMembershipStub{role: types.TenantRoleContributor},
+		tenants: productionReleaseTenantRepoStub{tenant: &types.Tenant{
+			ID: 7,
+			RetrieverEngines: types.RetrieverEngines{Engines: []types.RetrieverEngineParams{{
+				RetrieverType: types.VectorRetrieverType, RetrieverEngineType: types.PostgresRetrieverEngineType,
+			}}},
+		}},
+		models: productionReleaseModelStub{}, storage: storage,
 		kbs:       productionReleaseKBStub{kb: &types.KnowledgeBase{ID: "kb-1", TenantID: 7, CreatorID: "00000000-0000-4000-8000-000000000007", Type: types.KnowledgeBaseTypeDocument}},
 		knowledge: productionReleaseKnowledgeStub{knowledge: knowledge, repo: knowledgeRepo},
 		graph:     productionReleaseGraphStub{}, wiki: productionReleaseWikiStub{events: &events}, cleanup: productionReleaseCleanupStub{events: &events},
 		uow: productionReleaseUOWStub{repo: repo}, audit: &productionReleaseAuditStub{}, now: time.Now,
 	}
 	return service, repo, &events
+}
+
+func configuredProductionReleaseTargetKB() *types.KnowledgeBase {
+	return &types.KnowledgeBase{
+		ID: "kb-1", TenantID: 7, CreatorID: "00000000-0000-4000-8000-000000000007",
+		Type:                  types.KnowledgeBaseTypeDocument,
+		StorageProviderConfig: &types.StorageProviderConfig{Provider: "local"},
+		ChunkingConfig:        types.ChunkingConfig{Strategy: "recursive", ChunkSize: 256},
+		EmbeddingModelID:      "embedding-1",
+		SummaryModelID:        "summary-1",
+		IndexingStrategy:      types.IndexingStrategy{VectorEnabled: true, GraphEnabled: true},
+		ExtractConfig:         &types.ExtractConfig{Enabled: true},
+	}
 }
 
 func TestProductionReleasePrepareRequiresPublisherAndOwnedWritableKB(t *testing.T) {
@@ -653,6 +749,45 @@ func TestProductionReleasePrepareRequiresPublisherAndOwnedWritableKB(t *testing.
 	svc.kbs = productionReleaseKBStub{kb: &types.KnowledgeBase{ID: "kb-1", TenantID: 8, Type: types.KnowledgeBaseTypeDocument}}
 	_, err = svc.Prepare(productionReleaseContext(), "document-1", "version-3", []string{"kb-1"})
 	require.ErrorIs(t, err, types.ErrProductionForbidden)
+}
+
+func TestProductionReleasePrepareRejectsTooManyTargetsBeforeReadinessWork(t *testing.T) {
+	svc, _, _ := newProductionReleaseServiceFixture(t)
+	kbs := &productionReleaseCountingKBStub{kb: configuredProductionReleaseTargetKB()}
+	svc.kbs = kbs
+	targetIDs := make([]string, 101)
+	for index := range targetIDs {
+		targetIDs[index] = fmt.Sprintf("00000000-0000-4000-8000-%012d", index+1)
+	}
+
+	_, err := svc.Prepare(productionReleaseContext(), "document-1", "version-3", targetIDs)
+	require.ErrorIs(t, err, types.ErrProductionReleaseInvalid)
+	require.Zero(t, kbs.calls)
+}
+
+func TestProductionActivationRequiresReprepareWhenVectorStoreBindingChanged(t *testing.T) {
+	svc, repo, _ := newProductionReleaseServiceFixture(t)
+	target := repo.targets["target-new"]
+	snapshot, digest, err := types.CanonicalProductionReleaseTargetConfig(types.JSON(`{
+		"version":1,
+		"indexing_strategy":{"vector_enabled":true,"keyword_enabled":true,"wiki_enabled":false,"graph_enabled":false},
+		"chunking":{"strategy":"recursive","chunk_size":256},
+		"embedding_model_id":"embedding-1","summary_model_id":"summary-1",
+		"graph":{"enabled":false,"model_id":"summary-1"},
+		"vector_store_id":"snapshot-store"
+	}`))
+	require.NoError(t, err)
+	target.ConfigSnapshot = snapshot
+	target.ConfigDigest = digest
+	currentStore := "current-store"
+	svc.kbs = productionReleaseKBStub{kb: &types.KnowledgeBase{
+		ID: "kb-1", TenantID: 7, CreatorID: "00000000-0000-4000-8000-000000000007",
+		Type: types.KnowledgeBaseTypeDocument, VectorStoreID: &currentStore,
+	}}
+
+	err = svc.Activate(productionReleaseContext(), target.ID, 1)
+	require.ErrorIs(t, err, types.ErrProductionReleaseReprepareRequired)
+	require.Equal(t, 1, repo.lock)
 }
 
 func TestProductionReleaseWritableTargetKBNormalizesConcreteRepositoryNotFoundAndForeignTenant(t *testing.T) {
@@ -693,6 +828,65 @@ func TestProductionReleasePrepareSnapshotsImmutableTargetProcessingConfig(t *tes
 	require.Contains(t, string(release.Targets[0].ConfigSnapshot), `"storage_provider":"local"`)
 	require.NotEmpty(t, release.Targets[0].ConfigDigest)
 	require.Same(t, release, repo.release)
+}
+
+func TestProductionReleasePrepareReusesEquivalentLatestAndSupersedesChangedConfig(t *testing.T) {
+	svc, repo, _ := newProductionReleaseServiceFixture(t)
+	kb := configuredProductionReleaseTargetKB()
+	svc.kbs = productionReleaseKBStub{kb: kb}
+
+	first, err := svc.Prepare(productionReleaseContext(), "document-1", "version-3", []string{"kb-1"})
+	require.NoError(t, err)
+	replayed, err := svc.Prepare(productionReleaseContext(), "document-1", "version-3", []string{"kb-1"})
+	require.NoError(t, err)
+	require.Equal(t, first.ID, replayed.ID)
+	require.Equal(t, 1, repo.createCalls)
+
+	kb.ChunkingConfig.ChunkSize = 512
+	successor, err := svc.Prepare(productionReleaseContext(), "document-1", "version-3", []string{"kb-1"})
+	require.NoError(t, err)
+	require.NotEqual(t, first.ID, successor.ID)
+	require.NotNil(t, successor.SupersedesReleaseID)
+	require.Equal(t, first.ID, *successor.SupersedesReleaseID)
+	require.Equal(t, 2, repo.createCalls)
+}
+
+func TestProductionReleasePrepareConcurrentEquivalentReprepareCreatesOneSuccessor(t *testing.T) {
+	const callers = 32
+	svc, repo, _ := newProductionReleaseServiceFixture(t)
+	kb := configuredProductionReleaseTargetKB()
+	svc.kbs = productionReleaseKBStub{kb: kb}
+
+	first, err := svc.Prepare(productionReleaseContext(), "document-1", "version-3", []string{"kb-1"})
+	require.NoError(t, err)
+	kb.ChunkingConfig.ChunkSize = 512
+
+	start := make(chan struct{})
+	results := make(chan *types.ProductionRelease, callers)
+	errs := make(chan error, callers)
+	for range callers {
+		go func() {
+			<-start
+			release, prepareErr := svc.Prepare(productionReleaseContext(), "document-1", "version-3", []string{"kb-1"})
+			results <- release
+			errs <- prepareErr
+		}()
+	}
+	close(start)
+
+	var successorID string
+	for range callers {
+		require.NoError(t, <-errs)
+		release := <-results
+		require.NotNil(t, release)
+		if successorID == "" {
+			successorID = release.ID
+		}
+		require.Equal(t, successorID, release.ID)
+		require.NotNil(t, release.SupersedesReleaseID)
+		require.Equal(t, first.ID, *release.SupersedesReleaseID)
+	}
+	require.Equal(t, 2, repo.createCalls, "the initial release and one successor are the only writes")
 }
 
 func TestProductionReleasePrepareRequiresHealthyConcreteStorageBackend(t *testing.T) {
@@ -1461,6 +1655,71 @@ func TestProductionReleaseRollbackReplayRetainsIntentAcrossCrashWindow(t *testin
 	require.Equal(t, types.AuditActionProductionProjectionRolledBack, audit.entries[0].Action)
 	require.NoError(t, handler.Handle(context.Background(), task), "post-commit replay must be idempotent")
 	require.Len(t, audit.entries, 1)
+}
+
+func TestProductionProjectionDelayedActivationReauthorizesRevokedPublisher(t *testing.T) {
+	svc, repo, _ := newProductionReleaseServiceFixture(t)
+	svc.authorizer = productionReleaseAuthorizerStub{err: types.ErrProductionForbidden}
+	payload, err := json.Marshal(types.ProductionProjectionTaskPayload{
+		Operation: types.ProductionProjectionOperationActivate,
+		TenantID:  7, ProjectID: "project-1", TargetID: "target-new",
+		ActorUserID: "00000000-0000-4000-8000-000000000007", ExpectedLock: 1,
+	})
+	require.NoError(t, err)
+	handler := NewProductionProjectionTaskHandler(svc, &ProductionProjectionCleanup{})
+
+	err = handler.Handle(context.Background(), asynq.NewTask(types.TypeProductionActivate, payload))
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
+	require.Equal(t, 1, repo.lock)
+	require.Equal(t, types.ReleaseTargetReady, repo.targets["target-new"].Status)
+}
+
+func TestProductionProjectionDelayedHeadMutationRejectsMissingActor(t *testing.T) {
+	tests := []struct {
+		name      string
+		operation types.ProductionProjectionOperation
+		targetID  string
+		lock      int
+		prepare   func(*ProductionReleaseService, *productionReleaseRepoStub)
+	}{
+		{name: "activate", operation: types.ProductionProjectionOperationActivate, targetID: "target-new", lock: 1},
+		{name: "rollback", operation: types.ProductionProjectionOperationRollback, targetID: "target-old", lock: 2,
+			prepare: func(svc *ProductionReleaseService, repo *productionReleaseRepoStub) {
+				prepareProductionRollbackFixture(svc, repo)
+			}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, repo, _ := newProductionReleaseServiceFixture(t)
+			if tc.prepare != nil {
+				tc.prepare(svc, repo)
+			}
+			payload, err := json.Marshal(types.ProductionProjectionTaskPayload{
+				Operation: tc.operation, TenantID: 7, ProjectID: "project-1", TargetID: tc.targetID, ExpectedLock: tc.lock,
+			})
+			require.NoError(t, err)
+			handler := NewProductionProjectionTaskHandler(svc, &ProductionProjectionCleanup{})
+
+			err = handler.Handle(context.Background(), asynq.NewTask(types.TypeProductionActivate, payload))
+			require.ErrorIs(t, err, types.ErrProductionForbidden)
+			require.Equal(t, tc.lock, repo.lock)
+		})
+	}
+}
+
+func TestProductionProjectionPostCommitReplayAllowsSystemFollowups(t *testing.T) {
+	svc, repo, _ := newProductionReleaseServiceFixture(t)
+	repo.targets["target-new"].Status = types.ReleaseTargetActive
+	repo.targets["target-old"].Status = types.ReleaseTargetRolledBack
+	payload, err := json.Marshal(types.ProductionProjectionTaskPayload{
+		Operation: types.ProductionProjectionOperationActivate,
+		TenantID:  7, ProjectID: "project-1", TargetID: "target-new", ExpectedLock: 2,
+	})
+	require.NoError(t, err)
+	handler := NewProductionProjectionTaskHandler(svc, &ProductionProjectionCleanup{})
+
+	require.NoError(t, handler.Handle(context.Background(), asynq.NewTask(types.TypeProductionActivate, payload)))
+	require.Equal(t, types.ReleaseTargetActive, repo.targets["target-new"].Status)
 }
 
 func TestProductionReleaseConcurrentRollbackIsStable(t *testing.T) {

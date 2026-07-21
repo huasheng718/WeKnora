@@ -98,7 +98,9 @@ func (s *ProductionProjectionCleanup) Cleanup(ctx context.Context, targetID stri
 		target.Status = types.ReleaseTargetCleanupPending
 	}
 
-	chunks, err := s.chunks.ListChunksByKnowledgeID(ctx, target.KnowledgeID)
+	chunks, err := listChunksByKnowledgeIDForProductionWorker(
+		ctx, s.chunks, target.TenantID, target.KnowledgeID,
+	)
 	if err != nil {
 		return err
 	}
@@ -276,4 +278,43 @@ func authenticatedProductionProjectionRetrievalSnapshot(target *types.Production
 		return "", nil, false, fmt.Errorf("%w: retained retrieval configuration is unavailable", types.ErrProductionReleaseConfigInvalid)
 	}
 	return vectorStoreID, snapshot.RetrieverEngines, true, nil
+}
+
+func requireProductionProjectionRoutingUnchanged(
+	ctx context.Context,
+	target *types.ProductionReleaseTarget,
+	kb *types.KnowledgeBase,
+) error {
+	if target == nil || kb == nil || target.TargetKnowledgeBaseID != kb.ID || target.TenantID != kb.TenantID {
+		return types.ErrProductionForbidden
+	}
+	canonical, digest, err := types.CanonicalProductionReleaseTargetConfig(target.ConfigSnapshot)
+	if err != nil || digest != target.ConfigDigest || string(canonical) != string(target.ConfigSnapshot) {
+		return fmt.Errorf("%w: retained configuration authentication failed", types.ErrProductionReleaseConfigInvalid)
+	}
+	var snapshot struct {
+		IndexingStrategy *types.IndexingStrategy       `json:"indexing_strategy"`
+		VectorStoreID    *string                       `json:"vector_store_id"`
+		RetrieverEngines []types.RetrieverEngineParams `json:"retriever_engines"`
+	}
+	if err := json.Unmarshal(canonical, &snapshot); err != nil {
+		return fmt.Errorf("%w: retained routing configuration is invalid", types.ErrProductionReleaseConfigInvalid)
+	}
+	snapshotStoreID := strings.TrimSpace(valueOrEmpty(snapshot.VectorStoreID))
+	if snapshotStoreID != strings.TrimSpace(valueOrEmpty(kb.VectorStoreID)) {
+		return types.ErrProductionReleaseReprepareRequired
+	}
+	if snapshot.IndexingStrategy == nil || !snapshot.IndexingStrategy.NeedsEmbedding() || snapshotStoreID != "" {
+		return nil
+	}
+	tenant, ok := types.TenantInfoFromContext(ctx)
+	if !ok || tenant == nil || tenant.ID != target.TenantID {
+		return types.ErrProductionReleaseReprepareRequired
+	}
+	snapshotEngines, snapshotErr := json.Marshal(snapshot.RetrieverEngines)
+	currentEngines, currentErr := json.Marshal(tenant.GetEffectiveEngines())
+	if snapshotErr != nil || currentErr != nil || string(snapshotEngines) != string(currentEngines) {
+		return types.ErrProductionReleaseReprepareRequired
+	}
+	return nil
 }

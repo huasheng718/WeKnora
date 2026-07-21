@@ -58,6 +58,10 @@ func (s *initialPostProcessChunkService) CreateChunks(context.Context, []*types.
 	return nil
 }
 
+func (s *initialPostProcessChunkService) ListChunksByKnowledgeIDForSystem(context.Context, string) ([]*types.Chunk, error) {
+	return nil, nil
+}
+
 type initialPostProcessTenantRepo struct {
 	interfaces.TenantRepository
 }

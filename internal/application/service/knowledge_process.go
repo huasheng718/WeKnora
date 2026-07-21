@@ -952,7 +952,7 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 		// "finalizing". When we DO return an error asynq will retry, so
 		// we only drain on the final attempt.
 		if err := finalizeSubtaskDetached(ctx, s.repo, s.productionReleaseRepo, payload.KnowledgeID, "summary",
-			retErr, false, isFinalAsynqAttempt(ctx)); err != nil && retErr == nil {
+			retErr, errors.Is(retErr, types.ErrProductionReleaseReprepareRequired), isFinalAsynqAttempt(ctx)); err != nil && retErr == nil {
 			retErr = err
 		}
 		if span == nil {
@@ -1009,6 +1009,11 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 			return nil
 		}
 	}
+	ctx, err = s.requireProductionProjectionSubtaskRouting(ctx, knowledge, kb)
+	if err != nil {
+		summaryErr = err
+		return err
+	}
 
 	// Update summary status to processing
 	knowledge.SummaryStatus = types.SummaryStatusProcessing
@@ -1027,7 +1032,9 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 	}
 
 	// Get text chunks for this knowledge
-	chunks, err := s.chunkService.ListChunksByKnowledgeID(ctx, payload.KnowledgeID)
+	chunks, err := listChunksByKnowledgeIDForProductionWorker(
+		ctx, s.chunkService, knowledge.TenantID, payload.KnowledgeID,
+	)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to get chunks: %v", err)
 		markSummaryFailed()
@@ -1286,7 +1293,7 @@ func (s *knowledgeService) processQuestionGenerationForKnowledge(ctx context.Con
 	// unwind LIFO, so this one declared first executes last.
 	defer func() {
 		if err := finalizeSubtaskDetached(ctx, s.repo, s.productionReleaseRepo, payload.KnowledgeID, "question_legacy",
-			retErr, superseded, isFinalAsynqAttempt(ctx)); err != nil && retErr == nil {
+			retErr, superseded || errors.Is(retErr, types.ErrProductionReleaseReprepareRequired), isFinalAsynqAttempt(ctx)); err != nil && retErr == nil {
 			retErr = err
 		}
 	}()
@@ -1420,9 +1427,16 @@ func (s *knowledgeService) processQuestionGenerationForKnowledge(ctx context.Con
 			return nil
 		}
 	}
+	ctx, err = s.requireProductionProjectionSubtaskRouting(ctx, knowledge, kb)
+	if err != nil {
+		qErr = err
+		return err
+	}
 
 	// Get text chunks for this knowledge
-	chunks, err := s.chunkService.ListChunksByKnowledgeID(ctx, payload.KnowledgeID)
+	chunks, err := listChunksByKnowledgeIDForProductionWorker(
+		ctx, s.chunkService, knowledge.TenantID, payload.KnowledgeID,
+	)
 	if err != nil {
 		exitStatus = "list_chunks_failed"
 		logger.Errorf(ctx, "Failed to get chunks: %v", err)
@@ -1664,7 +1678,7 @@ func (s *knowledgeService) processQuestionGenerationForChunks(ctx context.Contex
 	defer func() {
 		if err := finalizeSubtaskDetached(ctx, s.repo, s.productionReleaseRepo, payload.KnowledgeID,
 			fmt.Sprintf("question_batch[%d]", payload.BatchIndex),
-			retErr, superseded, isFinalAsynqAttempt(ctx)); err != nil && retErr == nil {
+			retErr, superseded || errors.Is(retErr, types.ErrProductionReleaseReprepareRequired), isFinalAsynqAttempt(ctx)); err != nil && retErr == nil {
 			retErr = err
 		}
 	}()
@@ -1767,6 +1781,11 @@ func (s *knowledgeService) processQuestionGenerationForChunks(ctx context.Contex
 				knowledge.ParseStatus, payload.BatchIndex)
 			return nil
 		}
+	}
+	ctx, err = s.requireProductionProjectionSubtaskRouting(ctx, knowledge, kb)
+	if err != nil {
+		qErr = err
+		return err
 	}
 
 	summaryModelID := kb.SummaryModelID

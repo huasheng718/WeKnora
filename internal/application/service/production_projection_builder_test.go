@@ -137,6 +137,10 @@ func (s *projectionBuilderDelegatingKnowledgeService) GetKnowledgeByID(context.C
 	return nil, apprepository.ErrKnowledgeNotFound
 }
 
+func (s *projectionBuilderDelegatingKnowledgeService) GetKnowledgeByIDForSystem(ctx context.Context, id string) (*types.Knowledge, error) {
+	return s.GetKnowledgeByID(ctx, id)
+}
+
 func (s *projectionBuilderDelegatingKnowledgeService) CreateKnowledgeFromProductionProjection(
 	ctx context.Context, payload *types.ProductionProjectionKnowledgePayload,
 ) (*types.Knowledge, error) {
@@ -149,6 +153,10 @@ func (s *projectionBuilderKnowledgeService) GetKnowledgeByID(context.Context, st
 	}
 	copyKnowledge := *s.existing
 	return &copyKnowledge, nil
+}
+
+func (s *projectionBuilderKnowledgeService) GetKnowledgeByIDForSystem(ctx context.Context, id string) (*types.Knowledge, error) {
+	return s.GetKnowledgeByID(ctx, id)
 }
 
 func (s *projectionBuilderKnowledgeService) CreateKnowledgeFromProductionProjection(
@@ -247,7 +255,8 @@ func newProjectionBuilderFixture(t *testing.T) *projectionBuilderFixture {
 			"embedding_model_id":"snapshot-embedding",
 			"summary_model_id":"snapshot-summary",
 			"question_generation_config":{"enabled":false,"question_count":3},
-			"graph":{"enabled":false,"model_id":"snapshot-graph"}
+			"graph":{"enabled":false,"model_id":"snapshot-graph"},
+			"vector_store_id":"snapshot-store"
 	}`))
 	require.NoError(t, err)
 	target := &types.ProductionReleaseTarget{
@@ -275,6 +284,7 @@ func newProjectionBuilderFixture(t *testing.T) *projectionBuilderFixture {
 		&projectionBuilderKBService{kb: &types.KnowledgeBase{
 			ID: projectionKBID, TenantID: projectionTenantID, Type: types.KnowledgeBaseTypeDocument,
 			EmbeddingModelID: "live-embedding", ChunkingConfig: types.ChunkingConfig{ChunkSize: 100},
+			VectorStoreID: projectionStringPtr("snapshot-store"),
 		}},
 		knowledge, projectionBuilderUOW{}, audit,
 	)
@@ -300,6 +310,31 @@ func TestProjectionTargetExistsBeforeKnowledgeIsQueued(t *testing.T) {
 	require.Equal(t, "snapshot-graph", fixture.knowledge.created.GraphModelID)
 	require.Equal(t, 777, fixture.knowledge.created.ProcessOverrides.ChunkingConfig.ChunkSize)
 	require.False(t, *fixture.knowledge.created.ProcessOverrides.GraphEnabled)
+}
+
+func TestProjectionBuildRequiresReprepareWhenVectorStoreBindingChanged(t *testing.T) {
+	fixture := newProjectionBuilderFixture(t)
+	snapshot, digest, err := types.CanonicalProductionReleaseTargetConfig(types.JSON(`{
+		"version":1,
+		"indexing_strategy":{"vector_enabled":true,"keyword_enabled":true,"wiki_enabled":false,"graph_enabled":false},
+		"chunking":{"strategy":"recursive","chunk_size":777,"chunk_overlap":77},
+		"embedding_model_id":"snapshot-embedding","summary_model_id":"snapshot-summary",
+		"question_generation_config":{"enabled":false,"question_count":3},
+		"graph":{"enabled":false,"model_id":"snapshot-graph"},
+		"vector_store_id":"snapshot-store"
+	}`))
+	require.NoError(t, err)
+	fixture.releases.target.ConfigSnapshot = snapshot
+	fixture.releases.target.ConfigDigest = digest
+	currentStore := "current-store"
+	fixture.builder.kbs = &projectionBuilderKBService{kb: &types.KnowledgeBase{
+		ID: projectionKBID, TenantID: projectionTenantID, Type: types.KnowledgeBaseTypeDocument,
+		VectorStoreID: &currentStore,
+	}}
+
+	_, err = fixture.builder.Build(projectionBuildContext(), projectionTargetID)
+	require.ErrorIs(t, err, types.ErrProductionReleaseReprepareRequired)
+	require.Nil(t, fixture.knowledge.created)
 }
 
 func TestProjectionRejectsTamperedApprovedVersionAtomicallyBeforeKnowledge(t *testing.T) {
@@ -523,8 +558,6 @@ func newProductionProjectionBuilderIntegrationFixture(
 	)`).Error)
 	for _, name := range []string{
 		"000005_knowledge_production_publication.up.sql",
-		"000006_knowledge_production_projection_integrity.up.sql",
-		"000007_production_projection_failure_recovery.up.sql",
 	} {
 		migration, readErr := os.ReadFile(filepath.Join(migrationDir, name))
 		require.NoError(t, readErr)

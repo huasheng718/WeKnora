@@ -1338,9 +1338,153 @@ func TestProductionPublicationMigrationsDeclareRequiredTables(t *testing.T) {
 	}
 }
 
-func TestProductionProjectionIntegrityMigrationsAreAdditiveAndParse(t *testing.T) {
-	postgresUp := mustReadMigration(t, "../../migrations/versioned/000075_knowledge_production_projection_integrity.up.sql")
-	postgresDown := mustReadMigration(t, "../../migrations/versioned/000075_knowledge_production_projection_integrity.down.sql")
+func TestProductionPublicationBindingVersionsContainAllProjectionSchema(t *testing.T) {
+	postgresUp := mustReadMigration(t, "../../migrations/versioned/000074_knowledge_production_publication.up.sql")
+	sqliteUp := mustReadMigration(t, "../../migrations/sqlite/000005_knowledge_production_publication.up.sql")
+	for _, migration := range []string{postgresUp, sqliteUp} {
+		for _, required := range []string{
+			"release_digest_version", "failure_code", "failure_reason", "recovery_attempted_at",
+			"idx_production_release_targets_failure_recovery", "supersedes_release_id",
+			"uq_production_releases_version_root", "uq_production_releases_successor",
+		} {
+			require.Contains(t, migration, required)
+		}
+	}
+	for _, removed := range []string{
+		"../../migrations/versioned/000075_knowledge_production_projection_integrity.up.sql",
+		"../../migrations/versioned/000075_knowledge_production_projection_integrity.down.sql",
+		"../../migrations/versioned/000076_production_projection_failure_recovery.up.sql",
+		"../../migrations/versioned/000076_production_projection_failure_recovery.down.sql",
+		"../../migrations/sqlite/000006_knowledge_production_projection_integrity.up.sql",
+		"../../migrations/sqlite/000006_knowledge_production_projection_integrity.down.sql",
+		"../../migrations/sqlite/000007_production_projection_failure_recovery.up.sql",
+		"../../migrations/sqlite/000007_production_projection_failure_recovery.down.sql",
+	} {
+		_, err := os.Stat(removed)
+		require.ErrorIs(t, err, os.ErrNotExist, removed)
+	}
+}
+
+func TestProductionPublicationReprepareLineageConstraints(t *testing.T) {
+	postgres := mustReadMigration(t, "../../migrations/versioned/000074_knowledge_production_publication.up.sql")
+	_, err := pg_query.Parse(postgres)
+	require.NoError(t, err)
+	for _, declaration := range []string{
+		"supersedes_release_id VARCHAR(36) NULL",
+		"FOREIGN KEY (supersedes_release_id, tenant_id, project_id, document_id, version_id)",
+		"CREATE UNIQUE INDEX IF NOT EXISTS uq_production_releases_version_root",
+		"CREATE UNIQUE INDEX IF NOT EXISTS uq_production_releases_successor",
+	} {
+		require.Contains(t, postgres, declaration)
+	}
+	require.NotContains(t, postgres, "UNIQUE(tenant_id, project_id, document_id, version_id)")
+
+	db := openProductionPublicationSQLite(t)
+	seedProductionReleaseScope(t, db)
+	insertProductionPublicationRelease(t, db, "release-lineage-root", "version-1", "review-pub-1", strings.Repeat("a", 64))
+	_, err = db.Exec(`INSERT INTO production_releases
+		(id, tenant_id, project_id, document_id, version_id, review_request_id, release_digest, created_by)
+		VALUES ('release-lineage-root-2', 1, 'project-1', 'document-1', 'version-1', 'review-pub-1', ?, 'owner-1')`, strings.Repeat("a", 64))
+	require.Error(t, err, "one approved version can have only one root release")
+
+	_, err = db.Exec(`INSERT INTO production_releases
+		(id, tenant_id, project_id, document_id, version_id, review_request_id, release_digest, supersedes_release_id, created_by)
+		VALUES ('release-lineage-next', 1, 'project-1', 'document-1', 'version-1', 'review-pub-1', ?, 'release-lineage-root', 'owner-1')`, strings.Repeat("a", 64))
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_releases
+		(id, tenant_id, project_id, document_id, version_id, review_request_id, release_digest, supersedes_release_id, created_by)
+		VALUES ('release-lineage-fork', 1, 'project-1', 'document-1', 'version-1', 'review-pub-1', ?, 'release-lineage-root', 'owner-1')`, strings.Repeat("a", 64))
+	require.Error(t, err, "one release can have only one direct successor")
+	_, err = db.Exec(`UPDATE production_releases SET supersedes_release_id = NULL WHERE id = 'release-lineage-next'`)
+	require.ErrorContains(t, err, "production release identity is immutable")
+}
+
+func TestProductionLifecycleDerivationTimestampsAreWriteOnceInSQLite(t *testing.T) {
+	db := openProductionProjectionIntegritySQLite(t)
+	seedProductionReleaseScope(t, db)
+	insertProductionPublicationRelease(t, db, "release-frozen-lifecycle", "version-1", "review-pub-1", strings.Repeat("a", 64))
+	insertProductionPublicationTarget(t, db, "target-frozen-lifecycle", "release-frozen-lifecycle", "version-1", "kb-1", "knowledge-frozen-lifecycle", strings.Repeat("a", 64))
+
+	_, err := db.Exec(`UPDATE production_release_targets
+		SET status = 'failed', failure_code = 'PROJECTION_BUILD_FAILED', failure_reason = 'projection build failed',
+		    failed_at = '2020-01-01 00:00:00', retention_until = '2020-01-31 00:00:00'
+		WHERE id = 'target-frozen-lifecycle'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_release_targets
+		SET failed_at = '2020-02-01 00:00:00', retention_until = '2020-03-02 00:00:00'
+		WHERE id = 'target-frozen-lifecycle'`)
+	require.ErrorContains(t, err, "retention_until is immutable")
+
+	_, err = db.Exec(`UPDATE production_release_targets
+		SET status = 'cleanup_pending', cleanup_requested_at = '2020-02-01 00:00:00'
+		WHERE id = 'target-frozen-lifecycle'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_release_targets
+		SET cleanup_requested_at = '2020-02-02 00:00:00'
+		WHERE id = 'target-frozen-lifecycle'`)
+	require.ErrorContains(t, err, "cleanup_requested_at is immutable")
+
+	_, err = db.Exec(`UPDATE production_release_targets
+		SET status = 'cleaned', cleaned_at = '2020-02-03 00:00:00'
+		WHERE id = 'target-frozen-lifecycle'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_release_targets
+		SET cleaned_at = '2020-02-04 00:00:00'
+		WHERE id = 'target-frozen-lifecycle'`)
+	require.ErrorContains(t, err, "cleaned_at is immutable")
+}
+
+func TestProductionLifecycleRetentionAllowsRetryAndIsPreservedThroughCleanup(t *testing.T) {
+	postgres := mustReadMigration(t, "../../migrations/versioned/000074_knowledge_production_publication.up.sql")
+	for _, declaration := range []string{
+		"OLD.status IN ('failed', 'rolled_back', 'cleanup_pending', 'cleaned') AND\n       NEW.status = OLD.status AND",
+		"OLD.status IN ('failed', 'rolled_back') AND NEW.status = 'cleanup_pending'",
+		"OLD.status = 'cleanup_pending' AND NEW.status = 'cleaned'",
+	} {
+		require.Contains(t, postgres, declaration)
+	}
+
+	db := openProductionProjectionIntegritySQLite(t)
+	seedProductionReleaseScope(t, db)
+	insertProductionPublicationRelease(t, db, "release-retention-retry", "version-1", "review-pub-1", strings.Repeat("a", 64))
+	insertProductionPublicationTarget(t, db, "target-retention-retry", "release-retention-retry", "version-1", "kb-1", "knowledge-retention-retry", strings.Repeat("a", 64))
+
+	_, err := db.Exec(`UPDATE production_release_targets
+		SET status = 'failed', failure_code = 'PROJECTION_BUILD_FAILED', failure_reason = 'projection build failed',
+		    failed_at = '2020-01-01 00:00:00', retention_until = '2020-01-31 00:00:00'
+		WHERE id = 'target-retention-retry'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_release_targets
+		SET status = 'building', failure_code = '', failure_reason = '', failed_at = NULL, retention_until = NULL,
+		    updated_at = '2020-02-01 00:00:00'
+		WHERE id = 'target-retention-retry'`)
+	require.NoError(t, err, "failed targets must be retryable after clearing lifecycle fields")
+
+	insertProductionPublicationTarget(t, db, "target-retention-cleanup", "release-retention-retry", "version-1", "kb-2", "knowledge-retention-cleanup", strings.Repeat("a", 64))
+	_, err = db.Exec(`UPDATE production_release_targets
+		SET status = 'failed', failure_code = 'PROJECTION_BUILD_FAILED', failure_reason = 'projection build failed',
+		    failed_at = '2020-01-01 00:00:00', retention_until = '2020-01-31 00:00:00'
+		WHERE id = 'target-retention-cleanup'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_release_targets
+		SET status = 'cleanup_pending', cleanup_requested_at = '2020-02-01 00:00:00', retention_until = '2020-02-01 00:00:00'
+		WHERE id = 'target-retention-cleanup'`)
+	require.ErrorContains(t, err, "retention_until is immutable",
+		"cleanup entry must preserve the eligibility deadline")
+	_, err = db.Exec(`UPDATE production_release_targets
+		SET status = 'cleanup_pending', cleanup_requested_at = '2020-02-01 00:00:00'
+		WHERE id = 'target-retention-cleanup'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE production_release_targets
+		SET status = 'cleaned', cleaned_at = '2020-02-02 00:00:00', retention_until = '2020-02-01 00:00:00'
+		WHERE id = 'target-retention-cleanup'`)
+	require.ErrorContains(t, err, "retention_until is immutable",
+		"cleanup completion must preserve the eligibility deadline")
+}
+
+func TestProductionProjectionIntegrityIsFoldedAndParses(t *testing.T) {
+	postgresUp := mustReadMigration(t, "../../migrations/versioned/000074_knowledge_production_publication.up.sql")
+	postgresDown := mustReadMigration(t, "../../migrations/versioned/000074_knowledge_production_publication.down.sql")
 	_, err := pg_query.Parse(postgresUp)
 	require.NoError(t, err)
 	_, err = pg_query.Parse(postgresDown)
@@ -1348,7 +1492,7 @@ func TestProductionProjectionIntegrityMigrationsAreAdditiveAndParse(t *testing.T
 
 	for _, migration := range []string{
 		postgresUp,
-		mustReadMigration(t, "../../migrations/sqlite/000006_knowledge_production_projection_integrity.up.sql"),
+		mustReadMigration(t, "../../migrations/sqlite/000005_knowledge_production_publication.up.sql"),
 	} {
 		require.Contains(t, migration, "release_digest_version")
 		require.Contains(t, migration, "failure_code")
@@ -1356,9 +1500,9 @@ func TestProductionProjectionIntegrityMigrationsAreAdditiveAndParse(t *testing.T
 	}
 }
 
-func TestProductionFailureRecoveryMigrationsAreAdditiveAndParse(t *testing.T) {
-	postgresUp := mustReadMigration(t, "../../migrations/versioned/000076_production_projection_failure_recovery.up.sql")
-	postgresDown := mustReadMigration(t, "../../migrations/versioned/000076_production_projection_failure_recovery.down.sql")
+func TestProductionFailureRecoveryIsFoldedAndParses(t *testing.T) {
+	postgresUp := mustReadMigration(t, "../../migrations/versioned/000074_knowledge_production_publication.up.sql")
+	postgresDown := mustReadMigration(t, "../../migrations/versioned/000074_knowledge_production_publication.down.sql")
 	_, err := pg_query.Parse(postgresUp)
 	require.NoError(t, err)
 	_, err = pg_query.Parse(postgresDown)
@@ -1366,7 +1510,7 @@ func TestProductionFailureRecoveryMigrationsAreAdditiveAndParse(t *testing.T) {
 
 	for _, migration := range []string{
 		postgresUp,
-		mustReadMigration(t, "../../migrations/sqlite/000007_production_projection_failure_recovery.up.sql"),
+		mustReadMigration(t, "../../migrations/sqlite/000005_knowledge_production_publication.up.sql"),
 	} {
 		require.Contains(t, migration, "recovery_attempted_at")
 		require.Contains(t, migration, "idx_production_release_targets_failure_recovery")
@@ -1375,41 +1519,31 @@ func TestProductionFailureRecoveryMigrationsAreAdditiveAndParse(t *testing.T) {
 	}
 }
 
-func TestProductionFailureRecoverySQLiteUpgradesAndDowngradesPopulatedTargets(t *testing.T) {
+func TestProductionFailureRecoverySQLiteBindingVersionSupportsPopulatedTargets(t *testing.T) {
 	db := openProductionPublicationSQLite(t)
 	seedProductionReleaseScope(t, db)
 	insertProductionPublicationRelease(t, db, "release-recovery", "version-1", "review-pub-1", strings.Repeat("a", 64))
 	insertProductionPublicationTarget(t, db, "target-recovery", "release-recovery", "version-1", "kb-1", "knowledge-recovery", strings.Repeat("a", 64))
-	_, err := db.Exec(mustReadMigration(t, "../../migrations/sqlite/000006_knowledge_production_projection_integrity.up.sql"))
-	require.NoError(t, err)
-
-	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000007_production_projection_failure_recovery.up.sql"))
-	require.NoError(t, err)
 	var attemptedAt sql.NullTime
 	require.NoError(t, db.QueryRow(`SELECT recovery_attempted_at FROM production_release_targets WHERE id = 'target-recovery'`).Scan(&attemptedAt))
 	require.False(t, attemptedAt.Valid)
-	_, err = db.Exec(`UPDATE production_release_targets SET recovery_attempted_at = CURRENT_TIMESTAMP WHERE id = 'target-recovery'`)
+	_, err := db.Exec(`UPDATE production_release_targets SET recovery_attempted_at = CURRENT_TIMESTAMP WHERE id = 'target-recovery'`)
 	require.NoError(t, err)
 
-	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000007_production_projection_failure_recovery.down.sql"))
-	require.NoError(t, err)
-	require.Empty(t, sqliteColumnTypeIfPresent(t, db, "production_release_targets", "recovery_attempted_at"))
 	var targetCount int
 	require.NoError(t, db.QueryRow(`SELECT count(*) FROM production_release_targets WHERE id = 'target-recovery'`).Scan(&targetCount))
 	require.Equal(t, 1, targetCount)
 }
 
 func TestProductionProjectionIntegrityPostgreSQLBackfillsLegacyFailedTargetsBeforeConstraint(t *testing.T) {
-	postgresUp := mustReadMigration(t, "../../migrations/versioned/000075_knowledge_production_projection_integrity.up.sql")
-	backfill := "UPDATE production_release_targets\nSET failure_code = 'LEGACY_PROJECTION_FAILURE'"
-	constraint := "ADD CONSTRAINT chk_production_release_targets_failure"
-
-	require.Contains(t, postgresUp, backfill)
-	require.Less(t, strings.Index(postgresUp, backfill), strings.Index(postgresUp, constraint),
-		"legacy failed rows must be backfilled before the failure metadata constraint is installed")
+	postgresUp := mustReadMigration(t, "../../migrations/versioned/000074_knowledge_production_publication.up.sql")
+	require.Contains(t, postgresUp, "ADD CONSTRAINT chk_production_release_targets_failure")
+	require.NotContains(t, postgresUp, "LEGACY_PROJECTION_FAILURE",
+		"the unreleased binding migration has no legacy publication rows to backfill")
 }
 
 func TestProductionProjectionIntegrityPostgreSQLUpgradesPopulatedFailedTarget(t *testing.T) {
+	t.Skip("publication binding migration is unreleased; incremental upgrade is intentionally removed")
 	dsn := os.Getenv("WEKNORA_TEST_POSTGRES_DSN")
 	if dsn == "" {
 		t.Skip("WEKNORA_TEST_POSTGRES_DSN is not configured")
@@ -1471,7 +1605,7 @@ VALUES
 `)
 	require.NoError(t, err)
 
-	_, err = conn.Exec(ctx, mustReadMigration(t, "../../migrations/versioned/000075_knowledge_production_projection_integrity.up.sql"))
+	_, err = conn.Exec(ctx, mustReadMigration(t, "../../migrations/versioned/000074_knowledge_production_publication.up.sql"))
 	require.NoError(t, err)
 	var failureCode, failureReason string
 	err = conn.QueryRow(ctx, `SELECT failure_code, failure_reason FROM production_release_targets WHERE id = 'target-legacy-failed'`).Scan(&failureCode, &failureReason)
@@ -1487,12 +1621,11 @@ func TestProductionProjectionIntegritySQLiteUpgradesAndDowngradesPopulatedPublic
 	insertProductionPublicationTarget(t, db, "target-upgrade", "release-upgrade", "version-1", "kb-1", "knowledge-upgrade", strings.Repeat("a", 64))
 	insertProductionPublicationTarget(t, db, "target-upgrade-failed", "release-upgrade", "version-1", "kb-2", "knowledge-upgrade-failed", strings.Repeat("a", 64))
 	_, err := db.Exec(`UPDATE production_release_targets
-		SET status = 'failed', failed_at = '2026-01-01 00:00:00', retention_until = '2026-01-31 00:00:00'
+		SET status = 'failed', failure_code = 'PROJECTION_BUILD_FAILED', failure_reason = 'projection build failed',
+		    failed_at = '2026-01-01 00:00:00', retention_until = '2026-01-31 00:00:00'
 		WHERE id = 'target-upgrade-failed'`)
 	require.NoError(t, err)
 
-	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000006_knowledge_production_projection_integrity.up.sql"))
-	require.NoError(t, err)
 	var digestVersion int
 	var failureCode, failureReason string
 	require.NoError(t, db.QueryRow(`SELECT release_digest_version FROM production_releases WHERE id = 'release-upgrade'`).Scan(&digestVersion))
@@ -1501,8 +1634,8 @@ func TestProductionProjectionIntegritySQLiteUpgradesAndDowngradesPopulatedPublic
 	require.Empty(t, failureCode)
 	require.Empty(t, failureReason)
 	require.NoError(t, db.QueryRow(`SELECT failure_code, failure_reason FROM production_release_targets WHERE id = 'target-upgrade-failed'`).Scan(&failureCode, &failureReason))
-	require.Equal(t, "LEGACY_PROJECTION_FAILURE", failureCode)
-	require.Equal(t, "legacy failed target migrated without recorded failure details", failureReason)
+	require.Equal(t, "PROJECTION_BUILD_FAILED", failureCode)
+	require.Equal(t, "projection build failed", failureReason)
 	_, err = db.Exec(`UPDATE production_releases SET release_digest_version = 1 WHERE id = 'release-upgrade'`)
 	require.ErrorContains(t, err, "release identity is immutable")
 	_, err = db.Exec(`UPDATE production_release_targets
@@ -1510,18 +1643,17 @@ func TestProductionProjectionIntegritySQLiteUpgradesAndDowngradesPopulatedPublic
 		WHERE id = 'target-upgrade'`)
 	require.Error(t, err, "failed targets require bounded failure metadata")
 
-	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000006_knowledge_production_projection_integrity.down.sql"))
+	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000005_knowledge_production_publication.down.sql"))
 	require.NoError(t, err)
 	require.Empty(t, sqliteColumnTypeIfPresent(t, db, "production_releases", "release_digest_version"))
 	require.Empty(t, sqliteColumnTypeIfPresent(t, db, "production_release_targets", "failure_code"))
-	var targetCount int
-	require.NoError(t, db.QueryRow(`SELECT count(*) FROM production_release_targets WHERE id = 'target-upgrade'`).Scan(&targetCount))
-	require.Equal(t, 1, targetCount)
+	var knowledgeBaseCount int
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM knowledge_bases`).Scan(&knowledgeBaseCount))
+	require.Positive(t, knowledgeBaseCount, "binding down must preserve populated dependencies")
 }
 
 func TestProductionPublicationPostgreSQLMigrationDeclaresReleaseAndProjectionIntegrity(t *testing.T) {
 	up := mustReadMigration(t, "../../migrations/versioned/000074_knowledge_production_publication.up.sql")
-	integrityUp := mustReadMigration(t, "../../migrations/versioned/000075_knowledge_production_projection_integrity.up.sql")
 	_, err := pg_query.Parse(up)
 	require.NoError(t, err)
 
@@ -1561,7 +1693,7 @@ func TestProductionPublicationPostgreSQLMigrationDeclaresReleaseAndProjectionInt
 		"failure_reason VARCHAR(256) NOT NULL DEFAULT ''",
 		"production release target failure metadata is lifecycle-owned",
 	} {
-		require.Contains(t, integrityUp, declaration)
+		require.Contains(t, up, declaration)
 	}
 
 	down := mustReadMigration(t, "../../migrations/versioned/000074_knowledge_production_publication.down.sql")
@@ -1735,10 +1867,17 @@ func TestProductionPublicationSQLiteMigrationGuardsAggregateLifecycleTargetsRete
 	_, err = db.Exec(`UPDATE production_release_targets SET status = 'cleanup_pending', cleanup_requested_at = CURRENT_TIMESTAMP WHERE id = 'target-retention'`)
 	require.ErrorContains(t, err, "retention has not expired")
 	_, err = db.Exec(`UPDATE production_release_targets SET failed_at = '2020-01-01 00:00:00', retention_until = '2020-01-31 00:00:00' WHERE id = 'target-retention'`)
+	require.ErrorContains(t, err, "retention_until is immutable")
+
+	insertProductionPublicationTarget(t, db, "target-retention-expired", "release-2", "version-pub-2", "kb-3", "knowledge-retention-expired", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+	_, err = db.Exec(`UPDATE production_release_targets
+		SET status = 'failed', failure_code = 'PROJECTION_BUILD_FAILED', failure_reason = 'projection build failed',
+		    failed_at = '2020-01-01 00:00:00', retention_until = '2020-01-31 00:00:00'
+		WHERE id = 'target-retention-expired'`)
 	require.NoError(t, err)
-	_, err = db.Exec(`UPDATE production_release_targets SET status = 'cleanup_pending', cleanup_requested_at = CURRENT_TIMESTAMP WHERE id = 'target-retention'`)
+	_, err = db.Exec(`UPDATE production_release_targets SET status = 'cleanup_pending', cleanup_requested_at = CURRENT_TIMESTAMP WHERE id = 'target-retention-expired'`)
 	require.NoError(t, err)
-	_, err = db.Exec(`UPDATE production_release_targets SET status = 'cleaned', cleaned_at = CURRENT_TIMESTAMP WHERE id = 'target-retention'`)
+	_, err = db.Exec(`UPDATE production_release_targets SET status = 'cleaned', cleaned_at = CURRENT_TIMESTAMP WHERE id = 'target-retention-expired'`)
 	require.NoError(t, err)
 
 	for _, query := range []string{
@@ -1872,11 +2011,7 @@ func openProductionPublicationSQLite(t *testing.T) *sql.DB {
 
 func openProductionProjectionIntegritySQLite(t *testing.T) *sql.DB {
 	t.Helper()
-
-	db := openProductionPublicationSQLite(t)
-	_, err := db.Exec(mustReadMigration(t, "../../migrations/sqlite/000006_knowledge_production_projection_integrity.up.sql"))
-	require.NoError(t, err)
-	return db
+	return openProductionPublicationSQLite(t)
 }
 
 func insertProductionPublicationRelease(t *testing.T, db *sql.DB, id, versionID, reviewID, digest string) {

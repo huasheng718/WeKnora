@@ -10,6 +10,7 @@ import (
 type ProductionReleaseRepository interface {
 	CreateRelease(ctx context.Context, release *types.ProductionRelease, targets []*types.ProductionReleaseTarget) error
 	GetRelease(ctx context.Context, tenantID uint64, releaseID string) (*types.ProductionRelease, error)
+	GetLatestReleaseForVersion(ctx context.Context, tenantID uint64, documentID, versionID string) (*types.ProductionRelease, error)
 	GetTarget(ctx context.Context, tenantID uint64, targetID string) (*types.ProductionReleaseTarget, error)
 	GetTargetForUpdate(ctx context.Context, tenantID uint64, targetID string) (*types.ProductionReleaseTarget, error)
 	TransitionTarget(ctx context.Context, targetID string, from, to types.ProductionReleaseTargetStatus, patch types.JSONMap) (bool, error)

@@ -2,6 +2,7 @@ package neo4j
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -177,6 +178,16 @@ type graphSearchRow struct {
 	Relation           *types.GraphRelation
 }
 
+func graphSearchInNamespacesQuery(labelExpr string) string {
+	return `
+		MATCH (n:` + labelExpr + `)-[r]-(m:` + labelExpr + `)
+		WHERE ANY(nodeText IN $nodes WHERE n.name CONTAINS nodeText)
+		  AND ($allow_all OR (n.kg IN $knowledge_ids AND m.kg IN $knowledge_ids
+		       AND ANY(knowledgeID IN coalesce(r.kg, []) WHERE knowledgeID IN $knowledge_ids)))
+		RETURN n, r, m
+	`
+}
+
 func graphDataFromSearchRows(rows []graphSearchRow) *types.GraphData {
 	graph := &types.GraphData{}
 	nodesByName := make(map[string]*types.GraphNode)
@@ -249,21 +260,52 @@ func (n *Neo4jRepository) SearchNode(
 	namespace types.NameSpace,
 	nodes []string,
 ) (*types.GraphData, error) {
+	return n.SearchNodeInNamespaces(ctx, []types.NameSpace{namespace}, nodes)
+}
+
+func (n *Neo4jRepository) SearchNodeInNamespaces(
+	ctx context.Context,
+	namespaces []types.NameSpace,
+	nodes []string,
+) (*types.GraphData, error) {
 	if n.driver == nil {
 		logger.Warnf(ctx, "NOT SUPPORT RETRIEVE GRAPH")
 		return nil, nil
+	}
+	if len(namespaces) == 0 {
+		return &types.GraphData{}, nil
+	}
+	knowledgeBaseID := strings.TrimSpace(namespaces[0].KnowledgeBase)
+	if knowledgeBaseID == "" {
+		return nil, errors.New("graph namespaces require one knowledge base")
+	}
+	allowAll := false
+	seen := make(map[string]struct{}, len(namespaces))
+	knowledgeIDs := make([]string, 0, len(namespaces))
+	for _, namespace := range namespaces {
+		if strings.TrimSpace(namespace.KnowledgeBase) != knowledgeBaseID {
+			return nil, errors.New("graph namespaces must share one knowledge base")
+		}
+		knowledgeID := strings.TrimSpace(namespace.Knowledge)
+		if knowledgeID == "" {
+			allowAll = true
+			continue
+		}
+		if _, duplicate := seen[knowledgeID]; duplicate {
+			continue
+		}
+		seen[knowledgeID] = struct{}{}
+		knowledgeIDs = append(knowledgeIDs, knowledgeID)
 	}
 	session := n.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeRead})
 	defer session.Close(ctx)
 
 	result, err := session.ExecuteRead(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
-		labelExpr := n.Label(namespace)
-		query := `
-			MATCH (n:` + labelExpr + `)-[r]-(m:` + labelExpr + `)
-			WHERE ANY(nodeText IN $nodes WHERE n.name CONTAINS nodeText)
-			RETURN n, r, m
-		`
-		params := map[string]interface{}{"nodes": nodes}
+		labelExpr := n.Label(types.NameSpace{KnowledgeBase: knowledgeBaseID})
+		query := graphSearchInNamespacesQuery(labelExpr)
+		params := map[string]interface{}{
+			"nodes": nodes, "allow_all": allowAll, "knowledge_ids": knowledgeIDs,
+		}
 		result, err := tx.Run(ctx, query, params)
 		if err != nil {
 			return nil, fmt.Errorf("failed to run query: %v", err)

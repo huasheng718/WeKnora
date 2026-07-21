@@ -58,12 +58,6 @@ func newProductionReleaseRepoFixture(t *testing.T, clock ProductionReleaseClock)
 	migration, err := os.ReadFile(filepath.Join(filepath.Dir(filename), "../../../migrations/sqlite/000005_knowledge_production_publication.up.sql"))
 	require.NoError(t, err)
 	require.NoError(t, db.Exec(string(migration)).Error)
-	integrityMigration, err := os.ReadFile(filepath.Join(filepath.Dir(filename), "../../../migrations/sqlite/000006_knowledge_production_projection_integrity.up.sql"))
-	require.NoError(t, err)
-	require.NoError(t, db.Exec(string(integrityMigration)).Error)
-	recoveryMigration, err := os.ReadFile(filepath.Join(filepath.Dir(filename), "../../../migrations/sqlite/000007_production_projection_failure_recovery.up.sql"))
-	require.NoError(t, err)
-	require.NoError(t, db.Exec(string(recoveryMigration)).Error)
 	require.NoError(t, db.Exec(`INSERT INTO knowledge_bases (id, tenant_id) VALUES (?, ?), (?, ?), (?, 8)`, releaseKBOne, reviewTenantID, releaseKBTwo, reviewTenantID, releaseKBTwo+"-other", 8).Error)
 
 	approveProductionReleaseReview(t, db, reviewRepo, reviewID(700), reviewVersionOne, 700)
@@ -942,6 +936,81 @@ func TestProductionProjectionHeadInitialActivationAndCASSwitchRefreshTriggerStat
 	require.Equal(t, types.ReleaseTargetRolledBack, firstTarget.Status)
 	require.NotNil(t, firstTarget.RetentionUntil)
 	require.Equal(t, types.ReleaseTargetActive, secondTarget.Status)
+}
+
+func TestProductionReleaseRepositoryAllowsSupersedingSameApprovedVersion(t *testing.T) {
+	repo, _ := newProductionReleaseRepoFixture(t, nil)
+	first := productionRelease(releaseIDOne, reviewVersionOne, reviewID(700))
+	second := productionRelease(releaseIDTwo, reviewVersionOne, reviewID(700))
+	second.SupersedesReleaseID = &first.ID
+	require.NoError(t, repo.CreateRelease(productionReleaseContext(reviewTenantID, reviewAuthorID), first,
+		[]*types.ProductionReleaseTarget{productionReleaseTarget(releaseTarget1, releaseKBOne, releaseKnowledge1)}))
+
+	err := repo.CreateRelease(productionReleaseContext(reviewTenantID, reviewAuthorID), second,
+		[]*types.ProductionReleaseTarget{productionReleaseTarget(releaseTarget2, releaseKBOne, releaseKnowledge2)})
+	require.NoError(t, err)
+	latest, err := repo.GetLatestReleaseForVersion(productionReleaseContext(reviewTenantID, reviewAuthorID), reviewTenantID, reviewDocumentID, reviewVersionOne)
+	require.NoError(t, err)
+	require.Equal(t, second.ID, latest.ID)
+	require.Equal(t, first.ID, *latest.SupersedesReleaseID)
+}
+
+func TestProductionReleaseRepositoryRejectsForkedSuccessors(t *testing.T) {
+	repo, _ := newProductionReleaseRepoFixture(t, nil)
+	root := productionRelease(releaseIDOne, reviewVersionOne, reviewID(700))
+	firstSuccessor := productionRelease(releaseIDTwo, reviewVersionOne, reviewID(700))
+	secondSuccessor := productionRelease("30000000-0000-4000-8000-00000000000b", reviewVersionOne, reviewID(700))
+	firstSuccessor.SupersedesReleaseID = &root.ID
+	secondSuccessor.SupersedesReleaseID = &root.ID
+	require.NoError(t, repo.CreateRelease(productionReleaseContext(reviewTenantID, reviewAuthorID), root,
+		[]*types.ProductionReleaseTarget{productionReleaseTarget(releaseTarget1, releaseKBOne, releaseKnowledge1)}))
+	require.NoError(t, repo.CreateRelease(productionReleaseContext(reviewTenantID, reviewAuthorID), firstSuccessor,
+		[]*types.ProductionReleaseTarget{productionReleaseTarget(releaseTarget2, releaseKBOne, releaseKnowledge2)}))
+
+	err := repo.CreateRelease(productionReleaseContext(reviewTenantID, reviewAuthorID), secondSuccessor,
+		[]*types.ProductionReleaseTarget{productionReleaseTarget(releaseTarget3, releaseKBOne, releaseKnowledge3)})
+	require.ErrorIs(t, err, types.ErrProductionConflict)
+}
+
+func TestProductionReleaseRepositoryConcurrentSuccessorHasOneWinner(t *testing.T) {
+	const callers = 16
+	repo, _ := newProductionReleaseRepoFixture(t, nil)
+	root := productionRelease(releaseIDOne, reviewVersionOne, reviewID(700))
+	require.NoError(t, repo.CreateRelease(productionReleaseContext(reviewTenantID, reviewAuthorID), root,
+		[]*types.ProductionReleaseTarget{productionReleaseTarget(releaseTarget1, releaseKBOne, releaseKnowledge1)}))
+
+	start := make(chan struct{})
+	results := make(chan error, callers)
+	for index := range callers {
+		go func() {
+			<-start
+			release := productionRelease(fmt.Sprintf("release-successor-%02d", index), reviewVersionOne, reviewID(700))
+			release.SupersedesReleaseID = &root.ID
+			target := productionReleaseTarget(
+				fmt.Sprintf("target-successor-%02d", index), releaseKBOne, fmt.Sprintf("knowledge-successor-%02d", index),
+			)
+			results <- repo.CreateRelease(productionReleaseContext(reviewTenantID, reviewAuthorID), release,
+				[]*types.ProductionReleaseTarget{target})
+		}()
+	}
+	close(start)
+
+	successes := 0
+	for range callers {
+		err := <-results
+		if err == nil {
+			successes++
+			continue
+		}
+		require.ErrorIs(t, err, types.ErrProductionConflict)
+	}
+	require.Equal(t, 1, successes)
+	latest, err := repo.GetLatestReleaseForVersion(
+		productionReleaseContext(reviewTenantID, reviewAuthorID), reviewTenantID, reviewDocumentID, reviewVersionOne,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, latest.SupersedesReleaseID)
+	require.Equal(t, root.ID, *latest.SupersedesReleaseID)
 }
 
 func TestProductionProjectionHeadRejectsStaleLockAndPreservesCurrentHead(t *testing.T) {

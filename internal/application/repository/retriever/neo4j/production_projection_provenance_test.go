@@ -36,6 +36,15 @@ func TestGraphPropertyStringsRejectsMalformedKnowledgeProvenance(t *testing.T) {
 	require.Nil(t, graphPropertyStrings(map[string]any{"kg": []string{"knowledge-1", ""}}, "kg"))
 }
 
+func TestBulkGraphSearchFiltersEveryPathElementByAllowedKnowledgeProvenance(t *testing.T) {
+	query := graphSearchInNamespacesQuery("ENTITYkb")
+	require.Contains(t, query, "MATCH (n:ENTITYkb)-[r]-(m:ENTITYkb)")
+	require.Contains(t, query, "n.kg IN $knowledge_ids")
+	require.Contains(t, query, "m.kg IN $knowledge_ids")
+	require.Contains(t, query, "coalesce(r.kg, [])")
+	require.Contains(t, query, "$allow_all")
+}
+
 func TestGraphDataFromSearchRowsAggregatesSameNameEvidenceRegardlessOfOrder(t *testing.T) {
 	active := graphSearchRow{
 		Source:             &types.GraphNode{Name: "shared", Chunks: []string{"chunk-active", "chunk-active"}, Attributes: []string{"active-attribute"}},

@@ -459,8 +459,11 @@ func BuildContainer(container *dig.Container) *dig.Container {
 		must(container.Invoke(router.RunAsynqServer))
 	} else {
 		must(container.Invoke(router.RegisterSyncHandlers))
-		must(container.Invoke(startProductionCleanupRecovery))
 	}
+	// Cleanup tasks may be lost after Redis retry exhaustion just as Lite
+	// in-process work may be lost on restart. The durable bounded sweep is the
+	// common recovery path for both runtimes.
+	must(container.Invoke(startProductionCleanupRecovery))
 	must(container.Invoke(startProductionFailureRecovery))
 	must(container.Invoke(recoverPendingProductionRuns))
 	// Wiki operation rows are durable, while their wake-up triggers may be

@@ -258,7 +258,7 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) (retErr
 		// payload field; legacy in-flight tasks without it are skipped.
 		if err := finalizeSubtaskDetached(ctx, s.knowledgeRepo, s.productionReleaseRepo, p.KnowledgeID,
 			fmt.Sprintf("graph_chunk[%d]", p.ChunkIndex),
-			handleErr, false, isFinalAsynqAttempt(ctx)); err != nil && retErr == nil {
+			handleErr, errors.Is(handleErr, types.ErrProductionReleaseReprepareRequired), isFinalAsynqAttempt(ctx)); err != nil && retErr == nil {
 			retErr = err
 		}
 		if gSpan == nil {
@@ -309,12 +309,14 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) (retErr
 
 	var processOverrides *types.KnowledgeProcessOverrides
 	var projection *types.ProductionProjectionMetadata
+	var knowledge *types.Knowledge
 	knowledgeID := p.KnowledgeID
 	if knowledgeID == "" {
 		knowledgeID = chunk.KnowledgeID
 	}
 	if knowledgeID != "" && s.knowledgeRepo != nil {
 		if k, kerr := s.knowledgeRepo.GetKnowledgeByIDOnly(ctx, knowledgeID); kerr == nil && k != nil {
+			knowledge = k
 			processOverrides, _ = k.ProcessOverrides()
 			projection, kerr = types.ValidateProductionProjectionIntegrity(k)
 			if kerr != nil {
@@ -322,6 +324,12 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) (retErr
 				return kerr
 			}
 		}
+	}
+	if err := requireProductionProjectionSubtaskVectorStoreUnchanged(
+		ctx, knowledge, projection, kb, s.productionReleaseRepo,
+	); err != nil {
+		handleErr = err
+		return err
 	}
 	extractCfg := ResolveProcessConfig(kb, processOverrides).ExtractConfig
 	if projection != nil {
@@ -510,7 +518,7 @@ type extractionResources struct {
 // 思路：集中加载所有依赖，统一错误处理，避免分散的资源获取逻辑
 func (s *DataTableSummaryService) prepareResources(ctx context.Context, payload DataTableSummaryPayload) (*extractionResources, error) {
 	// 获取并验证知识文件
-	knowledge, err := s.knowledgeService.GetKnowledgeByID(ctx, payload.KnowledgeID)
+	knowledge, err := s.knowledgeService.GetKnowledgeByIDForSystem(ctx, payload.KnowledgeID)
 	if err != nil {
 		logger.Errorf(ctx, "failed to get knowledge: %v", err)
 		return nil, err

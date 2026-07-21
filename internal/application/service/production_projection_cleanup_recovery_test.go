@@ -40,6 +40,54 @@ type productionCleanupRecoverySweeperStub struct {
 	err   error
 }
 
+type productionCleanupConcurrentChunks struct {
+	interfaces.ChunkService
+	mu      sync.Mutex
+	chunks  []*types.Chunk
+	updates int
+}
+
+func (s *productionCleanupConcurrentChunks) ListChunksByKnowledgeID(context.Context, string) ([]*types.Chunk, error) {
+	return nil, errors.New("projection cleanup used user-facing chunk read")
+}
+
+func (s *productionCleanupConcurrentChunks) ListChunksByKnowledgeIDForSystem(context.Context, string) ([]*types.Chunk, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]*types.Chunk, 0, len(s.chunks))
+	for _, chunk := range s.chunks {
+		copy := *chunk
+		out = append(out, &copy)
+	}
+	return out, nil
+}
+
+func (s *productionCleanupConcurrentChunks) UpdateChunks(_ context.Context, chunks []*types.Chunk) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.updates++
+	for _, update := range chunks {
+		for _, chunk := range s.chunks {
+			if chunk.ID == update.ID {
+				chunk.IsEnabled = update.IsEnabled
+			}
+		}
+	}
+	return nil
+}
+
+type productionCleanupConcurrentIndex struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (s *productionCleanupConcurrentIndex) DisableChunks(context.Context, *types.ProductionReleaseTarget, []*types.Chunk) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	return nil
+}
+
 func (s *productionCleanupRecoverySweeperStub) CleanupExpired(ctx context.Context, limit int) error {
 	tenantID, _ := types.TenantIDFromContext(ctx)
 	actorID, _ := types.UserIDFromContext(ctx)
@@ -217,4 +265,48 @@ func TestProductionCleanupRecoveryResumesCleanupPendingAfterRestartIdempotently(
 	require.Equal(t, 1, indexes.calls)
 	require.Equal(t, 1, chunks.updates)
 	require.Equal(t, types.ReleaseTargetActive, repo.targets["target-new"].Status)
+}
+
+func TestProductionCleanupRecoveryDuplicateRunnersRemainIdempotent(t *testing.T) {
+	_, repo, _ := newProductionReleaseServiceFixture(t)
+	target := repo.targets["target-old"]
+	rolledBackAt := time.Now().Add(-2 * time.Hour)
+	retentionUntil := time.Now().Add(-time.Hour)
+	target.Status = types.ReleaseTargetRolledBack
+	target.RolledBackAt = &rolledBackAt
+	target.RetentionUntil = &retentionUntil
+	repo.targets["target-new"].Status = types.ReleaseTargetActive
+	chunks := &productionCleanupConcurrentChunks{chunks: []*types.Chunk{{
+		ID: "chunk-duplicate-runner", KnowledgeID: target.KnowledgeID, IsEnabled: true,
+	}}}
+	indexes := &productionCleanupConcurrentIndex{}
+	cleanup := &ProductionProjectionCleanup{
+		releases: repo, chunks: chunks, indexes: indexes,
+		uow: productionReleaseUOWStub{repo: repo}, audit: &productionReleaseAuditStub{}, now: time.Now,
+	}
+	tenants := &productionCleanupRecoveryTenantStub{tenants: []*types.Tenant{{ID: target.TenantID}}}
+	firstTicker := newProductionCleanupRecoveryTickerStub()
+	secondTicker := newProductionCleanupRecoveryTickerStub()
+	first := newProductionCleanupRecoveryRunner(cleanup, tenants, 100, time.Hour,
+		func(time.Duration) productionCleanupRecoveryTicker { return firstTicker })
+	second := newProductionCleanupRecoveryRunner(cleanup, tenants, 100, time.Hour,
+		func(time.Duration) productionCleanupRecoveryTicker { return secondTicker })
+	first.Start(context.Background())
+	second.Start(context.Background())
+	t.Cleanup(first.Stop)
+	t.Cleanup(second.Stop)
+
+	require.Eventually(t, func() bool {
+		repo.mu.Lock()
+		defer repo.mu.Unlock()
+		return repo.targets[target.ID].Status == types.ReleaseTargetCleaned
+	}, time.Second, time.Millisecond)
+	chunks.mu.Lock()
+	require.False(t, chunks.chunks[0].IsEnabled)
+	require.LessOrEqual(t, chunks.updates, 2)
+	chunks.mu.Unlock()
+	indexes.mu.Lock()
+	require.GreaterOrEqual(t, indexes.calls, 1)
+	require.LessOrEqual(t, indexes.calls, 2)
+	indexes.mu.Unlock()
 }

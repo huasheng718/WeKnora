@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -13,11 +14,23 @@ import (
 
 type productionCleanupChunksStub struct {
 	interfaces.ChunkService
-	chunks  []*types.Chunk
-	updates int
+	chunks      []*types.Chunk
+	updates     int
+	userCalls   int
+	systemCalls int
 }
 
 func (s *productionCleanupChunksStub) ListChunksByKnowledgeID(context.Context, string) ([]*types.Chunk, error) {
+	s.userCalls++
+	return nil, errors.New("projection cleanup used user-facing chunk read")
+}
+func (s *productionCleanupChunksStub) ListChunksByKnowledgeIDForSystem(ctx context.Context, _ string) ([]*types.Chunk, error) {
+	s.systemCalls++
+	actorID, _ := types.UserIDFromContext(ctx)
+	tenantID, _ := types.TenantIDFromContext(ctx)
+	if actorID != types.ProductionSystemActorID || tenantID != 7 {
+		return nil, types.ErrProductionForbidden
+	}
 	return s.chunks, nil
 }
 func (s *productionCleanupChunksStub) UpdateChunks(_ context.Context, chunks []*types.Chunk) error {
@@ -101,6 +114,8 @@ func TestProjectionCleanupNeverTouchesActiveHeadAndIsIdempotent(t *testing.T) {
 	require.Equal(t, types.ReleaseTargetCleaned, repo.targets["target-old"].Status)
 	require.NoError(t, cleanup.Cleanup(productionReleaseContext(), "target-old"))
 	require.Equal(t, 1, indexes.calls)
+	require.Zero(t, chunks.userCalls)
+	require.Equal(t, 1, chunks.systemCalls)
 }
 
 func TestProjectionCleanupRetentionBoundaryIsFailClosed(t *testing.T) {

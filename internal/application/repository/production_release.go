@@ -108,6 +108,14 @@ func validateProductionReleaseForCreate(release *types.ProductionRelease, target
 	if release.ReleaseDigestVersion != 0 && release.ReleaseDigestVersion != types.ProductionReleaseDigestVersionCurrent {
 		return types.ErrProductionReleaseReprepareRequired
 	}
+	if release.SupersedesReleaseID != nil {
+		if err := requireProductionReleaseIdentity("supersedes_release_id", *release.SupersedesReleaseID); err != nil {
+			return err
+		}
+		if *release.SupersedesReleaseID == release.ID {
+			return fmt.Errorf("%w: a release cannot supersede itself", types.ErrProductionReleaseInvalid)
+		}
+	}
 	if release.Status != "" && release.Status != types.ProductionReleaseBuilding {
 		return types.ErrProductionReleaseLifecycle
 	}
@@ -324,7 +332,43 @@ func (r *productionReleaseRepository) GetRelease(
 	if err := db.Where("tenant_id = ? AND id = ?", tenantID, releaseID).First(&release).Error; err != nil {
 		return nil, translateProductionReleaseTargetReadError(err)
 	}
-	if err := db.Where("tenant_id = ? AND release_id = ?", tenantID, releaseID).
+	return loadProductionReleaseTargets(db, tenantID, &release)
+}
+
+func (r *productionReleaseRepository) GetLatestReleaseForVersion(
+	ctx context.Context,
+	tenantID uint64,
+	documentID string,
+	versionID string,
+) (*types.ProductionRelease, error) {
+	if err := requireProductionReleaseTenantContext(ctx, tenantID); err != nil {
+		return nil, err
+	}
+	if err := requireProductionReleaseIdentity("document_id", documentID); err != nil {
+		return nil, err
+	}
+	if err := requireProductionReleaseIdentity("version_id", versionID); err != nil {
+		return nil, err
+	}
+	db := database.DBFromContext(ctx, r.db).WithContext(ctx)
+	var release types.ProductionRelease
+	err := db.Where(
+		"production_releases.tenant_id = ? AND production_releases.document_id = ? AND production_releases.version_id = ? "+
+			"AND NOT EXISTS (SELECT 1 FROM production_releases successor WHERE successor.supersedes_release_id = production_releases.id)",
+		tenantID, documentID, versionID,
+	).Order("production_releases.created_at DESC, production_releases.id DESC").First(&release).Error
+	if err != nil {
+		return nil, translateProductionReleaseTargetReadError(err)
+	}
+	return loadProductionReleaseTargets(db, tenantID, &release)
+}
+
+func loadProductionReleaseTargets(
+	db *gorm.DB,
+	tenantID uint64,
+	release *types.ProductionRelease,
+) (*types.ProductionRelease, error) {
+	if err := db.Where("tenant_id = ? AND release_id = ?", tenantID, release.ID).
 		Order("id ASC").Find(&release.Targets).Error; err != nil {
 		return nil, translateProductionReleaseTargetReadError(err)
 	}
@@ -333,7 +377,7 @@ func (r *productionReleaseRepository) GetRelease(
 			return nil, err
 		}
 	}
-	return &release, nil
+	return release, nil
 }
 
 // normalizeProductionReleaseTargetConfig authenticates driver-returned
