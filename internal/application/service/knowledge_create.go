@@ -1300,13 +1300,13 @@ func (s *knowledgeService) enqueueManualProcessingWithEncoder(
 		asynq.Queue(types.QueueDefault), asynq.MaxRetry(3), asynq.Timeout(30*time.Minute))
 	var enqueueOptions []asynq.Option
 	if projection != nil {
-		phase := "build"
+		taskID := productionProjectionTaskID(projection.ReleaseTargetID, knowledge.ID, "build")
 		if needCleanup {
-			phase = "retry"
+			taskID = productionProjectionAttemptTaskID(
+				projection.ReleaseTargetID, knowledge.ID, "retry", payload.Attempt,
+			)
 		}
-		enqueueOptions = append(enqueueOptions, asynq.TaskID(productionProjectionTaskID(
-			projection.ReleaseTargetID, knowledge.ID, phase,
-		)))
+		enqueueOptions = append(enqueueOptions, asynq.TaskID(taskID))
 	}
 	info, err := s.task.Enqueue(task, enqueueOptions...)
 	if err != nil {

@@ -349,6 +349,39 @@ func TestProductionProjectionFailedRetryAllocatesFreshPersistedAttempt(t *testin
 	require.Equal(t, 2, tracker.LatestAttempt(context.Background(), knowledge.ID))
 }
 
+func TestProductionProjectionFailedRetryEscapesArchivedPriorAttemptTaskID(t *testing.T) {
+	tracker, spanDB := setupSpanTrackerTest(t)
+	knowledge := initialPostProcessProjectionKnowledge(t, types.ParseStatusPending)
+	seedSpanTrackerKnowledgeTest(t, spanDB, knowledge.TenantID, knowledge.ID)
+	tasks := &manualAttemptRetryEnqueuer{accepted: make(map[string]*asynq.Task)}
+	service := &knowledgeService{task: tasks, spanTracker: tracker}
+
+	require.NoError(t, service.enqueueManualProcessing(context.Background(), knowledge, "# governed projection", true))
+	firstRetryID := productionProjectionAttemptTaskID("target-1", knowledge.ID, "retry", 1)
+	firstTask := tasks.accepted[firstRetryID]
+	require.NotNil(t, firstTask)
+	tracker.FinalizeAttempt(context.Background(), knowledge.ID, 1, types.SpanStatusFailed, nil,
+		"MANUAL_TASK_DEAD_LETTERED", "manual retry exhausted")
+
+	require.NoError(t, service.enqueueManualProcessing(context.Background(), knowledge, "# governed projection", true))
+	secondRetryID := productionProjectionAttemptTaskID("target-1", knowledge.ID, "retry", 2)
+	secondTask := tasks.accepted[secondRetryID]
+	require.NotNil(t, secondTask, "an archived attempt-1 task ID must not block attempt 2")
+	var secondPayload types.ManualProcessPayload
+	require.NoError(t, json.Unmarshal(secondTask.Payload(), &secondPayload))
+	require.Equal(t, 2, secondPayload.Attempt)
+	require.Equal(t, 2, tracker.LatestAttempt(context.Background(), knowledge.ID))
+	require.Len(t, tasks.accepted, 2)
+
+	require.NoError(t, service.enqueueManualProcessing(
+		context.Background(), knowledge, "# governed projection", true, secondPayload.Attempt,
+	))
+	require.Equal(t, 2, tracker.LatestAttempt(context.Background(), knowledge.ID),
+		"same-attempt replay must not open another root")
+	require.Len(t, tasks.accepted, 2, "same-attempt TaskID conflict must not enqueue another worker")
+	require.Equal(t, []string{firstRetryID, secondRetryID, secondRetryID}, tasks.taskIDs)
+}
+
 func TestOrdinaryManualEnqueueRemainsCompatibleWithoutSpanTracker(t *testing.T) {
 	knowledge := &types.Knowledge{
 		ID: "ordinary-knowledge-1", TenantID: 1, KnowledgeBaseID: "kb-1", Type: types.KnowledgeTypeManual,

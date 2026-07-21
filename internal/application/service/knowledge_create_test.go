@@ -345,7 +345,7 @@ func TestCreateKnowledgeFromProductionProjectionRearmsPendingWithDeterministicTa
 	require.Equal(t, 2, tasks.calls)
 }
 
-func TestCreateKnowledgeFromProductionProjectionTreatsRetryTaskConflictAsDurableSuccess(t *testing.T) {
+func TestCreateKnowledgeFromProductionProjectionTreatsSameAttemptRetryTaskConflictAsDurableSuccess(t *testing.T) {
 	owned := &types.Knowledge{
 		ID: "knowledge-1", TenantID: 1, KnowledgeBaseID: "kb-1", Type: types.KnowledgeTypeManual,
 		ParseStatus: types.ParseStatusFailed,
@@ -371,7 +371,7 @@ func TestCreateKnowledgeFromProductionProjectionTreatsRetryTaskConflictAsDurable
 		ProductionProjection: meta.ProductionProjection,
 	})
 	require.NoError(t, err)
-	require.Equal(t, []string{"production-projection-retry-target-1-knowledge-1"}, tasks.taskIDs)
+	require.Equal(t, []string{productionProjectionAttemptTaskID("target-1", "knowledge-1", "retry", 1)}, tasks.taskIDs)
 	require.Equal(t, types.ParseStatusPending, repo.columnUpdates["parse_status"])
 }
 
