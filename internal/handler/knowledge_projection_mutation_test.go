@@ -37,19 +37,27 @@ func (s *projectionMutationKnowledgeService) GetKnowledgeByIDOnly(_ context.Cont
 	return knowledge, nil
 }
 
-func (s *projectionMutationKnowledgeService) GetKnowledgeByID(_ context.Context, id string) (*types.Knowledge, error) {
-	return s.GetKnowledgeByIDOnly(context.Background(), id)
+func (s *projectionMutationKnowledgeService) GetKnowledgeByID(ctx context.Context, id string) (*types.Knowledge, error) {
+	knowledge, err := s.GetKnowledgeByIDOnly(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	tenantID, _ := types.TenantIDFromContext(ctx)
+	if tenantID == 0 || knowledge.TenantID != tenantID {
+		return nil, fmt.Errorf("knowledge not found")
+	}
+	return knowledge, nil
 }
 
-func (s *projectionMutationKnowledgeService) GetKnowledgeBatch(_ context.Context, _ uint64, ids []string) ([]*types.Knowledge, error) {
+func (s *projectionMutationKnowledgeService) GetKnowledgeBatch(_ context.Context, tenantID uint64, ids []string) ([]*types.Knowledge, error) {
 	if s.batch != nil {
 		return s.batch, nil
 	}
 	result := make([]*types.Knowledge, 0, len(ids))
 	for _, id := range ids {
 		knowledge := s.byID[id]
-		if knowledge == nil {
-			return nil, fmt.Errorf("knowledge not found")
+		if knowledge == nil || knowledge.TenantID != tenantID {
+			continue
 		}
 		result = append(result, knowledge)
 	}
@@ -91,6 +99,21 @@ func (s *projectionMutationKnowledgeService) SaveKnowledgeMoveProgress(context.C
 
 func (s *projectionMutationKnowledgeService) mutationCalls() int32 {
 	return s.calls.update.Load() + s.calls.manual.Load() + s.calls.image.Load() + s.calls.reparse.Load() + s.calls.cancel.Load() + s.calls.tags.Load() + s.calls.moveProgress.Load()
+}
+
+func assertOnlyProjectionMutationCall(t *testing.T, service *projectionMutationKnowledgeService, operation string) {
+	t.Helper()
+	calls := map[string]int32{
+		"update": service.calls.update.Load(), "manual": service.calls.manual.Load(), "image": service.calls.image.Load(),
+		"reparse": service.calls.reparse.Load(), "cancel": service.calls.cancel.Load(), "tags": service.calls.tags.Load(), "move": service.calls.moveProgress.Load(),
+	}
+	for name, count := range calls {
+		want := int32(0)
+		if name == operation {
+			want = 1
+		}
+		require.Equalf(t, want, count, "%s calls", name)
+	}
 }
 
 type projectionMutationKBService struct {
@@ -265,22 +288,28 @@ func TestDirectKnowledgeMutationsPermitOrdinaryKnowledgeAndRejectMixedOrUnauthor
 	projection := activeProductionKnowledge(t, "projection-1")
 
 	for _, tc := range []struct {
-		name, method, path string
-		body               any
+		name, operation, method, path string
+		body                          any
 	}{
-		{"update", http.MethodPut, "/knowledge/" + ordinary.ID, map[string]any{}},
-		{"manual update", http.MethodPut, "/knowledge/manual/" + ordinary.ID, map[string]any{}},
-		{"image update", http.MethodPut, "/knowledge/image/" + ordinary.ID + "/chunk-1", map[string]any{}},
-		{"reparse", http.MethodPost, "/knowledge/" + ordinary.ID + "/reparse", nil},
-		{"cancel", http.MethodPost, "/knowledge/" + ordinary.ID + "/cancel-parse", nil},
-		{"tags", http.MethodPut, "/knowledge/tags", map[string]any{"updates": map[string][]string{ordinary.ID: {}}}},
-		{"move", http.MethodPost, "/knowledge/move", map[string]any{"source_kb_id": "kb-1", "target_kb_id": "kb-2", "knowledge_ids": []string{ordinary.ID}, "mode": "reparse"}},
+		{"update", "update", http.MethodPut, "/knowledge/" + ordinary.ID, map[string]any{}},
+		{"manual update", "manual", http.MethodPut, "/knowledge/manual/" + ordinary.ID, map[string]any{}},
+		{"image update", "image", http.MethodPut, "/knowledge/image/" + ordinary.ID + "/chunk-1", map[string]any{}},
+		{"reparse", "reparse", http.MethodPost, "/knowledge/" + ordinary.ID + "/reparse", nil},
+		{"cancel", "cancel", http.MethodPost, "/knowledge/" + ordinary.ID + "/cancel-parse", nil},
+		{"tags", "tags", http.MethodPut, "/knowledge/tags", map[string]any{"updates": map[string][]string{ordinary.ID: {}}}},
+		{"move", "move", http.MethodPost, "/knowledge/move", map[string]any{"source_kb_id": "kb-1", "target_kb_id": "kb-2", "knowledge_ids": []string{ordinary.ID}, "mode": "reparse"}},
 	} {
 		t.Run("ordinary "+tc.name, func(t *testing.T) {
 			service := &projectionMutationKnowledgeService{byID: map[string]*types.Knowledge{ordinary.ID: ordinary}}
 			tasks := &projectionMutationTaskEnqueuer{}
 			response := performProjectionMutationRequest(t, newProjectionMutationRouter(service, tasks), tc.method, tc.path, tc.body)
-			require.NotEqual(t, http.StatusConflict, response.Code, response.Body.String())
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assertOnlyProjectionMutationCall(t, service, tc.operation)
+			if tc.operation == "move" {
+				require.Equal(t, int32(1), tasks.calls.Load())
+			} else {
+				require.Zero(t, tasks.calls.Load())
+			}
 		})
 	}
 
@@ -315,4 +344,25 @@ func TestDirectKnowledgeMutationsPermitOrdinaryKnowledgeAndRejectMixedOrUnauthor
 		require.Equal(t, http.StatusForbidden, response.Code, response.Body.String())
 		require.Zero(t, service.mutationCalls())
 	})
+
+	for _, tc := range []struct {
+		name, method, path string
+		body               any
+		want               int
+	}{
+		{"tag missing", http.MethodPut, "/knowledge/tags", map[string]any{"updates": map[string][]string{ordinary.ID: {}, "missing": {}}}, http.StatusNotFound},
+		{"tag cross tenant", http.MethodPut, "/knowledge/tags", map[string]any{"updates": map[string][]string{ordinary.ID: {}, "foreign-1": {}}}, http.StatusForbidden},
+		{"move missing", http.MethodPost, "/knowledge/move", map[string]any{"source_kb_id": "kb-1", "target_kb_id": "kb-2", "knowledge_ids": []string{ordinary.ID, "missing"}, "mode": "reparse"}, http.StatusBadRequest},
+		{"move cross tenant", http.MethodPost, "/knowledge/move", map[string]any{"source_kb_id": "kb-1", "target_kb_id": "kb-2", "knowledge_ids": []string{ordinary.ID, "foreign-1"}, "mode": "reparse"}, http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			foreign := &types.Knowledge{ID: "foreign-1", TenantID: 2, KnowledgeBaseID: "kb-1", ParseStatus: types.ParseStatusCompleted}
+			service := &projectionMutationKnowledgeService{byID: map[string]*types.Knowledge{ordinary.ID: ordinary, foreign.ID: foreign}}
+			tasks := &projectionMutationTaskEnqueuer{}
+			response := performProjectionMutationRequest(t, newProjectionMutationRouter(service, tasks), tc.method, tc.path, tc.body)
+			require.Equal(t, tc.want, response.Code, response.Body.String())
+			require.Zero(t, service.mutationCalls())
+			require.Zero(t, tasks.calls.Load())
+		})
+	}
 }
