@@ -197,7 +197,11 @@ func (p *PluginSearchEntity) OnEvent(ctx context.Context,
 		searchResult := chunk2SearchResult(chunk, knowledgeMap[chunk.KnowledgeID])
 		entityResults = append(entityResults, searchResult)
 	}
-	searchutil.EnrichSearchResultsImageInfo(ctx, p.chunkRepo, types.MustTenantIDFromContext(ctx), entityResults)
+	if err := p.enrichEntityResultsImageInfo(ctx, chunks, entityResults); err != nil {
+		logger.Errorf(ctx, "Failed to enrich entity images, session_id: %s, error: %v", chatManage.SessionID, err)
+		clearEntitySearchResults(chatManage)
+		return next()
+	}
 	chatManage.SearchResult = append(chatManage.SearchResult, entityResults...)
 	// remove duplicate results
 	chatManage.SearchResult = removeDuplicateResults(chatManage.SearchResult)
@@ -246,6 +250,44 @@ func entityOwnerTenants(targets types.SearchTargets, fallback uint64) map[string
 func clearEntitySearchResults(chatManage *types.ChatManage) {
 	chatManage.GraphResult = &types.GraphData{}
 	chatManage.SearchResult = nil
+}
+
+func (p *PluginSearchEntity) enrichEntityResultsImageInfo(
+	ctx context.Context,
+	chunks []*types.Chunk,
+	results []*types.SearchResult,
+) error {
+	type ownerScope struct {
+		tenantID        uint64
+		knowledgeBaseID string
+	}
+	chunksByID := make(map[string]*types.Chunk, len(chunks))
+	for _, chunk := range chunks {
+		if chunk != nil {
+			chunksByID[chunk.ID] = chunk
+		}
+	}
+	groups := make(map[ownerScope][]*types.SearchResult)
+	for _, result := range results {
+		if result == nil {
+			return fmt.Errorf("entity image enrichment received nil result")
+		}
+		chunk := chunksByID[result.ID]
+		if chunk == nil || chunk.TenantID == 0 || chunk.KnowledgeBaseID == "" || result.KnowledgeBaseID != chunk.KnowledgeBaseID {
+			return fmt.Errorf("entity image enrichment has incomplete owner provenance")
+		}
+		scope := ownerScope{tenantID: chunk.TenantID, knowledgeBaseID: chunk.KnowledgeBaseID}
+		groups[scope] = append(groups[scope], result)
+	}
+	for scope, scopedResults := range groups {
+		ownerCtx := context.WithValue(ctx, types.TenantIDContextKey, scope.tenantID)
+		if err := searchutil.EnrichSearchResultsImageInfoInScope(
+			ownerCtx, p.chunkRepo, scope.tenantID, scope.knowledgeBaseID, scopedResults,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (p *PluginSearchEntity) listEntityChunks(ctx context.Context, chunkTenants map[string]uint64, chunkKnowledgeBases map[string]string, ids []string) ([]*types.Chunk, error) {

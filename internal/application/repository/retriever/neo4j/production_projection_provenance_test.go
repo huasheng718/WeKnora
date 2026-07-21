@@ -34,3 +34,39 @@ func TestGraphPropertyStringsRejectsMalformedKnowledgeProvenance(t *testing.T) {
 	require.Nil(t, graphPropertyStrings(map[string]any{"kg": []any{"knowledge-1", 42}}, "kg"))
 	require.Nil(t, graphPropertyStrings(map[string]any{"kg": []string{"knowledge-1", ""}}, "kg"))
 }
+
+func TestGraphDataFromSearchRowsAggregatesSameNameEvidenceRegardlessOfOrder(t *testing.T) {
+	active := graphSearchRow{
+		Source:   &types.GraphNode{Name: "shared", Chunks: []string{"chunk-active", "chunk-active"}, Attributes: []string{"active-attribute"}},
+		Target:   &types.GraphNode{Name: "peer", Chunks: []string{"chunk-peer-active"}},
+		Relation: &types.GraphRelation{Node1: "shared", Node2: "peer", Type: "related", KnowledgeIDs: []string{"knowledge-active"}},
+	}
+	inactive := graphSearchRow{
+		Source:   &types.GraphNode{Name: "shared", Chunks: []string{"chunk-old"}, Attributes: []string{"old-attribute"}},
+		Target:   &types.GraphNode{Name: "peer", Chunks: []string{"chunk-peer-old"}},
+		Relation: &types.GraphRelation{Node1: "shared", Node2: "peer", Type: "related", KnowledgeIDs: []string{"knowledge-old"}},
+	}
+	for _, tc := range []struct {
+		name string
+		rows []graphSearchRow
+	}{
+		{name: "active first", rows: []graphSearchRow{active, inactive}},
+		{name: "inactive first", rows: []graphSearchRow{inactive, active}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			graph := graphDataFromSearchRows(tc.rows)
+			require.Len(t, graph.Node, 2)
+			nodes := map[string]*types.GraphNode{}
+			for _, node := range graph.Node {
+				nodes[node.Name] = node
+			}
+			require.ElementsMatch(t, []string{"chunk-active", "chunk-old"}, nodes["shared"].Chunks)
+			require.ElementsMatch(t, []string{"active-attribute", "old-attribute"}, nodes["shared"].Attributes)
+			require.ElementsMatch(t, []string{"chunk-peer-active", "chunk-peer-old"}, nodes["peer"].Chunks)
+			require.Len(t, graph.Relation, 2)
+			require.ElementsMatch(t, []string{"knowledge-active", "knowledge-old"}, []string{
+				graph.Relation[0].KnowledgeIDs[0], graph.Relation[1].KnowledgeIDs[0],
+			})
+		})
+	}
+}

@@ -28,12 +28,61 @@ func CollectImageInfoByChunkIDs(
 	tenantID uint64,
 	chunkIDs []string,
 ) map[string]string {
+	result, _ := collectImageInfoByChunkIDs(ctx, chunkRepo, tenantID, "", chunkIDs, false)
+	return result
+}
+
+// CollectImageInfoByChunkIDsInScope collects image metadata while requiring
+// every returned child to remain within the authorized tenant and KB.
+func CollectImageInfoByChunkIDsInScope(
+	ctx context.Context,
+	chunkRepo interfaces.ChunkRepository,
+	tenantID uint64,
+	knowledgeBaseID string,
+	chunkIDs []string,
+) (map[string]string, error) {
+	if tenantID == 0 || strings.TrimSpace(knowledgeBaseID) == "" {
+		return nil, fmt.Errorf("image enrichment requires an authorized tenant and knowledge base")
+	}
+	return collectImageInfoByChunkIDs(ctx, chunkRepo, tenantID, knowledgeBaseID, chunkIDs, true)
+}
+
+func collectImageInfoByChunkIDs(
+	ctx context.Context,
+	chunkRepo interfaces.ChunkRepository,
+	tenantID uint64,
+	knowledgeBaseID string,
+	chunkIDs []string,
+	strictScope bool,
+) (map[string]string, error) {
 	if len(chunkIDs) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	children, err := chunkRepo.ListChunksByParentIDs(ctx, tenantID, chunkIDs)
-	if err != nil || len(children) == 0 {
+	if err != nil {
+		if strictScope {
+			return nil, err
+		}
+		return nil, nil
+	}
+	if len(children) == 0 {
+		return nil, nil
+	}
+	requestedParents := make(map[string]struct{}, len(chunkIDs))
+	for _, id := range chunkIDs {
+		requestedParents[id] = struct{}{}
+	}
+	validateChild := func(child *types.Chunk, parents map[string]struct{}) error {
+		if child == nil {
+			return fmt.Errorf("image enrichment dependency returned nil child")
+		}
+		if _, ok := parents[child.ParentChunkID]; !ok {
+			return fmt.Errorf("image enrichment child has unexpected parent")
+		}
+		if strictScope && (child.TenantID != tenantID || child.KnowledgeBaseID != knowledgeBaseID) {
+			return fmt.Errorf("image enrichment child scope mismatch")
+		}
 		return nil
 	}
 
@@ -82,6 +131,12 @@ func CollectImageInfoByChunkIDs(
 	textToParent := make(map[string]string)
 
 	for _, child := range children {
+		if err := validateChild(child, requestedParents); err != nil {
+			if strictScope {
+				return nil, err
+			}
+			continue
+		}
 		switch child.ChunkType {
 		case types.ChunkTypeImageOCR, types.ChunkTypeImageCaption:
 			addInfo(child.ParentChunkID, child)
@@ -93,14 +148,28 @@ func CollectImageInfoByChunkIDs(
 
 	if len(textChildIDs) > 0 {
 		grandChildren, err := chunkRepo.ListChunksByParentIDs(ctx, tenantID, textChildIDs)
-		if err == nil {
-			for _, gc := range grandChildren {
-				if gc.ChunkType != types.ChunkTypeImageOCR && gc.ChunkType != types.ChunkTypeImageCaption {
-					continue
+		if err != nil {
+			if strictScope {
+				return nil, err
+			}
+			grandChildren = nil
+		}
+		textParents := make(map[string]struct{}, len(textChildIDs))
+		for _, id := range textChildIDs {
+			textParents[id] = struct{}{}
+		}
+		for _, gc := range grandChildren {
+			if err := validateChild(gc, textParents); err != nil {
+				if strictScope {
+					return nil, err
 				}
-				if parentTextID, ok := textToParent[gc.ParentChunkID]; ok {
-					addInfo(parentTextID, gc)
-				}
+				continue
+			}
+			if gc.ChunkType != types.ChunkTypeImageOCR && gc.ChunkType != types.ChunkTypeImageCaption {
+				continue
+			}
+			if parentTextID, ok := textToParent[gc.ParentChunkID]; ok {
+				addInfo(parentTextID, gc)
 			}
 		}
 	}
@@ -120,7 +189,7 @@ func CollectImageInfoByChunkIDs(
 		}
 		out[id] = string(data)
 	}
-	return out
+	return out, nil
 }
 
 // EnrichSearchResultsImageInfo fills in ImageInfo for SearchResults that have
@@ -159,6 +228,41 @@ func EnrichSearchResultsImageInfo(
 			r.ImageInfo = merged
 		}
 	}
+}
+
+// EnrichSearchResultsImageInfoInScope enriches results only from children
+// validated against one authorized tenant and knowledge base.
+func EnrichSearchResultsImageInfoInScope(
+	ctx context.Context,
+	chunkRepo interfaces.ChunkRepository,
+	tenantID uint64,
+	knowledgeBaseID string,
+	results []*types.SearchResult,
+) error {
+	var chunkIDs []string
+	seen := make(map[string]bool)
+	for _, result := range results {
+		if result == nil {
+			return fmt.Errorf("image enrichment received nil search result")
+		}
+		if result.ImageInfo == "" && !seen[result.ID] {
+			seen[result.ID] = true
+			chunkIDs = append(chunkIDs, result.ID)
+		}
+	}
+	if len(chunkIDs) == 0 {
+		return nil
+	}
+	infoMap, err := CollectImageInfoByChunkIDsInScope(ctx, chunkRepo, tenantID, knowledgeBaseID, chunkIDs)
+	if err != nil {
+		return err
+	}
+	for _, result := range results {
+		if result.ImageInfo == "" {
+			result.ImageInfo = infoMap[result.ID]
+		}
+	}
+	return nil
 }
 
 // MergeImageInfoJSON combines per-chunk image_info JSON strings (from

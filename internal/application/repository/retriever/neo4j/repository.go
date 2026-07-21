@@ -169,6 +169,58 @@ func (n *Neo4jRepository) DelGraph(ctx context.Context, namespaces []types.NameS
 	return nil
 }
 
+type graphSearchRow struct {
+	Source   *types.GraphNode
+	Target   *types.GraphNode
+	Relation *types.GraphRelation
+}
+
+func graphDataFromSearchRows(rows []graphSearchRow) *types.GraphData {
+	graph := &types.GraphData{}
+	nodesByName := make(map[string]*types.GraphNode)
+	mergeNode := func(node *types.GraphNode) {
+		if node == nil || node.Name == "" {
+			return
+		}
+		existing := nodesByName[node.Name]
+		if existing == nil {
+			copy := *node
+			copy.Chunks = appendUniqueGraphStrings(nil, node.Chunks)
+			copy.Attributes = appendUniqueGraphStrings(nil, node.Attributes)
+			nodesByName[node.Name] = &copy
+			graph.Node = append(graph.Node, &copy)
+			return
+		}
+		existing.Chunks = appendUniqueGraphStrings(existing.Chunks, node.Chunks)
+		existing.Attributes = appendUniqueGraphStrings(existing.Attributes, node.Attributes)
+	}
+	for _, row := range rows {
+		mergeNode(row.Source)
+		mergeNode(row.Target)
+		if row.Relation != nil {
+			copy := *row.Relation
+			copy.KnowledgeIDs = append([]string(nil), row.Relation.KnowledgeIDs...)
+			graph.Relation = append(graph.Relation, &copy)
+		}
+	}
+	return graph
+}
+
+func appendUniqueGraphStrings(existing, additions []string) []string {
+	seen := make(map[string]struct{}, len(existing)+len(additions))
+	for _, value := range existing {
+		seen[value] = struct{}{}
+	}
+	for _, value := range additions {
+		if _, duplicate := seen[value]; duplicate {
+			continue
+		}
+		seen[value] = struct{}{}
+		existing = append(existing, value)
+	}
+	return existing
+}
+
 // SearchNode searches for nodes in the Neo4j repository
 func (n *Neo4jRepository) SearchNode(
 	ctx context.Context,
@@ -195,8 +247,7 @@ func (n *Neo4jRepository) SearchNode(
 			return nil, fmt.Errorf("failed to run query: %v", err)
 		}
 
-		graphData := &types.GraphData{}
-		nodeSeen := make(map[string]bool)
+		rows := make([]graphSearchRow, 0)
 		for result.Next(ctx) {
 			record := result.Record()
 			node, _ := record.Get("n")
@@ -206,29 +257,27 @@ func (n *Neo4jRepository) SearchNode(
 			nodeData := node.(neo4j.Node)
 			targetNodeData := targetNode.(neo4j.Node)
 
-			// Convert node to types.Node
-			for _, n := range []neo4j.Node{nodeData, targetNodeData} {
-				nameStr := n.Props["name"].(string)
-				if _, ok := nodeSeen[nameStr]; !ok {
-					nodeSeen[nameStr] = true
-					graphData.Node = append(graphData.Node, &types.GraphNode{
-						Name:       nameStr,
-						Chunks:     listI2listS(n.Props["chunks"].([]interface{})),
-						Attributes: listI2listS(n.Props["attributes"].([]interface{})),
-					})
-				}
-			}
-
-			// Convert relationship to types.Relation
 			relData := rel.(neo4j.Relationship)
-			graphData.Relation = append(graphData.Relation, &types.GraphRelation{
-				Node1:        nodeData.Props["name"].(string),
-				Node2:        targetNodeData.Props["name"].(string),
-				Type:         relData.Type,
-				KnowledgeIDs: graphPropertyStrings(relData.Props, "kg"),
+			rows = append(rows, graphSearchRow{
+				Source: &types.GraphNode{
+					Name:       nodeData.Props["name"].(string),
+					Chunks:     listI2listS(nodeData.Props["chunks"].([]interface{})),
+					Attributes: listI2listS(nodeData.Props["attributes"].([]interface{})),
+				},
+				Target: &types.GraphNode{
+					Name:       targetNodeData.Props["name"].(string),
+					Chunks:     listI2listS(targetNodeData.Props["chunks"].([]interface{})),
+					Attributes: listI2listS(targetNodeData.Props["attributes"].([]interface{})),
+				},
+				Relation: &types.GraphRelation{
+					Node1:        nodeData.Props["name"].(string),
+					Node2:        targetNodeData.Props["name"].(string),
+					Type:         relData.Type,
+					KnowledgeIDs: graphPropertyStrings(relData.Props, "kg"),
+				},
 			})
 		}
-		return graphData, nil
+		return graphDataFromSearchRows(rows), nil
 	})
 	if err != nil {
 		logger.Errorf(ctx, "search node failed: %v", err)

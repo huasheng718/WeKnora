@@ -42,8 +42,16 @@ func TestEntitySearchRejectsSameTenantWrongKnowledgeBaseBackReference(t *testing
 
 type projectionEntityChunkRepo struct {
 	interfaces.ChunkRepository
-	chunks []*types.Chunk
-	err    error
+	chunks      []*types.Chunk
+	children    []*types.Chunk
+	err         error
+	parentCalls []projectionEntityParentCall
+}
+
+type projectionEntityParentCall struct {
+	tenantID        uint64
+	contextTenantID uint64
+	parentIDs       []string
 }
 
 func (r *projectionEntityChunkRepo) ListChunksByID(_ context.Context, _ uint64, ids []string) ([]*types.Chunk, error) {
@@ -58,6 +66,23 @@ func (r *projectionEntityChunkRepo) ListChunksByID(_ context.Context, _ uint64, 
 	for _, chunk := range r.chunks {
 		if _, ok := wanted[chunk.ID]; ok {
 			result = append(result, chunk)
+		}
+	}
+	return result, nil
+}
+
+func (r *projectionEntityChunkRepo) ListChunksByParentIDs(ctx context.Context, tenantID uint64, parentIDs []string) ([]*types.Chunk, error) {
+	r.parentCalls = append(r.parentCalls, projectionEntityParentCall{
+		tenantID: tenantID, contextTenantID: types.MustTenantIDFromContext(ctx), parentIDs: append([]string(nil), parentIDs...),
+	})
+	wanted := make(map[string]struct{}, len(parentIDs))
+	for _, id := range parentIDs {
+		wanted[id] = struct{}{}
+	}
+	var result []*types.Chunk
+	for _, child := range r.children {
+		if _, ok := wanted[child.ParentChunkID]; ok {
+			result = append(result, child)
 		}
 	}
 	return result, nil
@@ -116,6 +141,52 @@ func TestEntitySearchPrunesInactiveProductionProjectionGraphAndChunks(t *testing
 	require.Equal(t, "knowledge-active", chat.SearchResult[0].KnowledgeID)
 }
 
+type sameNameProjectionEntityGraphRepo struct {
+	interfaces.RetrieveGraphRepository
+}
+
+func (*sameNameProjectionEntityGraphRepo) SearchNode(context.Context, types.NameSpace, []string) (*types.GraphData, error) {
+	return &types.GraphData{
+		Node: []*types.GraphNode{
+			{Name: "shared", Chunks: []string{"chunk-old", "chunk-active"}},
+			{Name: "peer", Chunks: []string{"chunk-old", "chunk-active"}},
+		},
+		Relation: []*types.GraphRelation{
+			{Node1: "shared", Node2: "peer", Type: "related", KnowledgeIDs: []string{"knowledge-old"}},
+			{Node1: "shared", Node2: "peer", Type: "related", KnowledgeIDs: []string{"knowledge-active"}},
+		},
+	}, nil
+}
+
+func TestEntitySearchPreservesActiveSameNameRelationAndEvidence(t *testing.T) {
+	chunks := []*types.Chunk{
+		{ID: "chunk-active", TenantID: 7, KnowledgeID: "knowledge-active", KnowledgeBaseID: "kb-1", ImageInfo: "[]"},
+		{ID: "chunk-old", TenantID: 7, KnowledgeID: "knowledge-old", KnowledgeBaseID: "kb-1", ImageInfo: "[]"},
+	}
+	p := &PluginSearchEntity{
+		graphRepo:     &sameNameProjectionEntityGraphRepo{},
+		chunkRepo:     &projectionEntityChunkRepo{chunks: chunks},
+		knowledgeRepo: &projectionEntityKnowledgeRepo{rows: []*types.Knowledge{{ID: "knowledge-active", TenantID: 7, KnowledgeBaseID: "kb-1"}}},
+	}
+	chat := &types.ChatManage{
+		PipelineRequest: types.PipelineRequest{TenantID: 7, SearchTargets: types.SearchTargets{&types.SearchTarget{
+			Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-1", TenantID: 7,
+			ExcludeKnowledgeIDs: []string{"knowledge-old"},
+		}}},
+		PipelineState: types.PipelineState{Entity: []string{"term"}, EntityKBIDs: []string{"kb-1"}},
+	}
+	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(7))
+	require.Nil(t, p.OnEvent(ctx, types.ENTITY_SEARCH, chat, func() *PluginError { return nil }))
+	require.Len(t, chat.GraphResult.Node, 2)
+	for _, node := range chat.GraphResult.Node {
+		require.Equal(t, []string{"chunk-active"}, node.Chunks)
+	}
+	require.Len(t, chat.GraphResult.Relation, 1)
+	require.Equal(t, []string{"knowledge-active"}, chat.GraphResult.Relation[0].KnowledgeIDs)
+	require.Len(t, chat.SearchResult, 1)
+	require.Equal(t, "knowledge-active", chat.SearchResult[0].KnowledgeID)
+}
+
 func TestEntitySearchPreservesAuthorizedCrossTenantSharedKnowledgeBase(t *testing.T) {
 	chunks := []*types.Chunk{
 		{ID: "chunk-active", TenantID: 200, KnowledgeID: "knowledge-active", KnowledgeBaseID: "kb-shared", ImageInfo: "[]"},
@@ -140,6 +211,75 @@ func TestEntitySearchPreservesAuthorizedCrossTenantSharedKnowledgeBase(t *testin
 	require.Len(t, chat.SearchResult, 1)
 	require.Equal(t, "knowledge-active", chat.SearchResult[0].KnowledgeID)
 	require.Equal(t, "kb-shared", chat.SearchResult[0].KnowledgeBaseID)
+}
+
+type singleProjectionEntityGraphRepo struct {
+	interfaces.RetrieveGraphRepository
+}
+
+func (*singleProjectionEntityGraphRepo) SearchNode(context.Context, types.NameSpace, []string) (*types.GraphData, error) {
+	return &types.GraphData{Node: []*types.GraphNode{{Name: "active", Chunks: []string{"chunk-active"}}}}, nil
+}
+
+func TestEntitySearchEnrichesSharedKnowledgeImagesUnderOwnerScope(t *testing.T) {
+	chunkRepo := &projectionEntityChunkRepo{
+		chunks: []*types.Chunk{{ID: "chunk-active", TenantID: 200, KnowledgeID: "knowledge-active", KnowledgeBaseID: "kb-shared"}},
+		children: []*types.Chunk{{
+			ID: "image-owner", ParentChunkID: "chunk-active", ChunkType: types.ChunkTypeImageOCR,
+			TenantID: 200, KnowledgeID: "knowledge-active", KnowledgeBaseID: "kb-shared",
+			ImageInfo: `[{"url":"https://owner/image.png","ocr_text":"owner OCR"}]`,
+		}},
+	}
+	p := &PluginSearchEntity{
+		graphRepo:     &singleProjectionEntityGraphRepo{},
+		chunkRepo:     chunkRepo,
+		knowledgeRepo: &projectionEntityKnowledgeRepo{rows: []*types.Knowledge{{ID: "knowledge-active", TenantID: 200, KnowledgeBaseID: "kb-shared"}}},
+	}
+	chat := &types.ChatManage{
+		PipelineRequest: types.PipelineRequest{TenantID: 7, SearchTargets: types.SearchTargets{&types.SearchTarget{
+			Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-shared", TenantID: 200,
+		}}},
+		PipelineState: types.PipelineState{Entity: []string{"term"}, EntityKBIDs: []string{"kb-shared"}},
+	}
+	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(7))
+	require.Nil(t, p.OnEvent(ctx, types.ENTITY_SEARCH, chat, func() *PluginError { return nil }))
+	require.Len(t, chat.SearchResult, 1)
+	require.Contains(t, chat.SearchResult[0].ImageInfo, "owner OCR")
+	require.Len(t, chunkRepo.parentCalls, 1)
+	require.Equal(t, uint64(200), chunkRepo.parentCalls[0].tenantID)
+	require.Equal(t, uint64(200), chunkRepo.parentCalls[0].contextTenantID)
+}
+
+func TestEntitySearchFailsClosedOnWrongScopeImageChild(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		child *types.Chunk
+	}{
+		{name: "wrong tenant", child: &types.Chunk{ID: "image-wrong-tenant", ParentChunkID: "chunk-active", ChunkType: types.ChunkTypeImageOCR, TenantID: 7, KnowledgeID: "knowledge-active", KnowledgeBaseID: "kb-shared", ImageInfo: `[{"url":"https://wrong/tenant.png"}]`}},
+		{name: "wrong knowledge base", child: &types.Chunk{ID: "image-wrong-kb", ParentChunkID: "chunk-active", ChunkType: types.ChunkTypeImageCaption, TenantID: 200, KnowledgeID: "knowledge-active", KnowledgeBaseID: "kb-wrong", ImageInfo: `[{"url":"https://wrong/kb.png"}]`}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			chunkRepo := &projectionEntityChunkRepo{
+				chunks:   []*types.Chunk{{ID: "chunk-active", TenantID: 200, KnowledgeID: "knowledge-active", KnowledgeBaseID: "kb-shared"}},
+				children: []*types.Chunk{tc.child},
+			}
+			p := &PluginSearchEntity{
+				graphRepo:     &singleProjectionEntityGraphRepo{},
+				chunkRepo:     chunkRepo,
+				knowledgeRepo: &projectionEntityKnowledgeRepo{rows: []*types.Knowledge{{ID: "knowledge-active", TenantID: 200, KnowledgeBaseID: "kb-shared"}}},
+			}
+			chat := &types.ChatManage{
+				PipelineRequest: types.PipelineRequest{TenantID: 7, SearchTargets: types.SearchTargets{&types.SearchTarget{
+					Type: types.SearchTargetTypeKnowledgeBase, KnowledgeBaseID: "kb-shared", TenantID: 200,
+				}}},
+				PipelineState: types.PipelineState{Entity: []string{"term"}, EntityKBIDs: []string{"kb-shared"}},
+			}
+			ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(7))
+			_ = p.OnEvent(ctx, types.ENTITY_SEARCH, chat, func() *PluginError { return nil })
+			require.Empty(t, chat.GraphResult.Node)
+			require.Empty(t, chat.SearchResult)
+		})
+	}
 }
 
 func TestEntitySearchFailsClosedOnMissingOrErroredProvenanceDependency(t *testing.T) {
