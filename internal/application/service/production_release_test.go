@@ -9,10 +9,13 @@ import (
 	"testing"
 	"time"
 
+	apprepository "github.com/Tencent/WeKnora/internal/application/repository"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/hibiken/asynq"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 )
 
 type productionReleaseRepoStub struct {
@@ -291,12 +294,25 @@ func (s productionReleaseMembershipStub) GetMembership(context.Context, string, 
 
 type productionReleaseKBStub struct {
 	interfaces.KnowledgeBaseService
-	kb *types.KnowledgeBase
+	kb  *types.KnowledgeBase
+	err error
 }
 
 func (s productionReleaseKBStub) GetKnowledgeBaseByIDOnly(context.Context, string) (*types.KnowledgeBase, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
 	copy := *s.kb
 	return &copy, nil
+}
+
+type productionReleaseKBRepositoryBoundary struct {
+	interfaces.KnowledgeBaseService
+	repo interfaces.KnowledgeBaseRepository
+}
+
+func (s productionReleaseKBRepositoryBoundary) GetKnowledgeBaseByIDOnly(ctx context.Context, id string) (*types.KnowledgeBase, error) {
+	return s.repo.GetKnowledgeBaseByID(ctx, id)
 }
 
 type productionReleaseModelStub struct{ interfaces.ModelService }
@@ -636,6 +652,24 @@ func TestProductionReleasePrepareRequiresPublisherAndOwnedWritableKB(t *testing.
 	svc.authorizer = productionReleaseAuthorizerStub{}
 	svc.kbs = productionReleaseKBStub{kb: &types.KnowledgeBase{ID: "kb-1", TenantID: 8, Type: types.KnowledgeBaseTypeDocument}}
 	_, err = svc.Prepare(productionReleaseContext(), "document-1", "version-3", []string{"kb-1"})
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
+}
+
+func TestProductionReleaseWritableTargetKBNormalizesConcreteRepositoryNotFoundAndForeignTenant(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&types.KnowledgeBase{}))
+	repo := apprepository.NewKnowledgeBaseRepository(db)
+
+	svc, _, _ := newProductionReleaseServiceFixture(t)
+	svc.kbs = productionReleaseKBRepositoryBoundary{repo: repo}
+
+	_, err = svc.requireWritableTargetKB(productionReleaseContext(), 7, "00000000-0000-4000-8000-000000000007", "missing-kb")
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
+
+	foreign := &types.KnowledgeBase{ID: "foreign-kb", TenantID: 8, CreatorID: "foreign-user", Type: types.KnowledgeBaseTypeDocument}
+	require.NoError(t, repo.CreateKnowledgeBase(context.Background(), foreign))
+	_, err = svc.requireWritableTargetKB(productionReleaseContext(), 7, "00000000-0000-4000-8000-000000000007", foreign.ID)
 	require.ErrorIs(t, err, types.ErrProductionForbidden)
 }
 

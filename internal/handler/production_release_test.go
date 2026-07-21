@@ -131,4 +131,16 @@ func TestProductionReleaseHandlerRejectsInvalidRequestsAndMapsGovernanceErrors(t
 	require.Equal(t, http.StatusBadRequest, invalid.Code)
 }
 
+func TestProductionReleaseCreateMapsStaleReviewScopeToConflict(t *testing.T) {
+	service := &productionReleaseServiceStub{prepareErr: types.ErrProductionReviewScopeInvalid}
+	h := NewProductionReleaseHandler(service)
+	response := performProductionHandlerRequest(
+		http.MethodPost, "/production/documents/:id/releases",
+		"/production/documents/"+productionProjectID+"/releases",
+		`{"version_id":"`+productionDocumentTypeID+`","target_knowledge_base_ids":["`+productionReviewerID+`"]}`,
+		h.Create,
+	)
+	require.Equal(t, http.StatusConflict, response.Code, response.Body.String())
+}
+
 var _ ProductionReleaseService = (*productionReleaseServiceStub)(nil)

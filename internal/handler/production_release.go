@@ -156,6 +156,7 @@ func handleProductionReleaseServiceError(c *gin.Context, err error, message stri
 		errors.Is(err, types.ErrProductionProjectionConflict),
 		errors.Is(err, types.ErrProductionProjectionInactive),
 		errors.Is(err, types.ErrProductionReleaseReprepareRequired),
+		errors.Is(err, types.ErrProductionReviewScopeInvalid),
 		errors.Is(err, types.ErrProductionConflict):
 		c.Error(apperrors.NewConflictError("production release state conflict"))
 	case errors.Is(err, types.ErrProductionReleaseInvalid),

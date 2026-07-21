@@ -818,6 +818,9 @@ func (s *ProductionReleaseService) authorizeTarget(ctx context.Context, targetID
 func (s *ProductionReleaseService) requireWritableTargetKB(ctx context.Context, tenantID uint64, actorID, kbID string) (*types.KnowledgeBase, error) {
 	kb, err := s.kbs.GetKnowledgeBaseByIDOnly(ctx, kbID)
 	if err != nil {
+		if errors.Is(err, apprepository.ErrKnowledgeBaseNotFound) {
+			return nil, types.ErrProductionForbidden
+		}
 		return nil, err
 	}
 	if kb == nil || kb.ID != kbID || kb.TenantID != tenantID || kb.Type != types.KnowledgeBaseTypeDocument || kb.IsTemporary {
