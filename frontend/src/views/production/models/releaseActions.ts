@@ -12,7 +12,6 @@ const TENANT_LEVEL: Record<TenantRole, number> = { viewer: 10, contributor: 20, 
 export function releaseActions(target: Pick<ProductionReleaseTarget, 'status' | 'retention_until'>, now = new Date()): ProductionReleaseAction[] {
   if (target.status === 'failed') return ['retry']
   if (target.status === 'ready') return ['activate']
-  if (target.status === 'active') return ['rollback']
   if (target.status === 'rolled_back' && target.retention_until && Date.parse(target.retention_until) > now.getTime()) return ['rollback']
   return []
 }

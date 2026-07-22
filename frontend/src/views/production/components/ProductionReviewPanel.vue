@@ -35,24 +35,28 @@ import type { TenantRole } from '@/api/tenant/members'
 import { cancelProductionReview, decideProductionReviewStep, listProductionDocumentReviews, rejectProductionReview, submitProductionReview, type ProductionProjectRole, type ProductionReview, type ProductionReviewStep } from '@/api/production'
 import { createProductionCommand, type ProductionCommand } from '@/api/production/idempotency'
 import { reviewStepActions, reviewSubmitGate, reviewTerminalActions } from '../models/reviewGate'
+import { createLatestRequestCoordinator } from '../models/latestRequestCoordinator'
+import { commandForReviewVersion, type ReviewVersionCommand } from '../models/reviewLifecycle'
 import { createScopedMutationCoordinator } from '../models/scopedMutationCoordinator'
 const props = defineProps<{ documentId: string; versionId: string; frozen: boolean; current: boolean; openBlocking: number; tenantRole: TenantRole | ''; projectRoles: ProductionProjectRole[] }>()
 const emit = defineEmits<{ (event: 'changed'): void }>()
 const { t, locale } = useI18n()
 const reviews = shallowRef<ProductionReview[]>([]); const loading = ref(false); const submitting = ref(false); const error = ref(''); const page = ref(1); const hasMore = ref(false)
 const mutationCoordinator = createScopedMutationCoordinator()
-let submitCommand: ProductionCommand<{ version_id: string }> | null = null
+const loadCoordinator = createLatestRequestCoordinator()
+let submitCommand: ReviewVersionCommand<ProductionCommand<{ version_id: string }>> | null = null
 const commands = new Map<string, ProductionCommand<any>>()
 const pending = computed(() => reviews.value.find(row => row.status === 'pending'))
 const submitGate = computed(() => reviewSubmitGate({ openBlocking: props.openBlocking, frozen: props.frozen, current: props.current, reviewStatus: pending.value?.status, tenantRole: props.tenantRole, projectRoles: props.projectRoles }))
 const submitReason = computed(() => submitGate.value.reason ? t(`production.reviewConsole.gates.${submitGate.value.reason}`) : t('production.reviewConsole.submit'))
 function formatDate(value: string) { return new Intl.DateTimeFormat(locale.value, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value)) }
-async function load(next = 1, append = false) { if (!props.documentId) return; loading.value = true; try { const r = await listProductionDocumentReviews(props.documentId, next, 20); if (!r.success) throw new Error(r.message); reviews.value = append ? [...reviews.value, ...(r.data ?? [])] : (r.data ?? []); page.value = next; hasMore.value = r.has_more } catch (e) { error.value = e instanceof Error ? e.message : t('production.reviewConsole.loadFailed') } finally { loading.value = false } }
-async function submit() { if (!submitGate.value.allowed) return; const mutation = mutationCoordinator.start(props.documentId); submitCommand ??= createProductionCommand({ version_id: props.versionId }); submitting.value = true; try { await submitProductionReview(props.documentId, submitCommand); if (mutationCoordinator.isCurrent(mutation, props.documentId)) { submitCommand = null; await load(); emit('changed') } } catch (e) { error.value = e instanceof Error ? e.message : t('production.reviewConsole.commandFailed') } finally { if (mutationCoordinator.isCurrent(mutation, props.documentId)) submitting.value = false } }
+async function load(next = 1, append = false) { const documentId = props.documentId; if (!documentId) return; loading.value = true; error.value = ''; await loadCoordinator.run(async () => { const response = await listProductionDocumentReviews(documentId, next, 20); if (!response.success) throw new Error(response.message); return response }, { success: response => { reviews.value = append ? [...reviews.value, ...(response.data ?? [])] : (response.data ?? []); page.value = next; hasMore.value = response.has_more }, error: cause => { error.value = cause instanceof Error ? cause.message : t('production.reviewConsole.loadFailed') }, settled: () => { loading.value = false } }) }
+async function submit() { if (!submitGate.value.allowed) return; const mutation = mutationCoordinator.start(props.documentId); submitCommand = commandForReviewVersion(props.versionId, submitCommand, () => createProductionCommand({ version_id: props.versionId })); submitting.value = true; try { await submitProductionReview(props.documentId, submitCommand.command); if (mutationCoordinator.isCurrent(mutation, props.documentId)) { submitCommand = null; await load(); emit('changed') } } catch (e) { error.value = e instanceof Error ? e.message : t('production.reviewConsole.commandFailed') } finally { if (mutationCoordinator.isCurrent(mutation, props.documentId)) submitting.value = false } }
 async function decide(review: ProductionReview, step: ProductionReviewStep, decision: 'approved' | 'changes_requested' | 'rejected') { const comment = decision === 'approved' ? '' : t('production.reviewConsole.defaultComment'); const key = `${step.id}:${decision}:${comment}`; const command = commands.get(key) ?? createProductionCommand({ decision, comment }); commands.set(key, command); try { await decideProductionReviewStep(review.id, step.id, command); commands.delete(key); await load(); emit('changed') } catch (e) { MessagePlugin.error(e instanceof Error ? e.message : t('production.reviewConsole.commandFailed')) } }
 function terminal(review: ProductionReview, action: 'reject' | 'cancel') { const dialog = DialogPlugin.confirm({ header: t(`production.reviewConsole.confirm.${action}`), body: t('production.reviewConsole.confirm.body'), onConfirm: async () => { const reason = t('production.reviewConsole.defaultComment'); const key = `${review.id}:${action}:${reason}`; const command = commands.get(key) ?? createProductionCommand({ reason }); commands.set(key, command); try { if (action === 'reject') await rejectProductionReview(review.id, command); else await cancelProductionReview(review.id, command); commands.delete(key); await load(); emit('changed') } finally { dialog.destroy() } }, onCancel: () => dialog.destroy() }) }
-watch(() => props.documentId, () => { mutationCoordinator.invalidate(); reviews.value = []; submitCommand = null; load() }, { immediate: true })
-onBeforeUnmount(() => mutationCoordinator.invalidate())
+watch(() => props.documentId, () => { mutationCoordinator.invalidate(); loadCoordinator.invalidate(); reviews.value = []; submitCommand = null; load() }, { immediate: true })
+watch(() => props.versionId, () => { mutationCoordinator.invalidate(); submitCommand = null })
+onBeforeUnmount(() => { mutationCoordinator.invalidate(); loadCoordinator.invalidate() })
 </script>
 <style scoped>
 .review-panel { min-width: 0; border-bottom: 1px solid var(--td-component-stroke); }

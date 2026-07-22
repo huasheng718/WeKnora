@@ -6,11 +6,12 @@ function source(path: string) { return readFileSync(new URL(path, import.meta.ur
 
 test('review panel exposes role-aware governed commands with lifecycle coordination', () => {
   const panel = source('./components/ProductionReviewPanel.vue')
-  for (const contract of ['reviewSubmitGate', 'reviewStepActions', 'reviewTerminalActions', 'createScopedMutationCoordinator', 'createProductionCommand']) {
+  for (const contract of ['reviewSubmitGate', 'reviewStepActions', 'reviewTerminalActions', 'createScopedMutationCoordinator', 'createLatestRequestCoordinator', 'commandForReviewVersion']) {
     assert.match(panel, new RegExp(contract))
   }
-  assert.match(panel, /onBeforeUnmount\(\(\) => mutationCoordinator\.invalidate\(\)\)/)
+  assert.match(panel, /onBeforeUnmount\(\(\) => \{ mutationCoordinator\.invalidate\(\); loadCoordinator\.invalidate\(\) \}\)/)
   assert.match(panel, /listProductionDocumentReviews/)
+  assert.match(panel, /props\.versionId/)
 })
 
 test('release dialog uses paged authoritative preflight and stable create commands', () => {
@@ -25,10 +26,11 @@ test('release dialog uses paged authoritative preflight and stable create comman
 
 test('release status uses lifecycle actions, head locks, and rollback confirmation', () => {
   const status = source('./components/ProductionReleaseStatus.vue')
-  for (const contract of ['releaseActions', 'activateProductionReleaseTarget', 'retryProductionReleaseTarget', 'rollbackProductionReleaseTarget', 'head_lock_version']) {
+  for (const contract of ['releaseActions', 'releaseHistoryPage', 'appendReleaseHistory', 'createLatestRequestCoordinator', 'activateProductionReleaseTarget', 'retryProductionReleaseTarget', 'rollbackProductionReleaseTarget', 'head_lock_version']) {
     assert.match(status, new RegExp(contract))
   }
   assert.match(status, /DialogPlugin\.confirm/)
+  assert.match(status, /if \(!props\.canPublish\) return/)
 })
 
 test('workbenches compose review diff and real publication surfaces', () => {
