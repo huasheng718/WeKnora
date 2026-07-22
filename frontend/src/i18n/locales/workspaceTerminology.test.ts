@@ -75,6 +75,23 @@ test('user-facing locale values use workspace terminology', () => {
   }
 })
 
+test('document type management copy is complete in every locale', () => {
+  const requiredKeys = [
+    'manage', 'title', 'description', 'create', 'emptyTitle', 'emptyEditable', 'emptyReadonly',
+    'loadFailedTitle', 'loadFailed', 'readonlyHint', 'activate', 'activateTitle', 'activateBody',
+    'created', 'activated', 'createFailed', 'activateFailed', 'invalidJson',
+  ]
+
+  for (const check of localeChecks) {
+    const production = (check.locale as Record<string, unknown>).production as Record<string, unknown>
+    const documentTypes = production.documentTypes as Record<string, unknown> | undefined
+    assert.ok(documentTypes, `${check.name} is missing production.documentTypes`)
+    for (const key of requiredKeys) {
+      assert.equal(typeof documentTypes?.[key], 'string', `${check.name} is missing production.documentTypes.${key}`)
+    }
+  }
+})
+
 test('public documentation uses workspace terminology', () => {
   const legacyLines = publicDocumentationRoots.flatMap((relativePath) => {
     const absolutePath = resolve(repositoryRoot, relativePath)

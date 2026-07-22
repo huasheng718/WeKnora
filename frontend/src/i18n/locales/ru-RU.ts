@@ -57,6 +57,17 @@ export default {
       emptyTitle: 'Нет производственных проектов', emptyEditable: 'Создайте проект, чтобы начать сбор управляемых источников.', emptyReadonly: 'Вам не предоставлено ни одного проекта.',
       noDescription: 'Нет описания', notFoundTitle: 'Проект недоступен', notFound: 'Проект не существует или у вас больше нет доступа.'
     },
+    documentTypes: {
+      manage: 'Типы документов', title: 'Управление типами документов', description: 'Управляйте версиями структуры, требований к источникам, привязок навыков и правил публикации.', create: 'Создать черновик',
+      count: 'Версий: {count}', activeCount: 'Активных: {count}', emptyTitle: 'Нет типов документов', emptyEditable: 'Создайте и активируйте тип документа, чтобы проекты могли собирать источники.', emptyReadonly: 'В рабочей области не настроены типы документов.',
+      loadFailedTitle: 'Не удалось загрузить типы документов', loadFailed: 'Не удалось загрузить типы документов.', readonlyHint: 'Ваша роль позволяет только просматривать типы документов.', activate: 'Активировать', noAction: 'Нет действий',
+      activateTitle: 'Активировать тип документа?', activateBody: 'Активировать {name} v{version} и вывести из эксплуатации текущую активную версию с тем же code.', drawerTitle: 'Создать черновик типа документа',
+      created: 'Черновик типа документа создан.', activated: 'Тип документа активирован.', createFailed: 'Не удалось создать тип документа.', activateFailed: 'Не удалось активировать тип документа.',
+      invalidJson: 'Поле «{field}» должно содержать допустимый JSON.', invalidSchemaVersion: 'Версия Schema должна быть целым числом больше нуля.', required: 'Заполните поле «{field}».',
+      fields: { name: 'Название типа', code: 'Code типа', schemaVersion: 'Версия Schema', status: 'Статус', actions: 'Действия', blockSchema: 'Схема блоков', sourceRequirements: 'Требования к источникам', skillBindings: 'Привязки навыков', workflowPlan: 'План процесса', qualityRules: 'Правила качества', reviewPolicy: 'Политика проверки', publicationPolicy: 'Политика публикации' },
+      placeholders: { code: 'Например, service_baseline', name: 'Например, стандарт оказания услуг', description: 'Область применения типа' },
+      status: { draft: 'Черновик', active: 'Активен', retired: 'Выведен' }
+    },
     metrics: { documents: 'Документы', sourceSets: 'Источники', activity: 'Активность', updated: 'Обновлено', inFlight: 'В работе: {count}' },
     projectStatus: { active: 'Активен', archived: 'В архиве' },
     tabs: { sources: 'Источники', documents: 'Документы', reviews: 'Проверки', releases: 'Публикации' },

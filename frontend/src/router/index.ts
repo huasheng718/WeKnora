@@ -117,6 +117,11 @@ const router = createRouter({
           component: () => import("../views/production/ProductionProjectList.vue"),
         },
         {
+          path: "knowledge-production/document-types",
+          name: "productionDocumentTypes",
+          component: () => import("../views/production/ProductionDocumentTypeManagement.vue"),
+        },
+        {
           path: "knowledge-production/projects/:projectId",
           name: "productionProject",
           component: () => import("../views/production/ProductionProjectWorkbench.vue"),

@@ -57,6 +57,17 @@ export default {
       emptyTitle: "暂无生产项目", emptyEditable: "创建项目后即可开始采集受治理的来源。", emptyReadonly: "当前没有向你开放的项目。",
       noDescription: "暂无描述", notFoundTitle: "项目不可用", notFound: "项目不存在，或你已无权访问。"
     },
+    documentTypes: {
+      manage: "文档类型管理", title: "文档类型管理", description: "维护结构、来源要求、技能绑定与发布规则的版本化定义。", create: "创建草稿",
+      count: "共 {count} 个版本", activeCount: "{count} 个生效版本", emptyTitle: "暂无文档类型", emptyEditable: "创建并激活第一个文档类型后，项目即可建立来源集。", emptyReadonly: "当前空间尚未配置文档类型。",
+      loadFailedTitle: "无法加载文档类型", loadFailed: "加载文档类型失败。", readonlyHint: "当前空间角色仅可查看文档类型。", activate: "激活", noAction: "无操作",
+      activateTitle: "激活文档类型？", activateBody: "将激活“{name}”v{version}，并退役同 code 的当前生效版本。", drawerTitle: "创建文档类型草稿",
+      created: "文档类型草稿已创建。", activated: "文档类型已激活。", createFailed: "创建文档类型失败。", activateFailed: "激活文档类型失败。",
+      invalidJson: "{field} 必须是有效的 JSON。", invalidSchemaVersion: "Schema 版本必须是大于 0 的整数。", required: "请填写{field}。",
+      fields: { name: "类型名称", code: "类型 code", schemaVersion: "Schema 版本", status: "状态", actions: "操作", blockSchema: "内容块结构", sourceRequirements: "来源要求", skillBindings: "技能绑定", workflowPlan: "工作流计划", qualityRules: "质量规则", reviewPolicy: "审核策略", publicationPolicy: "发布策略" },
+      placeholders: { code: "例如：service_baseline", name: "例如：服务交付基线", description: "说明该类型的适用范围" },
+      status: { draft: "草稿", active: "生效", retired: "已退役" }
+    },
     metrics: { documents: "文档", sourceSets: "来源集", activity: "最近活动", updated: "更新时间", inFlight: "{count} 个运行中" },
     projectStatus: { active: "进行中", archived: "已归档" },
     tabs: { sources: "来源", documents: "文档", reviews: "审核", releases: "发布" },

@@ -2,7 +2,7 @@ type MenuRouteName = string | symbol | null | undefined
 
 const MENU_ROUTE_NAMES: Readonly<Record<string, readonly string[]>> = {
   'knowledge-bases': ['knowledgeBaseList', 'knowledgeBaseDetail', 'knowledgeBaseSettings'],
-  'knowledge-production': ['productionProjects', 'productionProject', 'productionDocument'],
+  'knowledge-production': ['productionProjects', 'productionDocumentTypes', 'productionProject', 'productionDocument'],
   agents: ['agentList'],
   organizations: ['organizationList'],
   creatChat: ['kbCreatChat', 'globalCreatChat'],

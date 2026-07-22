@@ -4,7 +4,7 @@ import test from 'node:test'
 import { isMenuPathActive } from './menuActiveState'
 
 test('knowledge production routes activate only the knowledge production menu', () => {
-  const productionRoutes = ['productionProjects', 'productionProject', 'productionDocument']
+  const productionRoutes = ['productionProjects', 'productionDocumentTypes', 'productionProject', 'productionDocument']
   const otherMenuPaths = ['knowledge-bases', 'agents', 'organizations', 'creatChat', 'settings']
 
   for (const routeName of productionRoutes) {

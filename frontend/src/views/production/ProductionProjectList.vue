@@ -6,14 +6,20 @@
         <h1>{{ t('production.projects.title') }}</h1>
         <p>{{ t('production.projects.description') }}</p>
       </div>
-      <t-tooltip :content="canCreate ? t('production.projects.create') : t('production.permissions.createDenied')">
-        <span>
-          <t-button :disabled="!canCreate || loading" @click="dialogVisible = true">
-            <template #icon><t-icon name="add" /></template>
-            {{ t('production.projects.create') }}
-          </t-button>
-        </span>
-      </t-tooltip>
+      <div class="header-actions">
+        <t-button variant="outline" @click="openDocumentTypes">
+          <template #icon><t-icon name="setting" /></template>
+          {{ t('production.documentTypes.manage') }}
+        </t-button>
+        <t-tooltip :content="canCreate ? t('production.projects.create') : t('production.permissions.createDenied')">
+          <span>
+            <t-button :disabled="!canCreate || loading" @click="dialogVisible = true">
+              <template #icon><t-icon name="add" /></template>
+              {{ t('production.projects.create') }}
+            </t-button>
+          </span>
+        </t-tooltip>
+      </div>
     </header>
 
     <div class="list-toolbar" aria-live="polite">
@@ -138,6 +144,10 @@ function openProject(projectId: string) {
   router.push(productionProjectLocation(projectId))
 }
 
+function openDocumentTypes() {
+  router.push({ name: 'productionDocumentTypes' })
+}
+
 function onProjectCreated(project: ProductionProject) {
   store.upsertProject(project)
   openProject(project.id)
@@ -174,6 +184,7 @@ onBeforeUnmount(() => loadCoordinator.invalidate())
 .page-kicker { margin: 0 0 5px !important; color: var(--td-brand-color) !important; font-size: 12px !important; font-weight: 600; text-transform: uppercase; }
 .page-header h1 { margin: 0; font-size: 26px; line-height: 34px; letter-spacing: 0; }
 .page-header p { max-width: 680px; margin: 6px 0 0; color: var(--td-text-color-secondary); font-size: 14px; line-height: 22px; }
+.header-actions { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; }
 .list-toolbar { min-height: 48px; display: flex; align-items: center; justify-content: space-between; color: var(--td-text-color-secondary); font-size: 13px; }
 .project-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 290px), 1fr)); gap: 14px; }
 .project-card { min-height: 242px; display: flex; flex-direction: column; padding: 18px; box-sizing: border-box; border: 1px solid var(--td-component-stroke); border-radius: var(--td-radius-medium); background: var(--td-bg-color-container); }
@@ -199,7 +210,8 @@ onBeforeUnmount(() => loadCoordinator.invalidate())
 @media (max-width: 720px) {
   .production-page { padding: 20px 16px 36px; }
   .page-header { flex-direction: column; gap: 18px; }
-  .page-header > span, .page-header :deep(.t-button) { width: 100%; }
+  .header-actions, .header-actions > span, .header-actions :deep(.t-button) { width: 100%; }
+  .header-actions { flex-direction: column; }
   .project-card { min-height: 228px; }
 }
 </style>

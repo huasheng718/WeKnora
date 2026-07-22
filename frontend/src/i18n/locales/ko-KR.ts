@@ -57,6 +57,17 @@ export default {
       emptyTitle: "프로덕션 프로젝트 없음", emptyEditable: "프로젝트를 만들어 관리되는 소스 수집을 시작하세요.", emptyReadonly: "공유된 프로젝트가 없습니다.",
       noDescription: "설명 없음", notFoundTitle: "프로젝트를 사용할 수 없음", notFound: "프로젝트가 없거나 더 이상 접근 권한이 없습니다."
     },
+    documentTypes: {
+      manage: "문서 유형 관리", title: "문서 유형 관리", description: "구조, 소스 요구 사항, 스킬 연결 및 게시 규칙의 버전 정의를 관리합니다.", create: "초안 만들기",
+      count: "버전 {count}개", activeCount: "활성 {count}개", emptyTitle: "문서 유형 없음", emptyEditable: "첫 문서 유형을 만들고 활성화하면 프로젝트에서 소스 세트를 만들 수 있습니다.", emptyReadonly: "현재 작업 공간에 구성된 문서 유형이 없습니다.",
+      loadFailedTitle: "문서 유형을 불러올 수 없음", loadFailed: "문서 유형을 불러오지 못했습니다.", readonlyHint: "현재 작업 공간 역할은 문서 유형을 조회만 할 수 있습니다.", activate: "활성화", noAction: "작업 없음",
+      activateTitle: "문서 유형을 활성화할까요?", activateBody: "{name} v{version}을 활성화하고 같은 code의 현재 활성 버전을 사용 중지합니다.", drawerTitle: "문서 유형 초안 만들기",
+      created: "문서 유형 초안을 만들었습니다.", activated: "문서 유형을 활성화했습니다.", createFailed: "문서 유형을 만들지 못했습니다.", activateFailed: "문서 유형을 활성화하지 못했습니다.",
+      invalidJson: "{field}에 올바른 JSON을 입력하세요.", invalidSchemaVersion: "Schema 버전은 0보다 큰 정수여야 합니다.", required: "{field}을(를) 입력하세요.",
+      fields: { name: "유형 이름", code: "유형 code", schemaVersion: "Schema 버전", status: "상태", actions: "작업", blockSchema: "블록 스키마", sourceRequirements: "소스 요구 사항", skillBindings: "스킬 연결", workflowPlan: "워크플로 계획", qualityRules: "품질 규칙", reviewPolicy: "검토 정책", publicationPolicy: "게시 정책" },
+      placeholders: { code: "예: service_baseline", name: "예: 서비스 제공 기준", description: "이 유형의 적용 범위" },
+      status: { draft: "초안", active: "활성", retired: "사용 중지" }
+    },
     metrics: { documents: "문서", sourceSets: "소스 세트", activity: "최근 활동", updated: "업데이트", inFlight: "{count}개 실행 중" },
     projectStatus: { active: "활성", archived: "보관됨" },
     tabs: { sources: "소스", documents: "문서", reviews: "검토", releases: "릴리스" },

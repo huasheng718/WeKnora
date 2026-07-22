@@ -57,6 +57,17 @@ export default {
       emptyTitle: 'No production projects', emptyEditable: 'Create a project to begin collecting governed sources.', emptyReadonly: 'No projects have been shared with you.',
       noDescription: 'No description', notFoundTitle: 'Project unavailable', notFound: 'The project does not exist or you no longer have access.'
     },
+    documentTypes: {
+      manage: 'Document types', title: 'Document type management', description: 'Maintain versioned definitions for structure, source requirements, skill bindings, and publication rules.', create: 'Create draft',
+      count: '{count} versions', activeCount: '{count} active', emptyTitle: 'No document types', emptyEditable: 'Create and activate a document type before projects collect source sets.', emptyReadonly: 'No document types are configured for this workspace.',
+      loadFailedTitle: 'Unable to load document types', loadFailed: 'Failed to load document types.', readonlyHint: 'Your workspace role can only view document types.', activate: 'Activate', noAction: 'No action',
+      activateTitle: 'Activate document type?', activateBody: 'Activate {name} v{version} and retire the currently active version with the same code.', drawerTitle: 'Create document type draft',
+      created: 'Document type draft created.', activated: 'Document type activated.', createFailed: 'Failed to create the document type.', activateFailed: 'Failed to activate the document type.',
+      invalidJson: '{field} must contain valid JSON.', invalidSchemaVersion: 'Schema version must be an integer greater than zero.', required: 'Enter {field}.',
+      fields: { name: 'Type name', code: 'Type code', schemaVersion: 'Schema version', status: 'Status', actions: 'Actions', blockSchema: 'Block schema', sourceRequirements: 'Source requirements', skillBindings: 'Skill bindings', workflowPlan: 'Workflow plan', qualityRules: 'Quality rules', reviewPolicy: 'Review policy', publicationPolicy: 'Publication policy' },
+      placeholders: { code: 'e.g. service_baseline', name: 'e.g. Service delivery baseline', description: 'Where this type should be used' },
+      status: { draft: 'Draft', active: 'Active', retired: 'Retired' }
+    },
     metrics: { documents: 'Documents', sourceSets: 'Source sets', activity: 'Activity', updated: 'Updated', inFlight: '{count} running' },
     projectStatus: { active: 'Active', archived: 'Archived' },
     tabs: { sources: 'Sources', documents: 'Documents', reviews: 'Reviews', releases: 'Releases' },
