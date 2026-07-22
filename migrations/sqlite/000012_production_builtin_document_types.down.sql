@@ -1,7 +1,27 @@
+DROP TRIGGER IF EXISTS trg_production_document_types_prevent_referenced_builtin_delete;
+
+CREATE TRIGGER trg_production_document_types_prevent_referenced_builtin_delete
+    BEFORE DELETE ON production_document_types
+    FOR EACH ROW
+    WHEN OLD.origin = 'builtin' AND (
+        EXISTS (
+            SELECT 1 FROM production_source_sets
+            WHERE tenant_id = OLD.tenant_id AND document_type_id = OLD.id
+        ) OR EXISTS (
+            SELECT 1 FROM production_documents
+            WHERE tenant_id = OLD.tenant_id AND document_type_id = OLD.id
+        )
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'referenced built-in production document types prevent rollback');
+END;
+
 DELETE FROM production_document_types
 WHERE origin = 'builtin'
   AND schema_version = 1
   AND template_key IN ('sop', 'policy_process', 'product_service_guide', 'faq', 'incident_playbook');
+
+DROP TRIGGER IF EXISTS trg_production_document_types_prevent_referenced_builtin_delete;
 
 PRAGMA foreign_keys = OFF;
 

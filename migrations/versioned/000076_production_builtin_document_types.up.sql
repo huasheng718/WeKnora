@@ -6,9 +6,9 @@ ALTER TABLE production_document_types
     ADD CONSTRAINT chk_production_document_types_origin
         CHECK (origin IN ('builtin', 'custom')),
     ADD CONSTRAINT chk_production_document_types_builtin_template_key
-        CHECK (origin <> 'builtin' OR template_key IN (
+        CHECK (origin <> 'builtin' OR (template_key IS NOT NULL AND template_key IN (
             'sop', 'policy_process', 'product_service_guide', 'faq', 'incident_playbook'
-        ));
+        )));
 
 CREATE UNIQUE INDEX uq_production_document_types_live_template_version
     ON production_document_types (tenant_id, template_key, schema_version)

@@ -92,6 +92,10 @@ func TestProductionBuiltinDocumentTypeMigrationSQLiteBackfillsAndRollsBack(t *te
 	require.Equal(t, "keep me", customDescription)
 	require.Equal(t, "custom", customOrigin)
 	require.False(t, customTemplate.Valid)
+	_, err = db.Exec(`INSERT INTO production_document_types
+		(id, tenant_id, code, name, schema_version, status, origin, created_by)
+		VALUES ('invalid-builtin', 1, 'invalid-builtin', 'Invalid', 1, 'draft', 'builtin', 'owner-1')`)
+	require.Error(t, err, "built-in document types must require a non-null governed template key")
 
 	_, err = db.Exec(`UPDATE production_document_types SET origin = 'custom' WHERE tenant_id = 1 AND code = 'sop'`)
 	require.ErrorContains(t, err, "immutable")
@@ -108,6 +112,35 @@ func TestProductionBuiltinDocumentTypeMigrationSQLiteBackfillsAndRollsBack(t *te
 	require.Equal(t, 1, total)
 }
 
+func TestProductionBuiltinDocumentTypeMigrationSQLiteReferencedDownAbortsWithoutForeignKeys(t *testing.T) {
+	db := openSQLiteThroughProductionMigrationFive(t)
+	_, err := db.Exec(`INSERT INTO tenants (name, retriever_engines, business) VALUES ('Tenant A', '[]', 'qa')`)
+	require.NoError(t, err)
+	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000012_production_builtin_document_types.up.sql"))
+	require.NoError(t, err)
+
+	var foreignKeys int
+	require.NoError(t, db.QueryRow(`PRAGMA foreign_keys`).Scan(&foreignKeys))
+	require.Zero(t, foreignKeys, "regression must cover the production migration connection without FK enforcement")
+	var sopID string
+	require.NoError(t, db.QueryRow(`SELECT id FROM production_document_types WHERE tenant_id = 1 AND code = 'sop'`).Scan(&sopID))
+	_, err = db.Exec(`INSERT INTO production_projects (id, tenant_id, name, owner_user_id) VALUES ('project-guard', 1, 'Guard', 'owner-1')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO production_source_sets
+		(id, tenant_id, project_id, document_type_id, created_by)
+		VALUES ('source-set-guard', 1, 'project-guard', ?, 'owner-1')`, sopID)
+	require.NoError(t, err)
+
+	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000012_production_builtin_document_types.down.sql"))
+	require.ErrorContains(t, err, "referenced built-in production document types prevent rollback")
+	require.Equal(t, "varchar(16)", sqliteColumnType(t, db, "production_document_types", "origin"))
+	var parentCount, childCount int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM production_document_types WHERE id = ?`, sopID).Scan(&parentCount))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM production_source_sets WHERE id = 'source-set-guard'`).Scan(&childCount))
+	require.Equal(t, 1, parentCount)
+	require.Equal(t, 1, childCount)
+}
+
 func TestProductionBuiltinDocumentTypeMigrationPostgreSQLParity(t *testing.T) {
 	up := mustReadMigration(t, "../../migrations/versioned/000076_production_builtin_document_types.up.sql")
 	down := mustReadMigration(t, "../../migrations/versioned/000076_production_builtin_document_types.down.sql")
@@ -118,6 +151,7 @@ func TestProductionBuiltinDocumentTypeMigrationPostgreSQLParity(t *testing.T) {
 	for _, fragment := range []string{
 		"ADD COLUMN origin", "ADD COLUMN template_key", "chk_production_document_types_origin",
 		"chk_production_document_types_builtin_template_key", "uq_production_document_types_live_template_version",
+		"origin <> 'builtin' OR (template_key IS NOT NULL AND template_key IN (",
 		"uuid_generate_v4()::varchar(36)", "system:builtin-document-types",
 		"NEW.origin IS DISTINCT FROM OLD.origin", "NEW.template_key IS DISTINCT FROM OLD.template_key",
 		"sop", "policy_process", "product_service_guide", "faq", "incident_playbook",
