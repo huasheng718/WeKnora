@@ -683,6 +683,35 @@ func TestProductionWriterMarksUnsupportedFactsForConfirmation(t *testing.T) {
 	require.Equal(t, true, attributes["needs_confirmation"])
 }
 
+func TestProductionWriterNormalizesFactToGovernedParagraph(t *testing.T) {
+	for _, test := range []struct {
+		name              string
+		evidence          []string
+		needsConfirmation bool
+	}{
+		{name: "accepted evidence", evidence: []string{writerEvidenceID}},
+		{name: "no accepted evidence", evidence: []string{}, needsConfirmation: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newProductionWriterFixture(t, productionWriterOutput(t,
+				writerFact("fact-a", "governed claim", test.evidence, false),
+			))
+
+			_, err := fixture.writer.Write(productionWriterTestContext(t, fixture.run), fixture.run)
+
+			require.NoError(t, err)
+			persisted := fixture.service.input.Blocks[len(fixture.service.input.Blocks)-1]
+			require.Equal(t, "paragraph", persisted.BlockType)
+			var content string
+			require.NoError(t, json.Unmarshal(persisted.Content, &content))
+			require.Equal(t, "governed claim", content)
+			attributes := decodeWriterAttributes(t, persisted.Attributes)
+			require.Equal(t, true, attributes["factual"])
+			require.Equal(t, test.needsConfirmation, attributes["needs_confirmation"])
+		})
+	}
+}
+
 func TestProductionWriterRejectsUnknownOrUnacceptedEvidenceReference(t *testing.T) {
 	for _, test := range []struct {
 		name string

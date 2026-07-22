@@ -97,6 +97,32 @@ func TestProductionEvidenceValidatorRequiresEvidenceOrExplicitConfirmationForFac
 	require.Empty(t, ValidateProductionVersion(version, nil).Errors)
 }
 
+func TestValidateProductionVersionRejectsRawFactAndAcceptsNormalizedFactualParagraph(t *testing.T) {
+	rawFact := productionBaselineVersion()
+	rawFact.Blocks = append(rawFact.Blocks,
+		productionValidationBlock("raw-fact", "fact", len(rawFact.Blocks), `{"text":"claim"}`, `{}`, `[]`),
+	)
+	require.Contains(t, productionIssueCodes(ValidateProductionVersion(rawFact, nil).Errors), "unsupported_block_type")
+
+	withoutEvidence := productionBaselineVersion()
+	withoutEvidence.Blocks = append(withoutEvidence.Blocks,
+		productionValidationBlock("factual", "paragraph", len(withoutEvidence.Blocks), `"claim"`, `{"factual":true}`, `[]`),
+	)
+	require.Equal(t, []string{"factual_evidence_required"}, productionIssueCodes(ValidateProductionVersion(withoutEvidence, nil).Errors))
+
+	withEvidence := productionBaselineVersion()
+	withEvidence.Blocks = append(withEvidence.Blocks,
+		productionValidationBlock("factual", "paragraph", len(withEvidence.Blocks), `"claim"`, `{"factual":true}`, `["e-1"]`),
+	)
+	require.Empty(t, ValidateProductionVersion(withEvidence, map[string]struct{}{"e-1": {}}).Errors)
+
+	withConfirmation := productionBaselineVersion()
+	withConfirmation.Blocks = append(withConfirmation.Blocks,
+		productionValidationBlock("factual", "paragraph", len(withConfirmation.Blocks), `"claim"`, `{"factual":true,"needs_confirmation":true}`, `[]`),
+	)
+	require.Empty(t, ValidateProductionVersion(withConfirmation, nil).Errors)
+}
+
 func TestProductionEvidenceValidatorClassifiesClaimCapableBlocksWithoutProducerOptIn(t *testing.T) {
 	version := productionBaselineVersion()
 	position := len(version.Blocks)

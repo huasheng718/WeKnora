@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -1557,18 +1558,26 @@ func TestProductionPublicationBindingVersionsContainAllProjectionSchema(t *testi
 			require.Contains(t, migration, required)
 		}
 	}
-	for _, removed := range []string{
-		"../../migrations/versioned/000075_knowledge_production_projection_integrity.up.sql",
-		"../../migrations/versioned/000075_knowledge_production_projection_integrity.down.sql",
-		"../../migrations/versioned/000076_production_projection_failure_recovery.up.sql",
-		"../../migrations/versioned/000076_production_projection_failure_recovery.down.sql",
-		"../../migrations/sqlite/000006_knowledge_production_projection_integrity.up.sql",
-		"../../migrations/sqlite/000006_knowledge_production_projection_integrity.down.sql",
-		"../../migrations/sqlite/000007_production_projection_failure_recovery.up.sql",
-		"../../migrations/sqlite/000007_production_projection_failure_recovery.down.sql",
+	for _, path := range []string{
+		"../../migrations/versioned/000074_knowledge_production_publication.up.sql",
+		"../../migrations/versioned/000074_knowledge_production_publication.down.sql",
+		"../../migrations/sqlite/000005_knowledge_production_publication.up.sql",
+		"../../migrations/sqlite/000005_knowledge_production_publication.down.sql",
 	} {
-		_, err := os.Stat(removed)
-		require.ErrorIs(t, err, os.ErrNotExist, removed)
+		_, err := os.Stat(path)
+		require.NoError(t, err, path)
+	}
+}
+
+func TestProductionMigrationTestPathsExist(t *testing.T) {
+	contents, err := os.ReadFile("production_migration_test.go")
+	require.NoError(t, err)
+
+	paths := regexp.MustCompile(`\.\./\.\./migrations/(?:versioned|sqlite)/[0-9]{6}_[a-z0-9_]+\.(?:up|down)\.sql`).FindAllString(string(contents), -1)
+	require.NotEmpty(t, paths)
+	for _, path := range paths {
+		_, err := os.Stat(path)
+		require.NoError(t, err, path)
 	}
 }
 
