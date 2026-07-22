@@ -3,6 +3,7 @@ package router
 import (
 	"container/heap"
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -199,6 +200,9 @@ func (e *SyncTaskExecutor) Enqueue(task *asynq.Task, opts ...asynq.Option) (*asy
 				logger.Infof(ctx, "[SyncTask] Task completed type=%s id=%s elapsed=%v",
 					task.Type(), taskID, time.Since(start))
 				return
+			}
+			if errors.Is(lastErr, asynq.SkipRetry) {
+				break
 			}
 		}
 

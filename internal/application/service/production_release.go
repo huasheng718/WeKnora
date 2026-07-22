@@ -743,6 +743,9 @@ func (s *ProductionReleaseService) Activate(ctx context.Context, targetID string
 	if err != nil {
 		return err
 	}
+	if err := s.validateActivationPrerequisites(ctx, target, expectedLock); err != nil {
+		return err
+	}
 	if err := s.enqueueProjectionTask(ctx, types.TypeProductionActivate, types.ProductionProjectionOperationActivate, target, expectedLock); err != nil {
 		return err
 	}
@@ -754,14 +757,50 @@ func (s *ProductionReleaseService) Rollback(ctx context.Context, targetID string
 	if err != nil {
 		return err
 	}
-	if target.Status != types.ReleaseTargetActive && (target.Status != types.ReleaseTargetRolledBack ||
-		target.RetentionUntil == nil || !target.RetentionUntil.After(s.clockNow())) {
-		return types.ErrProductionReleaseLifecycle
+	if err := s.validateRollbackPrerequisites(ctx, target, expectedLock); err != nil {
+		return err
 	}
 	if err := s.enqueueProjectionTask(ctx, types.TypeProductionActivate, types.ProductionProjectionOperationRollback, target, expectedLock); err != nil {
 		return err
 	}
 	return s.rollbackAuthorized(ctx, target, expectedLock)
+}
+
+func (s *ProductionReleaseService) validateActivationPrerequisites(
+	ctx context.Context,
+	target *types.ProductionReleaseTarget,
+	expectedLock int,
+) error {
+	if target == nil || expectedLock < 0 {
+		return types.ErrProductionProjectionConflict
+	}
+	if target.Status == types.ReleaseTargetActive {
+		return nil
+	}
+	if target.Status != types.ReleaseTargetReady {
+		return types.ErrProductionReleaseLifecycle
+	}
+	_, err := s.requireProjectionReady(ctx, target)
+	return err
+}
+
+func (s *ProductionReleaseService) validateRollbackPrerequisites(
+	ctx context.Context,
+	target *types.ProductionReleaseTarget,
+	expectedLock int,
+) error {
+	if target == nil || expectedLock < 0 {
+		return types.ErrProductionProjectionConflict
+	}
+	if target.Status == types.ReleaseTargetActive {
+		return nil
+	}
+	if target.Status != types.ReleaseTargetRolledBack || target.RetentionUntil == nil ||
+		!target.RetentionUntil.After(s.clockNow()) {
+		return types.ErrProductionReleaseLifecycle
+	}
+	_, err := s.requireProjectionReady(ctx, target)
+	return err
 }
 
 func (s *ProductionReleaseService) enqueueProjectionTask(
@@ -835,17 +874,11 @@ func productionProjectionBuildTaskPhase(target *types.ProductionReleaseTarget) (
 }
 
 func (s *ProductionReleaseService) activateAuthorized(ctx context.Context, target *types.ProductionReleaseTarget, expectedLock int) error {
-	if target == nil || expectedLock < 0 {
-		return types.ErrProductionProjectionConflict
+	if err := s.validateActivationPrerequisites(ctx, target, expectedLock); err != nil {
+		return err
 	}
 	if target.Status == types.ReleaseTargetActive {
 		return s.enqueueActivationFollowups(ctx, target)
-	}
-	if target.Status != types.ReleaseTargetReady {
-		return types.ErrProductionReleaseLifecycle
-	}
-	if _, err := s.requireProjectionReady(ctx, target); err != nil {
-		return err
 	}
 	history, err := s.releases.ListProjectionHistory(ctx, target.TenantID, target.DocumentID, target.TargetKnowledgeBaseID)
 	if err != nil {
@@ -889,17 +922,11 @@ func (s *ProductionReleaseService) activateAuthorized(ctx context.Context, targe
 }
 
 func (s *ProductionReleaseService) rollbackAuthorized(ctx context.Context, target *types.ProductionReleaseTarget, expectedLock int) error {
-	if target == nil || expectedLock < 0 {
-		return types.ErrProductionProjectionConflict
+	if err := s.validateRollbackPrerequisites(ctx, target, expectedLock); err != nil {
+		return err
 	}
 	if target.Status == types.ReleaseTargetActive {
 		return s.enqueueActivationFollowups(ctx, target)
-	}
-	if target.Status != types.ReleaseTargetRolledBack || target.RetentionUntil == nil || !target.RetentionUntil.After(s.clockNow()) {
-		return types.ErrProductionReleaseLifecycle
-	}
-	if _, err := s.requireProjectionReady(ctx, target); err != nil {
-		return err
 	}
 	history, err := s.releases.ListProjectionHistory(ctx, target.TenantID, target.DocumentID, target.TargetKnowledgeBaseID)
 	if err != nil {

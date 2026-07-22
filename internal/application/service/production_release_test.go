@@ -1494,6 +1494,24 @@ func TestProductionReleaseActivateRequiresReadyCompletedParseAndGraph(t *testing
 	require.Equal(t, types.ReleaseTargetActive, repo.targets["target-old"].Status)
 }
 
+func TestProductionReleaseRejectedActivationDoesNotLeaveDurableIntent(t *testing.T) {
+	svc, repo, _ := newProductionReleaseServiceFixture(t)
+	tasks := &productionReleaseTaskEnqueuerStub{accepted: make(map[string]*asynq.Task)}
+	svc.tasks = tasks
+	repo.targets["target-new"].Status = types.ReleaseTargetBuilding
+
+	err := svc.Activate(productionReleaseContext(), "target-new", 1)
+
+	require.ErrorIs(t, err, types.ErrProductionReleaseLifecycle)
+	require.Zero(t, tasks.calls)
+	require.Empty(t, tasks.accepted)
+
+	// A later worker completion cannot revive an intent the API rejected.
+	repo.targets["target-new"].Status = types.ReleaseTargetReady
+	require.Equal(t, types.ReleaseTargetActive, repo.targets["target-old"].Status)
+	require.Equal(t, 1, repo.lock)
+}
+
 func TestProductionReleaseActivateCASAndConcurrentActivation(t *testing.T) {
 	svc, repo, _ := newProductionReleaseServiceFixture(t)
 	require.ErrorIs(t, svc.Activate(productionReleaseContext(), "target-new", 99), types.ErrProductionProjectionConflict)
@@ -1678,6 +1696,24 @@ func TestProductionReleaseRollbackReadinessFailurePrecedesMutation(t *testing.T)
 	require.Zero(t, repo.transitionCalls)
 }
 
+func TestProductionReleaseRejectedRollbackDoesNotLeaveDurableIntent(t *testing.T) {
+	svc, repo, _ := newProductionReleaseServiceFixture(t)
+	retained := prepareProductionRollbackFixture(svc, repo)
+	tasks := &productionReleaseTaskEnqueuerStub{accepted: make(map[string]*asynq.Task)}
+	svc.tasks = tasks
+	svc.graph = productionReleaseGraphStub{err: errors.New("graph not ready")}
+
+	err := svc.Rollback(productionReleaseContext(), "target-old", 2)
+
+	require.Error(t, err)
+	require.Zero(t, tasks.calls)
+	require.Empty(t, tasks.accepted)
+	require.Equal(t, types.ReleaseTargetRolledBack, repo.targets["target-old"].Status)
+	require.Equal(t, retained, *repo.targets["target-old"].RetentionUntil)
+	require.Equal(t, types.ReleaseTargetActive, repo.targets["target-new"].Status)
+	require.Equal(t, 2, repo.lock)
+}
+
 func TestProductionReleaseRollbackMutationAndAuditAreAtomic(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -1744,6 +1780,56 @@ func TestProductionProjectionDelayedActivationReauthorizesRevokedPublisher(t *te
 	require.ErrorIs(t, err, types.ErrProductionForbidden)
 	require.Equal(t, 1, repo.lock)
 	require.Equal(t, types.ReleaseTargetReady, repo.targets["target-new"].Status)
+}
+
+func TestProductionProjectionHeadMutationWorkerSkipsRetryForPermanentRejections(t *testing.T) {
+	tests := []struct {
+		name         string
+		configure    func(*ProductionReleaseService, *productionReleaseRepoStub)
+		expectedErr  error
+		expectedLock int
+	}{
+		{
+			name: "lifecycle",
+			configure: func(_ *ProductionReleaseService, repo *productionReleaseRepoStub) {
+				repo.targets["target-new"].Status = types.ReleaseTargetBuilding
+			},
+			expectedErr:  types.ErrProductionReleaseLifecycle,
+			expectedLock: 1,
+		},
+		{
+			name:         "stale lock",
+			configure:    func(_ *ProductionReleaseService, _ *productionReleaseRepoStub) {},
+			expectedErr:  types.ErrProductionProjectionConflict,
+			expectedLock: 99,
+		},
+		{
+			name: "authorization",
+			configure: func(svc *ProductionReleaseService, _ *productionReleaseRepoStub) {
+				svc.authorizer = productionReleaseAuthorizerStub{err: types.ErrProductionForbidden}
+			},
+			expectedErr:  types.ErrProductionForbidden,
+			expectedLock: 1,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, repo, _ := newProductionReleaseServiceFixture(t)
+			tc.configure(svc, repo)
+			payload, err := json.Marshal(types.ProductionProjectionTaskPayload{
+				Operation: types.ProductionProjectionOperationActivate,
+				TenantID:  7, ProjectID: "project-1", TargetID: "target-new",
+				ActorUserID: "00000000-0000-4000-8000-000000000007", ExpectedLock: tc.expectedLock,
+			})
+			require.NoError(t, err)
+			handler := NewProductionProjectionTaskHandler(svc, &ProductionProjectionCleanup{})
+
+			err = handler.Handle(context.Background(), asynq.NewTask(types.TypeProductionActivate, payload))
+
+			require.ErrorIs(t, err, tc.expectedErr)
+			require.ErrorIs(t, err, asynq.SkipRetry)
+		})
+	}
 }
 
 func TestProductionProjectionDelayedHeadMutationRejectsMissingActor(t *testing.T) {

@@ -418,6 +418,39 @@ func TestSyncTaskExecutorCallsTerminalFailureOnceBeforeRetainingFailedTaskID(t *
 	require.EqualValues(t, 1, callbacks.Load())
 }
 
+func TestSyncTaskExecutorHonorsAsynqSkipRetry(t *testing.T) {
+	clock := &syncTaskTestClock{now: time.Date(2026, 7, 22, 8, 0, 0, 0, time.UTC)}
+	executor := newSyncTaskExecutor(clock.Now, func(time.Duration) <-chan time.Time {
+		ready := make(chan time.Time, 1)
+		ready <- clock.Now()
+		return ready
+	})
+	var attempts atomic.Int32
+	expectedErr := errors.New("permanent head mutation rejection")
+	executor.RegisterHandler(types.TypeProductionActivate, func(context.Context, *asynq.Task) error {
+		attempts.Add(1)
+		return errors.Join(expectedErr, asynq.SkipRetry)
+	})
+	terminal := make(chan error, 1)
+	executor.SetTerminalFailureHandler(func(_ context.Context, _ *asynq.Task, taskErr error) {
+		terminal <- taskErr
+	})
+
+	_, err := executor.Enqueue(
+		asynq.NewTask(types.TypeProductionActivate, nil),
+		asynq.TaskID("permanent-head-mutation"), asynq.Retention(time.Minute), asynq.MaxRetry(8),
+	)
+	require.NoError(t, err)
+	select {
+	case taskErr := <-terminal:
+		require.ErrorIs(t, taskErr, expectedErr)
+		require.ErrorIs(t, taskErr, asynq.SkipRetry)
+	case <-time.After(time.Second):
+		t.Fatal("terminal failure callback did not run")
+	}
+	require.EqualValues(t, 1, attempts.Load())
+}
+
 func TestSyncTaskExecutorUsesProjectionFailureCallbackForKnowledgeTerminalFailures(t *testing.T) {
 	for _, taskType := range []string{
 		types.TypeDocumentProcess,

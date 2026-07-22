@@ -50,18 +50,18 @@ func (h *ProductionProjectionTaskHandler) Handle(ctx context.Context, task *asyn
 		return err
 	}
 	if target == nil || target.TenantID != payload.TenantID || target.ProjectID != payload.ProjectID || target.ID != payload.TargetID {
-		return types.ErrProductionForbidden
+		return productionHeadMutationTaskError(types.ErrProductionForbidden)
 	}
 	if isUserHeadMutation {
 		if target.Status == types.ReleaseTargetActive {
 			ctx = context.WithValue(ctx, types.UserIDContextKey, types.ProductionSystemActorID)
 		} else {
 			if strings.TrimSpace(actorID) == "" || actorID == types.ProductionSystemActorID {
-				return types.ErrProductionForbidden
+				return productionHeadMutationTaskError(types.ErrProductionForbidden)
 			}
 			target, err = h.releases.authorizeTarget(ctx, target.ID)
 			if err != nil {
-				return err
+				return productionHeadMutationTaskError(err)
 			}
 		}
 	}
@@ -80,14 +80,26 @@ func (h *ProductionProjectionTaskHandler) Handle(ctx context.Context, task *asyn
 		return err
 	case types.TypeProductionActivate:
 		if payload.Operation == types.ProductionProjectionOperationRollback {
-			return h.releases.rollbackAuthorized(ctx, target, payload.ExpectedLock)
+			return productionHeadMutationTaskError(h.releases.rollbackAuthorized(ctx, target, payload.ExpectedLock))
 		}
-		return h.releases.activateAuthorized(ctx, target, payload.ExpectedLock)
+		return productionHeadMutationTaskError(h.releases.activateAuthorized(ctx, target, payload.ExpectedLock))
 	case types.TypeProductionCleanup:
 		return h.handleCleanup(ctx, target, payload.CleanupGeneration)
 	default:
 		return errors.New("unsupported production projection task type")
 	}
+}
+
+func productionHeadMutationTaskError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, types.ErrProductionReleaseLifecycle) ||
+		errors.Is(err, types.ErrProductionProjectionConflict) ||
+		errors.Is(err, types.ErrProductionForbidden) {
+		return errors.Join(err, asynq.SkipRetry)
+	}
+	return err
 }
 
 func (h *ProductionProjectionTaskHandler) handleCleanup(
