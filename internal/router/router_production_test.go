@@ -76,6 +76,30 @@ type productionRouterProjectService struct {
 	createCalls int
 }
 
+type productionRouterDocumentTypeService struct {
+	deriveCalls int
+}
+
+func (*productionRouterDocumentTypeService) CreateDocumentType(context.Context, uint64, interfaces.CreateProductionDocumentTypeInput) (*types.ProductionDocumentType, error) {
+	return &types.ProductionDocumentType{}, nil
+}
+func (s *productionRouterDocumentTypeService) DeriveDraft(_ context.Context, tenantID uint64, _ string, input interfaces.DeriveProductionDocumentTypeInput) (*types.ProductionDocumentType, error) {
+	s.deriveCalls++
+	return &types.ProductionDocumentType{
+		ID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", TenantID: tenantID, Code: "sop", Name: input.Name,
+		SchemaVersion: 2, Status: types.ProductionDocumentTypeDraft,
+	}, nil
+}
+func (*productionRouterDocumentTypeService) ActivateDocumentType(context.Context, uint64, string, int) (*types.ProductionDocumentType, error) {
+	return &types.ProductionDocumentType{}, nil
+}
+func (*productionRouterDocumentTypeService) GetDocumentType(context.Context, uint64, string) (*types.ProductionDocumentType, error) {
+	return &types.ProductionDocumentType{}, nil
+}
+func (*productionRouterDocumentTypeService) ListDocumentTypes(context.Context, uint64) ([]*types.ProductionDocumentType, error) {
+	return nil, nil
+}
+
 type productionRouterSourceService struct {
 	freezeCalls int
 	err         error
@@ -272,6 +296,7 @@ func newProductionRouteTestEngineForRoleAndReview(
 	reviewService *productionRouterReviewService,
 	repo interfaces.ProductionIdempotencyRepository,
 	role types.TenantRole,
+	documentTypeHandlers ...*handler.ProductionDocumentTypeHandler,
 ) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	enforce := true
@@ -286,10 +311,14 @@ func newProductionRouteTestEngineForRoleAndReview(
 		c.Next()
 	})
 	v1 := engine.Group("/api/v1")
+	documentTypeHandler := &handler.ProductionDocumentTypeHandler{}
+	if len(documentTypeHandlers) > 0 {
+		documentTypeHandler = documentTypeHandlers[0]
+	}
 	RegisterProductionRoutes(
 		v1,
 		projectHandler,
-		&handler.ProductionDocumentTypeHandler{},
+		documentTypeHandler,
 		sourceHandler,
 		documentHandler,
 		runHandler,
@@ -475,6 +504,7 @@ func TestProductionFoundationRoutesAreRegistered(t *testing.T) {
 		{http.MethodGet, "/api/v1/production/document-types"},
 		{http.MethodPost, "/api/v1/production/document-types"},
 		{http.MethodPut, "/api/v1/production/document-types/:id/activate"},
+		{http.MethodPost, "/api/v1/production/document-types/:id/drafts"},
 		{http.MethodGet, "/api/v1/production/projects/:id/source-sets"},
 		{http.MethodPost, "/api/v1/production/projects/:id/source-sets"},
 		{http.MethodPut, "/api/v1/production/source-items/:id/decision"},
@@ -506,6 +536,7 @@ func TestEveryProductionWriteRouteRequiresIdempotencyKey(t *testing.T) {
 		{http.MethodDelete, "/api/v1/production/projects/project-1/members/user-1/author", ""},
 		{http.MethodPost, "/api/v1/production/document-types", `{}`},
 		{http.MethodPut, "/api/v1/production/document-types/type-1/activate", ""},
+		{http.MethodPost, "/api/v1/production/document-types/type-1/drafts", `{}`},
 		{http.MethodPost, "/api/v1/production/projects/project-1/source-sets", `{}`},
 		{http.MethodPut, "/api/v1/production/source-items/item-1/decision", `{}`},
 		{http.MethodPost, "/api/v1/production/source-sets/set-1/freeze", ""},
@@ -534,6 +565,58 @@ func TestEveryProductionWriteRouteRequiresIdempotencyKey(t *testing.T) {
 	}
 }
 
+func TestProductionRoutesDocumentTypeDeriveRequiresAdminAndReplaysIdempotencyKey(t *testing.T) {
+	const baseID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+	requestBody := `{
+		"name":"Tenant SOP","description":"Derived",
+		"block_schema":{"version":1,"required_sections":["Scope"],"allowed_block_types":["paragraph"]},
+		"source_requirements":{"version":1,"min_accepted_evidence":1,"allowed_source_kinds":["upload"],"require_evidence_section":true,"allow_unsupported_facts":false},
+		"skill_bindings":{"version":1,"skills":[]},"workflow_plan":{"version":1,"steps":[]},
+		"quality_rules":{"version":1,"require_evidence_for_facts":true,"block_needs_confirmation":true,"gates":["section_completeness"]},
+		"review_policy":{"steps":["business_reviewer"]},
+		"publication_policy":{"version":1,"target_type":"knowledge_base","chunking":"inherit_target","knowledge_graph":"inherit_target","require_approved_review":true}
+	}`
+	perform := func(engine *gin.Engine, key string) *httptest.ResponseRecorder {
+		response := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, "/api/v1/production/document-types/"+baseID+"/drafts", strings.NewReader(requestBody))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Idempotency-Key", key)
+		engine.ServeHTTP(response, request)
+		return response
+	}
+
+	t.Run("admin replay", func(t *testing.T) {
+		repo := newProductionRouterIdempotencyRepo()
+		service := &productionRouterDocumentTypeService{}
+		engine := newProductionRouteTestEngineForRoleAndReview(
+			&handler.ProductionProjectHandler{}, handler.NewProductionSourceHandler(&productionRouterSourceService{}),
+			handler.NewProductionDocumentHandler(&productionRouterDocumentService{}), handler.NewProductionRunHandler(&productionRouterRunService{}),
+			&productionRouterReviewService{}, repo, types.TenantRoleAdmin,
+			handler.NewProductionDocumentTypeHandler(service),
+		)
+		first := perform(engine, "derive-replay")
+		replay := perform(engine, "derive-replay")
+		require.Equal(t, http.StatusCreated, first.Code, first.Body.String())
+		require.Equal(t, first.Body.String(), replay.Body.String())
+		require.Equal(t, 1, service.deriveCalls)
+	})
+
+	t.Run("contributor denied before idempotency", func(t *testing.T) {
+		repo := newProductionRouterIdempotencyRepo()
+		service := &productionRouterDocumentTypeService{}
+		engine := newProductionRouteTestEngineForRoleAndReview(
+			&handler.ProductionProjectHandler{}, handler.NewProductionSourceHandler(&productionRouterSourceService{}),
+			handler.NewProductionDocumentHandler(&productionRouterDocumentService{}), handler.NewProductionRunHandler(&productionRouterRunService{}),
+			&productionRouterReviewService{}, repo, types.TenantRoleContributor,
+			handler.NewProductionDocumentTypeHandler(service),
+		)
+		response := perform(engine, "derive-forbidden")
+		require.Equal(t, http.StatusForbidden, response.Code, response.Body.String())
+		require.Zero(t, service.deriveCalls)
+		require.Empty(t, repo.records)
+	})
+}
+
 func TestProductionWriteReplaysSameIdempotencyKey(t *testing.T) {
 	service := &productionRouterProjectService{}
 	engine := newProductionRouteTestEngine(handler.NewProductionProjectHandler(service), newProductionRouterIdempotencyRepo())
@@ -557,6 +640,7 @@ func TestProductionWriteReplaysSameIdempotencyKey(t *testing.T) {
 
 var _ interfaces.ProductionIdempotencyRepository = (*productionRouterIdempotencyRepo)(nil)
 var _ interfaces.ProductionProjectService = (*productionRouterProjectService)(nil)
+var _ interfaces.ProductionDocumentTypeService = (*productionRouterDocumentTypeService)(nil)
 var _ interfaces.ProductionSourceService = (*productionRouterSourceService)(nil)
 var _ interfaces.ProductionDocumentService = (*productionRouterDocumentService)(nil)
 var _ interfaces.ProductionRunService = (*productionRouterRunService)(nil)

@@ -17,6 +17,9 @@ import (
 type productionDocumentTypeServiceStub struct {
 	documentTypes []*types.ProductionDocumentType
 	created       interfaces.CreateProductionDocumentTypeInput
+	derived       interfaces.DeriveProductionDocumentTypeInput
+	deriveBaseID  string
+	deriveCalls   int
 	activatedCode string
 	activatedVer  int
 	getID         string
@@ -29,6 +32,18 @@ func (s *productionDocumentTypeServiceStub) CreateDocumentType(_ context.Context
 		return nil, s.err
 	}
 	return &types.ProductionDocumentType{ID: productionDocumentTypeID, TenantID: tenantID, Code: input.Code, Name: input.Name, SchemaVersion: input.SchemaVersion, Status: types.ProductionDocumentTypeDraft, CreatedBy: "admin-1"}, nil
+}
+func (s *productionDocumentTypeServiceStub) DeriveDraft(_ context.Context, tenantID uint64, baseID string, input interfaces.DeriveProductionDocumentTypeInput) (*types.ProductionDocumentType, error) {
+	s.deriveCalls++
+	s.deriveBaseID, s.derived = baseID, input
+	if s.err != nil {
+		return nil, s.err
+	}
+	return &types.ProductionDocumentType{
+		ID: productionDocumentTypeID, TenantID: tenantID, Code: "sop", Name: input.Name,
+		SchemaVersion: 2, Status: types.ProductionDocumentTypeDraft,
+		Origin: types.ProductionDocumentTypeOriginCustom,
+	}, nil
 }
 func (s *productionDocumentTypeServiceStub) ActivateDocumentType(_ context.Context, tenantID uint64, code string, schemaVersion int) (*types.ProductionDocumentType, error) {
 	s.activatedCode, s.activatedVer = code, schemaVersion
@@ -150,6 +165,55 @@ func TestProductionDocumentTypeHandlerRejectsMalformedIDBeforeServiceAccess(t *t
 	require.Equal(t, http.StatusBadRequest, response.Code)
 	require.Contains(t, response.Body.String(), "valid UUID")
 	require.Empty(t, service.getID)
+}
+
+func productionDocumentTypeDeriveRequestBody() string {
+	return `{
+		"name":"Tenant SOP","description":"Derived",
+		"block_schema":{"version":1,"required_sections":["Scope"],"allowed_block_types":["paragraph"]},
+		"source_requirements":{"version":1,"min_accepted_evidence":1,"allowed_source_kinds":["upload"],"require_evidence_section":true,"allow_unsupported_facts":false},
+		"skill_bindings":{"version":1,"skills":[]},
+		"workflow_plan":{"version":1,"steps":[]},
+		"quality_rules":{"version":1,"require_evidence_for_facts":true,"block_needs_confirmation":true,"gates":["section_completeness"]},
+		"review_policy":{"steps":["business_reviewer"]},
+		"publication_policy":{"version":1,"target_type":"knowledge_base","chunking":"inherit_target","knowledge_graph":"inherit_target","require_approved_review":true}
+	}`
+}
+
+func TestDocumentTypeHandlerDerivesDraftFromValidatedPathAndEditableBody(t *testing.T) {
+	service := &productionDocumentTypeServiceStub{}
+	h := NewProductionDocumentTypeHandler(service)
+
+	response := performProductionHandlerRequest(
+		http.MethodPost,
+		"/production/document-types/:id/drafts",
+		"/production/document-types/"+productionDocumentTypeID+"/drafts",
+		productionDocumentTypeDeriveRequestBody(),
+		h.DeriveDraft,
+	)
+
+	require.Equal(t, http.StatusCreated, response.Code, response.Body.String())
+	require.Equal(t, productionDocumentTypeID, service.deriveBaseID)
+	require.Equal(t, "Tenant SOP", service.derived.Name)
+	require.Equal(t, 1, service.deriveCalls)
+	require.Contains(t, response.Body.String(), `"origin":"custom"`)
+}
+
+func TestDocumentTypeHandlerDeriveRejectsMalformedBaseIDBeforeServiceAccess(t *testing.T) {
+	service := &productionDocumentTypeServiceStub{}
+	h := NewProductionDocumentTypeHandler(service)
+
+	response := performProductionHandlerRequest(
+		http.MethodPost,
+		"/production/document-types/:id/drafts",
+		"/production/document-types/not-a-uuid/drafts",
+		productionDocumentTypeDeriveRequestBody(),
+		h.DeriveDraft,
+	)
+
+	require.Equal(t, http.StatusBadRequest, response.Code)
+	require.Contains(t, response.Body.String(), "valid UUID")
+	require.Zero(t, service.deriveCalls)
 }
 
 var _ interfaces.ProductionDocumentTypeService = (*productionDocumentTypeServiceStub)(nil)

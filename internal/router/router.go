@@ -325,6 +325,7 @@ func RegisterProductionRoutes(
 	production.DELETE("/projects/:id/members/:user_id/:role", g.Contributor(), idempotency.Require(), projectHandler.RemoveRole)
 	production.GET("/document-types", g.Viewer(), documentTypeHandler.List)
 	production.POST("/document-types", g.Admin(), idempotency.Require(), documentTypeHandler.Create)
+	production.POST("/document-types/:id/drafts", g.Admin(), idempotency.Require(), documentTypeHandler.DeriveDraft)
 	production.PUT("/document-types/:id/activate", g.Admin(), idempotency.Require(), documentTypeHandler.Activate)
 	production.GET("/projects/:id/source-sets", g.Viewer(), sourceHandler.ListSets)
 	production.POST("/projects/:id/source-sets", g.Contributor(), idempotency.Require(), sourceHandler.CreateSet)

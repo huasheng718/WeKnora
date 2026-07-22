@@ -3,14 +3,21 @@ package repository
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sync"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/Tencent/WeKnora/internal/database"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/postgres"
+	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -249,4 +256,200 @@ END`).Error)
 	got, err = repo.GetActiveByIDForReview(context.Background(), 7, active.ID, 3)
 	require.Nil(t, got)
 	require.ErrorIs(t, err, types.ErrProductionDocumentTypeInactive)
+}
+
+func validDerivedProductionDocumentType(id string, tenantID uint64) *types.ProductionDocumentType {
+	return &types.ProductionDocumentType{
+		ID: id, TenantID: tenantID, Name: "Tenant SOP", Description: "Derived definition",
+		BlockSchema:        types.JSON(`{"allowed_block_types":["paragraph"],"required_sections":["Scope"],"version":1}`),
+		SourceRequirements: types.JSON(`{"allow_unsupported_facts":false,"allowed_source_kinds":["upload"],"min_accepted_evidence":1,"require_evidence_section":true,"version":1}`),
+		SkillBindings:      types.JSON(`{"skills":[],"version":1}`),
+		WorkflowPlan:       types.JSON(`{"steps":[],"version":1}`),
+		QualityRules:       types.JSON(`{"block_needs_confirmation":true,"gates":["section_completeness"],"require_evidence_for_facts":true,"version":1}`),
+		ReviewPolicy:       types.JSON(`{"steps":["business_reviewer"]}`),
+		PublicationPolicy:  types.JSON(`{"chunking":"inherit_target","knowledge_graph":"inherit_target","require_approved_review":true,"target_type":"knowledge_base","version":1}`),
+		CreatedBy:          "author-1",
+	}
+}
+
+func TestDocumentTypeRepositoryDerivesDraftWithImmutableLineageAndNextVersion(t *testing.T) {
+	repo, db := newProductionDocumentTypeRepoTestDB(t)
+	templateKey := "sop"
+	base := productionDocumentType("base-active", 7, "sop", 1)
+	base.Status = types.ProductionDocumentTypeActive
+	base.Origin = types.ProductionDocumentTypeOriginBuiltin
+	base.TemplateKey = &templateKey
+	retired := productionDocumentType("base-retired", 7, "sop", 2)
+	retired.Status = types.ProductionDocumentTypeRetired
+	retired.Origin = types.ProductionDocumentTypeOriginCustom
+	retired.TemplateKey = &templateKey
+	require.NoError(t, db.Create(base).Error)
+	require.NoError(t, db.Create(retired).Error)
+
+	draft := validDerivedProductionDocumentType("derived-1", 7)
+	draft.Code = "client-code"
+	draft.SchemaVersion = 99
+	draft.Status = types.ProductionDocumentTypeActive
+	draft.Origin = types.ProductionDocumentTypeOriginBuiltin
+	clientTemplate := "client-template"
+	draft.TemplateKey = &clientTemplate
+	derived, err := repo.DeriveDraft(context.Background(), 7, retired.ID, draft)
+
+	require.NoError(t, err)
+	require.Equal(t, "sop", derived.Code)
+	require.Equal(t, 3, derived.SchemaVersion)
+	require.Equal(t, types.ProductionDocumentTypeDraft, derived.Status)
+	require.Equal(t, types.ProductionDocumentTypeOriginCustom, derived.Origin)
+	require.NotNil(t, derived.TemplateKey)
+	require.Equal(t, templateKey, *derived.TemplateKey)
+	require.Equal(t, "Tenant SOP", derived.Name)
+}
+
+func TestDocumentTypeRepositoryDeriveRejectsCrossTenantBase(t *testing.T) {
+	repo, db := newProductionDocumentTypeRepoTestDB(t)
+	base := productionDocumentType("base-tenant-8", 8, "sop", 1)
+	base.Status = types.ProductionDocumentTypeActive
+	require.NoError(t, db.Create(base).Error)
+
+	derived, err := repo.DeriveDraft(context.Background(), 7, base.ID, validDerivedProductionDocumentType("derived-cross-tenant", 7))
+
+	require.Nil(t, derived)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+}
+
+func TestDocumentTypeRepositoryDeriveConcurrentRequestsAllocateConsecutiveVersions(t *testing.T) {
+	dsn := "file:" + filepath.Join(t.TempDir(), "document-type.db") +
+		"?_foreign_keys=1&_busy_timeout=5000&_journal_mode=WAL"
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(4)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	_, filename, _, ok := runtime.Caller(0)
+	require.True(t, ok)
+	migration, err := os.ReadFile(filepath.Join(
+		filepath.Dir(filename), "../../../migrations/sqlite/000001_knowledge_production_foundation.up.sql",
+	))
+	require.NoError(t, err)
+	require.NoError(t, db.Exec(string(migration)).Error)
+	require.NoError(t, db.Exec(`ALTER TABLE production_document_types ADD COLUMN template_key VARCHAR(255)`).Error)
+	require.NoError(t, db.Exec(`ALTER TABLE production_document_types ADD COLUMN origin VARCHAR(16) NOT NULL DEFAULT 'custom'`).Error)
+	require.NoError(t, db.Exec(`CREATE UNIQUE INDEX uq_production_document_types_live_template_version ON production_document_types (tenant_id, template_key, schema_version) WHERE template_key IS NOT NULL AND deleted_at IS NULL`).Error)
+	repo := NewProductionDocumentTypeRepository(db)
+	base := productionDocumentType("base-concurrent", 7, "sop", 1)
+	base.Status = types.ProductionDocumentTypeActive
+	require.NoError(t, db.Create(base).Error)
+
+	start := make(chan struct{})
+	results := make(chan *types.ProductionDocumentType, 2)
+	errorsCh := make(chan error, 2)
+	var ready sync.WaitGroup
+	ready.Add(2)
+	for index := range 2 {
+		go func(index int) {
+			ready.Done()
+			<-start
+			derived, deriveErr := repo.DeriveDraft(
+				context.Background(), 7, base.ID,
+				validDerivedProductionDocumentType(fmt.Sprintf("derived-concurrent-%d", index), 7),
+			)
+			results <- derived
+			errorsCh <- deriveErr
+		}(index)
+	}
+	ready.Wait()
+	close(start)
+
+	versions := make([]int, 0, 2)
+	for range 2 {
+		require.NoError(t, <-errorsCh)
+		versions = append(versions, (<-results).SchemaVersion)
+	}
+	require.ElementsMatch(t, []int{2, 3}, versions)
+}
+
+func TestDocumentTypeRepositoryDerivePostgresLocksCodeBeforeVersionAllocation(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT \* FROM "production_document_types" WHERE .*tenant_id = \$1 AND id = \$2 AND status IN \(\$3,\$4\).*FOR UPDATE`).
+		WithArgs(uint64(7), "base-postgres", types.ProductionDocumentTypeActive, types.ProductionDocumentTypeRetired, 1).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "code", "schema_version", "status", "origin", "template_key"}).
+			AddRow("base-postgres", 7, "sop", 4, string(types.ProductionDocumentTypeActive), string(types.ProductionDocumentTypeOriginBuiltin), "sop"))
+	mock.ExpectExec(`SELECT pg_advisory_xact_lock\(hashtextextended\(\$1, 0\)\)`).
+		WithArgs("7:sop").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`SELECT COALESCE\(MAX\(schema_version\), 0\) \+ 1 FROM "production_document_types" WHERE .*tenant_id = \$1 AND code = \$2`).
+		WithArgs(uint64(7), "sop").WillReturnRows(sqlmock.NewRows([]string{"coalesce"}).AddRow(5))
+	mock.ExpectQuery(`INSERT INTO "production_document_types".*RETURNING`).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"block_schema", "source_requirements", "skill_bindings", "workflow_plan",
+			"quality_rules", "review_policy", "publication_policy",
+		}).AddRow(
+			`{"allowed_block_types":["paragraph"],"required_sections":["Scope"],"version":1}`,
+			`{"allow_unsupported_facts":false,"allowed_source_kinds":["upload"],"min_accepted_evidence":1,"require_evidence_section":true,"version":1}`,
+			`{"skills":[],"version":1}`, `{"steps":[],"version":1}`,
+			`{"block_needs_confirmation":true,"gates":["section_completeness"],"require_evidence_for_facts":true,"version":1}`,
+			`{"steps":["business_reviewer"]}`,
+			`{"chunking":"inherit_target","knowledge_graph":"inherit_target","require_approved_review":true,"target_type":"knowledge_base","version":1}`,
+		))
+	mock.ExpectCommit()
+
+	derived, err := NewProductionDocumentTypeRepository(db).DeriveDraft(
+		context.Background(), 7, "base-postgres", validDerivedProductionDocumentType("derived-postgres", 7),
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, 5, derived.SchemaVersion)
+	require.Equal(t, types.ProductionDocumentTypeOriginCustom, derived.Origin)
+	require.NotNil(t, derived.TemplateKey)
+	require.Equal(t, "sop", *derived.TemplateKey)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestDocumentTypeRepositoryDeriveRetriesUniqueConflictInsideBoundedOperation(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err)
+
+	expectAttempt := func(nextVersion int, insertErr error) {
+		mock.ExpectBegin()
+		mock.ExpectQuery(`SELECT \* FROM "production_document_types" WHERE .*FOR UPDATE`).
+			WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "code", "schema_version", "status"}).
+				AddRow("base-retry", 7, "sop", 4, string(types.ProductionDocumentTypeActive)))
+		mock.ExpectExec(`SELECT pg_advisory_xact_lock`).WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectQuery(`SELECT COALESCE\(MAX\(schema_version\), 0\) \+ 1`).
+			WillReturnRows(sqlmock.NewRows([]string{"coalesce"}).AddRow(nextVersion))
+		insert := mock.ExpectQuery(`INSERT INTO "production_document_types".*RETURNING`)
+		if insertErr != nil {
+			insert.WillReturnError(insertErr)
+			mock.ExpectRollback()
+			return
+		}
+		insert.WillReturnRows(sqlmock.NewRows([]string{
+			"block_schema", "source_requirements", "skill_bindings", "workflow_plan",
+			"quality_rules", "review_policy", "publication_policy",
+		}).AddRow(`{}`, `{}`, `{}`, `{}`, `{}`, `{}`, `{}`))
+		mock.ExpectCommit()
+	}
+	expectAttempt(5, &pgconn.PgError{Code: "23505", Message: "duplicate key"})
+	expectAttempt(6, nil)
+
+	derived, err := NewProductionDocumentTypeRepository(db).DeriveDraft(
+		context.Background(), 7, "base-retry", validDerivedProductionDocumentType("derived-retry", 7),
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, 6, derived.SchemaVersion)
+	require.NoError(t, mock.ExpectationsWereMet())
 }

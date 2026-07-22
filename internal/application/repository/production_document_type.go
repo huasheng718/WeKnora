@@ -16,6 +16,8 @@ type productionDocumentTypeRepository struct {
 	db *gorm.DB
 }
 
+const productionDocumentTypeDeriveMaxAttempts = 3
+
 // NewProductionDocumentTypeRepository creates a tenant-scoped document-type repository.
 func NewProductionDocumentTypeRepository(db *gorm.DB) interfaces.ProductionDocumentTypeRepository {
 	return &productionDocumentTypeRepository{db: db}
@@ -31,6 +33,99 @@ func (r *productionDocumentTypeRepository) Create(
 	return translateProductionWriteError(
 		database.DBFromContext(ctx, r.db).WithContext(ctx).Create(documentType).Error,
 	)
+}
+
+func (r *productionDocumentTypeRepository) DeriveDraft(
+	ctx context.Context,
+	tenantID uint64,
+	baseID string,
+	draft *types.ProductionDocumentType,
+) (*types.ProductionDocumentType, error) {
+	if draft == nil {
+		return nil, errors.New("derived production document type is required")
+	}
+	var lastErr error
+	for range productionDocumentTypeDeriveMaxAttempts {
+		derived, err := r.deriveDraftAttempt(ctx, tenantID, baseID, draft)
+		if err == nil {
+			return derived, nil
+		}
+		if !errors.Is(err, types.ErrProductionConflict) {
+			return nil, err
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+func (r *productionDocumentTypeRepository) deriveDraftAttempt(
+	ctx context.Context,
+	tenantID uint64,
+	baseID string,
+	draft *types.ProductionDocumentType,
+) (*types.ProductionDocumentType, error) {
+	var derived types.ProductionDocumentType
+	err := database.WithTransactionContext(ctx, r.db, func(txCtx context.Context) error {
+		db := database.DBFromContext(txCtx, r.db).WithContext(txCtx)
+		var base types.ProductionDocumentType
+		baseQuery := db.Where(
+			"tenant_id = ? AND id = ? AND status IN ?",
+			tenantID, baseID,
+			[]types.ProductionDocumentTypeStatus{types.ProductionDocumentTypeActive, types.ProductionDocumentTypeRetired},
+		)
+		if db.Dialector.Name() == "postgres" {
+			if err := baseQuery.Clauses(clause.Locking{Strength: "UPDATE"}).First(&base).Error; err != nil {
+				return err
+			}
+			lockKey := fmt.Sprintf("%d:%s", tenantID, base.Code)
+			if err := db.Exec("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", lockKey).Error; err != nil {
+				return err
+			}
+		} else {
+			// SQLite has one writer. A no-op update reserves it before MAX is
+			// read, so concurrent derivations cannot allocate the same version.
+			result := baseQuery.Model(&types.ProductionDocumentType{}).
+				UpdateColumn("status", gorm.Expr("status"))
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return gorm.ErrRecordNotFound
+			}
+			if err := db.Where("tenant_id = ? AND id = ?", tenantID, baseID).First(&base).Error; err != nil {
+				return err
+			}
+		}
+
+		var nextVersion int
+		if err := db.Model(&types.ProductionDocumentType{}).
+			Select("COALESCE(MAX(schema_version), 0) + 1").
+			Where("tenant_id = ? AND code = ? AND deleted_at IS NULL", tenantID, base.Code).
+			Scan(&nextVersion).Error; err != nil {
+			return err
+		}
+
+		derived = *draft
+		derived.TenantID = tenantID
+		derived.Code = base.Code
+		derived.SchemaVersion = nextVersion
+		derived.Status = types.ProductionDocumentTypeDraft
+		derived.Origin = types.ProductionDocumentTypeOriginCustom
+		derived.TemplateKey = cloneProductionTemplateKey(base.TemplateKey)
+		return translateProductionWriteError(db.Create(&derived).Error)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &derived, nil
+}
+
+func cloneProductionTemplateKey(templateKey *string) *string {
+	if templateKey == nil {
+		return nil
+	}
+	copy := *templateKey
+	return &copy
 }
 
 func (r *productionDocumentTypeRepository) SeedBuiltins(

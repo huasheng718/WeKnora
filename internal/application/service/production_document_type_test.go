@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -18,8 +19,11 @@ type productionDocumentTypeRepoStub struct {
 	getErr      error
 	listErr     error
 	activeErr   error
+	deriveErr   error
 	activeCalls int
 	created     *types.ProductionDocumentType
+	derived     *types.ProductionDocumentType
+	derivedBase string
 	activated   struct {
 		tenantID      uint64
 		code          string
@@ -41,6 +45,29 @@ func (r *productionDocumentTypeRepoStub) Create(_ context.Context, documentType 
 	}
 	r.rows[documentType.TenantID][documentType.ID] = documentType
 	return nil
+}
+
+func (r *productionDocumentTypeRepoStub) DeriveDraft(
+	_ context.Context,
+	tenantID uint64,
+	baseID string,
+	draft *types.ProductionDocumentType,
+) (*types.ProductionDocumentType, error) {
+	if r.deriveErr != nil {
+		return nil, r.deriveErr
+	}
+	base := r.rows[tenantID][baseID]
+	if base == nil {
+		return nil, gorm.ErrRecordNotFound
+	}
+	r.derivedBase = baseID
+	draft.Code = base.Code
+	draft.SchemaVersion = base.SchemaVersion + 1
+	draft.Status = types.ProductionDocumentTypeDraft
+	draft.Origin = types.ProductionDocumentTypeOriginCustom
+	draft.TemplateKey = base.TemplateKey
+	r.derived = draft
+	return draft, nil
 }
 
 func (*productionDocumentTypeRepoStub) SeedBuiltins(
@@ -131,9 +158,24 @@ func (r *productionDocumentTypeRepoStub) add(row *types.ProductionDocumentType) 
 func productionDocumentTypeInput() interfaces.CreateProductionDocumentTypeInput {
 	return interfaces.CreateProductionDocumentTypeInput{
 		Code: "baseline", Name: "Baseline", Description: "Definition", SchemaVersion: 1,
-		BlockSchema: types.JSON(`{"type":"object"}`), SourceRequirements: types.JSON(`{}`),
-		SkillBindings: types.JSON(`{}`), QualityRules: types.JSON(`{}`),
-		ReviewPolicy: types.JSON(`{}`), PublicationPolicy: types.JSON(`{}`),
+		BlockSchema:        types.JSON(`{ "version": 1, "required_sections": ["Scope"], "allowed_block_types": ["paragraph"] }`),
+		SourceRequirements: types.JSON(`{"version":1,"min_accepted_evidence":1,"allowed_source_kinds":["upload"],"require_evidence_section":true,"allow_unsupported_facts":false}`),
+		SkillBindings:      types.JSON(`{"version":1,"skills":[]}`),
+		WorkflowPlan:       types.JSON(`{"version":1,"steps":[]}`),
+		QualityRules:       types.JSON(`{"version":1,"require_evidence_for_facts":true,"block_needs_confirmation":true,"gates":["section_completeness"]}`),
+		ReviewPolicy:       types.JSON(`{"steps":["business_reviewer"]}`),
+		PublicationPolicy:  types.JSON(`{"version":1,"target_type":"knowledge_base","chunking":"inherit_target","knowledge_graph":"inherit_target","require_approved_review":true}`),
+	}
+}
+
+func productionDocumentTypeDeriveInput() interfaces.DeriveProductionDocumentTypeInput {
+	create := productionDocumentTypeInput()
+	return interfaces.DeriveProductionDocumentTypeInput{
+		Name: create.Name, Description: create.Description,
+		BlockSchema: create.BlockSchema, SourceRequirements: create.SourceRequirements,
+		SkillBindings: create.SkillBindings, WorkflowPlan: create.WorkflowPlan,
+		QualityRules: create.QualityRules, ReviewPolicy: create.ReviewPolicy,
+		PublicationPolicy: create.PublicationPolicy,
 	}
 }
 
@@ -300,6 +342,87 @@ func TestProductionProjectAndDocumentTypeAuditActionWireValues(t *testing.T) {
 	require.Equal(t, types.AuditAction("production.project_role_set"), types.AuditActionProductionProjectRoleSet)
 	require.Equal(t, types.AuditAction("production.document_type_created"), types.AuditActionProductionDocumentTypeCreated)
 	require.Equal(t, types.AuditAction("production.document_type_activated"), types.AuditActionProductionDocumentTypeActivated)
+	require.Equal(t, types.AuditAction("production.document_type_derived"), types.AuditActionProductionDocumentTypeDerived)
 	require.Equal(t, types.AuditAction("production.source_frozen"), types.AuditActionProductionSourceFrozen)
 	require.Equal(t, types.AuditAction("production.version_created"), types.AuditActionProductionVersionCreated)
+}
+
+func TestDocumentTypeServiceDerivesCanonicalDraftForAdminAndOwner(t *testing.T) {
+	for _, role := range []types.TenantRole{types.TenantRoleAdmin, types.TenantRoleOwner} {
+		t.Run(string(role), func(t *testing.T) {
+			svc, repo, _, audit := newProductionDocumentTypeServiceFixture(role)
+			templateKey := "sop"
+			repo.add(&types.ProductionDocumentType{
+				ID: "base-1", TenantID: 7, Code: "sop", SchemaVersion: 4,
+				Status: types.ProductionDocumentTypeRetired, Origin: types.ProductionDocumentTypeOriginBuiltin,
+				TemplateKey: &templateKey,
+			})
+
+			derived, err := svc.DeriveDraft(ctxForUser(7, "actor"), 7, "base-1", productionDocumentTypeDeriveInput())
+
+			require.NoError(t, err)
+			require.Equal(t, "base-1", repo.derivedBase)
+			require.Equal(t, types.ProductionDocumentTypeOriginCustom, derived.Origin)
+			require.Equal(t, templateKey, *derived.TemplateKey)
+			require.Equal(t, types.JSON(`{"allowed_block_types":["paragraph"],"required_sections":["Scope"],"version":1}`), derived.BlockSchema)
+			require.Len(t, audit.entries, 1)
+			require.Equal(t, types.AuditActionProductionDocumentTypeDerived, audit.entries[0].Action)
+			var details map[string]any
+			require.NoError(t, json.Unmarshal(audit.entries[0].Details, &details))
+			require.Equal(t, "base-1", details["base_document_type_id"])
+			require.Equal(t, float64(4), details["base_schema_version"])
+			require.Equal(t, float64(5), details["derived_schema_version"])
+		})
+	}
+}
+
+func TestDocumentTypeServiceDeriveDeniesContributorAndCrossTenantBase(t *testing.T) {
+	t.Run("contributor", func(t *testing.T) {
+		svc, repo, _, audit := newProductionDocumentTypeServiceFixture(types.TenantRoleContributor)
+		derived, err := svc.DeriveDraft(ctxForUser(7, "actor"), 7, "base-1", productionDocumentTypeDeriveInput())
+		require.Nil(t, derived)
+		require.ErrorIs(t, err, types.ErrProductionForbidden)
+		require.Nil(t, repo.derived)
+		require.Empty(t, audit.entries)
+	})
+
+	t.Run("cross tenant base", func(t *testing.T) {
+		svc, repo, _, audit := newProductionDocumentTypeServiceFixture(types.TenantRoleAdmin)
+		repo.add(&types.ProductionDocumentType{ID: "tenant-8-base", TenantID: 8, Code: "sop", SchemaVersion: 1})
+		derived, err := svc.DeriveDraft(ctxForUser(7, "actor"), 7, "tenant-8-base", productionDocumentTypeDeriveInput())
+		require.Nil(t, derived)
+		require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+		require.Empty(t, audit.entries)
+	})
+}
+
+func TestDocumentTypeServiceDeriveRejectsStrictConfigAndAuditsOnlySuccessfulWrite(t *testing.T) {
+	svc, repo, _, audit := newProductionDocumentTypeServiceFixture(types.TenantRoleAdmin)
+	repo.add(&types.ProductionDocumentType{ID: "base-1", TenantID: 7, Code: "sop", SchemaVersion: 1})
+	invalid := productionDocumentTypeDeriveInput()
+	invalid.QualityRules = types.JSON(`{"version":1,"unknown":true}`)
+
+	derived, err := svc.DeriveDraft(ctxForUser(7, "actor"), 7, "base-1", invalid)
+	require.Nil(t, derived)
+	require.ErrorIs(t, err, types.ErrProductionDocumentTypeConfigInvalid)
+	require.Nil(t, repo.derived)
+	require.Empty(t, audit.entries)
+
+	repo.deriveErr = errors.New("derive failed")
+	derived, err = svc.DeriveDraft(ctxForUser(7, "actor"), 7, "base-1", productionDocumentTypeDeriveInput())
+	require.Nil(t, derived)
+	require.ErrorContains(t, err, "derive failed")
+	require.Empty(t, audit.entries)
+}
+
+func TestDocumentTypeServiceCreateCanonicalizesConfigsAndForcesCustomLineage(t *testing.T) {
+	svc, repo, _, _ := newProductionDocumentTypeServiceFixture(types.TenantRoleAdmin)
+
+	created, err := svc.CreateDocumentType(ctxForUser(7, "actor"), 7, productionDocumentTypeInput())
+
+	require.NoError(t, err)
+	require.Same(t, repo.created, created)
+	require.Equal(t, types.ProductionDocumentTypeOriginCustom, created.Origin)
+	require.Nil(t, created.TemplateKey)
+	require.Equal(t, types.JSON(`{"allowed_block_types":["paragraph"],"required_sections":["Scope"],"version":1}`), created.BlockSchema)
 }

@@ -134,6 +134,7 @@ const (
 	AuditActionProductionProjectCreated           AuditAction = "production.project_created"
 	AuditActionProductionProjectRoleSet           AuditAction = "production.project_role_set"
 	AuditActionProductionDocumentTypeCreated      AuditAction = "production.document_type_created"
+	AuditActionProductionDocumentTypeDerived      AuditAction = "production.document_type_derived"
 	AuditActionProductionDocumentTypeActivated    AuditAction = "production.document_type_activated"
 	AuditActionProductionSourceFrozen             AuditAction = "production.source_frozen"
 	AuditActionProductionVersionCreated           AuditAction = "production.version_created"

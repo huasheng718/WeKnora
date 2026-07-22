@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"errors"
 	"math"
 	"net/http"
 	"strings"
@@ -32,6 +33,18 @@ type createProductionDocumentTypeRequest struct {
 	SourceRequirements types.JSON `json:"source_requirements" binding:"required"`
 	SkillBindings      types.JSON `json:"skill_bindings" binding:"required"`
 	WorkflowPlan       types.JSON `json:"workflow_plan"`
+	QualityRules       types.JSON `json:"quality_rules" binding:"required"`
+	ReviewPolicy       types.JSON `json:"review_policy" binding:"required"`
+	PublicationPolicy  types.JSON `json:"publication_policy" binding:"required"`
+}
+
+type deriveProductionDocumentTypeRequest struct {
+	Name               string     `json:"name" binding:"required"`
+	Description        string     `json:"description"`
+	BlockSchema        types.JSON `json:"block_schema" binding:"required"`
+	SourceRequirements types.JSON `json:"source_requirements" binding:"required"`
+	SkillBindings      types.JSON `json:"skill_bindings" binding:"required"`
+	WorkflowPlan       types.JSON `json:"workflow_plan" binding:"required"`
 	QualityRules       types.JSON `json:"quality_rules" binding:"required"`
 	ReviewPolicy       types.JSON `json:"review_policy" binding:"required"`
 	PublicationPolicy  types.JSON `json:"publication_policy" binding:"required"`
@@ -89,10 +102,57 @@ func (h *ProductionDocumentTypeHandler) Create(c *gin.Context) {
 			PublicationPolicy:  request.PublicationPolicy,
 		})
 	if err != nil {
-		handleProductionServiceError(c, err, "failed to create production document type")
+		handleProductionDocumentTypeServiceError(c, err, "failed to create production document type")
 		return
 	}
 	c.JSON(http.StatusCreated, gin.H{"success": true, "data": documentType})
+}
+
+func (h *ProductionDocumentTypeHandler) DeriveDraft(c *gin.Context) {
+	tenantID, _, ok := productionRequestIdentity(c)
+	if !ok {
+		return
+	}
+	baseID := strings.TrimSpace(c.Param("id"))
+	if !isProductionUUID(baseID) {
+		c.Error(apperrors.NewValidationError("document type id must be a valid UUID"))
+		return
+	}
+	var request deriveProductionDocumentTypeRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.Error(apperrors.NewValidationError("invalid production document type draft request").WithDetails(err.Error()))
+		return
+	}
+	request.Name = strings.TrimSpace(request.Name)
+	if request.Name == "" {
+		c.Error(apperrors.NewValidationError("document type name is required"))
+		return
+	}
+	if utf8.RuneCountInString(request.Name) > 255 {
+		c.Error(apperrors.NewValidationError("document type name must be at most 255 characters"))
+		return
+	}
+	derived, err := h.service.DeriveDraft(c.Request.Context(), tenantID, baseID,
+		interfaces.DeriveProductionDocumentTypeInput{
+			Name: request.Name, Description: request.Description,
+			BlockSchema: request.BlockSchema, SourceRequirements: request.SourceRequirements,
+			SkillBindings: request.SkillBindings, WorkflowPlan: request.WorkflowPlan,
+			QualityRules: request.QualityRules, ReviewPolicy: request.ReviewPolicy,
+			PublicationPolicy: request.PublicationPolicy,
+		})
+	if err != nil {
+		handleProductionDocumentTypeServiceError(c, err, "failed to derive production document type draft")
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{"success": true, "data": derived})
+}
+
+func handleProductionDocumentTypeServiceError(c *gin.Context, err error, message string) {
+	if errors.Is(err, types.ErrProductionDocumentTypeConfigInvalid) {
+		c.Error(apperrors.NewValidationError("invalid production document type config"))
+		return
+	}
+	handleProductionServiceError(c, err, message)
 }
 
 func (h *ProductionDocumentTypeHandler) Activate(c *gin.Context) {
