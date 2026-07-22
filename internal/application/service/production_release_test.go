@@ -314,17 +314,26 @@ type productionReleaseReviewsStub struct {
 
 type productionReleaseDocumentTypeRepoStub struct {
 	interfaces.ProductionDocumentTypeRepository
-	documentType *types.ProductionDocumentType
-	requestedID  string
+	documentType  *types.ProductionDocumentType
+	requestedIDMu sync.RWMutex
+	requestedID   string
 }
 
 func (s *productionReleaseDocumentTypeRepoStub) GetByID(_ context.Context, tenantID uint64, documentTypeID string) (*types.ProductionDocumentType, error) {
+	s.requestedIDMu.Lock()
 	s.requestedID = documentTypeID
+	s.requestedIDMu.Unlock()
 	if s.documentType == nil || s.documentType.TenantID != tenantID || s.documentType.ID != documentTypeID {
 		return nil, gorm.ErrRecordNotFound
 	}
 	copy := *s.documentType
 	return &copy, nil
+}
+
+func (s *productionReleaseDocumentTypeRepoStub) lastRequestedID() string {
+	s.requestedIDMu.RLock()
+	defer s.requestedIDMu.RUnlock()
+	return s.requestedID
 }
 
 func (s *productionReleaseReviewsStub) GetApprovedReviewForVersion(context.Context, uint64, string, string) (*types.ProductionReviewRequest, error) {
@@ -860,7 +869,7 @@ func TestProductionReleasePrepareUsesRetiredExactBoundPublicationPolicy(t *testi
 
 	require.NoError(t, err)
 	require.NotNil(t, release)
-	require.Equal(t, "type-bound", typesRepo.requestedID)
+	require.Equal(t, "type-bound", typesRepo.lastRequestedID())
 }
 
 func TestProductionReleasePrepareCompletesWithAllEmptyLegacyGovernance(t *testing.T) {

@@ -82,4 +82,3 @@
 - [ ] Run `npm run build` and confirm Vite exits successfully.
 - [ ] Verify the new page against the local backend at desktop and mobile widths, including load state, read-only/admin behavior, JSON validation, local table scrolling, and absence of console errors.
 - [ ] Confirm `http://127.0.0.1:5173/platform/knowledge-production/document-types` serves the rebuilt page.
-
