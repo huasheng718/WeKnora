@@ -31,6 +31,7 @@ import GlobalInvitationBell from '@/components/GlobalInvitationBell.vue'
 import NewUserGuide from '@/components/NewUserGuide.vue'
 import { useCommandPaletteStore } from '@/stores/commandPalette'
 import { useChatResourcesStore } from '@/stores/chatResources'
+import { useUIStore } from '@/stores/ui'
 import { getKnowledgeBaseById } from '@/api/knowledge-base/index'
 import { MessagePlugin } from 'tdesign-vue-next'
 import { useI18n } from 'vue-i18n'
@@ -39,9 +40,17 @@ let { requestMethod } = useKnowledgeBase()
 const route = useRoute();
 const router = useRouter();
 const commandPaletteStore = useCommandPaletteStore();
+const uiStore = useUIStore();
 let ismask = ref(false)
 let uploadInput = ref();
 const { t } = useI18n();
+const compactViewport = window.matchMedia('(max-width: 640px)')
+
+const syncCompactSidebar = () => {
+    uiStore.sidebarCollapsed = compactViewport.matches || localStorage.getItem('sidebar_collapsed') === 'true'
+}
+
+syncCompactSidebar()
 
 const isRouterAlive = ref(true)
 const reloadApp = () => {
@@ -203,6 +212,7 @@ const handleGlobalDrop = async (event: DragEvent) => {
 
 // 组件挂载时添加全局事件监听器
 onMounted(() => {
+    compactViewport.addEventListener('change', syncCompactSidebar);
     document.addEventListener('dragenter', handleGlobalDragEnter, true);
     document.addEventListener('dragover', handleGlobalDragOver, true);
     document.addEventListener('dragleave', handleGlobalDragLeave, true);
@@ -238,6 +248,7 @@ function maybeOpenCmdkFromRoute() {
 
 // 组件卸载时移除全局事件监听器
 onUnmounted(() => {
+    compactViewport.removeEventListener('change', syncCompactSidebar);
     document.removeEventListener('dragenter', handleGlobalDragEnter, true);
     document.removeEventListener('dragover', handleGlobalDragOver, true);
     document.removeEventListener('dragleave', handleGlobalDragLeave, true);
@@ -273,6 +284,12 @@ onUnmounted(() => {
     display: flex;
     flex-direction: column;
     overflow: hidden;
+}
+
+@media (max-width: 640px) {
+    .main {
+        min-width: 0;
+    }
 }
 
 .upload-mask {
