@@ -157,6 +157,10 @@ func (f *fakeTenantService) DeleteTenant(ctx context.Context, id uint64) error {
 	return nil
 }
 
+func (f *fakeTenantService) PurgeProvisionedTenant(ctx context.Context, id uint64) error {
+	return nil
+}
+
 func (f *fakeTenantService) ListTenants(ctx context.Context) ([]*types.Tenant, error) {
 	return nil, nil
 }

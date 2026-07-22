@@ -33,7 +33,8 @@ func (s *stubTenantService) GetTenantByID(context.Context, uint64) (*types.Tenan
 func (s *stubTenantService) GetTenantsByIDs(context.Context, []uint64) (map[uint64]*types.Tenant, error) {
 	return map[uint64]*types.Tenant{s.tenant.ID: s.tenant}, nil
 }
-func (s *stubTenantService) DeleteTenant(context.Context, uint64) error { return nil }
+func (s *stubTenantService) DeleteTenant(context.Context, uint64) error           { return nil }
+func (s *stubTenantService) PurgeProvisionedTenant(context.Context, uint64) error { return nil }
 func (s *stubTenantService) ListTenants(context.Context) ([]*types.Tenant, error) {
 	return []*types.Tenant{s.tenant}, nil
 }

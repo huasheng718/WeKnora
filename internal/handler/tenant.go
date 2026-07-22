@@ -357,9 +357,9 @@ func (h *TenantHandler) CreateTenant(c *gin.Context) {
 			logger.Errorf(ctx,
 				"Failed to bootstrap owner membership for user %s tenant %d: %v — rolling back tenant",
 				caller.ID, createdTenant.ID, err)
-			if delErr := h.service.DeleteTenant(ctx, createdTenant.ID); delErr != nil {
+			if delErr := h.service.PurgeProvisionedTenant(ctx, createdTenant.ID); delErr != nil {
 				logger.Errorf(ctx,
-					"Rollback DeleteTenant failed for orphan tenant %d: %v",
+					"Provisioning purge failed for orphan tenant %d: %v",
 					createdTenant.ID, delErr,
 				)
 			}
@@ -398,9 +398,9 @@ func (h *TenantHandler) CreateTenant(c *gin.Context) {
 							caller.ID, createdTenant.ID, rmErr,
 						)
 					}
-					if delErr := h.service.DeleteTenant(ctx, createdTenant.ID); delErr != nil {
+					if delErr := h.service.PurgeProvisionedTenant(ctx, createdTenant.ID); delErr != nil {
 						logger.Errorf(ctx,
-							"Rollback DeleteTenant failed for over-quota tenant %d: %v",
+							"Provisioning purge failed for over-quota tenant %d: %v",
 							createdTenant.ID, delErr,
 						)
 					}
@@ -424,7 +424,10 @@ func (h *TenantHandler) CreateTenant(c *gin.Context) {
 			if h.memberService != nil {
 				_ = h.memberService.RemoveMember(ctx, caller.ID, createdTenant.ID)
 			}
-			_ = h.service.DeleteTenant(ctx, createdTenant.ID)
+			if purgeErr := h.service.PurgeProvisionedTenant(ctx, createdTenant.ID); purgeErr != nil {
+				logger.Errorf(ctx, "Provisioning purge failed for tenant %d after default workspace finalization: %v",
+					createdTenant.ID, purgeErr)
+			}
 			c.Error(errors.NewInternalServerError("Failed to finalise default workspace").WithDetails(err.Error()))
 			return
 		}

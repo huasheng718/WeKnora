@@ -132,6 +132,26 @@ func (r *tenantRepository) DeleteTenant(ctx context.Context, id uint64) error {
 	})
 }
 
+// PurgeProvisionedTenant permanently removes the rows created while
+// provisioning a workspace that never became externally usable. It accepts
+// only the tenant ID so storage credential snapshots are neither loaded nor
+// exposed during compensation. Normal workspace deletion uses DeleteTenant.
+func (r *tenantRepository) PurgeProvisionedTenant(ctx context.Context, id uint64) error {
+	return database.WithTransactionContext(ctx, r.db, func(txCtx context.Context) error {
+		tx := database.DBFromContext(txCtx, r.db).WithContext(txCtx)
+		if err := tx.Unscoped().Where("tenant_id = ?", id).Delete(&types.ProductionDocumentType{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Unscoped().Where("tenant_id = ?", id).Delete(&types.StorageBackend{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Unscoped().Where("tenant_id = ?", id).Delete(&types.TenantMember{}).Error; err != nil {
+			return err
+		}
+		return tx.Unscoped().Where("id = ?", id).Delete(&types.Tenant{}).Error
+	})
+}
+
 func (r *tenantRepository) AdjustStorageUsed(ctx context.Context, tenantID uint64, delta int64) error {
 	return database.DBFromContext(ctx, r.db).WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var tenant types.Tenant

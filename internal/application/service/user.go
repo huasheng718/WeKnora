@@ -178,7 +178,7 @@ func (s *userService) Register(ctx context.Context, req *types.RegisterRequest) 
 	if err != nil {
 		logger.Errorf(ctx, "Failed to create user: %v", err)
 		if createdTenant != nil {
-			if rollbackErr := s.tenantService.DeleteTenant(ctx, createdTenant.ID); rollbackErr != nil {
+			if rollbackErr := s.tenantService.PurgeProvisionedTenant(ctx, createdTenant.ID); rollbackErr != nil {
 				logger.Errorf(ctx, "Failed to roll back tenant %d after user creation failure: %v", createdTenant.ID, rollbackErr)
 			}
 		}
@@ -194,7 +194,9 @@ func (s *userService) Register(ctx context.Context, req *types.RegisterRequest) 
 			logger.Errorf(ctx, "Failed to create owner membership for user %s tenant %d: %v",
 				user.ID, createdTenant.ID, err)
 			_ = s.userRepo.DeleteUser(ctx, user.ID)
-			_ = s.tenantService.DeleteTenant(ctx, createdTenant.ID)
+			if rollbackErr := s.tenantService.PurgeProvisionedTenant(ctx, createdTenant.ID); rollbackErr != nil {
+				logger.Errorf(ctx, "Failed to roll back tenant %d after owner finalization failure: %v", createdTenant.ID, rollbackErr)
+			}
 			return nil, errors.New("failed to finalise workspace ownership")
 		}
 	}

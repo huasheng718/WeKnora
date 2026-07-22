@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/Tencent/WeKnora/internal/types"
@@ -12,6 +13,8 @@ type provisioningUserRepo struct {
 	interfaces.UserRepository
 	created       *types.User
 	updatedTenant uint64
+	createErr     error
+	deleteCalls   int
 }
 
 func (r *provisioningUserRepo) GetUserByEmail(context.Context, string) (*types.User, error) {
@@ -23,6 +26,9 @@ func (r *provisioningUserRepo) GetUserByUsername(context.Context, string) (*type
 }
 
 func (r *provisioningUserRepo) CreateUser(_ context.Context, user *types.User) error {
+	if r.createErr != nil {
+		return r.createErr
+	}
 	copy := *user
 	r.created = &copy
 	return nil
@@ -33,9 +39,16 @@ func (r *provisioningUserRepo) UpdateUser(_ context.Context, user *types.User) e
 	return nil
 }
 
+func (r *provisioningUserRepo) DeleteUser(context.Context, string) error {
+	r.deleteCalls++
+	return nil
+}
+
 type provisioningTenantService struct {
 	interfaces.TenantService
 	createCalls int
+	deleteCalls int
+	purgeCalls  int
 }
 
 func (s *provisioningTenantService) CreateTenant(context.Context, *types.Tenant) (*types.Tenant, error) {
@@ -47,13 +60,31 @@ func (s *provisioningTenantService) GetTenantByID(_ context.Context, id uint64) 
 	return &types.Tenant{ID: id}, nil
 }
 
+func (s *provisioningTenantService) DeleteTenant(context.Context, uint64) error {
+	s.deleteCalls++
+	return nil
+}
+
+func (s *provisioningTenantService) PurgeProvisionedTenant(context.Context, uint64) error {
+	s.purgeCalls++
+	return nil
+}
+
 type provisioningMemberService struct {
 	interfaces.TenantMemberService
-	members []*types.TenantMember
+	members   []*types.TenantMember
+	ensureErr error
 }
 
 func (s *provisioningMemberService) ListByUser(context.Context, string) ([]*types.TenantMember, error) {
 	return s.members, nil
+}
+
+func (s *provisioningMemberService) EnsureOwner(context.Context, string, uint64) (*types.TenantMember, error) {
+	if s.ensureErr != nil {
+		return nil, s.ensureErr
+	}
+	return &types.TenantMember{Role: types.TenantRoleOwner}, nil
 }
 
 func TestUserServiceRegisterTenantlessSkipsTenantCreation(t *testing.T) {
@@ -92,5 +123,45 @@ func TestResolveLoginTenantIDRepairsTenantlessUserWithMembership(t *testing.T) {
 	}
 	if repo.updatedTenant != 42 || user.TenantID != 42 {
 		t.Fatalf("repair was not persisted: repo=%d user=%d", repo.updatedTenant, user.TenantID)
+	}
+}
+
+func TestUserServiceRegisterPurgesProvisionedTenantWhenUserCreateFails(t *testing.T) {
+	repo := &provisioningUserRepo{createErr: errors.New("create user failed")}
+	tenantSvc := &provisioningTenantService{}
+	svc := &userService{userRepo: repo, tenantService: tenantSvc}
+
+	user, err := svc.Register(context.Background(), &types.RegisterRequest{
+		Username: "alice", Email: "alice@example.com", Password: "supersecret",
+		TenantProvisioning: types.TenantProvisioningCreatePersonal,
+	})
+
+	if err == nil || user != nil {
+		t.Fatalf("Register = (%v, %v), want failure", user, err)
+	}
+	if tenantSvc.purgeCalls != 1 || tenantSvc.deleteCalls != 0 {
+		t.Fatalf("rollback calls: purge=%d delete=%d, want 1/0", tenantSvc.purgeCalls, tenantSvc.deleteCalls)
+	}
+}
+
+func TestUserServiceRegisterPurgesProvisionedTenantWhenOwnerFinalizationFails(t *testing.T) {
+	repo := &provisioningUserRepo{}
+	tenantSvc := &provisioningTenantService{}
+	members := &provisioningMemberService{ensureErr: errors.New("ensure owner failed")}
+	svc := &userService{userRepo: repo, tenantService: tenantSvc, memberService: members}
+
+	user, err := svc.Register(context.Background(), &types.RegisterRequest{
+		Username: "alice", Email: "alice@example.com", Password: "supersecret",
+		TenantProvisioning: types.TenantProvisioningCreatePersonal,
+	})
+
+	if err == nil || user != nil {
+		t.Fatalf("Register = (%v, %v), want failure", user, err)
+	}
+	if repo.deleteCalls != 1 {
+		t.Fatalf("DeleteUser calls = %d, want 1", repo.deleteCalls)
+	}
+	if tenantSvc.purgeCalls != 1 || tenantSvc.deleteCalls != 0 {
+		t.Fatalf("rollback calls: purge=%d delete=%d, want 1/0", tenantSvc.purgeCalls, tenantSvc.deleteCalls)
 	}
 }

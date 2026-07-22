@@ -225,6 +225,21 @@ func (s *tenantService) DeleteTenant(ctx context.Context, id uint64) error {
 	return nil
 }
 
+// PurgeProvisionedTenant compensates a workspace creation that failed after
+// CreateTenant committed but before the workspace became externally usable.
+// It intentionally bypasses the ordinary soft-delete lifecycle.
+func (s *tenantService) PurgeProvisionedTenant(ctx context.Context, id uint64) error {
+	if id == 0 {
+		return errors.New("tenant ID cannot be 0")
+	}
+	if err := s.repo.PurgeProvisionedTenant(ctx, id); err != nil {
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{"tenant_id": id})
+		return err
+	}
+	logger.Infof(ctx, "Purged incomplete workspace provisioning, ID: %d", id)
+	return nil
+}
+
 // ListAllTenants lists all tenants (for users with cross-tenant access permission)
 // This method returns all tenants without filtering, intended for admin users
 func (s *tenantService) ListAllTenants(ctx context.Context) ([]*types.Tenant, error) {
