@@ -18,6 +18,18 @@ const (
 
 var ErrProductionDocumentTypeConfigInvalid = errors.New("production document type config is invalid")
 
+var legacyProductionRequiredSections = map[string][]string{
+	"software-development-baseline": {
+		"基线范围与目标", "需求基线", "产品与交互设计基线", "技术方案与架构基线",
+		"代码仓库、分支与提交基线", "依赖和运行环境基线", "测试、质量和安全基线",
+		"发布、部署和回滚基线", "已知风险、例外和遗留项", "证据清单",
+	},
+	"project-retrospective": {
+		"项目背景和目标", "关联研发基线", "计划与实际结果", "需求和范围变化", "质量、交付和运营数据",
+		"事故、偏差和影响", "根因分析", "有效实践和经验", "改进行动项、负责人和截止时间", "证据清单",
+	},
+}
+
 type ProductionBlockSchemaV1 struct {
 	Version           int      `json:"version"`
 	RequiredSections  []string `json:"required_sections"`
@@ -225,6 +237,117 @@ func CanonicalProductionDocumentTypeConfig(input ProductionDocumentTypeConfigInp
 		return ProductionDocumentTypeConfig{}, configFieldError("publication_policy", err)
 	}
 	return output, nil
+}
+
+// NormalizeProductionDocumentTypeConfig returns strict canonical governance,
+// adapting only the two pre-governance built-in document types.
+func NormalizeProductionDocumentTypeConfig(
+	code string,
+	input ProductionDocumentTypeConfigInput,
+) (ProductionDocumentTypeConfig, bool, error) {
+	config, err := CanonicalProductionDocumentTypeConfig(input)
+	if err == nil {
+		return config, false, nil
+	}
+	if !legacyProductionDocumentTypeConfigInput(input) {
+		return ProductionDocumentTypeConfig{}, false, err
+	}
+	legacy, ok := LegacyProductionDocumentTypeConfig(code)
+	if !ok {
+		return ProductionDocumentTypeConfig{}, false, err
+	}
+	return legacy, true, nil
+}
+
+// LegacyProductionDocumentTypeConfig returns the canonical governance assigned
+// to the two built-in document types that predate persisted governance fields.
+func LegacyProductionDocumentTypeConfig(code string) (ProductionDocumentTypeConfig, bool) {
+	sections, ok := legacyProductionRequiredSections[code]
+	if !ok {
+		return ProductionDocumentTypeConfig{}, false
+	}
+	values := ProductionDocumentTypeConfig{
+		BlockSchema: ProductionBlockSchemaV1{
+			Version: 1, RequiredSections: append([]string(nil), sections...),
+			AllowedBlockTypes: []string{"heading", "paragraph", "code", "callout", "list", "table", "image"},
+		},
+		SourceRequirements: ProductionSourceRequirementsV1{
+			Version: 1, MinAcceptedEvidence: 1,
+			AllowedSourceKinds: []ProductionSourceKind{
+				ProductionSourceKindUpload, ProductionSourceKindDatasource, ProductionSourceKindMCP,
+				ProductionSourceKindSkill, ProductionSourceKindManual,
+			},
+			RequireEvidenceSection: true,
+		},
+		SkillBindings: ProductionSkillBindingsV1{Version: 1, Skills: []ProductionSkillBindingV1{}},
+		WorkflowPlan:  ProductionWorkflowPlanV1{Version: 1, Steps: []ProductionWorkflowStepV1{}},
+		QualityRules: ProductionQualityRulesV1{
+			Version: 1, RequireEvidenceForFacts: true,
+			Gates: []string{"section_completeness", "fact_evidence"},
+		},
+		ReviewPolicy: ProductionReviewPolicyV1{Steps: []ProductionRole{ProductionRoleBusinessReviewer}},
+		PublicationPolicy: ProductionPublicationPolicyV1{
+			Version: 1, TargetType: "knowledge_base", Chunking: "inherit_target",
+			KnowledgeGraph: "inherit_target", RequireApprovedReview: true,
+		},
+	}
+	input := ProductionDocumentTypeConfigInput{}
+	var err error
+	input.BlockSchema, err = canonicalProductionDocumentTypeConfigValue(values.BlockSchema)
+	if err != nil {
+		return ProductionDocumentTypeConfig{}, false
+	}
+	input.SourceRequirements, err = canonicalProductionDocumentTypeConfigValue(values.SourceRequirements)
+	if err != nil {
+		return ProductionDocumentTypeConfig{}, false
+	}
+	input.SkillBindings, err = canonicalProductionDocumentTypeConfigValue(values.SkillBindings)
+	if err != nil {
+		return ProductionDocumentTypeConfig{}, false
+	}
+	input.WorkflowPlan, err = canonicalProductionDocumentTypeConfigValue(values.WorkflowPlan)
+	if err != nil {
+		return ProductionDocumentTypeConfig{}, false
+	}
+	input.QualityRules, err = canonicalProductionDocumentTypeConfigValue(values.QualityRules)
+	if err != nil {
+		return ProductionDocumentTypeConfig{}, false
+	}
+	input.ReviewPolicy, err = canonicalProductionDocumentTypeConfigValue(values.ReviewPolicy)
+	if err != nil {
+		return ProductionDocumentTypeConfig{}, false
+	}
+	input.PublicationPolicy, err = canonicalProductionDocumentTypeConfigValue(values.PublicationPolicy)
+	if err != nil {
+		return ProductionDocumentTypeConfig{}, false
+	}
+	canonical, err := CanonicalProductionDocumentTypeConfig(input)
+	return canonical, err == nil
+}
+
+func legacyProductionDocumentTypeConfigInput(input ProductionDocumentTypeConfigInput) bool {
+	for _, raw := range []JSON{
+		input.BlockSchema, input.SourceRequirements, input.SkillBindings,
+		input.QualityRules, input.ReviewPolicy, input.PublicationPolicy,
+	} {
+		if !emptyProductionJSONObject(raw) {
+			return false
+		}
+	}
+	if emptyProductionJSONObject(input.WorkflowPlan) {
+		return len(input.WorkflowPlan) != 0
+	}
+	canonical, err := CanonicalProductionWorkflowPlanSnapshot(input.WorkflowPlan)
+	return err == nil && bytes.Equal(canonical, input.WorkflowPlan) &&
+		bytes.Equal(canonical, JSON(`{"steps":[],"version":1}`))
+}
+
+func emptyProductionJSONObject(raw JSON) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var object map[string]json.RawMessage
+	return json.Unmarshal(raw, &object) == nil && object != nil && len(object) == 0
 }
 
 func decodeProductionDocumentTypeConfig(raw JSON, target any, requiredFields ...string) error {

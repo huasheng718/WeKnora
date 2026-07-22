@@ -280,19 +280,9 @@ func decodeProductionWriterDocumentType(raw types.JSON) (*productionWriterDocume
 		QualityRules: wire.QualityRules, ReviewPolicy: wire.ReviewPolicy,
 		PublicationPolicy: wire.PublicationPolicy,
 	}
-	config, err := types.CanonicalProductionDocumentTypeConfig(input)
+	config, _, err := types.NormalizeProductionDocumentTypeConfig(wire.Code, input)
 	if err != nil {
-		if !isLegacyProductionDocumentTypeConfig(input) {
-			return nil, fmt.Errorf("%w: invalid document type governance snapshot: %v", errProductionWriterScope, err)
-		}
-		var adapted bool
-		config, adapted, err = canonicalLegacyProductionDocumentTypeConfig(wire.Code, input)
-		if !adapted {
-			return nil, fmt.Errorf("%w: invalid document type governance snapshot: %v", errProductionWriterScope, err)
-		}
-		if err != nil {
-			return nil, fmt.Errorf("%w: invalid legacy document type governance snapshot: %v", errProductionWriterScope, err)
-		}
+		return nil, fmt.Errorf("%w: invalid document type governance snapshot: %v", errProductionWriterScope, err)
 	}
 	return &productionWriterDocumentTypeSnapshot{
 		ID: wire.ID, Code: wire.Code, SchemaVersion: wire.SchemaVersion,
@@ -313,59 +303,8 @@ func productionDocumentTypeConfig(documentType *types.ProductionDocumentType) (t
 		QualityRules: documentType.QualityRules, ReviewPolicy: documentType.ReviewPolicy,
 		PublicationPolicy: documentType.PublicationPolicy,
 	}
-	config, err := types.CanonicalProductionDocumentTypeConfig(input)
-	if err == nil {
-		return config, nil
-	}
-	if isLegacyProductionDocumentTypeConfig(input) {
-		legacy, ok, legacyErr := canonicalLegacyProductionDocumentTypeConfig(documentType.Code, input)
-		if ok {
-			if legacyErr != nil {
-				return types.ProductionDocumentTypeConfig{}, legacyErr
-			}
-			return legacy, nil
-		}
-	}
-	return types.ProductionDocumentTypeConfig{}, err
-}
-
-func isLegacyProductionDocumentTypeConfig(input types.ProductionDocumentTypeConfigInput) bool {
-	for _, raw := range []types.JSON{
-		input.BlockSchema, input.SourceRequirements, input.SkillBindings, input.WorkflowPlan,
-		input.QualityRules, input.ReviewPolicy, input.PublicationPolicy,
-	} {
-		if !isEmptyProductionJSONObject(raw) {
-			return false
-		}
-	}
-	return true
-}
-
-func isEmptyProductionJSONObject(raw types.JSON) bool {
-	if len(raw) == 0 {
-		return true
-	}
-	var object map[string]json.RawMessage
-	if err := decodeProductionJSON(raw, &object, false); err != nil || object == nil {
-		return false
-	}
-	return len(object) == 0
-}
-
-func canonicalLegacyProductionDocumentTypeConfig(
-	code string,
-	input types.ProductionDocumentTypeConfigInput,
-) (types.ProductionDocumentTypeConfig, bool, error) {
-	legacy, ok := legacyProductionDocumentTypeConfig(code)
-	if !ok {
-		return types.ProductionDocumentTypeConfig{}, false, nil
-	}
-	legacyInput, err := productionDocumentTypeConfigInput(legacy)
-	if err != nil {
-		return types.ProductionDocumentTypeConfig{}, true, err
-	}
-	config, err := types.CanonicalProductionDocumentTypeConfig(legacyInput)
-	return config, true, err
+	config, _, err := types.NormalizeProductionDocumentTypeConfig(documentType.Code, input)
+	return config, err
 }
 
 func productionDocumentTypeConfigInput(
@@ -395,40 +334,7 @@ func productionDocumentTypeConfigInput(
 }
 
 func legacyProductionDocumentTypeConfig(code string) (types.ProductionDocumentTypeConfig, bool) {
-	var template ProductionBuiltinTemplate
-	switch code {
-	case "software-development-baseline":
-		template = BuiltinSoftwareDevelopmentBaseline()
-	case "project-retrospective":
-		template = BuiltinProjectRetrospective()
-	default:
-		return types.ProductionDocumentTypeConfig{}, false
-	}
-	return types.ProductionDocumentTypeConfig{
-		BlockSchema: types.ProductionBlockSchemaV1{
-			Version: 1, RequiredSections: append([]string(nil), template.RequiredSections...),
-			AllowedBlockTypes: []string{"heading", "paragraph", "code", "callout", "list", "table", "image"},
-		},
-		SourceRequirements: types.ProductionSourceRequirementsV1{
-			Version: 1, MinAcceptedEvidence: 1,
-			AllowedSourceKinds: []types.ProductionSourceKind{
-				types.ProductionSourceKindUpload, types.ProductionSourceKindDatasource, types.ProductionSourceKindMCP,
-				types.ProductionSourceKindSkill, types.ProductionSourceKindManual,
-			},
-			RequireEvidenceSection: true,
-		},
-		SkillBindings: types.ProductionSkillBindingsV1{Version: 1, Skills: []types.ProductionSkillBindingV1{}},
-		WorkflowPlan:  types.ProductionWorkflowPlanV1{Version: 1, Steps: []types.ProductionWorkflowStepV1{}},
-		QualityRules: types.ProductionQualityRulesV1{
-			Version: 1, RequireEvidenceForFacts: true,
-			Gates: []string{"section_completeness", "fact_evidence"},
-		},
-		ReviewPolicy: types.ProductionReviewPolicyV1{Steps: []types.ProductionRole{types.ProductionRoleBusinessReviewer}},
-		PublicationPolicy: types.ProductionPublicationPolicyV1{
-			Version: 1, TargetType: "knowledge_base", Chunking: "inherit_target",
-			KnowledgeGraph: "inherit_target", RequireApprovedReview: true,
-		},
-	}, true
+	return types.LegacyProductionDocumentTypeConfig(code)
 }
 
 func (w *ProductionWriter) loadContext(

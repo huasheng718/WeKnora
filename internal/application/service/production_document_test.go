@@ -53,6 +53,14 @@ func newProductionDocumentServiceFixture(t *testing.T) (*productionDocumentServi
 }
 
 func newProductionDocumentServiceFixtureWithEvidenceDigest(t *testing.T, evidenceDigest string) (*productionDocumentService, interfaces.ProductionDocumentRepository, *gorm.DB, *productionDocumentAuthorizerStub) {
+	return newProductionDocumentServiceFixtureWithConfig(t, evidenceDigest, nil)
+}
+
+func newProductionDocumentServiceFixtureWithConfig(
+	t *testing.T,
+	evidenceDigest string,
+	configInput *types.ProductionDocumentTypeConfigInput,
+) (*productionDocumentService, interfaces.ProductionDocumentRepository, *gorm.DB, *productionDocumentAuthorizerStub) {
 	t.Helper()
 	dsn := "file:" + filepath.Join(t.TempDir(), "document-service.db") + "?_foreign_keys=1&_busy_timeout=5000&_journal_mode=WAL"
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
@@ -79,10 +87,13 @@ func newProductionDocumentServiceFixtureWithEvidenceDigest(t *testing.T, evidenc
 	require.NoError(t, db.Create(&types.ProductionProject{
 		ID: documentServiceProjectID, TenantID: 7, Name: "Project", OwnerUserID: "owner", Status: types.ProductionProjectActive,
 	}).Error)
-	config, ok := legacyProductionDocumentTypeConfig("software-development-baseline")
-	require.True(t, ok)
-	configInput, err := productionDocumentTypeConfigInput(config)
-	require.NoError(t, err)
+	if configInput == nil {
+		config, ok := legacyProductionDocumentTypeConfig("software-development-baseline")
+		require.True(t, ok)
+		canonicalInput, configErr := productionDocumentTypeConfigInput(config)
+		require.NoError(t, configErr)
+		configInput = &canonicalInput
+	}
 	require.NoError(t, db.Create(&types.ProductionDocumentType{
 		ID: documentServiceTypeID, TenantID: 7, Code: "software-development-baseline", Name: "Baseline", SchemaVersion: 3,
 		BlockSchema: configInput.BlockSchema, SourceRequirements: configInput.SourceRequirements,
@@ -555,6 +566,90 @@ func TestProductionDocumentServiceInternalAppendUsesRetiredExactBoundType(t *tes
 	require.Equal(t, int64(2), countServiceRows(t, db, &types.ProductionDocumentVersion{}))
 }
 
+func TestProductionDocumentServiceSchemaDefaultLegacyRunSurvivesExactTypeRetirement(t *testing.T) {
+	legacyInput := &types.ProductionDocumentTypeConfigInput{
+		BlockSchema: types.JSON(`{}`), SourceRequirements: types.JSON(`{}`), SkillBindings: types.JSON(`{}`),
+		WorkflowPlan: types.JSON(`{"steps":[],"version":1}`), QualityRules: types.JSON(`{}`),
+		ReviewPolicy: types.JSON(`{}`), PublicationPolicy: types.JSON(`{}`),
+	}
+	svc, documents, db, authorizer := newProductionDocumentServiceFixtureWithConfig(t, "", legacyInput)
+	document := createServiceDocument(t, svc)
+	modelID := "66000000-0000-4000-8000-000000000001"
+	runService := NewProductionRunService(
+		svc.runs,
+		documents,
+		apprepository.NewProductionSourceRepository(db),
+		apprepository.NewProductionDocumentTypeRepository(db),
+		&productionWorkflowModelRepository{model: &types.Model{
+			ID: modelID, TenantID: 7, Name: "writer", Type: types.ModelTypeKnowledgeQA,
+			Status: types.ModelStatusActive,
+		}},
+		authorizer,
+		&productionAuditServiceStub{},
+		apprepository.NewProductionUnitOfWork(db),
+		&productionRunServiceResumerStub{},
+	)
+
+	run, err := runService.StartDocumentRun(productionDocumentContext(7), document.ID, interfaces.StartProductionDocumentRunInput{
+		RunType: types.ProductionRunWrite, ModelID: modelID,
+	})
+	require.NoError(t, err)
+	var snapshot productionWriterDocumentTypeSnapshotWire
+	require.NoError(t, decodeProductionJSON(run.DocumentTypeSnapshot, &snapshot, false))
+	canonical, err := types.CanonicalProductionDocumentTypeConfig(types.ProductionDocumentTypeConfigInput{
+		BlockSchema: snapshot.BlockSchema, SourceRequirements: snapshot.SourceRequirements,
+		SkillBindings: snapshot.SkillBindings, WorkflowPlan: snapshot.WorkflowPlan,
+		QualityRules: snapshot.QualityRules, ReviewPolicy: snapshot.ReviewPolicy,
+		PublicationPolicy: snapshot.PublicationPolicy,
+	})
+	require.NoError(t, err, "all seven persisted run governance fields must be canonical")
+	expected, ok := legacyProductionDocumentTypeConfig("software-development-baseline")
+	require.True(t, ok)
+	expectedInput, err := productionDocumentTypeConfigInput(expected)
+	require.NoError(t, err)
+	require.Equal(t, expectedInput, canonical.Canonical)
+	require.Equal(t, expectedInput.WorkflowPlan, run.WorkflowPlanSnapshot)
+
+	claimed, won, err := svc.runs.Claim(context.Background(), 7, run.ID, productionRunCAS(run), time.Minute)
+	require.NoError(t, err)
+	require.True(t, won)
+	require.NoError(t, db.Model(&types.ProductionDocumentType{}).Where("id = ?", documentServiceTypeID).
+		Update("status", types.ProductionDocumentTypeRetired).Error)
+	persistedRun, err := svc.runs.Get(context.Background(), 7, run.ID)
+	require.NoError(t, err)
+	require.Equal(t, types.ProductionRunRunning, persistedRun.Status)
+	var retiredType types.ProductionDocumentType
+	require.NoError(t, db.First(&retiredType, "id = ?", documentServiceTypeID).Error)
+	retiredSnapshot, _, err := canonicalProductionDocumentTypeSnapshot(&retiredType)
+	require.NoError(t, err)
+	require.JSONEq(t, string(run.DocumentTypeSnapshot), string(retiredSnapshot))
+	authorizer.err = types.ErrProductionForbidden
+	blocks := governedServiceBlocks(governedServiceParagraph("claim", `"governed claim"`))
+	for index := range blocks {
+		blocks[index].AIProvenance = types.JSON(`{"run_id":"` + run.ID + `"}`)
+	}
+	principal := types.ProductionInternalPrincipal{
+		ActorID: types.ProductionSystemActorID, ActorKind: types.ProductionInternalActorWorker,
+		TenantID: 7, ProjectID: documentServiceProjectID, RunID: run.ID,
+	}
+	ctx, err := types.WithProductionInternalPrincipal(context.Background(), principal)
+	require.NoError(t, err)
+	var sourceSet types.ProductionSourceSet
+	require.NoError(t, db.First(&sourceSet, "id = ?", documentServiceSetID).Error)
+	require.NoError(t, validateProductionInternalAppendRun(
+		persistedRun, principal, document, &sourceSet, &retiredType,
+		productionRunVersionID(run.ID), *document.CurrentVersionID,
+	))
+
+	version, err := svc.AppendVersion(ctx, document.ID, interfaces.AppendProductionVersionInput{
+		VersionID: productionRunVersionID(run.ID), ParentVersionID: *document.CurrentVersionID,
+		SourceSetID: documentServiceSetID, Origin: types.ProductionDocumentOriginAI, Blocks: blocks,
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, productionRunVersionID(claimed.ID), version.ID)
+}
+
 func TestProductionDocumentServiceIdempotentlyReplaysExactInternalRunVersion(t *testing.T) {
 	svc, repo, db, _ := newProductionDocumentServiceFixture(t)
 	document := createServiceDocument(t, svc)
@@ -787,9 +882,10 @@ func serviceInternalRun(
 	require.NoError(t, db.First(&sourceSet, "id = ?", documentServiceSetID).Error)
 	var documentType types.ProductionDocumentType
 	require.NoError(t, db.First(&documentType, "id = ?", documentServiceTypeID).Error)
-	run := newProductionRun(
+	run, err := newProductionRun(
 		7, document, &sourceSet, &documentType, "model-1", types.ProductionRunWrite, document.CurrentVersionID,
 	)
+	require.NoError(t, err)
 	run.ID = runID
 	run.Status = types.ProductionRunRunning
 	return run

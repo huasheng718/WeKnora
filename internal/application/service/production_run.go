@@ -78,9 +78,13 @@ func (s *productionRunService) StartDocumentRun(
 	if sourceSet.Status != types.ProductionSourceSetFrozen {
 		return nil, types.ErrProductionDocumentSourceSetInvalid
 	}
-	return s.persistAndResume(ctx, newProductionRun(
+	run, err := newProductionRun(
 		tenantID, document, sourceSet, documentType, input.ModelID, input.RunType, document.CurrentVersionID,
-	))
+	)
+	if err != nil {
+		return nil, err
+	}
+	return s.persistAndResume(ctx, run)
 }
 
 func (s *productionRunService) StartSourceSetCollection(
@@ -122,9 +126,13 @@ func (s *productionRunService) StartSourceSetCollection(
 	if sourceSet.Status == types.ProductionSourceSetFailed {
 		return nil, types.ErrProductionConflict
 	}
-	return s.persistAndResume(ctx, newProductionRun(
+	run, err := newProductionRun(
 		tenantID, nil, sourceSet, documentType, input.ModelID, types.ProductionRunCollect, nil,
-	))
+	)
+	if err != nil {
+		return nil, err
+	}
+	return s.persistAndResume(ctx, run)
 }
 
 func (s *productionRunService) GetRun(ctx context.Context, runID string) (*types.ProductionRun, error) {
@@ -361,8 +369,11 @@ func newProductionRun(
 	modelID string,
 	runType types.ProductionRunType,
 	inputVersionID *string,
-) *types.ProductionRun {
-	snapshot := productionDocumentTypeSnapshot(documentType)
+) (*types.ProductionRun, error) {
+	snapshot, workflowPlan, err := canonicalProductionDocumentTypeSnapshot(documentType)
+	if err != nil {
+		return nil, err
+	}
 	projectID := sourceSet.ProjectID
 	documentID := types.ProductionDocumentID("")
 	if document != nil {
@@ -373,25 +384,32 @@ func newProductionRun(
 		ID: uuid.NewString(), TenantID: tenantID, ProjectID: projectID, DocumentID: documentID,
 		SourceSetID: sourceSet.ID, RunType: runType, Status: types.ProductionRunQueued,
 		Attempt: 1, CurrentStep: 0, WakeupVersion: 1, StatePayload: types.JSON(`{}`),
-		ModelID: modelID, DocumentTypeSnapshot: snapshot, WorkflowPlanSnapshot: documentType.WorkflowPlan,
+		ModelID: modelID, DocumentTypeSnapshot: snapshot, WorkflowPlanSnapshot: workflowPlan,
 		InputVersionID: inputVersionID,
 		IdempotencyKey: uuid.NewString(),
-	}
+	}, nil
 }
 
-func productionDocumentTypeSnapshot(documentType *types.ProductionDocumentType) types.JSON {
-	if documentType == nil {
-		return nil
+func canonicalProductionDocumentTypeSnapshot(
+	documentType *types.ProductionDocumentType,
+) (types.JSON, types.JSON, error) {
+	config, err := productionDocumentTypeConfig(documentType)
+	if err != nil {
+		return nil, nil, err
+	}
+	input, err := productionDocumentTypeConfigInput(config)
+	if err != nil {
+		return nil, nil, err
 	}
 	snapshot, _ := canonicalProductionValue(map[string]any{
 		"id": documentType.ID, "code": documentType.Code, "name": documentType.Name,
-		"schema_version": documentType.SchemaVersion, "block_schema": productionJSONValue(documentType.BlockSchema),
-		"source_requirements": productionJSONValue(documentType.SourceRequirements),
-		"skill_bindings":      productionJSONValue(documentType.SkillBindings), "workflow_plan": productionJSONValue(documentType.WorkflowPlan),
-		"quality_rules": productionJSONValue(documentType.QualityRules),
-		"review_policy": productionJSONValue(documentType.ReviewPolicy), "publication_policy": productionJSONValue(documentType.PublicationPolicy),
+		"schema_version": documentType.SchemaVersion, "block_schema": productionJSONValue(input.BlockSchema),
+		"source_requirements": productionJSONValue(input.SourceRequirements),
+		"skill_bindings":      productionJSONValue(input.SkillBindings), "workflow_plan": productionJSONValue(input.WorkflowPlan),
+		"quality_rules": productionJSONValue(input.QualityRules),
+		"review_policy": productionJSONValue(input.ReviewPolicy), "publication_policy": productionJSONValue(input.PublicationPolicy),
 	})
-	return snapshot
+	return snapshot, input.WorkflowPlan, nil
 }
 
 func productionJSONValue(raw types.JSON) any {

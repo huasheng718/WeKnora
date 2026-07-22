@@ -46,6 +46,43 @@ func TestCanonicalProductionDocumentTypeConfigValidatesAndCanonicalizesV1(t *tes
 	require.Equal(t, got.Canonical, reorderedConfig.Canonical)
 }
 
+func TestNormalizeProductionDocumentTypeConfigAdaptsOnlyExactKnownLegacyShapes(t *testing.T) {
+	legacy := ProductionDocumentTypeConfigInput{
+		BlockSchema: JSON(`{}`), SourceRequirements: JSON(`{}`), SkillBindings: JSON(`{}`),
+		WorkflowPlan: JSON(`{"steps":[],"version":1}`), QualityRules: JSON(`{}`),
+		ReviewPolicy: JSON(`{}`), PublicationPolicy: JSON(`{}`),
+	}
+	for _, code := range []string{"software-development-baseline", "project-retrospective"} {
+		config, adapted, err := NormalizeProductionDocumentTypeConfig(code, legacy)
+		require.NoError(t, err)
+		require.True(t, adapted)
+		require.NotEmpty(t, config.BlockSchema.RequiredSections)
+		require.Equal(t, JSON(`{"steps":[],"version":1}`), config.Canonical.WorkflowPlan)
+	}
+
+	for name, mutate := range map[string]func(*ProductionDocumentTypeConfigInput, *string){
+		"unknown code": func(_ *ProductionDocumentTypeConfigInput, code *string) { *code = "unknown" },
+		"reordered workflow": func(input *ProductionDocumentTypeConfigInput, _ *string) {
+			input.WorkflowPlan = JSON(`{"version":1,"steps":[]}`)
+		},
+		"workflow step": func(input *ProductionDocumentTypeConfigInput, _ *string) {
+			input.WorkflowPlan = JSON(`{"steps":[{"provider_type":"mcp","provider_id":"33333333-3333-4333-8333-333333333333","tool_name":"lookup","request":{}}],"version":1}`)
+		},
+		"populated governance": func(input *ProductionDocumentTypeConfigInput, _ *string) {
+			input.SkillBindings = JSON(`{"skills":[],"version":1}`)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			input := legacy
+			code := "software-development-baseline"
+			mutate(&input, &code)
+			_, adapted, err := NormalizeProductionDocumentTypeConfig(code, input)
+			require.Error(t, err)
+			require.False(t, adapted)
+		})
+	}
+}
+
 func TestCanonicalProductionDocumentTypeConfigRejectsUnknownFieldsAndWrongVersions(t *testing.T) {
 	for name, mutate := range map[string]func(*ProductionDocumentTypeConfigInput){
 		"unknown block field": func(input *ProductionDocumentTypeConfigInput) {

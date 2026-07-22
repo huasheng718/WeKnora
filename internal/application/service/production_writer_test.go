@@ -285,12 +285,14 @@ func productionWriterTestDocumentTypeSnapshot(t *testing.T, skillBindings types.
 	input, err := productionDocumentTypeConfigInput(config)
 	require.NoError(t, err)
 	input.SkillBindings = skillBindings
-	return productionDocumentTypeSnapshot(&types.ProductionDocumentType{
+	snapshot, _, err := canonicalProductionDocumentTypeSnapshot(&types.ProductionDocumentType{
 		ID: writerTypeID, Code: "software-development-baseline", Name: "Baseline", SchemaVersion: 3,
 		BlockSchema: input.BlockSchema, SourceRequirements: input.SourceRequirements,
 		SkillBindings: input.SkillBindings, WorkflowPlan: input.WorkflowPlan,
 		QualityRules: input.QualityRules, ReviewPolicy: input.ReviewPolicy, PublicationPolicy: input.PublicationPolicy,
 	})
+	require.NoError(t, err)
+	return snapshot
 }
 
 func stringPointer(value string) *string { return &value }
@@ -712,6 +714,16 @@ func TestProductionLegacyAdapterRequiresEveryGovernanceFieldEmpty(t *testing.T) 
 		"quality_rules":{},"review_policy":{},"publication_policy":{}
 	}`)
 	_, err = decodeProductionWriterDocumentType(partial)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "invalid document type governance snapshot")
+
+	workflowWithStep := types.JSON(`{
+		"id":"22222222-2222-4222-8222-222222222222","code":"software-development-baseline","schema_version":3,
+		"block_schema":{},"source_requirements":{},"skill_bindings":{},
+		"workflow_plan":{"version":1,"steps":[{"provider_type":"mcp","provider_id":"33333333-3333-4333-8333-333333333333","tool_name":"lookup","request":{}}]},
+		"quality_rules":{},"review_policy":{},"publication_policy":{}
+	}`)
+	_, err = decodeProductionWriterDocumentType(workflowWithStep)
 	require.Error(t, err)
 	require.ErrorContains(t, err, "invalid document type governance snapshot")
 }

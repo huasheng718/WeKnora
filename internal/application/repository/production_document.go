@@ -409,29 +409,30 @@ func productionAppendRunSnapshotMatchesDocumentType(
 		snapshot.SchemaVersion != documentType.SchemaVersion {
 		return false
 	}
-	pairs := []struct {
-		snapshot json.RawMessage
-		current  types.JSON
-	}{
-		{snapshot.BlockSchema, documentType.BlockSchema},
-		{snapshot.SourceRequirements, documentType.SourceRequirements},
-		{snapshot.SkillBindings, documentType.SkillBindings},
-		{snapshot.WorkflowPlan, documentType.WorkflowPlan},
-		{snapshot.QualityRules, documentType.QualityRules},
-		{snapshot.ReviewPolicy, documentType.ReviewPolicy},
-		{snapshot.PublicationPolicy, documentType.PublicationPolicy},
+	snapshotConfig, err := types.CanonicalProductionDocumentTypeConfig(types.ProductionDocumentTypeConfigInput{
+		BlockSchema: types.JSON(snapshot.BlockSchema), SourceRequirements: types.JSON(snapshot.SourceRequirements),
+		SkillBindings: types.JSON(snapshot.SkillBindings), WorkflowPlan: types.JSON(snapshot.WorkflowPlan),
+		QualityRules: types.JSON(snapshot.QualityRules), ReviewPolicy: types.JSON(snapshot.ReviewPolicy),
+		PublicationPolicy: types.JSON(snapshot.PublicationPolicy),
+	})
+	if err != nil {
+		return false
 	}
-	for _, pair := range pairs {
-		if len(pair.snapshot) == 0 || len(pair.current) == 0 {
-			return false
-		}
-		canonicalSnapshot, snapshotErr := types.CanonicalProductionJSON(types.JSON(pair.snapshot))
-		canonicalCurrent, currentErr := types.CanonicalProductionJSON(pair.current)
-		if snapshotErr != nil || currentErr != nil || !bytes.Equal(canonicalSnapshot, canonicalCurrent) {
-			return false
-		}
+	currentConfig, _, err := types.NormalizeProductionDocumentTypeConfig(documentType.Code, types.ProductionDocumentTypeConfigInput{
+		BlockSchema: documentType.BlockSchema, SourceRequirements: documentType.SourceRequirements,
+		SkillBindings: documentType.SkillBindings, WorkflowPlan: documentType.WorkflowPlan,
+		QualityRules: documentType.QualityRules, ReviewPolicy: documentType.ReviewPolicy,
+		PublicationPolicy: documentType.PublicationPolicy,
+	})
+	if err != nil {
+		return false
 	}
-	return true
+	left, err := json.Marshal(snapshotConfig.Canonical)
+	if err != nil {
+		return false
+	}
+	right, err := json.Marshal(currentConfig.Canonical)
+	return err == nil && bytes.Equal(left, right)
 }
 
 func prepareProductionBlocks(version *types.ProductionDocumentVersion, blocks []*types.ProductionDocumentBlock) error {

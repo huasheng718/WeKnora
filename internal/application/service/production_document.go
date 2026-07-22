@@ -335,7 +335,8 @@ func validateProductionInternalAppendRun(
 		return types.ErrProductionForbidden
 	}
 	canonicalSnapshot, err := types.CanonicalProductionJSON(run.DocumentTypeSnapshot)
-	if err != nil || !bytes.Equal(canonicalSnapshot, productionDocumentTypeSnapshot(documentType)) {
+	expectedSnapshot, _, snapshotErr := canonicalProductionDocumentTypeSnapshot(documentType)
+	if err != nil || snapshotErr != nil || !bytes.Equal(canonicalSnapshot, expectedSnapshot) {
 		return types.ErrProductionForbidden
 	}
 	return nil
