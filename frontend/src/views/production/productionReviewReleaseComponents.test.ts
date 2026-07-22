@@ -17,8 +17,9 @@ test('review panel exposes role-aware governed commands with lifecycle coordinat
 test('review lifecycle settles submit state on version invalidation and localizes empty load failures', () => {
   const panel = source('./components/ProductionReviewPanel.vue')
 
-  assert.match(panel, /watch\(\(\) => props\.versionId, \(\) => \{ mutationCoordinator\.invalidate\(\); submitting\.value = false; submitCommand = null \}\)/)
+  assert.match(panel, /watch\(\(\) => props\.versionId, \(\) => \{ mutationCoordinator\.invalidate\(\); submitting\.value = false; error\.value = ''; submitCommand = null \}\)/)
   assert.match(panel, /throw new Error\(response\.message \|\| t\('production\.reviewConsole\.loadFailed'\)\)/)
+  assert.match(panel, /catch \(e\) \{ if \(mutationCoordinator\.isCurrent\(mutation, props\.documentId\)\) error\.value =/)
 })
 
 test('release dialog uses paged authoritative preflight and stable create commands', () => {
@@ -40,6 +41,14 @@ test('release preflight invalidates asynchronous state when its dialog scope cha
   assert.match(dialog, /onBeforeUnmount\(\(\) => \{ mutationCoordinator\.invalidate\(\); preflightCoordinator\.invalidate\(\) \}\)/)
 })
 
+test('release dialog settles and suppresses stale confirm mutations after a scope change', () => {
+  const dialog = source('./components/ProductionReleaseDialog.vue')
+
+  assert.match(dialog, /throw new Error\(response\.message \|\| t\('production\.releaseConsole\.loadFailed'\)\)/)
+  assert.match(dialog, /catch \(e\) \{ if \(mutationCoordinator\.isCurrent\(mutation, props\.documentId\)\) error\.value =/)
+  assert.match(dialog, /mutationCoordinator\.invalidate\(\); preflightCoordinator\.invalidate\(\); loading\.value = false; submitting\.value = false; error\.value = ''/)
+})
+
 test('release status uses lifecycle actions, head locks, and rollback confirmation', () => {
   const status = source('./components/ProductionReleaseStatus.vue')
   for (const contract of ['releaseActions', 'releaseHistoryPage', 'appendReleaseHistory', 'createLatestRequestCoordinator', 'activateProductionReleaseTarget', 'retryProductionReleaseTarget', 'rollbackProductionReleaseTarget', 'head_lock_version']) {
@@ -47,6 +56,10 @@ test('release status uses lifecycle actions, head locks, and rollback confirmati
   }
   assert.match(status, /DialogPlugin\.confirm/)
   assert.match(status, /if \(!props\.canPublish\) return/)
+  assert.match(status, /error: cause => \{ if \(requestedScope !== scope\.value\) return; error\.value =/)
+  assert.match(status, /settled: \(\) => \{ if \(requestedScope === scope\.value\) loading\.value = false \}/)
+  assert.match(status, /catch \(e\) \{ if \(mutationCoordinator\.isCurrent\(mutation, target\.id\)\) MessagePlugin\.error/)
+  assert.match(status, /loading\.value = false; error\.value = ''; busyId\.value = ''/)
 })
 
 test('workbenches compose review diff and real publication surfaces', () => {

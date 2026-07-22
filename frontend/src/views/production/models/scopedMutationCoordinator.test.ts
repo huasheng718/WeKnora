@@ -97,3 +97,22 @@ test('an unmounted workbench ignores a deferred annotation result', async t => {
     })
   }
 })
+
+test('a stale release confirm cannot alter a reopened dialog', async () => {
+  const coordinator = createScopedMutationCoordinator()
+  const request = deferred<void>()
+  const state = { scope: 'open:document-A:version-A', submitting: true, error: '' }
+  const mutation = coordinator.start(state.scope)
+  const pending = request.promise.catch(cause => {
+    if (coordinator.isCurrent(mutation, state.scope)) state.error = String(cause)
+  }).finally(() => {
+    if (coordinator.isCurrent(mutation, state.scope)) state.submitting = false
+  })
+
+  coordinator.invalidate()
+  Object.assign(state, { scope: 'open:document-A:version-B', submitting: false, error: '' })
+  request.reject(new Error('stale confirm failed'))
+  await pending
+
+  assert.deepEqual(state, { scope: 'open:document-A:version-B', submitting: false, error: '' })
+})
