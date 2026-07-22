@@ -8,6 +8,7 @@ import (
 
 	"github.com/Tencent/WeKnora/internal/application/repository"
 	"github.com/Tencent/WeKnora/internal/application/service"
+	"github.com/Tencent/WeKnora/internal/database"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/stretchr/testify/assert"
@@ -39,6 +40,14 @@ func TestCreateTenantCreatesConcreteDefaultStorageBackend(t *testing.T) {
 	assert.Equal(t, "local", backend.Provider)
 	assert.Equal(t, types.StorageBackendSourceEnv, backend.Source)
 	assert.True(t, backend.LegacyAlias)
+
+	persistedTenant, err := tenantRepo.GetTenantByID(context.Background(), tenant.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persistedTenant.DefaultStorageBackendID)
+	backends, err := storageRepo.List(context.Background(), tenant.ID)
+	require.NoError(t, err)
+	require.Len(t, backends, 1)
+	assert.Equal(t, backends[0].ID, *persistedTenant.DefaultStorageBackendID)
 }
 
 func TestCreateTenantCreatesExactlyFiveActiveBuiltins(t *testing.T) {
@@ -74,9 +83,32 @@ func TestCreateTenantCreatesExactlyFiveActiveBuiltins(t *testing.T) {
 
 type failingBuiltinSeeder struct {
 	interfaces.ProductionDocumentTypeRepository
+	partialRows int64
 }
 
-func (failingBuiltinSeeder) SeedBuiltins(context.Context, uint64, string, []types.ProductionDocumentType) error {
+func (f *failingBuiltinSeeder) SeedBuiltins(
+	ctx context.Context,
+	tenantID uint64,
+	actor string,
+	definitions []types.ProductionDocumentType,
+) error {
+	tx := database.DBFromContext(ctx, nil)
+	if tx == nil {
+		return errors.New("transaction context is required")
+	}
+	if len(definitions) == 0 {
+		return errors.New("built-in definitions are required")
+	}
+	if err := f.ProductionDocumentTypeRepository.SeedBuiltins(ctx, tenantID, actor, definitions[:1]); err != nil {
+		return err
+	}
+	if err := tx.WithContext(ctx).Unscoped().Model(&types.ProductionDocumentType{}).
+		Where("tenant_id = ?", tenantID).Count(&f.partialRows).Error; err != nil {
+		return err
+	}
+	if f.partialRows != 1 {
+		return errors.New("partial built-in seed did not join transaction")
+	}
 	return errors.New("seed failure")
 }
 
@@ -91,13 +123,15 @@ func TestCreateTenantBuiltinFailureRollsBackAllProvisioningRows(t *testing.T) {
 	uow := repository.NewProductionUnitOfWork(db)
 	catalog, err := service.NewProductionBuiltinCatalog()
 	require.NoError(t, err)
+	seeder := &failingBuiltinSeeder{ProductionDocumentTypeRepository: documentTypes}
 	tenantSvc := service.NewTenantService(
-		tenantRepo, storageRepo, failingBuiltinSeeder{ProductionDocumentTypeRepository: documentTypes}, uow, catalog,
+		tenantRepo, storageRepo, seeder, uow, catalog,
 	)
 
 	created, err := tenantSvc.CreateTenant(context.Background(), &types.Tenant{Name: "rollback-workspace"})
 	require.EqualError(t, err, "seed failure")
 	require.Nil(t, created)
+	require.Equal(t, int64(1), seeder.partialRows)
 
 	for name, model := range map[string]any{
 		"tenant":        &types.Tenant{},
