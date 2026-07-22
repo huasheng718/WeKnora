@@ -14,9 +14,11 @@ import (
 
 type tenantLifecycleRepository struct {
 	interfaces.TenantRepository
-	tenants     []*types.Tenant
-	deleteErr   error
-	updateCalls int
+	tenants           []*types.Tenant
+	deleteErr         error
+	activeUpdateErr   error
+	updateCalls       int
+	activeUpdateCalls int
 }
 
 func (r *tenantLifecycleRepository) ListTenants(context.Context) ([]*types.Tenant, error) {
@@ -30,6 +32,11 @@ func (r *tenantLifecycleRepository) GetTenantByID(context.Context, uint64) (*typ
 func (r *tenantLifecycleRepository) UpdateTenant(context.Context, *types.Tenant) error {
 	r.updateCalls++
 	return nil
+}
+
+func (r *tenantLifecycleRepository) UpdateActiveTenant(context.Context, *types.Tenant) error {
+	r.activeUpdateCalls++
+	return r.activeUpdateErr
 }
 
 func (r *tenantLifecycleRepository) DeleteTenant(context.Context, uint64) error {
@@ -70,11 +77,45 @@ func TestUpdateTenantRejectsProvisioningBeforeRepositoryWrite(t *testing.T) {
 	updated, err := svc.UpdateTenant(context.Background(), repo.tenants[0])
 	require.Nil(t, updated)
 	require.Zero(t, repo.updateCalls)
+	require.Zero(t, repo.activeUpdateCalls)
 	appErr, ok := apperrors.IsAppError(err)
 	require.True(t, ok)
 	require.Equal(t, http.StatusConflict, appErr.HTTPCode)
 	require.NotContains(t, appErr.Message, "provision")
 	require.NotContains(t, appErr.Message, "active")
+}
+
+func TestUpdateTenantUsesActiveCASAndMapsLostDeleteRace(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		casErr  error
+		wantErr bool
+	}{
+		{name: "active update succeeds"},
+		{name: "delete wins after precheck", casErr: apprepo.ErrTenantNotActive, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			repo := &tenantLifecycleRepository{
+				tenants:         []*types.Tenant{{ID: 3, Name: "active", Status: types.TenantStatusActive}},
+				activeUpdateErr: test.casErr,
+			}
+			svc := newTenantLifecycleBoundaryService(repo)
+
+			updated, err := svc.UpdateTenant(context.Background(), repo.tenants[0])
+			require.Zero(t, repo.updateCalls)
+			require.Equal(t, 1, repo.activeUpdateCalls)
+			if test.wantErr {
+				require.Nil(t, updated)
+				appErr, ok := apperrors.IsAppError(err)
+				require.True(t, ok)
+				require.Equal(t, http.StatusConflict, appErr.HTTPCode)
+				require.NotContains(t, appErr.Message, "active")
+				return
+			}
+			require.NoError(t, err)
+			require.Same(t, repo.tenants[0], updated)
+		})
+	}
 }
 
 func TestDeleteTenantMapsInactiveStateToGenericConflict(t *testing.T) {
@@ -100,9 +141,42 @@ func TestWeKnoraCloudCredentialsRejectProvisioningBeforeRepositoryWrite(t *testi
 
 	err := svc.updateTenantCredentials(context.Background(), 2, "app-id", "app-secret")
 	require.Zero(t, repo.updateCalls)
+	require.Zero(t, repo.activeUpdateCalls)
 	appErr, ok := apperrors.IsAppError(err)
 	require.True(t, ok)
 	require.Equal(t, http.StatusConflict, appErr.HTTPCode)
 	require.NotContains(t, appErr.Message, "provision")
 	require.NotContains(t, appErr.Message, "active")
+}
+
+func TestWeKnoraCloudCredentialsUseActiveCASAndMapLostDeleteRace(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		casErr  error
+		wantErr bool
+	}{
+		{name: "active update succeeds"},
+		{name: "delete wins after precheck", casErr: apprepo.ErrTenantNotActive, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			repo := &tenantLifecycleRepository{
+				tenants:         []*types.Tenant{{ID: 4, Name: "active", Status: types.TenantStatusActive}},
+				activeUpdateErr: test.casErr,
+			}
+			svc := &weKnoraCloudService{tenantRepo: repo}
+
+			err := svc.updateTenantCredentials(context.Background(), 4, "app-id", "app-secret")
+			require.Zero(t, repo.updateCalls)
+			require.Equal(t, 1, repo.activeUpdateCalls)
+			if test.wantErr {
+				appErr, ok := apperrors.IsAppError(err)
+				require.True(t, ok)
+				require.Equal(t, http.StatusConflict, appErr.HTTPCode)
+				require.NotContains(t, appErr.Message, "active")
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, "app-id", repo.tenants[0].Credentials.WeKnoraCloud.AppID)
+		})
+	}
 }

@@ -64,8 +64,12 @@ type TenantRepository interface {
 	ListTenants(ctx context.Context) ([]*types.Tenant, error)
 	// SearchTenants searches tenants with pagination and filters
 	SearchTenants(ctx context.Context, keyword string, tenantID uint64, page, pageSize int) ([]*types.Tenant, int64, error)
-	// UpdateTenant updates a tenant
+	// UpdateTenant performs an internal lifecycle-agnostic update. It is
+	// retained for provisioning writes before the tenant becomes active.
 	UpdateTenant(ctx context.Context, tenant *types.Tenant) error
+	// UpdateActiveTenant updates an externally managed tenant only while it
+	// remains active and visible. A lost lifecycle race returns an error.
+	UpdateActiveTenant(ctx context.Context, tenant *types.Tenant) error
 	// DeleteTenant deletes a tenant
 	DeleteTenant(ctx context.Context, id uint64) error
 	// PurgeProvisionedTenant hard-deletes every row created by unfinished

@@ -136,9 +136,26 @@ func (r *tenantRepository) SearchTenants(ctx context.Context, keyword string, te
 	return tenants, total, nil
 }
 
-// UpdateTenant updates tenant.
+// UpdateTenant is the lifecycle-agnostic internal update used while tenant
+// provisioning persists its default storage backend before activation.
 func (r *tenantRepository) UpdateTenant(ctx context.Context, tenant *types.Tenant) error {
 	return database.DBFromContext(ctx, r.db).WithContext(ctx).Model(&types.Tenant{}).Where("id = ?", tenant.ID).Updates(tenant).Error
+}
+
+// UpdateActiveTenant is the externally managed update path. The active-state
+// predicate and GORM soft-delete scope form the final write-time lifecycle CAS.
+func (r *tenantRepository) UpdateActiveTenant(ctx context.Context, tenant *types.Tenant) error {
+	result := database.DBFromContext(ctx, r.db).WithContext(ctx).
+		Model(&types.Tenant{}).
+		Where("id = ? AND status = ?", tenant.ID, types.TenantStatusActive).
+		Updates(tenant)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrTenantNotActive
+	}
+	return nil
 }
 
 // DeleteTenant soft-deletes the tenant and every active membership row

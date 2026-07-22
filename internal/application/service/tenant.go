@@ -217,7 +217,7 @@ func (s *tenantService) UpdateTenant(ctx context.Context, tenant *types.Tenant) 
 	tenant.UpdatedAt = time.Now()
 	logger.Info(ctx, "Saving tenant information to database")
 
-	if err := s.repo.UpdateTenant(ctx, tenant); err != nil {
+	if err := updateActiveTenant(ctx, s.repo, tenant); err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"tenant_id": tenant.ID,
 		})
@@ -328,6 +328,16 @@ func activeTenants(tenants []*types.Tenant) []*types.Tenant {
 
 func tenantLifecycleConflict(action string) error {
 	return werrors.NewConflictError("Workspace cannot be " + action + " in its current state")
+}
+
+func updateActiveTenant(ctx context.Context, repo interfaces.TenantRepository, tenant *types.Tenant) error {
+	if err := repo.UpdateActiveTenant(ctx, tenant); err != nil {
+		if errors.Is(err, apprepo.ErrTenantNotActive) {
+			return tenantLifecycleConflict("modified")
+		}
+		return err
+	}
+	return nil
 }
 
 // BulkSetStorageQuota delegates to the repository. Validation is

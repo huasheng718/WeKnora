@@ -160,6 +160,128 @@ func TestBulkSetStorageQuotaUpdatesOnlyActiveTenants(t *testing.T) {
 	require.Equal(t, int64(20), pending.StorageQuota)
 }
 
+func TestUpdateActiveTenantRejectsSoftDeletedTenant(t *testing.T) {
+	db := setupTestDB(t)
+	repo := NewTenantRepository(db)
+	tenant := &types.Tenant{Name: "before-delete", Status: types.TenantStatusActive}
+	require.NoError(t, db.Create(tenant).Error)
+	require.NoError(t, db.Delete(&types.Tenant{}, tenant.ID).Error)
+
+	tenant.Name = "must-not-update"
+	err := repo.UpdateActiveTenant(context.Background(), tenant)
+	require.ErrorIs(t, err, ErrTenantNotActive)
+
+	var stored types.Tenant
+	require.NoError(t, db.Unscoped().First(&stored, tenant.ID).Error)
+	require.Equal(t, "before-delete", stored.Name)
+}
+
+func TestUpdateActiveTenantAndDeleteTenantLinearizeInEitherOrder(t *testing.T) {
+	newFixture := func(t *testing.T, suffix string) (*gorm.DB, interfaces.TenantRepository, *types.Tenant) {
+		t.Helper()
+		dsn := fmt.Sprintf("file:%s/%s.db?_busy_timeout=5000&_journal_mode=WAL", t.TempDir(), suffix)
+		db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+		require.NoError(t, err)
+		sqlDB, err := db.DB()
+		require.NoError(t, err)
+		sqlDB.SetMaxOpenConns(4)
+		require.NoError(t, db.AutoMigrate(&types.Tenant{}, &types.TenantMember{}))
+		tenant := &types.Tenant{Name: "before-" + suffix, Status: types.TenantStatusActive}
+		require.NoError(t, db.Create(tenant).Error)
+		return db, NewTenantRepository(db), tenant
+	}
+
+	t.Run("delete first rejects update", func(t *testing.T) {
+		db, repo, tenant := newFixture(t, "delete-first")
+		deleteStart := make(chan struct{})
+		deleteDone := make(chan error, 1)
+		updateDone := make(chan error, 1)
+		go func() {
+			<-deleteStart
+			deleteDone <- repo.DeleteTenant(context.Background(), tenant.ID)
+		}()
+		go func() {
+			deleteErr := <-deleteDone
+			if deleteErr != nil {
+				updateDone <- deleteErr
+				return
+			}
+			tenant.Name = "after-delete"
+			updateDone <- repo.UpdateActiveTenant(context.Background(), tenant)
+		}()
+		close(deleteStart)
+
+		require.ErrorIs(t, <-updateDone, ErrTenantNotActive)
+		var stored types.Tenant
+		require.NoError(t, db.Unscoped().First(&stored, tenant.ID).Error)
+		require.Equal(t, "before-delete-first", stored.Name)
+		require.True(t, stored.DeletedAt.Valid)
+	})
+
+	t.Run("update first succeeds before delete", func(t *testing.T) {
+		db, repo, tenant := newFixture(t, "update-first")
+		updateStart := make(chan struct{})
+		updateDone := make(chan error, 1)
+		deleteDone := make(chan error, 1)
+		go func() {
+			<-updateStart
+			tenant.Name = "updated-first"
+			updateDone <- repo.UpdateActiveTenant(context.Background(), tenant)
+		}()
+		go func() {
+			updateErr := <-updateDone
+			if updateErr != nil {
+				deleteDone <- updateErr
+				return
+			}
+			deleteDone <- repo.DeleteTenant(context.Background(), tenant.ID)
+		}()
+		close(updateStart)
+
+		require.NoError(t, <-deleteDone)
+		var stored types.Tenant
+		require.NoError(t, db.Unscoped().First(&stored, tenant.ID).Error)
+		require.Equal(t, "updated-first", stored.Name)
+		require.True(t, stored.DeletedAt.Valid)
+	})
+}
+
+func TestUpdateActiveTenantPostgresRequiresActiveRowAndAffectedRow(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		rowsAffected int64
+		wantErr      error
+	}{
+		{name: "active row updated", rowsAffected: 1},
+		{name: "missing active row rejected", rowsAffected: 0, wantErr: ErrTenantNotActive},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sqlDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = sqlDB.Close() })
+			db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{
+				Logger: logger.Default.LogMode(logger.Silent),
+			})
+			require.NoError(t, err)
+			repo := NewTenantRepository(db)
+			tenant := &types.Tenant{ID: 31, Name: "cas", Status: types.TenantStatusActive}
+
+			mock.ExpectBegin()
+			mock.ExpectExec(`UPDATE "tenants" SET .* WHERE \(id = \$[0-9]+ AND status = \$[0-9]+\) AND "tenants"\."deleted_at" IS NULL`).
+				WillReturnResult(sqlmock.NewResult(0, test.rowsAffected))
+			mock.ExpectCommit()
+
+			err = repo.UpdateActiveTenant(context.Background(), tenant)
+			if test.wantErr != nil {
+				require.ErrorIs(t, err, test.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
 func TestDeleteTenantAndRegistrationPurgeDoNotOrphanPendingRegistration(t *testing.T) {
 	dsn := fmt.Sprintf("file:%s/tenant-lifecycle.db?_busy_timeout=5000&_journal_mode=WAL", t.TempDir())
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})

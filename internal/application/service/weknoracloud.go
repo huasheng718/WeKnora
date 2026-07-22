@@ -136,5 +136,5 @@ func (s *weKnoraCloudService) updateTenantCredentials(ctx context.Context, tenan
 		AppID:     appID,
 		AppSecret: appSecret,
 	}
-	return s.tenantRepo.UpdateTenant(ctx, tenant)
+	return updateActiveTenant(ctx, s.tenantRepo, tenant)
 }
