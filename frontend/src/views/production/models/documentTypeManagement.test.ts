@@ -3,14 +3,18 @@ import test from 'node:test'
 
 import type { ProductionDocumentType } from '@/api/production'
 import {
+  DocumentTypeDerivationLifecycle,
   canDeriveProductionDocumentType,
   canManageProductionDocumentTypes,
+  documentTypeControlVisibility,
   documentTypeConfigurationSummary,
   documentTypeListViewState,
   documentTypeOriginBadge,
   parseDerivedDocumentTypeDraft,
   parseDocumentTypeDraft,
   prefillDerivedDocumentTypeForm,
+  productionRequestFailure,
+  reconcileDocumentTypeDerivationBase,
   sortDocumentTypeVersions,
 } from './documentTypeManagement'
 
@@ -53,6 +57,28 @@ test('only tenant admin and owner can derive active or retired document types', 
   assert.equal(canDeriveProductionDocumentType('admin', 'draft'), false)
   assert.equal(canDeriveProductionDocumentType('contributor', 'active'), false)
   assert.equal(canDeriveProductionDocumentType('viewer', 'retired'), false)
+  assert.equal(canDeriveProductionDocumentType('admin', 'future' as never), false)
+})
+
+test('document type mutation controls are hidden outside their exact role and lifecycle states', () => {
+  assert.deepEqual(documentTypeControlVisibility('viewer', 'active'), {
+    inspect: true, create: false, activate: false, derive: false,
+  })
+  assert.deepEqual(documentTypeControlVisibility('contributor', 'draft'), {
+    inspect: true, create: false, activate: false, derive: false,
+  })
+  assert.deepEqual(documentTypeControlVisibility('admin', 'draft'), {
+    inspect: true, create: true, activate: true, derive: false,
+  })
+  assert.deepEqual(documentTypeControlVisibility('owner', 'active'), {
+    inspect: true, create: true, activate: false, derive: true,
+  })
+  assert.deepEqual(documentTypeControlVisibility('owner', 'retired'), {
+    inspect: true, create: true, activate: false, derive: true,
+  })
+  assert.deepEqual(documentTypeControlVisibility('owner', 'future' as never), {
+    inspect: true, create: true, activate: false, derive: false,
+  })
 })
 
 test('document type origin badge distinguishes governed built-ins from custom definitions', () => {
@@ -197,6 +223,96 @@ test('derived draft form prefills all editable JSON and omits lineage from the c
   })
   assert.equal('code' in result.payload, false)
   assert.equal('schema_version' in result.payload, false)
+})
+
+test('structured request failures retain server status and message', () => {
+  assert.deepEqual(productionRequestFailure({ status: 409, message: 'version already allocated' }, 'fallback'), {
+    status: 409,
+    message: 'version already allocated',
+  })
+  assert.deepEqual(productionRequestFailure({ response: { status: 503, data: { error: { message: 'temporarily unavailable' } } } }, 'fallback'), {
+    status: 503,
+    message: 'temporarily unavailable',
+  })
+  assert.deepEqual(productionRequestFailure({ message: '   ' }, 'fallback'), { status: null, message: 'fallback' })
+})
+
+test('derivation lifecycle reuses unchanged commands and replaces changed payload or base commands', () => {
+  const lifecycle = new DocumentTypeDerivationLifecycle<{ key: string }>()
+  let created = 0
+  const createCommand = () => ({ key: `command-${++created}` })
+  const payload = { name: 'SOP', block_schema: { version: 1 } }
+
+  const first = lifecycle.prepare('base-1', payload, createCommand)
+  assert.equal(lifecycle.prepare('base-1', { ...payload }, createCommand), first)
+
+  const changedPayload = lifecycle.prepare('base-1', { ...payload, name: 'Changed SOP' }, createCommand)
+  assert.notEqual(changedPayload, first)
+
+  const changedBase = lifecycle.prepare('base-2', { ...payload, name: 'Changed SOP' }, createCommand)
+  assert.notEqual(changedBase, changedPayload)
+  assert.equal(created, 3)
+})
+
+test('structured 409 preserves form and command while refreshing and reconciling the exact base', async () => {
+  const lifecycle = new DocumentTypeDerivationLifecycle<{ key: string }>()
+  const command = lifecycle.prepare('sop-1', { name: 'Edited SOP' }, () => ({ key: 'stable-command' }))
+  const form = { name: 'Edited SOP', description: 'Unsaved input' }
+  const base = documentType('sop', 1, '2026-07-22T00:00:00Z')
+  base.id = 'sop-1'
+  base.status = 'active'
+  const refreshedBase = { ...base, name: 'Server-refreshed SOP', status: 'retired' as const }
+  let refreshes = 0
+
+  const result = await lifecycle.fail(
+    { status: 409, message: 'a newer version exists' },
+    'derive failed',
+    form,
+    base,
+    async () => { refreshes += 1; return [refreshedBase] },
+  )
+
+  assert.equal(result.form, form)
+  assert.equal(result.preserveInput, true)
+  assert.equal(result.command, command)
+  assert.equal(result.message, 'a newer version exists')
+  assert.equal(result.status, 409)
+  assert.equal(result.refreshed, true)
+  assert.equal(result.base, refreshedBase)
+  assert.equal(refreshes, 1)
+  assert.equal(lifecycle.prepare('sop-1', { name: 'Edited SOP' }, () => ({ key: 'new-command' })), command)
+})
+
+test('non-conflict failure preserves input without refresh and success refreshes then clears command', async () => {
+  const lifecycle = new DocumentTypeDerivationLifecycle<{ key: string }>()
+  const command = lifecycle.prepare('base-1', { name: 'Draft' }, () => ({ key: 'command-1' }))
+  const form = { name: 'Draft' }
+  const base = documentType('sop', 1, '2026-07-22T00:00:00Z')
+  let refreshes = 0
+  const refresh = async () => { refreshes += 1; return [base] }
+
+  const failure = await lifecycle.fail({ status: 503, message: 'service unavailable' }, 'fallback', form, base, refresh)
+  assert.equal(failure.form, form)
+  assert.equal(failure.command, command)
+  assert.equal(failure.refreshed, false)
+  assert.equal(refreshes, 0)
+
+  const success = await lifecycle.succeed(refresh)
+  assert.equal(success.refreshed, true)
+  assert.deepEqual(success.items, [base])
+  assert.equal(refreshes, 1)
+  assert.equal(lifecycle.currentCommand, null)
+})
+
+test('base reconciliation fails closed for missing draft or malformed refreshed rows', () => {
+  const base = documentType('sop', 1, '2026-07-22T00:00:00Z')
+  base.id = 'base-1'
+  base.status = 'active'
+  const exact = { ...base, status: 'retired' as const }
+  assert.equal(reconcileDocumentTypeDerivationBase(base, [exact]), exact)
+  assert.equal(reconcileDocumentTypeDerivationBase(base, [{ ...exact, status: 'draft' }]), null)
+  assert.equal(reconcileDocumentTypeDerivationBase(base, [{ ...exact, status: 'future' as never }]), null)
+  assert.equal(reconcileDocumentTypeDerivationBase(base, []), null)
 })
 
 test('document type versions group by code and newest schema version first', () => {

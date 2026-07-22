@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict'
 import { existsSync, readFileSync } from 'node:fs'
 import test from 'node:test'
+import { compile } from '@vue/compiler-dom'
+import { parse } from '@vue/compiler-sfc'
+import { createSSRApp, defineComponent, h } from 'vue'
+import { renderToString } from '@vue/server-renderer'
+
+import { documentTypeControlVisibility } from './models/documentTypeManagement'
 
 const pageUrl = new URL('./ProductionDocumentTypeManagement.vue', import.meta.url)
 const apiSource = readFileSync(new URL('../../api/production/index.ts', import.meta.url), 'utf8')
@@ -22,14 +28,90 @@ test('management page coordinates requests, enforces role-aware controls, and cl
   assert.match(source, /listProductionDocumentTypes/)
   assert.match(source, /createProductionDocumentType/)
   assert.match(source, /activateProductionDocumentType/)
-  assert.match(source, /canManageProductionDocumentTypes/)
   assert.match(source, /createLatestRequestCoordinator\(\)/)
   assert.match(source, /onBeforeUnmount\(\(\) => \{[\s\S]*loadCoordinator\.invalidate\(\)/)
-  assert.match(source, /:disabled="!canManage/)
   assert.match(source, /class="table-scroll"/)
-  assert.match(source, /draftCommand\?\.signature === signature/)
   assert.match(source, /const activationCommands = new Map/)
   assert.match(source, /activationCommands\.delete\(item\.id\)/)
+})
+
+async function renderManagementTemplate(role: 'owner' | 'admin' | 'contributor' | 'viewer', status: 'draft' | 'active' | 'retired') {
+  const source = readFileSync(pageUrl, 'utf8')
+  const descriptor = parse(source, { filename: 'ProductionDocumentTypeManagement.vue' }).descriptor
+  assert.ok(descriptor.template)
+  const { code } = compile(descriptor.template.content, { mode: 'function' })
+  const render = Function('Vue', code)(await import('vue'))
+  render._rc = true
+  const pageControls = documentTypeControlVisibility(role)
+  const item = {
+    id: 'type-1', code: 'sop', name: 'SOP', description: '', schema_version: 1,
+    status, origin: 'builtin', template_key: 'sop', updated_at: '2026-07-22T00:00:00Z',
+  }
+  const app = createSSRApp(defineComponent({
+    render,
+    setup: () => ({
+      t: (key: string) => key,
+      backToProjects: () => {}, loading: false, loadDocumentTypes: () => {},
+      pageControls, openCreateDrawer: () => {},
+      viewState: 'ready', skeletonRows: [], error: '', documentTypes: [item], activeCountLabel: '',
+      documentTypeOriginBadge: () => ({ theme: 'primary', textKey: 'production.documentTypes.origin.builtin' }),
+      statusTheme: () => 'default', formatDate: () => 'date', openConfigurationDrawer: () => {},
+      rowControls: (rowStatus: typeof status) => documentTypeControlVisibility(role, rowStatus),
+      submitting: false, openDeriveDrawer: () => {}, activatingId: '', confirmActivation: () => {},
+      configurationDrawerVisible: false, inspectedDocumentType: null, inspectionSummary: null,
+      summaryList: () => '', requirementLabel: () => '', rawConfigFields: [], rawConfiguration: () => '',
+      drawerVisible: false, drawerMode: 'create', formError: '', deriveBase: null,
+      form: {}, jsonFields: [], submitDraft: () => {},
+    }),
+  }))
+  const passthrough = defineComponent({ inheritAttrs: false, setup: (_, { slots, attrs }) => () => h('span', attrs, slots.default?.()) })
+  app.component('t-button', defineComponent({ inheritAttrs: false, setup: (_, { slots, attrs }) => () => h('button', attrs, slots.default?.()) }))
+  app.component('t-tooltip', passthrough)
+  app.component('t-tag', passthrough)
+  app.component('t-alert', passthrough)
+  app.component('t-skeleton', passthrough)
+  app.component('t-icon', passthrough)
+  app.component('t-form', passthrough)
+  app.component('t-form-item', passthrough)
+  app.component('t-input', passthrough)
+  app.component('t-input-number', passthrough)
+  app.component('t-textarea', passthrough)
+  app.component('t-drawer', defineComponent({
+    inheritAttrs: false,
+    props: { visible: Boolean },
+    setup(props, { slots }) {
+      return () => props.visible ? h('aside', slots.default?.()) : null
+    },
+  }))
+  return renderToString(app)
+}
+
+test('compiled management template hides mutation controls from contributor and viewer roles', async () => {
+  for (const role of ['contributor', 'viewer'] as const) {
+    for (const status of ['draft', 'active', 'retired'] as const) {
+      const html = await renderManagementTemplate(role, status)
+      assert.match(html, /production\.documentTypes\.viewConfiguration/)
+      assert.doesNotMatch(html, /production\.documentTypes\.create/)
+      assert.doesNotMatch(html, /production\.documentTypes\.activate/)
+      assert.doesNotMatch(html, /production\.documentTypes\.deriveDraft/)
+    }
+  }
+})
+
+test('compiled management template shows only lifecycle-valid admin and owner mutation controls', async () => {
+  for (const role of ['admin', 'owner'] as const) {
+    const draft = await renderManagementTemplate(role, 'draft')
+    assert.match(draft, /production\.documentTypes\.create/)
+    assert.match(draft, /production\.documentTypes\.activate/)
+    assert.doesNotMatch(draft, /production\.documentTypes\.deriveDraft/)
+
+    for (const status of ['active', 'retired'] as const) {
+      const html = await renderManagementTemplate(role, status)
+      assert.match(html, /production\.documentTypes\.create/)
+      assert.match(html, /production\.documentTypes\.deriveDraft/)
+      assert.doesNotMatch(html, /production\.documentTypes\.activate/)
+    }
+  }
 })
 
 test('management page exposes built-in inspection and server-owned draft derivation', () => {
@@ -47,12 +129,8 @@ test('management page exposes built-in inspection and server-owned draft derivat
   assert.match(source, /openConfigurationDrawer/)
   assert.match(source, /openDeriveDrawer/)
   assert.match(source, /deriveProductionDocumentType/)
-  assert.match(source, /canDeriveProductionDocumentType/)
-  assert.match(source, /v-if="canDeriveProductionDocumentType\(currentRole, item\.status\)"/)
   assert.match(source, /production\.documentTypes\.generatedVersion/)
   assert.match(source, /production\.documentTypes\.fields\.templateKey/)
   assert.match(source, /class="raw-config-json"/)
   assert.match(source, /white-space:\s*pre-wrap/)
-  assert.match(source, /deriveCommand\?\.signature === signature/)
-  assert.match(source, /await loadDocumentTypes\(\)/)
 })

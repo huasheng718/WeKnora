@@ -15,9 +15,9 @@
           <template #icon><t-icon name="refresh" /></template>
           {{ t('production.actions.refresh') }}
         </t-button>
-        <t-tooltip :content="canManage ? t('production.documentTypes.create') : t('production.documentTypes.readonlyHint')">
+        <t-tooltip v-if="pageControls.create" :content="t('production.documentTypes.create')">
           <span>
-            <t-button :disabled="!canManage || loading" @click="openCreateDrawer">
+            <t-button :disabled="loading" @click="openCreateDrawer">
               <template #icon><t-icon name="add" /></template>
               {{ t('production.documentTypes.create') }}
             </t-button>
@@ -27,7 +27,7 @@
     </header>
 
     <t-alert
-      v-if="!canManage"
+      v-if="!pageControls.create"
       class="readonly-alert"
       theme="info"
       :message="t('production.documentTypes.readonlyHint')"
@@ -57,9 +57,9 @@
       <t-icon name="file-setting" size="34px" />
       <div>
         <strong>{{ t('production.documentTypes.emptyTitle') }}</strong>
-        <span>{{ canManage ? t('production.documentTypes.emptyEditable') : t('production.documentTypes.emptyReadonly') }}</span>
+        <span>{{ pageControls.create ? t('production.documentTypes.emptyEditable') : t('production.documentTypes.emptyReadonly') }}</span>
       </div>
-      <t-button v-if="canManage" size="small" @click="openCreateDrawer">
+      <t-button v-if="pageControls.create" size="small" @click="openCreateDrawer">
         <template #icon><t-icon name="add" /></template>
         {{ t('production.documentTypes.create') }}
       </t-button>
@@ -104,7 +104,7 @@
                     {{ t('production.documentTypes.viewConfiguration') }}
                   </t-button>
                   <t-tooltip
-                    v-if="canDeriveProductionDocumentType(currentRole, item.status)"
+                    v-if="rowControls(item.status).derive"
                     :content="t('production.documentTypes.deriveDraft')"
                   >
                     <span>
@@ -120,15 +120,15 @@
                     </span>
                   </t-tooltip>
                   <t-tooltip
-                    v-if="item.status === 'draft'"
-                    :content="canManage ? t('production.documentTypes.activate') : t('production.documentTypes.readonlyHint')"
+                    v-if="rowControls(item.status).activate"
+                    :content="t('production.documentTypes.activate')"
                   >
                     <span>
                       <t-button
                         variant="text"
                         size="small"
                         :loading="activatingId === item.id"
-                        :disabled="!canManage || Boolean(activatingId)"
+                        :disabled="Boolean(activatingId)"
                         @click="confirmActivation(item)"
                       >
                         <template #icon><t-icon name="check-circle" /></template>
@@ -252,7 +252,7 @@
         <t-button variant="outline" :disabled="submitting" @click="drawerVisible = false">
           {{ t('production.actions.cancel') }}
         </t-button>
-        <t-button :loading="submitting" :disabled="!canManage" @click="submitDraft">
+        <t-button v-if="pageControls.create" :loading="submitting" @click="submitDraft">
           <template #icon><t-icon name="save" /></template>
           {{ drawerMode === 'derive' ? t('production.documentTypes.deriveDraft') : t('production.documentTypes.create') }}
         </t-button>
@@ -282,8 +282,8 @@ import { createProductionCommand, type ProductionCommand } from '@/api/productio
 import { useAuthStore } from '@/stores/auth'
 import { createLatestRequestCoordinator } from './models/latestRequestCoordinator'
 import {
-  canDeriveProductionDocumentType,
-  canManageProductionDocumentTypes,
+  DocumentTypeDerivationLifecycle,
+  documentTypeControlVisibility,
   documentTypeConfigurationSummary,
   documentTypeListViewState,
   documentTypeOriginBadge,
@@ -291,6 +291,7 @@ import {
   parseDerivedDocumentTypeDraft,
   parseDocumentTypeDraft,
   prefillDerivedDocumentTypeForm,
+  productionRequestFailure,
   sortDocumentTypeVersions,
   type DocumentTypeDraftForm,
 } from './models/documentTypeManagement'
@@ -314,7 +315,7 @@ const formError = ref('')
 const activatingId = ref('')
 const items = shallowRef<ProductionDocumentType[]>([])
 let draftCommand: { signature: string; command: ProductionCommand<CreateProductionDocumentTypeInput> } | null = null
-let deriveCommand: { signature: string; command: ProductionCommand<DeriveProductionDocumentTypeInput> } | null = null
+const derivationLifecycle = new DocumentTypeDerivationLifecycle<ProductionCommand<DeriveProductionDocumentTypeInput>>()
 const activationCommands = new Map<string, ProductionCommand<void>>()
 
 const jsonFields = [
@@ -342,7 +343,7 @@ function emptyForm(): DocumentTypeDraftForm {
 
 const form = reactive<DocumentTypeDraftForm>(emptyForm())
 const currentRole = computed(() => auth.currentTenantRole as TenantRole | '')
-const canManage = computed(() => canManageProductionDocumentTypes(currentRole.value))
+const pageControls = computed(() => documentTypeControlVisibility(currentRole.value))
 const documentTypes = computed(() => sortDocumentTypeVersions(items.value))
 const inspectionSummary = computed(() => inspectedDocumentType.value
   ? documentTypeConfigurationSummary(inspectedDocumentType.value)
@@ -362,24 +363,29 @@ const skeletonRows = [
 ]
 
 function openCreateDrawer() {
+  if (!pageControls.value.create) return
   drawerMode.value = 'create'
   deriveBase.value = null
   Object.assign(form, emptyForm())
   formError.value = ''
   draftCommand = null
-  deriveCommand = null
+  derivationLifecycle.reset()
   drawerVisible.value = true
 }
 
 function openDeriveDrawer(item: ProductionDocumentType) {
-  if (!canDeriveProductionDocumentType(currentRole.value, item.status)) return
+  if (!rowControls(item.status).derive) return
   drawerMode.value = 'derive'
   deriveBase.value = item
   Object.assign(form, prefillDerivedDocumentTypeForm(item))
   formError.value = ''
   draftCommand = null
-  deriveCommand = null
+  derivationLifecycle.reset()
   drawerVisible.value = true
+}
+
+function rowControls(status: ProductionDocumentTypeStatus) {
+  return documentTypeControlVisibility(currentRole.value, status)
 }
 
 function openConfigurationDrawer(item: ProductionDocumentType) {
@@ -413,7 +419,8 @@ function formatDate(value: string) {
   return new Intl.DateTimeFormat(locale.value, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value))
 }
 
-async function loadDocumentTypes() {
+async function loadDocumentTypes(): Promise<ProductionDocumentType[] | null> {
+  let result: ProductionDocumentType[] | null = null
   loading.value = true
   error.value = ''
   await loadCoordinator.run(async () => {
@@ -424,18 +431,20 @@ async function loadDocumentTypes() {
     success: value => {
       items.value = value
       loaded.value = true
+      result = value
     },
     error: cause => {
-      error.value = cause instanceof Error ? cause.message : t('production.documentTypes.loadFailed')
+      error.value = productionRequestFailure(cause, t('production.documentTypes.loadFailed')).message
     },
     settled: () => {
       loading.value = false
     },
   })
+  return result
 }
 
 async function submitDraft() {
-  if (!canManage.value || submitting.value) return
+  if (!pageControls.value.create || submitting.value) return
   if (drawerMode.value === 'derive') {
     await submitDerivedDraft()
     return
@@ -466,7 +475,7 @@ async function submitDraft() {
     drawerVisible.value = false
     MessagePlugin.success(t('production.documentTypes.created'))
   } catch (cause) {
-    formError.value = cause instanceof Error ? cause.message : t('production.documentTypes.createFailed')
+    formError.value = productionRequestFailure(cause, t('production.documentTypes.createFailed')).message
   } finally {
     submitting.value = false
   }
@@ -474,6 +483,7 @@ async function submitDraft() {
 
 async function submitDerivedDraft() {
   if (!deriveBase.value) return
+  const base = deriveBase.value
   formError.value = ''
   const parsed = parseDerivedDocumentTypeDraft(form)
   if (!parsed.ok) {
@@ -485,27 +495,35 @@ async function submitDerivedDraft() {
   }
 
   submitting.value = true
-  const baseID = deriveBase.value.id
-  const signature = JSON.stringify({ baseID, payload: parsed.payload })
-  deriveCommand = deriveCommand?.signature === signature
-    ? deriveCommand
-    : { signature, command: createProductionCommand(parsed.payload) }
+  const baseID = base.id
+  const command = derivationLifecycle.prepare(
+    baseID,
+    parsed.payload,
+    () => createProductionCommand(parsed.payload),
+  )
   try {
-    const response = await deriveProductionDocumentType(baseID, deriveCommand.command)
+    const response = await deriveProductionDocumentType(baseID, command)
     if (!response.success || !response.data) throw new Error(response.message || t('production.documentTypes.deriveFailed'))
-    deriveCommand = null
-    await loadDocumentTypes()
+    await derivationLifecycle.succeed(loadDocumentTypes)
     drawerVisible.value = false
     MessagePlugin.success(t('production.documentTypes.derived'))
   } catch (cause) {
-    formError.value = cause instanceof Error ? cause.message : t('production.documentTypes.deriveFailed')
+    const failure = await derivationLifecycle.fail(
+      cause,
+      t('production.documentTypes.deriveFailed'),
+      form,
+      base,
+      loadDocumentTypes,
+    )
+    formError.value = failure.message
+    if (failure.status === 409 && failure.refreshed) deriveBase.value = failure.base
   } finally {
     submitting.value = false
   }
 }
 
 function confirmActivation(item: ProductionDocumentType) {
-  if (!canManage.value || item.status !== 'draft' || activatingId.value) return
+  if (!rowControls(item.status).activate || activatingId.value) return
   const dialog = DialogPlugin.confirm({
     header: t('production.documentTypes.activateTitle'),
     body: t('production.documentTypes.activateBody', { name: item.name, version: item.schema_version }),
@@ -522,7 +540,7 @@ function confirmActivation(item: ProductionDocumentType) {
         await loadDocumentTypes()
         MessagePlugin.success(t('production.documentTypes.activated'))
       } catch (cause) {
-        MessagePlugin.error(cause instanceof Error ? cause.message : t('production.documentTypes.activateFailed'))
+        MessagePlugin.error(productionRequestFailure(cause, t('production.documentTypes.activateFailed')).message)
       } finally {
         activatingId.value = ''
         dialog.destroy()
