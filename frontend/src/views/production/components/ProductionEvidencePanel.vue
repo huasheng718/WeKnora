@@ -13,7 +13,7 @@
         />
         <span>
           <strong>{{ evidenceTitle(row) }}</strong>
-          <small>{{ row.snapshot_type }} · {{ row.content_digest.slice(0, 10) }}</small>
+          <small>{{ t(`production.documentWorkbench.evidenceTypes.${row.snapshot_type}`) }} · {{ row.content_digest.slice(0, 10) }}</small>
         </span>
       </label>
     </div>

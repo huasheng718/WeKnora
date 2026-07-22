@@ -8,8 +8,8 @@
     </div>
     <div v-if="toolCalls.length" class="approval-list">
       <article v-for="call in toolCalls" :key="call.id" class="approval-row">
-        <header><strong>{{ call.tool_name }}</strong><t-tag size="small" variant="light" :theme="call.approval_status === 'pending' ? 'warning' : 'default'">{{ call.approval_status }}</t-tag></header>
-        <small>{{ call.provider_type }} · {{ call.provider_id }}</small>
+        <header><strong>{{ call.tool_name }}</strong><t-tag size="small" variant="light" :theme="call.approval_status === 'pending' ? 'warning' : 'default'">{{ t(`production.documentWorkbench.toolApproval.${call.approval_status}`) }}</t-tag></header>
+        <small>{{ t(`production.documentWorkbench.providerTypes.${call.provider_type}`) }} · {{ call.provider_id }}</small>
         <div v-if="call.approval_status === 'pending' && canEdit">
           <t-button size="small" variant="outline" theme="danger" @click="$emit('decide', call.id, 'reject')">{{ t('production.documentWorkbench.reject') }}</t-button>
           <t-button size="small" @click="$emit('decide', call.id, 'approve')">{{ t('production.documentWorkbench.approve') }}</t-button>
@@ -17,10 +17,10 @@
       </article>
     </div>
     <div class="run-list">
-      <article v-for="run in runs" :key="run.id" class="run-row" @click="$emit('select-run', run.id)">
-        <span><strong>{{ t(`production.documentWorkbench.runTypes.${run.run_type}`) }}</strong><t-tag size="small" variant="light" :theme="run.status === 'failed' ? 'danger' : run.status === 'completed' ? 'success' : 'primary'">{{ run.status }}</t-tag></span>
+      <button v-for="run in runs" :key="run.id" type="button" class="run-row" @click="$emit('select-run', run.id)">
+        <span><strong>{{ t(`production.documentWorkbench.runTypes.${run.run_type}`) }}</strong><t-tag size="small" variant="light" :theme="run.status === 'failed' ? 'danger' : run.status === 'completed' ? 'success' : 'primary'">{{ t(`production.documentWorkbench.runStatus.${run.status}`) }}</t-tag></span>
         <small>{{ run.id.slice(0, 12) }} · {{ run.current_step }}</small>
-      </article>
+      </button>
     </div>
     <div v-if="!runs.length" class="panel-empty">{{ t('production.documentWorkbench.noRuns') }}</div>
   </section>
@@ -54,7 +54,8 @@ const runTypeOptions = computed(() => (['write', 'rewrite', 'validate'] as const
 .approval-row header, .run-row > span { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .approval-row small, .run-row small { color: var(--td-text-color-placeholder); font-size: 10px; }
 .approval-row > div { display: flex; justify-content: flex-end; gap: 6px; }
-.run-row { cursor: pointer; }
+.run-row { appearance: none; width: 100%; border: 0; border-bottom: 1px solid var(--td-component-stroke); background: transparent; color: inherit; text-align: left; cursor: pointer; }
 .run-row:hover { background: var(--td-bg-color-container-hover); }
+.run-row:focus-visible { outline: 2px solid var(--td-brand-color); outline-offset: -2px; }
 .panel-empty { padding: 24px 12px; color: var(--td-text-color-placeholder); font-size: 12px; text-align: center; }
 </style>

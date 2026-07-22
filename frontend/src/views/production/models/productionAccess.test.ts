@@ -2,7 +2,11 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import type { ProductionProjectRole } from '@/api/production'
-import { productionAccess } from './productionAccess'
+import {
+  canCreateProductionAnnotation,
+  canResolveProductionAnnotation,
+  productionAccess,
+} from './productionAccess'
 
 test('viewer can view but cannot author or publish', () => {
   const access = productionAccess('viewer', ['observer'])
@@ -72,4 +76,32 @@ test('production root visibility follows the viewer tenant floor', () => {
     edit: false,
     publish: false,
   })
+})
+
+test('annotation creation follows the backend reviewer role matrix', () => {
+  const allowed = ['author', 'business_reviewer', 'engineering_reviewer', 'compliance_reviewer'] satisfies ProductionProjectRole[]
+  const denied = ['project_owner', 'knowledge_admin', 'publisher', 'observer'] satisfies ProductionProjectRole[]
+
+  for (const role of allowed) {
+    assert.equal(canCreateProductionAnnotation('contributor', [role]), true, role)
+    assert.equal(canCreateProductionAnnotation('viewer', [role]), false, `viewer ${role}`)
+  }
+  for (const role of denied) {
+    assert.equal(canCreateProductionAnnotation('owner', [role]), false, role)
+  }
+})
+
+test('annotation resolution follows creator author and compliance boundaries', () => {
+  const ordinary = { created_by: 'creator', annotation_type: 'comment', severity: 'warning' } as const
+  const blockingRisk = {
+    created_by: 'creator', annotation_type: 'quality_tag', quality_tag: 'compliance_risk', severity: 'blocking',
+  } as const
+
+  assert.equal(canResolveProductionAnnotation('contributor', [], 'creator', ordinary), true)
+  assert.equal(canResolveProductionAnnotation('viewer', [], 'creator', ordinary), false)
+  assert.equal(canResolveProductionAnnotation('contributor', ['author'], 'other', ordinary), true)
+  assert.equal(canResolveProductionAnnotation('contributor', ['business_reviewer'], 'other', ordinary), false)
+  assert.equal(canResolveProductionAnnotation('contributor', ['author'], 'creator', blockingRisk), false)
+  assert.equal(canResolveProductionAnnotation('contributor', ['compliance_reviewer'], 'creator', blockingRisk), true)
+  assert.equal(canResolveProductionAnnotation('contributor', ['project_owner'], 'other', blockingRisk), true)
 })

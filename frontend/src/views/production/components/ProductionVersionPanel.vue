@@ -1,6 +1,6 @@
 <template>
   <section class="side-panel">
-    <header class="panel-heading"><span><t-icon name="time" /><strong>{{ t('production.documentWorkbench.versions') }}</strong></span><t-button size="small" shape="square" variant="text" @click="$emit('reload')"><t-icon name="refresh" /></t-button></header>
+    <header class="panel-heading"><span><t-icon name="time" /><strong>{{ t('production.documentWorkbench.versions') }}</strong></span><t-tooltip :content="t('production.actions.refresh')"><t-button size="small" shape="square" variant="text" :aria-label="t('production.actions.refresh')" @click="$emit('reload')"><t-icon name="refresh" /></t-button></t-tooltip></header>
     <dl v-if="diff" class="version-diff">
       <div><dt>+</dt><dd>{{ diff.added }}</dd></div>
       <div><dt>~</dt><dd>{{ diff.changed }}</dd></div>

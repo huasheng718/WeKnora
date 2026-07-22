@@ -12,8 +12,8 @@
       </div>
       <div class="document-actions">
         <div class="responsive-tools">
-          <t-tooltip :content="t('production.documentWorkbench.openContext')"><t-button shape="square" variant="outline" @click="leftDrawerVisible = true"><t-icon name="view-list" /></t-button></t-tooltip>
-          <t-tooltip :content="t('production.documentWorkbench.openTools')"><t-button shape="square" variant="outline" @click="rightDrawerVisible = true"><t-icon name="control-platform" /></t-button></t-tooltip>
+          <t-tooltip :content="t('production.documentWorkbench.openContext')"><t-button shape="square" variant="outline" :aria-label="t('production.documentWorkbench.openContext')" @click="leftDrawerVisible = true"><t-icon name="view-list" /></t-button></t-tooltip>
+          <t-tooltip :content="t('production.documentWorkbench.openTools')"><t-button shape="square" variant="outline" :aria-label="t('production.documentWorkbench.openTools')" @click="rightDrawerVisible = true"><t-icon name="control-platform" /></t-button></t-tooltip>
         </div>
         <t-input v-model="changeSummary" class="change-summary" size="small" :disabled="!canEdit" :placeholder="t('production.documentWorkbench.changeSummary')" />
         <t-tooltip :content="saveHint"><span><t-button size="small" :loading="saving" :disabled="!canSave" @click="saveVersion"><template #icon><t-icon name="save" /></template>{{ t('production.documentWorkbench.saveVersion') }}</t-button></span></t-tooltip>
@@ -41,7 +41,7 @@
           :blocks="draftBlocks"
           :active-logical-block-id="activeLogicalBlockId"
           :can-edit="canEdit"
-          :can-annotate="canAnnotate"
+          :can-annotate="canCreateAnnotation"
           @select="activeLogicalBlockId = $event"
           @update="editBlock"
           @insert="insertBlock"
@@ -55,7 +55,7 @@
         <aside class="right-rail">
           <t-tabs v-model="rightTab" class="right-tabs">
             <t-tab-panel value="ai" :label="t('production.documentWorkbench.ai')"><ProductionAIRunPanel :runs="runs" :tool-calls="toolCalls" :models="models" :can-edit="canEdit" @start="startRun" @decide="decideTool" @select-run="loadToolCalls" /></t-tab-panel>
-            <t-tab-panel value="annotations" :label="t('production.documentWorkbench.notes')"><ProductionAnnotationPanel :annotations="annotations" :can-annotate="canAnnotate" :can-edit="canEdit" @create="createAnnotation" @resolve="resolveAnnotation" /></t-tab-panel>
+            <t-tab-panel value="annotations" :label="t('production.documentWorkbench.notes')"><ProductionAnnotationPanel v-model:body="annotationDraft.body" v-model:severity="annotationDraft.severity" :annotations="annotations" :can-annotate="canCreateAnnotation" :can-resolve="canResolveAnnotation" :submitting="annotationSubmitting" @create="createAnnotation" @resolve="resolveAnnotation" /></t-tab-panel>
             <t-tab-panel value="versions" :label="t('production.documentWorkbench.history')"><ProductionVersionPanel :versions="versions" :selected-version-id="selectedVersionId" :current-version-id="document.current_version_id ?? ''" :diff="versionDiff" @select="selectVersion" @reload="loadWorkbench(selectedVersionId)" /></t-tab-panel>
           </t-tabs>
         </aside>
@@ -68,7 +68,7 @@
       <t-drawer v-model:visible="rightDrawerVisible" placement="right" size="min(92vw, 400px)" :header="t('production.documentWorkbench.openTools')" :footer="false">
         <t-tabs v-model="rightTab">
           <t-tab-panel value="ai" :label="t('production.documentWorkbench.ai')"><ProductionAIRunPanel :runs="runs" :tool-calls="toolCalls" :models="models" :can-edit="canEdit" @start="startRun" @decide="decideTool" @select-run="loadToolCalls" /></t-tab-panel>
-          <t-tab-panel value="annotations" :label="t('production.documentWorkbench.notes')"><ProductionAnnotationPanel :annotations="annotations" :can-annotate="canAnnotate" :can-edit="canEdit" @create="createAnnotation" @resolve="resolveAnnotation" /></t-tab-panel>
+          <t-tab-panel value="annotations" :label="t('production.documentWorkbench.notes')"><ProductionAnnotationPanel v-model:body="annotationDraft.body" v-model:severity="annotationDraft.severity" :annotations="annotations" :can-annotate="canCreateAnnotation" :can-resolve="canResolveAnnotation" :submitting="annotationSubmitting" @create="createAnnotation" @resolve="resolveAnnotation" /></t-tab-panel>
           <t-tab-panel value="versions" :label="t('production.documentWorkbench.history')"><ProductionVersionPanel :versions="versions" :selected-version-id="selectedVersionId" :current-version-id="document.current_version_id ?? ''" :diff="versionDiff" @select="selectVersion" @reload="loadWorkbench(selectedVersionId)" /></t-tab-panel>
         </t-tabs>
       </t-drawer>
@@ -77,7 +77,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRoute, useRouter } from 'vue-router'
 import { MessagePlugin } from 'tdesign-vue-next'
@@ -99,7 +99,6 @@ import {
   startProductionDocumentRun,
   updateProductionAnnotationStatus,
   type AppendProductionVersionInput,
-  type CreateProductionAnnotationInput,
   type DecideProductionToolCallInput,
   type ProductionAnnotation,
   type ProductionDocument,
@@ -122,6 +121,12 @@ import ProductionEvidencePanel from './components/ProductionEvidencePanel.vue'
 import ProductionOutline from './components/ProductionOutline.vue'
 import ProductionVersionPanel from './components/ProductionVersionPanel.vue'
 import {
+  buildAnnotationSubmission,
+  completeAnnotationDraft,
+  type PendingAnnotationSubmission,
+  type ProductionAnnotationDraft,
+} from './models/annotationDraft'
+import {
   applyDocumentBlockOperation,
   draftBlocksPayload,
   summarizeVersionDiff,
@@ -131,6 +136,10 @@ import {
   type ProductionVersionDiff,
 } from './models/documentBlocks'
 import { createLatestRequestCoordinator } from './models/latestRequestCoordinator'
+import {
+  canCreateProductionAnnotation,
+  canResolveProductionAnnotation,
+} from './models/productionAccess'
 import { canEditProductionProject } from './models/productionViewModel'
 
 const { t } = useI18n()
@@ -157,6 +166,8 @@ const toolCalls = shallowRef<ProductionToolCall[]>([])
 const models = shallowRef<ModelConfig[]>([])
 const draftBlocks = shallowRef<ProductionDraftBlock[]>([])
 const versionDiff = ref<ProductionVersionDiff | null>(null)
+const annotationDraft = reactive<ProductionAnnotationDraft>({ body: '', severity: 'info' })
+const annotationSubmitting = ref(false)
 const selectedVersionId = ref('')
 const activeLogicalBlockId = ref('')
 const activeRunId = ref('')
@@ -168,11 +179,15 @@ const rightDrawerVisible = ref(false)
 const documentId = computed(() => typeof route.params.documentId === 'string' ? route.params.documentId : '')
 const activeBlock = computed<ProductionDraftBlock | null>(() => draftBlocks.value.find(row => row.logical_block_id === activeLogicalBlockId.value) ?? null)
 const canEditProject = computed(() => !!project.value && canEditProductionProject(auth.currentTenantRole as TenantRole | '', project.value))
+const projectRoles = computed(() => project.value?.current_user_roles ?? [])
 const canEdit = computed(() => canEditProject.value
   && document.value?.status !== 'archived'
   && selectedVersionId.value === document.value?.current_version_id)
 const selectedPersistedBlock = computed(() => versionDetail.value?.blocks.find(row => row.logical_block_id === activeLogicalBlockId.value) ?? null)
-const canAnnotate = computed(() => canEdit.value && !!selectedPersistedBlock.value)
+const canCreateAnnotation = computed(() => !!selectedPersistedBlock.value && canCreateProductionAnnotation(
+  auth.currentTenantRole as TenantRole | '',
+  projectRoles.value,
+))
 const canSave = computed(() => canEdit.value && !saving.value && draftBlocks.value.length > 0)
 const saveHint = computed(() => canEdit.value ? t('production.documentWorkbench.saveVersion') : readOnlyMessage.value)
 const readOnlyMessage = computed(() => {
@@ -186,7 +201,7 @@ let appendCommand: { signature: string; command: ProductionCommand<AppendProduct
 let runCommand: { signature: string; command: ProductionCommand<StartProductionDocumentRunInput> } | null = null
 const toolCommands = new Map<string, ProductionCommand<DecideProductionToolCallInput>>()
 const annotationStatusCommands = new Map<string, ProductionCommand<{ status: 'resolved' | 'dismissed' }>>()
-let annotationCommand: { signature: string; command: ProductionCommand<CreateProductionAnnotationInput> } | null = null
+let annotationCommand: PendingAnnotationSubmission | null = null
 
 function responseError(response: { message?: string }, fallback: string) { return new Error(response.message || fallback) }
 function isConflictError(cause: unknown) { return typeof cause === 'object' && cause !== null && 'response' in cause && (cause as { response?: { status?: number } }).response?.status === 409 }
@@ -324,17 +339,32 @@ async function decideTool(callId: string, decision: 'approve' | 'reject') {
   } catch (cause) { pageError.value = cause instanceof Error ? cause.message : t('production.documentWorkbench.decisionFailed') }
 }
 
-async function createAnnotation(input: { body: string; severity: ProductionAnnotation['severity'] }) {
-  if (!document.value || !versionDetail.value || !selectedPersistedBlock.value) return
-  const payload: CreateProductionAnnotationInput = { version_id: versionDetail.value.id, block_id: selectedPersistedBlock.value.id, annotation_type: 'comment', severity: input.severity, anchor: { logical_block_id: selectedPersistedBlock.value.logical_block_id }, body: input.body }
-  const signature = JSON.stringify(payload)
-  annotationCommand = stableCommand(annotationCommand, signature, payload)
+function canResolveAnnotation(annotation: ProductionAnnotation) {
+  return canResolveProductionAnnotation(
+    auth.currentTenantRole as TenantRole | '',
+    projectRoles.value,
+    auth.currentUserId,
+    annotation,
+  )
+}
+
+async function createAnnotation() {
+  if (!document.value || !versionDetail.value || !selectedPersistedBlock.value
+    || !canCreateAnnotation.value || !annotationDraft.body.trim() || annotationSubmitting.value) return
+  annotationSubmitting.value = true
+  annotationCommand = buildAnnotationSubmission(annotationDraft, {
+    versionId: versionDetail.value.id,
+    blockId: selectedPersistedBlock.value.id,
+    logicalBlockId: selectedPersistedBlock.value.logical_block_id,
+  }, annotationCommand)
   try {
     const response = await createProductionAnnotation(document.value.id, annotationCommand.command)
     if (!response.success || !response.data) throw responseError(response, t('production.documentWorkbench.annotationFailed'))
     annotations.value = [response.data, ...annotations.value]
+    Object.assign(annotationDraft, completeAnnotationDraft(annotationDraft))
     annotationCommand = null
   } catch (cause) { pageError.value = cause instanceof Error ? cause.message : t('production.documentWorkbench.annotationFailed') }
+  finally { annotationSubmitting.value = false }
 }
 
 async function resolveAnnotation(id: string) {
@@ -352,7 +382,15 @@ function selectVersion(id: string) { if (id !== selectedVersionId.value) loadWor
 function reloadLatest() { conflict.value = false; loadWorkbench(document.value?.current_version_id ?? '') }
 function backToProject() { router.push(project.value ? { name: 'productionProject', params: { projectId: project.value.id } } : { name: 'productionProjects' }) }
 
-watch(documentId, () => { loadCoordinator.invalidate(); toolCoordinator.invalidate(); loaded.value = false; document.value = null; loadWorkbench() })
+watch(documentId, () => {
+  loadCoordinator.invalidate()
+  toolCoordinator.invalidate()
+  loaded.value = false
+  document.value = null
+  annotationDraft.body = ''
+  annotationCommand = null
+  loadWorkbench()
+})
 onMounted(() => loadWorkbench())
 onBeforeUnmount(() => loadCoordinator.invalidate())
 onBeforeUnmount(() => toolCoordinator.invalidate())

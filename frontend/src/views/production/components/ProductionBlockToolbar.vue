@@ -2,11 +2,11 @@
   <div class="block-toolbar" :aria-label="t('production.documentWorkbench.blockToolbar')">
     <t-select :value="blockType" size="small" :disabled="disabled" :options="typeOptions" @change="$emit('change-type', $event as ProductionEditorBlockType)" />
     <span class="toolbar-rule" />
-    <t-tooltip :content="t('production.documentWorkbench.addBlock')"><t-button shape="square" size="small" variant="text" :disabled="disabled" @click="$emit('insert')"><t-icon name="add" /></t-button></t-tooltip>
-    <t-tooltip :content="t('production.documentWorkbench.moveUp')"><t-button shape="square" size="small" variant="text" :disabled="disabled || first" @click="$emit('move-up')"><t-icon name="arrow-up" /></t-button></t-tooltip>
-    <t-tooltip :content="t('production.documentWorkbench.moveDown')"><t-button shape="square" size="small" variant="text" :disabled="disabled || last" @click="$emit('move-down')"><t-icon name="arrow-down" /></t-button></t-tooltip>
-    <t-tooltip :content="t('production.documentWorkbench.annotate')"><t-button shape="square" size="small" variant="text" :disabled="!canAnnotate" @click="$emit('annotate')"><t-icon name="chat" /></t-button></t-tooltip>
-    <t-tooltip :content="t('production.documentWorkbench.deleteBlock')"><t-button shape="square" size="small" variant="text" theme="danger" :disabled="disabled || only" @click="$emit('delete')"><t-icon name="delete" /></t-button></t-tooltip>
+    <t-tooltip :content="t('production.documentWorkbench.addBlock')"><t-button shape="square" size="small" variant="text" :aria-label="t('production.documentWorkbench.addBlock')" :disabled="disabled" @click="$emit('insert')"><t-icon name="add" /></t-button></t-tooltip>
+    <t-tooltip :content="t('production.documentWorkbench.moveUp')"><t-button shape="square" size="small" variant="text" :aria-label="t('production.documentWorkbench.moveUp')" :disabled="disabled || first" @click="$emit('move-up')"><t-icon name="arrow-up" /></t-button></t-tooltip>
+    <t-tooltip :content="t('production.documentWorkbench.moveDown')"><t-button shape="square" size="small" variant="text" :aria-label="t('production.documentWorkbench.moveDown')" :disabled="disabled || last" @click="$emit('move-down')"><t-icon name="arrow-down" /></t-button></t-tooltip>
+    <t-tooltip :content="t('production.documentWorkbench.annotate')"><t-button shape="square" size="small" variant="text" :aria-label="t('production.documentWorkbench.annotate')" :disabled="!canAnnotate" @click="$emit('annotate')"><t-icon name="chat" /></t-button></t-tooltip>
+    <t-tooltip :content="t('production.documentWorkbench.deleteBlock')"><t-button shape="square" size="small" variant="text" theme="danger" :aria-label="t('production.documentWorkbench.deleteBlock')" :disabled="disabled || only" @click="$emit('delete')"><t-icon name="delete" /></t-button></t-tooltip>
   </div>
 </template>
 

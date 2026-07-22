@@ -49,3 +49,15 @@ test('production document route renders the real workbench', () => {
   const router = source('../../router/index.ts')
   assert.match(router, /name:\s*"productionDocument"[\s\S]*ProductionDocumentWorkbench\.vue/)
 })
+
+test('icon-only controls are labelled and AI runs are keyboard buttons', () => {
+  const workbench = source('./ProductionDocumentWorkbench.vue')
+  const toolbar = source('./components/ProductionBlockToolbar.vue')
+  const versions = source('./components/ProductionVersionPanel.vue')
+  const runs = source('./components/ProductionAIRunPanel.vue')
+  assert.doesNotMatch(workbench, /shape="square"(?![^>]*aria-label)/)
+  assert.doesNotMatch(toolbar, /shape="square"(?![^>]*aria-label)/)
+  assert.doesNotMatch(versions, /shape="square"(?![^>]*aria-label)/)
+  assert.match(runs, /<button[^>]*class="run-row"/)
+  assert.doesNotMatch(runs, /\{\{\s*(?:run\.status|call\.approval_status)\s*\}\}/)
+})

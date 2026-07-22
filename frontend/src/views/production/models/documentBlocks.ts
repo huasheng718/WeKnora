@@ -54,6 +54,11 @@ function isEditorBlockType(value: string): value is ProductionEditorBlockType {
   return ['heading', 'paragraph', 'code', 'callout', 'list', 'table', 'image'].includes(value)
 }
 
+function hasExactKeys(value: object, expected: readonly string[]): boolean {
+  const keys = Object.keys(value).sort()
+  return keys.length === expected.length && keys.every((key, index) => key === expected[index])
+}
+
 export function defaultBlockContent(blockType: ProductionEditorBlockType): ProductionJSON {
   if (blockType === 'list') return []
   if (blockType === 'table') return { headers: ['Column 1'], rows: [] }
@@ -70,6 +75,7 @@ export function isValidBlockContent(blockType: ProductionEditorBlockType, conten
   }
   if (blockType === 'table') {
     if (!content || typeof content !== 'object' || Array.isArray(content)) return false
+    if (!hasExactKeys(content, ['headers', 'rows'])) return false
 	const table = content as { headers?: unknown; rows?: unknown }
 	if (!Array.isArray(table.headers) || table.headers.length === 0 || !table.headers.every(item => typeof item === 'string')) return false
 	const headers = table.headers
@@ -78,6 +84,7 @@ export function isValidBlockContent(blockType: ProductionEditorBlockType, conten
 	)
   }
   if (!content || typeof content !== 'object' || Array.isArray(content)) return false
+  if (!hasExactKeys(content, ['alt', 'url'])) return false
   const image = content as { alt?: unknown; url?: unknown }
   if (typeof image.alt !== 'string' || typeof image.url !== 'string') return false
   try {

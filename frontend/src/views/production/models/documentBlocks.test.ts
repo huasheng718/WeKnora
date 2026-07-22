@@ -187,3 +187,19 @@ test('version diff counts stable logical ids as added changed removed or unchang
     unchanged: 0,
   })
 })
+
+test('table and image blocks reject unknown content fields', () => {
+  const table = versionDraftBlocks(versionFixture())
+  table[0].block_type = 'table'
+  table[0].content = { headers: ['A'], rows: [['value']], extra: true }
+  assert.throws(() => applyDocumentBlockOperation(table, {
+    op: 'edit', logicalBlockId: table[0].logical_block_id, content: table[0].content,
+  }), /invalid table/)
+
+  const image = versionDraftBlocks(versionFixture())
+  image[0].block_type = 'image'
+  assert.throws(() => applyDocumentBlockOperation(image, {
+    op: 'edit', logicalBlockId: image[0].logical_block_id,
+    content: { alt: 'Diagram', url: 'https://example.com/diagram.png', caption: 'extra' },
+  }), /invalid image/)
+})
