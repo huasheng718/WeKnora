@@ -33,7 +33,7 @@
 
 五种类型使用同一版本化 JSON 契约，创建和派生草稿时由后端完成结构校验和规范化。
 
-- `block_schema`：版本号、必需章节及允许的块类型。允许类型必须与持久化校验器一致，包括 `heading`、`paragraph`、`code`、`callout`、`list`、`table`、`image` 以及完成基线修复后的 `fact`。
+- `block_schema`：版本号、必需章节及允许的持久化块类型。允许类型必须与持久化校验器一致，包括 `heading`、`paragraph`、`code`、`callout`、`list`、`table`、`image`；模型输出的 `fact` 在写入前统一规范化为 `paragraph`，并写入 `factual=true` 和受治理的 `needs_confirmation` 属性，不增加第八种持久化块类型。
 - `source_requirements`：最低有效证据数量、允许的资料来源类型、是否要求证据清单及是否允许无来源事实。
 - `skill_bindings`：默认使用 `{"version":1,"skills":[]}`，不绑定不存在的 Skill 或伪造摘要。
 - `workflow_plan`：默认使用 `{"version":1,"steps":[]}`，保留后续绑定真实 Skill、MCP 或工具步骤的扩展点。
@@ -48,7 +48,7 @@ v1 使用以下精确结构，所有对象拒绝未知顶层字段；数组保�
   "block_schema": {
     "version": 1,
     "required_sections": ["类型对应的章节名称"],
-    "allowed_block_types": ["heading", "paragraph", "fact", "code", "callout", "list", "table", "image"]
+    "allowed_block_types": ["heading", "paragraph", "code", "callout", "list", "table", "image"]
   },
   "source_requirements": {
     "version": 1,
@@ -174,7 +174,7 @@ v1 使用以下精确结构，所有对象拒绝未知顶层字段；数组保�
 实施前先处理两个已确认的仓库基线问题：
 
 1. `internal/database/production_migration_test.go` 引用了不存在的 PostgreSQL `000075_knowledge_production_projection_integrity` 和 `000076_production_projection_failure_recovery` 文件，而当前 `000075` 已被临时文档迁移占用。必须先恢复或重编号该迁移链，再选择本功能的 PostgreSQL 与 SQLite 迁移编号。
-2. 写作提示当前要求事实声明使用 `block_type=fact`，但持久化版本校验器会把 `fact` 判为不支持。必须统一写作输出契约和校验器后再验收内置模板写作流程。
+2. 写作提示继续要求模型以 `block_type=fact` 表达事实声明，但持久化契约只允许七种块类型。必须以回归测试固定现有规范化边界：写入前将模型 `fact` 转换为 `paragraph + factual=true`，无证据时同时设置 `needs_confirmation=true`，持久化校验器继续拒绝原始 `fact`。
 
 这两项属于功能可用性的必要修复，不视为无关重构。
 

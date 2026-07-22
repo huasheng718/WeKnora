@@ -18,6 +18,7 @@
 - Default Skill bindings are `{"version":1,"skills":[]}` and workflow plans are `{"version":1,"steps":[]}`.
 - Review defaults are business for SOP/product/FAQ, business then compliance for policy, engineering then business for incident.
 - All tenant creation paths provision storage and five built-ins in one transaction.
+- Model `fact` output is normalized before persistence to `paragraph` with `factual=true` and governed `needs_confirmation`; persisted `block_schema.allowed_block_types` remains the existing seven types and raw persisted `fact` remains invalid.
 - PostgreSQL and SQLite behavior must remain equivalent.
 - Four locales are required: `zh-CN`, `en-US`, `ko-KR`, and `ru-RU`.
 - No document-type deletion, in-place active editing, visual rule builder, or automatic template upgrade.
@@ -52,29 +53,26 @@
 
 **Files:**
 - Modify: `internal/database/production_migration_test.go`
-- Modify: `internal/application/service/production_evidence_validator.go`
 - Modify: `internal/application/service/production_evidence_validator_test.go`
 - Modify: `internal/application/service/production_writer_test.go`
 
 **Interfaces:**
 - Consumes: consolidated publication migration `000074_knowledge_production_publication`.
-- Produces: `fact` as a supported string-content production block and a migration test suite with no deleted file references.
+- Produces: regression coverage for the established model-output normalization boundary and a migration test suite with no deleted file references.
 
 - [ ] **Step 1: Write failing regression tests**
 
-Add a validator case that proves a factual block is accepted only with valid string content and accepted evidence:
+Add a writer regression case proving model `block_type=fact` is persisted as an evidence-governed paragraph:
 
 ```go
-func TestValidateProductionVersionAcceptsEvidenceBackedFact(t *testing.T) {
-    version := validProductionVersionForCode("software-development-baseline")
-    version.Blocks = append(version.Blocks, &types.ProductionDocumentBlock{
-        LogicalBlockID: "fact-1", BlockType: "fact", Position: len(version.Blocks),
-        Content: types.JSON(`"verified statement"`), EvidenceRefs: types.JSON(`["evidence-1"]`),
-    })
-    result := ValidateProductionVersion(version, map[string]struct{}{"evidence-1": {}})
-    require.Empty(t, result.Errors)
+func TestProductionWriterNormalizesFactToGovernedParagraph(t *testing.T) {
+    // Use the existing writer fixture with one model fact and accepted evidence.
+    // Assert persisted BlockType is paragraph, attributes.factual is true,
+    // needs_confirmation follows evidence availability, and content is a string.
 }
 ```
+
+Add a validator regression proving a raw persisted `fact` still returns `unsupported_block_type`, while the normalized factual paragraph is accepted only with accepted evidence or `needs_confirmation=true`.
 
 Replace the four stale `000075_knowledge_production_projection_integrity` / `000076_production_projection_failure_recovery` file assertions with checks against the consolidated `000074` up/down migrations. Add an assertion that no production migration test names a nonexistent file.
 
@@ -83,29 +81,14 @@ Replace the four stale `000075_knowledge_production_projection_integrity` / `000
 Run:
 
 ```bash
-go test ./internal/database ./internal/application/service -run 'TestProduction.*Migration|TestValidateProductionVersionAcceptsEvidenceBackedFact' -count=1
+go test ./internal/database ./internal/application/service -run 'TestProduction.*Migration|TestProductionWriterNormalizesFact|TestValidateProductionVersion.*Fact' -count=1
 ```
 
-Expected: the fact test fails with `unsupported_block_type`; the migration test fails until stale paths are removed.
+Expected: migration assertions fail until stale paths are removed; any missing normalization/validator regression coverage fails before production code is changed.
 
 - [ ] **Step 3: Implement the minimum baseline fix**
 
-Extend `productionValidateBlockContent` without changing the existing text-block contract:
-
-```go
-case "heading", "paragraph", "code", "callout":
-    var text string
-    if err := decodeProductionJSON(block.Content, &text, true); err != nil {
-        return errors.New("content must be a JSON string")
-    }
-case "fact":
-    var text string
-    if err := decodeProductionJSON(block.Content, &text, true); err != nil || strings.TrimSpace(text) == "" {
-        return errors.New("content must be a non-empty JSON string")
-    }
-```
-
-Keep the writer instruction requiring `block_type=fact`; add a writer test asserting that instruction and the generated output schema remain aligned.
+Replace the four stale migration-file references with the consolidated `000074` up/down files and add a filesystem-existence assertion for every migration path named by this test suite. Keep the established writer behavior unchanged: its model schema requests `block_type=fact`, then normalizes it before persistence to `block_type=paragraph`, string content, `factual=true`, and evidence-derived `needs_confirmation`. Do not add `fact` to `productionValidateBlockContent` or to persisted allowed block types.
 
 - [ ] **Step 4: Run focused and package tests**
 
@@ -120,8 +103,8 @@ Expected: PASS with no attempt to open deleted migration files.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add internal/database/production_migration_test.go internal/application/service/production_evidence_validator.go internal/application/service/production_evidence_validator_test.go internal/application/service/production_writer_test.go
-git commit -m "fix(production): align migration and fact block contracts"
+git add internal/database/production_migration_test.go internal/application/service/production_evidence_validator_test.go internal/application/service/production_writer_test.go
+git commit -m "fix(production): align migration and fact normalization contracts"
 ```
 
 ---
@@ -494,7 +477,7 @@ Add tests proving:
 
 1. freeze fails below `min_accepted_evidence` or on a forbidden source kind;
 2. writer prompt contains snapshot sections/gates for `sop`, not a global lookup;
-3. validator rejects a missing required section, evidence-free fact, and `needs_confirmation` block;
+3. validator rejects a missing required section, an evidence-free factual paragraph, and a `needs_confirmation` block;
 4. review submission rejects policies whose required project role has no assignee;
 5. release rejects non-knowledge-base target policy, disabled approved-review requirement, or non-inherit processing values;
 6. retiring the type after run creation does not alter the run snapshot outcome.
@@ -668,6 +651,15 @@ go build ./...
 ```
 
 Expected: every command exits 0; race tests report no data race.
+
+Run the existing PostgreSQL migration integration coverage against a real disposable PostgreSQL database:
+
+```bash
+WEKNORA_TEST_POSTGRES_DSN="$WEKNORA_TEST_POSTGRES_DSN" \
+go test ./internal/database -run 'TestProduction.*PostgreSQL.*Migration|TestProductionBuiltin.*PostgreSQL' -count=1
+```
+
+Expected: with `WEKNORA_TEST_POSTGRES_DSN` configured, the built-in migration executes up/down and PostgreSQL/SQLite parity assertions pass. If the DSN is unavailable, record that exact environment limitation in progress and do not claim live PostgreSQL execution passed.
 
 - [ ] **Step 4: Run complete frontend and browser verification**
 
