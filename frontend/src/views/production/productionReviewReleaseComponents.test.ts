@@ -14,14 +14,30 @@ test('review panel exposes role-aware governed commands with lifecycle coordinat
   assert.match(panel, /props\.versionId/)
 })
 
+test('review lifecycle settles submit state on version invalidation and localizes empty load failures', () => {
+  const panel = source('./components/ProductionReviewPanel.vue')
+
+  assert.match(panel, /watch\(\(\) => props\.versionId, \(\) => \{ mutationCoordinator\.invalidate\(\); submitting\.value = false; submitCommand = null \}\)/)
+  assert.match(panel, /throw new Error\(response\.message \|\| t\('production\.reviewConsole\.loadFailed'\)\)/)
+})
+
 test('release dialog uses paged authoritative preflight and stable create commands', () => {
   const dialog = source('./components/ProductionReleaseDialog.vue')
-  for (const contract of ['getProductionReleasePreflight', 'createProductionRelease', 'canConfirmProductionRelease', 'createScopedMutationCoordinator']) {
+  for (const contract of ['getProductionReleasePreflight', 'createProductionRelease', 'canConfirmProductionRelease', 'createScopedMutationCoordinator', 'createLatestRequestCoordinator']) {
     assert.match(dialog, new RegExp(contract))
   }
   assert.match(dialog, /has_more/)
   assert.match(dialog, /selectedKnowledgeBaseIds/)
   assert.match(dialog, /rendered_markdown/)
+})
+
+test('release preflight invalidates asynchronous state when its dialog scope changes', () => {
+  const dialog = source('./components/ProductionReleaseDialog.vue')
+
+  assert.match(dialog, /const preflightCoordinator = createLatestRequestCoordinator\(\)/)
+  assert.match(dialog, /await preflightCoordinator\.run\(/)
+  assert.match(dialog, /preflightCoordinator\.invalidate\(\)/)
+  assert.match(dialog, /onBeforeUnmount\(\(\) => \{ mutationCoordinator\.invalidate\(\); preflightCoordinator\.invalidate\(\) \}\)/)
 })
 
 test('release status uses lifecycle actions, head locks, and rollback confirmation', () => {
