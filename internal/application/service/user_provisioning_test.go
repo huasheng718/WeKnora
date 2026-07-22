@@ -46,12 +46,16 @@ func (r *provisioningUserRepo) DeleteUser(context.Context, string) error {
 
 type provisioningTenantService struct {
 	interfaces.TenantService
-	createCalls   int
-	activateCalls int
-	deleteCalls   int
-	purgeCalls    int
-	activateErr   error
-	unavailable   map[uint64]bool
+	createCalls             int
+	activateCalls           int
+	deleteCalls             int
+	purgeCalls              int
+	registrationPurgeCalls  int
+	registrationPurgeErr    error
+	registrationPurgeTenant uint64
+	registrationPurgeUserID string
+	activateErr             error
+	unavailable             map[uint64]bool
 }
 
 func (s *provisioningTenantService) CreateTenant(context.Context, *types.Tenant) (*types.Tenant, error) {
@@ -92,6 +96,15 @@ func (s *provisioningTenantService) DeleteTenant(context.Context, uint64) error 
 func (s *provisioningTenantService) PurgeProvisionedTenant(context.Context, uint64) error {
 	s.purgeCalls++
 	return nil
+}
+
+func (s *provisioningTenantService) PurgeProvisionedRegistration(
+	_ context.Context, tenantID uint64, userID string,
+) error {
+	s.registrationPurgeCalls++
+	s.registrationPurgeTenant = tenantID
+	s.registrationPurgeUserID = userID
+	return s.registrationPurgeErr
 }
 
 type provisioningMemberService struct {
@@ -203,14 +216,17 @@ func TestUserServiceRegisterActivatesProvisionedTenant(t *testing.T) {
 	if tenantSvc.activateCalls != 1 {
 		t.Fatalf("ActivateProvisionedTenant calls = %d, want 1", tenantSvc.activateCalls)
 	}
-	if repo.deleteCalls != 0 || tenantSvc.purgeCalls != 0 {
-		t.Fatalf("unexpected rollback: user deletes=%d tenant purges=%d", repo.deleteCalls, tenantSvc.purgeCalls)
+	if repo.deleteCalls != 0 || tenantSvc.purgeCalls != 0 || tenantSvc.registrationPurgeCalls != 0 {
+		t.Fatalf("unexpected rollback: user deletes=%d tenant purges=%d registration purges=%d",
+			repo.deleteCalls, tenantSvc.purgeCalls, tenantSvc.registrationPurgeCalls)
 	}
 }
 
 func TestUserServiceRegisterPurgesProvisionedTenantWhenActivationFails(t *testing.T) {
 	repo := &provisioningUserRepo{}
-	tenantSvc := &provisioningTenantService{activateErr: errors.New("activation failed")}
+	tenantSvc := &provisioningTenantService{
+		activateErr: errors.New("activation failed"), registrationPurgeErr: errors.New("cleanup failed"),
+	}
 	members := &provisioningMemberService{}
 	svc := &userService{userRepo: repo, tenantService: tenantSvc, memberService: members}
 
@@ -225,8 +241,15 @@ func TestUserServiceRegisterPurgesProvisionedTenantWhenActivationFails(t *testin
 	if tenantSvc.activateCalls != 1 {
 		t.Fatalf("ActivateProvisionedTenant calls = %d, want 1", tenantSvc.activateCalls)
 	}
-	if repo.deleteCalls != 1 || tenantSvc.purgeCalls != 1 {
-		t.Fatalf("rollback calls: user deletes=%d tenant purges=%d, want 1/1", repo.deleteCalls, tenantSvc.purgeCalls)
+	if err.Error() != "failed to finalise workspace activation" {
+		t.Fatalf("Register error = %q, want original activation finalization error", err)
+	}
+	if repo.deleteCalls != 0 || tenantSvc.purgeCalls != 0 || tenantSvc.registrationPurgeCalls != 1 {
+		t.Fatalf("rollback calls: user deletes=%d tenant purges=%d registration purges=%d, want 0/0/1",
+			repo.deleteCalls, tenantSvc.purgeCalls, tenantSvc.registrationPurgeCalls)
+	}
+	if tenantSvc.registrationPurgeTenant != 99 || tenantSvc.registrationPurgeUserID == "" {
+		t.Fatalf("registration purge scope = tenant %d user %q", tenantSvc.registrationPurgeTenant, tenantSvc.registrationPurgeUserID)
 	}
 }
 
@@ -246,8 +269,9 @@ func TestUserServiceRegisterPurgesProvisionedTenantWhenMemberServiceUnavailable(
 	if tenantSvc.activateCalls != 0 {
 		t.Fatalf("ActivateProvisionedTenant calls = %d, want 0", tenantSvc.activateCalls)
 	}
-	if repo.deleteCalls != 1 || tenantSvc.purgeCalls != 1 {
-		t.Fatalf("rollback calls: user deletes=%d tenant purges=%d, want 1/1", repo.deleteCalls, tenantSvc.purgeCalls)
+	if repo.deleteCalls != 0 || tenantSvc.purgeCalls != 0 || tenantSvc.registrationPurgeCalls != 1 {
+		t.Fatalf("rollback calls: user deletes=%d tenant purges=%d registration purges=%d, want 0/0/1",
+			repo.deleteCalls, tenantSvc.purgeCalls, tenantSvc.registrationPurgeCalls)
 	}
 }
 
@@ -288,8 +312,9 @@ func TestUserServiceRegisterPurgesProvisionedTenantWhenUserCreateFails(t *testin
 	if err == nil || user != nil {
 		t.Fatalf("Register = (%v, %v), want failure", user, err)
 	}
-	if tenantSvc.purgeCalls != 1 || tenantSvc.deleteCalls != 0 {
-		t.Fatalf("rollback calls: purge=%d delete=%d, want 1/0", tenantSvc.purgeCalls, tenantSvc.deleteCalls)
+	if tenantSvc.purgeCalls != 1 || tenantSvc.deleteCalls != 0 || tenantSvc.registrationPurgeCalls != 0 {
+		t.Fatalf("rollback calls: purge=%d registration purge=%d delete=%d, want 1/0/0",
+			tenantSvc.purgeCalls, tenantSvc.registrationPurgeCalls, tenantSvc.deleteCalls)
 	}
 }
 
@@ -307,10 +332,8 @@ func TestUserServiceRegisterPurgesProvisionedTenantWhenOwnerFinalizationFails(t 
 	if err == nil || user != nil {
 		t.Fatalf("Register = (%v, %v), want failure", user, err)
 	}
-	if repo.deleteCalls != 1 {
-		t.Fatalf("DeleteUser calls = %d, want 1", repo.deleteCalls)
-	}
-	if tenantSvc.purgeCalls != 1 || tenantSvc.deleteCalls != 0 {
-		t.Fatalf("rollback calls: purge=%d delete=%d, want 1/0", tenantSvc.purgeCalls, tenantSvc.deleteCalls)
+	if repo.deleteCalls != 0 || tenantSvc.purgeCalls != 0 || tenantSvc.registrationPurgeCalls != 1 {
+		t.Fatalf("rollback calls: user deletes=%d tenant purges=%d registration purges=%d, want 0/0/1",
+			repo.deleteCalls, tenantSvc.purgeCalls, tenantSvc.registrationPurgeCalls)
 	}
 }

@@ -14,9 +14,10 @@ import (
 )
 
 var (
-	ErrTenantNotFound         = errors.New("tenant not found")
-	ErrTenantNotProvisioning  = errors.New("tenant is not awaiting activation")
-	ErrTenantHasKnowledgeBase = errors.New("tenant has associated knowledge bases")
+	ErrTenantNotFound           = errors.New("tenant not found")
+	ErrTenantNotProvisioning    = errors.New("tenant is not awaiting activation")
+	ErrProvisioningUserMismatch = errors.New("registration user does not belong to tenant")
+	ErrTenantHasKnowledgeBase   = errors.New("tenant has associated knowledge bases")
 )
 
 // tenantRepository implements tenant repository interface
@@ -173,6 +174,73 @@ func (r *tenantRepository) PurgeProvisionedTenant(ctx context.Context, id uint64
 			return result.Error
 		}
 		if result.RowsAffected != 1 {
+			return ErrTenantNotProvisioning
+		}
+		return nil
+	})
+}
+
+// PurgeProvisionedRegistration compensates failures after the registration
+// user is persisted. Every hard delete shares one transaction, and the final
+// status-qualified tenant delete prevents cleanup from winning over activation.
+func (r *tenantRepository) PurgeProvisionedRegistration(ctx context.Context, tenantID uint64, userID string) error {
+	return database.WithTransactionContext(ctx, r.db, func(txCtx context.Context) error {
+		tx := database.DBFromContext(txCtx, r.db).WithContext(txCtx)
+		locking := func(query *gorm.DB) *gorm.DB {
+			switch tx.Dialector.Name() {
+			case "postgres", "mysql":
+				return query.Clauses(clause.Locking{Strength: "UPDATE"})
+			default:
+				return query
+			}
+		}
+		var tenantState struct {
+			Status string `gorm:"column:status"`
+		}
+		result := locking(tx.Unscoped().Model(&types.Tenant{}).Select("status")).
+			Where("id = ?", tenantID).Take(&tenantState)
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return ErrTenantNotProvisioning
+		}
+		if result.Error != nil {
+			return result.Error
+		}
+		if tenantState.Status != types.TenantStatusProvisioning {
+			return ErrTenantNotProvisioning
+		}
+		var userState struct {
+			ID string `gorm:"column:id"`
+		}
+		result = tx.Unscoped().Model(&types.User{}).Select("id").
+			Where("id = ? AND tenant_id = ?", userID, tenantID).Take(&userState)
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return ErrProvisioningUserMismatch
+		}
+		if result.Error != nil {
+			return result.Error
+		}
+		if err := tx.Unscoped().Where("tenant_id = ?", tenantID).Delete(&types.ProductionDocumentType{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Unscoped().Where("tenant_id = ?", tenantID).Delete(&types.StorageBackend{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Unscoped().Where("tenant_id = ?", tenantID).Delete(&types.TenantMember{}).Error; err != nil {
+			return err
+		}
+		userResult := tx.Unscoped().Where("id = ? AND tenant_id = ?", userID, tenantID).Delete(&types.User{})
+		if userResult.Error != nil {
+			return userResult.Error
+		}
+		if userResult.RowsAffected != 1 {
+			return ErrProvisioningUserMismatch
+		}
+		tenantResult := tx.Unscoped().Where("id = ? AND status = ?", tenantID, types.TenantStatusProvisioning).
+			Delete(&types.Tenant{})
+		if tenantResult.Error != nil {
+			return tenantResult.Error
+		}
+		if tenantResult.RowsAffected != 1 {
 			return ErrTenantNotProvisioning
 		}
 		return nil

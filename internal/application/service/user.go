@@ -186,15 +186,10 @@ func (s *userService) Register(ctx context.Context, req *types.RegisterRequest) 
 	}
 
 	// Bootstrap an Owner membership before activation. Missing ownership is
-	// fatal: delete the new user and purge the still-hidden tenant.
+	// fatal: atomically purge the new user and still-hidden tenant.
 	if createdTenant != nil && s.memberService == nil {
 		logger.Errorf(ctx, "Workspace membership service unavailable while finalizing tenant %d", createdTenant.ID)
-		if cleanupErr := s.userRepo.DeleteUser(ctx, user.ID); cleanupErr != nil {
-			logger.Errorf(ctx, "Failed to delete user %s after owner service failure: %v", user.ID, cleanupErr)
-		}
-		if rollbackErr := s.tenantService.PurgeProvisionedTenant(ctx, createdTenant.ID); rollbackErr != nil {
-			logger.Errorf(ctx, "Failed to roll back tenant %d after owner service failure: %v", createdTenant.ID, rollbackErr)
-		}
+		s.purgeFailedRegistration(ctx, createdTenant.ID, user.ID, "owner service failure")
 		return nil, errors.New("failed to finalise workspace ownership")
 	}
 
@@ -202,12 +197,7 @@ func (s *userService) Register(ctx context.Context, req *types.RegisterRequest) 
 		if _, err := s.memberService.EnsureOwner(ctx, user.ID, createdTenant.ID); err != nil {
 			logger.Errorf(ctx, "Failed to create owner membership for user %s tenant %d: %v",
 				user.ID, createdTenant.ID, err)
-			if cleanupErr := s.userRepo.DeleteUser(ctx, user.ID); cleanupErr != nil {
-				logger.Errorf(ctx, "Failed to delete user %s after owner finalization failure: %v", user.ID, cleanupErr)
-			}
-			if rollbackErr := s.tenantService.PurgeProvisionedTenant(ctx, createdTenant.ID); rollbackErr != nil {
-				logger.Errorf(ctx, "Failed to roll back tenant %d after owner finalization failure: %v", createdTenant.ID, rollbackErr)
-			}
+			s.purgeFailedRegistration(ctx, createdTenant.ID, user.ID, "owner finalization failure")
 			return nil, errors.New("failed to finalise workspace ownership")
 		}
 	}
@@ -215,18 +205,20 @@ func (s *userService) Register(ctx context.Context, req *types.RegisterRequest) 
 	if createdTenant != nil {
 		if _, err := s.tenantService.ActivateProvisionedTenant(ctx, createdTenant.ID); err != nil {
 			logger.Errorf(ctx, "Failed to activate tenant %d after registration finalization: %v", createdTenant.ID, err)
-			if cleanupErr := s.userRepo.DeleteUser(ctx, user.ID); cleanupErr != nil {
-				logger.Errorf(ctx, "Failed to delete user %s after tenant activation failure: %v", user.ID, cleanupErr)
-			}
-			if rollbackErr := s.tenantService.PurgeProvisionedTenant(ctx, createdTenant.ID); rollbackErr != nil {
-				logger.Errorf(ctx, "Failed to roll back tenant %d after activation failure: %v", createdTenant.ID, rollbackErr)
-			}
+			s.purgeFailedRegistration(ctx, createdTenant.ID, user.ID, "activation failure")
 			return nil, errors.New("failed to finalise workspace activation")
 		}
 	}
 
 	logger.Info(ctx, "User registered successfully")
 	return user, nil
+}
+
+func (s *userService) purgeFailedRegistration(ctx context.Context, tenantID uint64, userID, stage string) {
+	if err := s.tenantService.PurgeProvisionedRegistration(ctx, tenantID, userID); err != nil {
+		logger.Errorf(ctx, "Failed to atomically purge registration user %s tenant %d after %s: %v",
+			userID, tenantID, stage, err)
+	}
 }
 
 // Login authenticates a user and returns tokens

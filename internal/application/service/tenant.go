@@ -271,6 +271,24 @@ func (s *tenantService) PurgeProvisionedTenant(ctx context.Context, id uint64) e
 	return nil
 }
 
+func (s *tenantService) PurgeProvisionedRegistration(ctx context.Context, tenantID uint64, userID string) error {
+	if tenantID == 0 {
+		return errors.New("tenant ID cannot be 0")
+	}
+	if userID == "" {
+		return errors.New("user ID cannot be empty")
+	}
+	if err := s.repo.PurgeProvisionedRegistration(ctx, tenantID, userID); err != nil {
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{
+			"tenant_id": tenantID,
+			"user_id":   userID,
+		})
+		return err
+	}
+	logger.Infof(ctx, "Purged incomplete registration for tenant %d", tenantID)
+	return nil
+}
+
 // ListAllTenants lists all tenants (for users with cross-tenant access permission)
 // This method returns all tenants without filtering, intended for admin users
 func (s *tenantService) ListAllTenants(ctx context.Context) ([]*types.Tenant, error) {

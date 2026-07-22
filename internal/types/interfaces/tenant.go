@@ -30,6 +30,9 @@ type TenantService interface {
 	// not finish. It is only for provisioning compensation; normal workspace
 	// deletion must continue to use DeleteTenant's soft-delete semantics.
 	PurgeProvisionedTenant(ctx context.Context, id uint64) error
+	// PurgeProvisionedRegistration atomically hard-deletes the scoped
+	// registration user and the still-provisioning tenant resources.
+	PurgeProvisionedRegistration(ctx context.Context, tenantID uint64, userID string) error
 	// ListAllTenants lists all tenants (for users with cross-tenant access permission)
 	ListAllTenants(ctx context.Context) ([]*types.Tenant, error)
 	// BulkSetStorageQuota overwrites every tenant's storage_quota with
@@ -68,6 +71,9 @@ type TenantRepository interface {
 	// PurgeProvisionedTenant hard-deletes every row created by unfinished
 	// workspace provisioning in one transaction.
 	PurgeProvisionedTenant(ctx context.Context, id uint64) error
+	// PurgeProvisionedRegistration hard-deletes the scoped registration user
+	// and unfinished workspace rows in one transaction.
+	PurgeProvisionedRegistration(ctx context.Context, tenantID uint64, userID string) error
 	// AdjustStorageUsed adjusts the storage used for a tenant
 	AdjustStorageUsed(ctx context.Context, tenantID uint64, delta int64) error
 	// BulkSetStorageQuota — see TenantService.BulkSetStorageQuota.

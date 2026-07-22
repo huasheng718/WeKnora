@@ -105,6 +105,9 @@ func (f *flowTenantSvc) UpdateTenant(context.Context, *types.Tenant) (*types.Ten
 }
 func (f *flowTenantSvc) DeleteTenant(context.Context, uint64) error           { return nil }
 func (f *flowTenantSvc) PurgeProvisionedTenant(context.Context, uint64) error { return nil }
+func (f *flowTenantSvc) PurgeProvisionedRegistration(context.Context, uint64, string) error {
+	return nil
+}
 func (f *flowTenantSvc) ListTenants(context.Context) ([]*types.Tenant, error) {
 	return nil, nil
 }
