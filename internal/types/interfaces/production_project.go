@@ -22,6 +22,7 @@ type ProductionProjectRepository interface {
 	AssignRole(ctx context.Context, tenantID uint64, member *types.ProductionProjectMember) error
 	RemoveRole(ctx context.Context, tenantID uint64, projectID, userID string, role types.ProductionRole) error
 	ListRoles(ctx context.Context, tenantID uint64, projectID, userID string) ([]types.ProductionRole, error)
+	HasLiveRoleAssignee(ctx context.Context, tenantID uint64, projectID string, role types.ProductionRole) (bool, error)
 }
 
 // ProductionProjectService is the production-project application contract.
@@ -32,4 +33,5 @@ type ProductionProjectService interface {
 	AssignRole(ctx context.Context, projectID, userID string, role types.ProductionRole) error
 	RemoveRole(ctx context.Context, projectID, userID string, role types.ProductionRole) error
 	RequireProjectRole(ctx context.Context, projectID string, roles ...types.ProductionRole) error
+	HasLiveRoleAssignee(ctx context.Context, tenantID uint64, projectID string, role types.ProductionRole) (bool, error)
 }

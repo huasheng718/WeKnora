@@ -166,7 +166,7 @@ func newProductionWorkflowGraph(
 		result:    &mcp.CallToolResult{Content: []mcp.ContentItem{{Type: "text", Text: "healthy"}}},
 	}
 	manager := &productionMCPManagerStub{client: client}
-	sourceService := NewProductionSourceService(sources, authorizer, nil, audit, uow)
+	sourceService := NewProductionSourceService(sources, documentTypes, authorizer, nil, audit, uow)
 	mcpAdapter := NewProductionMCPAdapter(
 		&productionMCPApprovalStub{required: true}, &productionMCPServiceStub{service: mcpService},
 		manager, runs, sources, sourceService,

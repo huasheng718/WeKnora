@@ -645,6 +645,92 @@ func mustDecodeProductionWriterDocumentType(t *testing.T, raw types.JSON) *produ
 	return snapshot
 }
 
+func TestProductionWriterRejectsInvalidGovernanceForLegacyCode(t *testing.T) {
+	raw := types.JSON(`{
+		"id":"22222222-2222-4222-8222-222222222222","code":"software-development-baseline","schema_version":9,
+		"block_schema":{"version":1,"required_sections":["Snapshot section"],"allowed_block_types":["heading","paragraph"]},
+		"source_requirements":{"version":1,"min_accepted_evidence":1,"allowed_source_kinds":["manual"],"require_evidence_section":true,"allow_unsupported_facts":false},
+		"skill_bindings":{"version":1,"skills":[]},"workflow_plan":{"version":1,"steps":[]},
+		"quality_rules":{"version":1,"require_evidence_for_facts":true,"block_needs_confirmation":true,"gates":["section_completeness","fact_evidence","no_unconfirmed"]},
+		"review_policy":{"steps":["business_reviewer"]},
+		"publication_policy":{"version":1,"target_type":"external_wiki","chunking":"inherit_target","knowledge_graph":"inherit_target","require_approved_review":true}
+	}`)
+
+	_, err := decodeProductionWriterDocumentType(raw)
+
+	require.Error(t, err)
+	require.ErrorContains(t, err, "invalid document type governance snapshot")
+}
+
+func TestProductionDocumentTypeConfigRejectsInvalidGovernanceForLegacyCode(t *testing.T) {
+	documentType := &types.ProductionDocumentType{
+		Code:               "software-development-baseline",
+		BlockSchema:        types.JSON(`{"version":1,"required_sections":["Snapshot section"],"allowed_block_types":["heading","paragraph"]}`),
+		SourceRequirements: types.JSON(`{"version":1,"min_accepted_evidence":1,"allowed_source_kinds":["manual"],"require_evidence_section":true,"allow_unsupported_facts":false}`),
+		SkillBindings:      types.JSON(`{"version":1,"skills":[]}`),
+		WorkflowPlan:       types.JSON(`{"version":1,"steps":[]}`),
+		QualityRules:       types.JSON(`{"version":1,"require_evidence_for_facts":true,"block_needs_confirmation":true,"gates":["section_completeness","fact_evidence","no_unconfirmed"]}`),
+		ReviewPolicy:       types.JSON(`{"steps":["business_reviewer"]}`),
+		PublicationPolicy:  types.JSON(`{"version":1,"target_type":"external_wiki","chunking":"inherit_target","knowledge_graph":"inherit_target","require_approved_review":true}`),
+	}
+
+	_, err := productionDocumentTypeConfig(documentType)
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, types.ErrProductionDocumentTypeConfigInvalid)
+}
+
+func TestProductionWriterLegacyAdapterPreservesSnapshottedWorkflow(t *testing.T) {
+	raw := types.JSON(`{
+		"id":"22222222-2222-4222-8222-222222222222","code":"software-development-baseline","schema_version":3,
+		"block_schema":{},"source_requirements":{},"skill_bindings":{"version":1,"skills":[]},
+		"workflow_plan":{"version":1,"steps":[{"provider_type":"mcp","provider_id":"33333333-3333-4333-8333-333333333333","tool_name":"lookup","request":{"source_item_id":"44444444-4444-4444-8444-444444444444","arguments":{"query":"status"}}}]},
+		"quality_rules":{},"review_policy":{},"publication_policy":{}
+	}`)
+
+	snapshot, err := decodeProductionWriterDocumentType(raw)
+
+	require.NoError(t, err)
+	require.Len(t, snapshot.WorkflowPlan.Steps, 1)
+	require.Equal(t, types.ProductionToolProviderMCP, snapshot.WorkflowPlan.Steps[0].ProviderType)
+	require.Equal(t, "lookup", snapshot.WorkflowPlan.Steps[0].ToolName)
+}
+
+func TestProductionWriterPromptUsesExactSnapshotGovernance(t *testing.T) {
+	raw := types.JSON(`{
+		"id":"22222222-2222-4222-8222-222222222222","code":"sop","schema_version":9,
+		"block_schema":{"version":1,"required_sections":["Snapshotted Runbook Section"],"allowed_block_types":["heading","paragraph"]},
+		"source_requirements":{"version":1,"min_accepted_evidence":1,"allowed_source_kinds":["manual"],"require_evidence_section":true,"allow_unsupported_facts":false},
+		"skill_bindings":{"version":1,"skills":[]},"workflow_plan":{"version":1,"steps":[]},
+		"quality_rules":{"version":1,"require_evidence_for_facts":true,"block_needs_confirmation":true,"gates":["section_completeness","fact_evidence","no_unconfirmed","sop_exception_path"]},
+		"review_policy":{"steps":["business_reviewer"]},
+		"publication_policy":{"version":1,"target_type":"knowledge_base","chunking":"inherit_target","knowledge_graph":"inherit_target","require_approved_review":true}
+	}`)
+	documentType, err := decodeProductionWriterDocumentType(raw)
+	require.NoError(t, err)
+	inputVersionID := "version-1"
+	run := &types.ProductionRun{ID: "run-1", ProjectID: "project-1", DocumentID: "document-1", SourceSetID: "source-set-1", InputVersionID: &inputVersionID}
+	messages, err := productionWriterMessages(
+		run,
+		documentType,
+		&types.ProductionDocument{ID: "document-1", Title: "Snapshot governed SOP"},
+		&types.ProductionSourceSet{ID: "source-set-1", Status: types.ProductionSourceSetFrozen},
+		&types.ProductionDocumentVersion{ID: inputVersionID},
+		nil,
+	)
+	require.NoError(t, err)
+	require.Len(t, messages, 2)
+	var prompt struct {
+		DocumentType struct {
+			RequiredSections []string `json:"required_sections"`
+			QualityGates     []string `json:"quality_gates"`
+		} `json:"document_type"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(messages[1].Content), &prompt))
+	require.Equal(t, []string{"Snapshotted Runbook Section"}, prompt.DocumentType.RequiredSections)
+	require.Equal(t, []string{"section_completeness", "fact_evidence", "no_unconfirmed", "sop_exception_path"}, prompt.DocumentType.QualityGates)
+}
+
 func TestProductionWriterRequiresExactInternalRunPrincipal(t *testing.T) {
 	fixture := newProductionWriterFixture(t, productionWriterOutput(t,
 		writerFact("block-a", "grounded", []string{writerEvidenceID}, false),

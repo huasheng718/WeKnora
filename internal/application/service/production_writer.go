@@ -66,11 +66,29 @@ type productionWriterOutputWire struct {
 }
 
 type productionWriterDocumentTypeSnapshot struct {
-	ID            string          `json:"id"`
-	Code          string          `json:"code"`
-	SchemaVersion int             `json:"schema_version"`
-	BlockSchema   json.RawMessage `json:"block_schema"`
-	SkillBindings json.RawMessage `json:"skill_bindings"`
+	ID                 string
+	Code               string
+	SchemaVersion      int
+	BlockSchema        types.ProductionBlockSchemaV1
+	SourceRequirements types.ProductionSourceRequirementsV1
+	SkillBindings      types.ProductionSkillBindingsV1
+	WorkflowPlan       types.ProductionWorkflowPlanV1
+	QualityRules       types.ProductionQualityRulesV1
+	ReviewPolicy       types.ProductionReviewPolicyV1
+	PublicationPolicy  types.ProductionPublicationPolicyV1
+}
+
+type productionWriterDocumentTypeSnapshotWire struct {
+	ID                 string     `json:"id"`
+	Code               string     `json:"code"`
+	SchemaVersion      int        `json:"schema_version"`
+	BlockSchema        types.JSON `json:"block_schema"`
+	SourceRequirements types.JSON `json:"source_requirements"`
+	SkillBindings      types.JSON `json:"skill_bindings"`
+	WorkflowPlan       types.JSON `json:"workflow_plan"`
+	QualityRules       types.JSON `json:"quality_rules"`
+	ReviewPolicy       types.JSON `json:"review_policy"`
+	PublicationPolicy  types.JSON `json:"publication_policy"`
 }
 
 type productionWriterPromptEvidence struct {
@@ -202,7 +220,7 @@ func (w *ProductionWriter) Write(
 	if err != nil {
 		return nil, err
 	}
-	if err := prevalidateProductionWriterCandidate(documentType.Code, inputs, evidenceByID); err != nil {
+	if err := prevalidateProductionWriterCandidate(documentType.BlockSchema, documentType.QualityRules, inputs, evidenceByID); err != nil {
 		return nil, err
 	}
 
@@ -250,17 +268,174 @@ func productionWriterAuditedResponse(run *types.ProductionRun) (string, string, 
 }
 
 func decodeProductionWriterDocumentType(raw types.JSON) (*productionWriterDocumentTypeSnapshot, error) {
-	var snapshot productionWriterDocumentTypeSnapshot
-	if err := decodeProductionJSON(raw, &snapshot, false); err != nil {
+	var wire productionWriterDocumentTypeSnapshotWire
+	if err := decodeProductionJSON(raw, &wire, false); err != nil {
 		return nil, fmt.Errorf("%w: invalid document type snapshot: %v", errProductionWriterScope, err)
 	}
-	if snapshot.ID == "" || snapshot.Code == "" || snapshot.SchemaVersion < 1 {
+	if wire.ID == "" || wire.Code == "" || wire.SchemaVersion < 1 {
 		return nil, fmt.Errorf("%w: incomplete document type snapshot", errProductionWriterScope)
 	}
-	if _, known := BuiltinProductionTemplate(snapshot.Code); !known {
-		return nil, fmt.Errorf("%w: unknown document type code", errProductionWriterScope)
+	input := types.ProductionDocumentTypeConfigInput{
+		BlockSchema: wire.BlockSchema, SourceRequirements: wire.SourceRequirements,
+		SkillBindings: wire.SkillBindings, WorkflowPlan: wire.WorkflowPlan,
+		QualityRules: wire.QualityRules, ReviewPolicy: wire.ReviewPolicy,
+		PublicationPolicy: wire.PublicationPolicy,
 	}
-	return &snapshot, nil
+	config, err := types.CanonicalProductionDocumentTypeConfig(input)
+	if err != nil {
+		if !isLegacyProductionDocumentTypeConfig(input) {
+			return nil, fmt.Errorf("%w: invalid document type governance snapshot: %v", errProductionWriterScope, err)
+		}
+		var adapted bool
+		config, adapted, err = canonicalLegacyProductionDocumentTypeConfig(wire.Code, input)
+		if !adapted {
+			return nil, fmt.Errorf("%w: invalid document type governance snapshot: %v", errProductionWriterScope, err)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("%w: invalid legacy document type governance snapshot: %v", errProductionWriterScope, err)
+		}
+	}
+	return &productionWriterDocumentTypeSnapshot{
+		ID: wire.ID, Code: wire.Code, SchemaVersion: wire.SchemaVersion,
+		BlockSchema: config.BlockSchema, SourceRequirements: config.SourceRequirements,
+		SkillBindings: config.SkillBindings, WorkflowPlan: config.WorkflowPlan,
+		QualityRules: config.QualityRules, ReviewPolicy: config.ReviewPolicy,
+		PublicationPolicy: config.PublicationPolicy,
+	}, nil
+}
+
+func productionDocumentTypeConfig(documentType *types.ProductionDocumentType) (types.ProductionDocumentTypeConfig, error) {
+	if documentType == nil {
+		return types.ProductionDocumentTypeConfig{}, types.ErrProductionDocumentTypeConfigInvalid
+	}
+	input := types.ProductionDocumentTypeConfigInput{
+		BlockSchema: documentType.BlockSchema, SourceRequirements: documentType.SourceRequirements,
+		SkillBindings: documentType.SkillBindings, WorkflowPlan: documentType.WorkflowPlan,
+		QualityRules: documentType.QualityRules, ReviewPolicy: documentType.ReviewPolicy,
+		PublicationPolicy: documentType.PublicationPolicy,
+	}
+	config, err := types.CanonicalProductionDocumentTypeConfig(input)
+	if err == nil {
+		return config, nil
+	}
+	if isLegacyProductionDocumentTypeConfig(input) {
+		legacy, ok, legacyErr := canonicalLegacyProductionDocumentTypeConfig(documentType.Code, input)
+		if ok {
+			if legacyErr != nil {
+				return types.ProductionDocumentTypeConfig{}, legacyErr
+			}
+			return legacy, nil
+		}
+	}
+	return types.ProductionDocumentTypeConfig{}, err
+}
+
+func isLegacyProductionDocumentTypeConfig(input types.ProductionDocumentTypeConfigInput) bool {
+	for _, raw := range []types.JSON{
+		input.BlockSchema, input.SourceRequirements, input.QualityRules,
+		input.ReviewPolicy, input.PublicationPolicy,
+	} {
+		if !isEmptyProductionJSONObject(raw) {
+			return false
+		}
+	}
+	return true
+}
+
+func isEmptyProductionJSONObject(raw types.JSON) bool {
+	if len(raw) == 0 {
+		return true
+	}
+	var object map[string]json.RawMessage
+	if err := decodeProductionJSON(raw, &object, false); err != nil || object == nil {
+		return false
+	}
+	return len(object) == 0
+}
+
+func canonicalLegacyProductionDocumentTypeConfig(
+	code string,
+	input types.ProductionDocumentTypeConfigInput,
+) (types.ProductionDocumentTypeConfig, bool, error) {
+	legacy, ok := legacyProductionDocumentTypeConfig(code)
+	if !ok {
+		return types.ProductionDocumentTypeConfig{}, false, nil
+	}
+	legacyInput, err := productionDocumentTypeConfigInput(legacy)
+	if err != nil {
+		return types.ProductionDocumentTypeConfig{}, true, err
+	}
+	if !isEmptyProductionJSONObject(input.SkillBindings) {
+		legacyInput.SkillBindings = input.SkillBindings
+	}
+	if !isEmptyProductionJSONObject(input.WorkflowPlan) {
+		legacyInput.WorkflowPlan = input.WorkflowPlan
+	}
+	config, err := types.CanonicalProductionDocumentTypeConfig(legacyInput)
+	return config, true, err
+}
+
+func productionDocumentTypeConfigInput(
+	config types.ProductionDocumentTypeConfig,
+) (types.ProductionDocumentTypeConfigInput, error) {
+	var input types.ProductionDocumentTypeConfigInput
+	values := []struct {
+		target *types.JSON
+		value  any
+	}{
+		{target: &input.BlockSchema, value: config.BlockSchema},
+		{target: &input.SourceRequirements, value: config.SourceRequirements},
+		{target: &input.SkillBindings, value: config.SkillBindings},
+		{target: &input.WorkflowPlan, value: config.WorkflowPlan},
+		{target: &input.QualityRules, value: config.QualityRules},
+		{target: &input.ReviewPolicy, value: config.ReviewPolicy},
+		{target: &input.PublicationPolicy, value: config.PublicationPolicy},
+	}
+	for _, value := range values {
+		encoded, err := canonicalProductionValue(value.value)
+		if err != nil {
+			return types.ProductionDocumentTypeConfigInput{}, err
+		}
+		*value.target = encoded
+	}
+	return input, nil
+}
+
+func legacyProductionDocumentTypeConfig(code string) (types.ProductionDocumentTypeConfig, bool) {
+	var template ProductionBuiltinTemplate
+	switch code {
+	case "software-development-baseline":
+		template = BuiltinSoftwareDevelopmentBaseline()
+	case "project-retrospective":
+		template = BuiltinProjectRetrospective()
+	default:
+		return types.ProductionDocumentTypeConfig{}, false
+	}
+	return types.ProductionDocumentTypeConfig{
+		BlockSchema: types.ProductionBlockSchemaV1{
+			Version: 1, RequiredSections: append([]string(nil), template.RequiredSections...),
+			AllowedBlockTypes: []string{"heading", "paragraph", "code", "callout", "list", "table", "image"},
+		},
+		SourceRequirements: types.ProductionSourceRequirementsV1{
+			Version: 1, MinAcceptedEvidence: 1,
+			AllowedSourceKinds: []types.ProductionSourceKind{
+				types.ProductionSourceKindUpload, types.ProductionSourceKindDatasource, types.ProductionSourceKindMCP,
+				types.ProductionSourceKindSkill, types.ProductionSourceKindManual,
+			},
+			RequireEvidenceSection: true,
+		},
+		SkillBindings: types.ProductionSkillBindingsV1{Version: 1, Skills: []types.ProductionSkillBindingV1{}},
+		WorkflowPlan:  types.ProductionWorkflowPlanV1{Version: 1, Steps: []types.ProductionWorkflowStepV1{}},
+		QualityRules: types.ProductionQualityRulesV1{
+			Version: 1, RequireEvidenceForFacts: true,
+			Gates: []string{"section_completeness", "fact_evidence"},
+		},
+		ReviewPolicy: types.ProductionReviewPolicyV1{Steps: []types.ProductionRole{types.ProductionRoleBusinessReviewer}},
+		PublicationPolicy: types.ProductionPublicationPolicyV1{
+			Version: 1, TargetType: "knowledge_base", Chunking: "inherit_target",
+			KnowledgeGraph: "inherit_target", RequireApprovedReview: true,
+		},
+	}, true
 }
 
 func (w *ProductionWriter) loadContext(
@@ -372,7 +547,6 @@ func productionWriterMessages(
 		}
 		promptEvidence = append(promptEvidence, entry)
 	}
-	template, _ := BuiltinProductionTemplate(documentType.Code)
 	contextValue := map[string]any{
 		"run": map[string]any{
 			"id": run.ID, "project_id": run.ProjectID, "document_id": run.DocumentID,
@@ -384,7 +558,10 @@ func productionWriterMessages(
 		"document_type": map[string]any{
 			"id": documentType.ID, "code": documentType.Code, "schema_version": documentType.SchemaVersion,
 			"block_schema": documentType.BlockSchema, "skill_bindings": documentType.SkillBindings,
-			"required_sections": template.RequiredSections, "quality_gates": template.QualityGates,
+			"source_requirements": documentType.SourceRequirements, "workflow_plan": documentType.WorkflowPlan,
+			"quality_rules": documentType.QualityRules, "review_policy": documentType.ReviewPolicy,
+			"publication_policy": documentType.PublicationPolicy,
+			"required_sections":  documentType.BlockSchema.RequiredSections, "quality_gates": documentType.QualityRules.Gates,
 		},
 		"source_set":                map[string]any{"id": sourceSet.ID, "status": sourceSet.Status},
 		"accepted_evidence":         promptEvidence,
@@ -495,7 +672,8 @@ func productionWriterBlockInputs(
 }
 
 func prevalidateProductionWriterCandidate(
-	documentTypeCode string,
+	blockSchema types.ProductionBlockSchemaV1,
+	qualityRules types.ProductionQualityRulesV1,
 	inputs []types.ProductionDocumentBlockInput,
 	evidenceByID map[string]*types.ProductionEvidenceSnapshot,
 ) error {
@@ -503,15 +681,13 @@ func prevalidateProductionWriterCandidate(
 	if err != nil {
 		return err
 	}
-	version := &types.ProductionDocumentVersion{
-		Origin: types.ProductionDocumentOriginAI, Blocks: blocks, DocumentTypeCode: documentTypeCode,
-	}
+	version := &types.ProductionDocumentVersion{Origin: types.ProductionDocumentOriginAI, Blocks: blocks}
 	version.ContentDigest = types.ComputeProductionVersionDigest(version)
 	accepted := make(map[string]struct{}, len(evidenceByID))
 	for id := range evidenceByID {
 		accepted[id] = struct{}{}
 	}
-	validation := ValidateProductionVersion(version, accepted)
+	validation := ValidateProductionVersion(version, accepted, blockSchema, qualityRules)
 	if len(validation.Errors) != 0 {
 		return &ProductionDocumentValidationError{Issues: validation.Errors}
 	}

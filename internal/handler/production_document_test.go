@@ -310,6 +310,10 @@ func (a *productionHTTPAuthorizer) RequireProjectRole(context.Context, string, .
 	return a.err
 }
 
+func (a *productionHTTPAuthorizer) HasLiveRoleAssignee(context.Context, uint64, string, types.ProductionRole) (bool, error) {
+	return true, a.err
+}
+
 type productionGovernedAuditService struct {
 	interfaces.AuditLogService
 	mu       sync.Mutex
@@ -398,7 +402,9 @@ func newProductionDocumentsHTTPFixture(t *testing.T) *productionDocumentsHTTPFix
 	}
 	authorizer := &productionHTTPAuthorizer{}
 	uow := apprepository.NewProductionUnitOfWork(db)
-	sourceService := appservice.NewProductionSourceService(fixture.sources, authorizer, nil, fixture.audit, uow)
+	sourceService := appservice.NewProductionSourceService(
+		fixture.sources, apprepository.NewProductionDocumentTypeRepository(db), authorizer, nil, fixture.audit, uow,
+	)
 	documentService := appservice.NewProductionDocumentService(
 		fixture.documents, fixture.sources, apprepository.NewProductionDocumentTypeRepository(db), authorizer, nil, fixture.audit, uow,
 		apprepository.NewProductionReviewRepository(db),

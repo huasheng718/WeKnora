@@ -100,6 +100,10 @@ func (a productionRunServiceAuthorizerStub) RequireProjectRole(context.Context, 
 	return a.err
 }
 
+func (a productionRunServiceAuthorizerStub) HasLiveRoleAssignee(context.Context, uint64, string, types.ProductionRole) (bool, error) {
+	return true, a.err
+}
+
 type productionRunServiceResumerStub struct {
 	calls int
 	err   error

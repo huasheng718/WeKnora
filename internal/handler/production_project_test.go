@@ -63,6 +63,9 @@ func (s *productionProjectServiceStub) RemoveRole(_ context.Context, projectID, 
 func (s *productionProjectServiceStub) RequireProjectRole(context.Context, string, ...types.ProductionRole) error {
 	return s.err
 }
+func (s *productionProjectServiceStub) HasLiveRoleAssignee(context.Context, uint64, string, types.ProductionRole) (bool, error) {
+	return true, s.err
+}
 
 func newProductionHandlerContext(method, target, body string) (*gin.Context, *httptest.ResponseRecorder) {
 	gin.SetMode(gin.TestMode)

@@ -43,6 +43,10 @@ func (a *productionSourceAuthorizerStub) RequireProjectRole(_ context.Context, p
 	return a.err
 }
 
+func (a *productionSourceAuthorizerStub) HasLiveRoleAssignee(context.Context, uint64, string, types.ProductionRole) (bool, error) {
+	return true, a.err
+}
+
 type productionSourceResourceCatalogStub struct {
 	resource *types.StoredResource
 	err      error
@@ -102,15 +106,18 @@ func newProductionSourceServiceFixture(t *testing.T) (*productionSourceService, 
 	}).Error)
 	require.NoError(t, db.Create(&types.ProductionDocumentType{
 		ID: serviceTypeID, TenantID: 7, Code: "type", Name: "Type", SchemaVersion: 1,
-		BlockSchema: types.JSON(`{}`), SourceRequirements: types.JSON(`{}`), SkillBindings: types.JSON(`{}`),
-		QualityRules: types.JSON(`{}`), ReviewPolicy: types.JSON(`{}`), PublicationPolicy: types.JSON(`{}`),
+		BlockSchema:        types.JSON(`{}`),
+		SourceRequirements: types.JSON(`{"version":1,"min_accepted_evidence":1,"allowed_source_kinds":["manual"],"require_evidence_section":true,"allow_unsupported_facts":false}`),
+		SkillBindings:      types.JSON(`{}`),
+		QualityRules:       types.JSON(`{}`), ReviewPolicy: types.JSON(`{}`), PublicationPolicy: types.JSON(`{}`),
 		Status: types.ProductionDocumentTypeActive, CreatedBy: "owner",
 	}).Error)
 	repo := apprepository.NewProductionSourceRepository(db)
 	authorizer := &productionSourceAuthorizerStub{}
 	resources := &productionSourceResourceCatalogStub{}
 	return NewProductionSourceService(
-		repo, authorizer, resources, &productionAuditServiceStub{}, apprepository.NewProductionUnitOfWork(db),
+		repo, apprepository.NewProductionDocumentTypeRepository(db), authorizer, resources,
+		&productionAuditServiceStub{}, apprepository.NewProductionUnitOfWork(db),
 	), repo, db, authorizer, resources
 }
 
@@ -134,6 +141,15 @@ func createServiceSourceItem(t *testing.T, repo interfaces.ProductionSourceRepos
 		Title: "Source", MimeType: "text/plain", ContentDigest: strings.Repeat("a", 64),
 		CapturedAt: time.Now().UTC(), Metadata: types.JSON(`{}`), Status: status,
 	}))
+}
+
+func seedServiceAcceptedEvidence(t *testing.T, svc *productionSourceService, repo interfaces.ProductionSourceRepository) {
+	t.Helper()
+	createServiceSourceItem(t, repo, types.ProductionSourceItemAccepted)
+	_, err := svc.AttachEvidence(sourceServiceContext(7), serviceItemID, interfaces.CreateEvidenceSnapshotInput{
+		SnapshotType: types.ProductionEvidenceSnapshotText, InlineContent: types.JSON(`"evidence"`),
+	})
+	require.NoError(t, err)
 }
 
 func TestProductionSourceServiceListsProjectSetsForAuthorizedReaders(t *testing.T) {
@@ -480,8 +496,10 @@ func TestProductionSourceServiceFreezeRequiresAcceptedEvidenceAndRejectsFrozenMu
 	createServiceSourceItem(t, repo, types.ProductionSourceItemAccepted)
 	ctx := sourceServiceContext(7)
 
-	require.ErrorIs(t, svc.Freeze(ctx, serviceSetID), types.ErrProductionEvidenceMissing)
-	_, err := svc.AttachEvidence(ctx, serviceItemID, interfaces.CreateEvidenceSnapshotInput{
+	err := svc.Freeze(ctx, serviceSetID)
+	require.ErrorIs(t, err, types.ErrProductionDocumentSourceSetInvalid)
+	require.ErrorContains(t, err, productionSourceReasonMinimumNotMet)
+	_, err = svc.AttachEvidence(ctx, serviceItemID, interfaces.CreateEvidenceSnapshotInput{
 		SnapshotType: types.ProductionEvidenceSnapshotText, InlineContent: types.JSON(`"evidence"`),
 	})
 	require.NoError(t, err)
@@ -686,16 +704,77 @@ func TestProductionSourceServiceReturnsRequiredFreezeAuditFailure(t *testing.T) 
 	audit := &productionAuditServiceStub{err: errors.New("governed audit unavailable")}
 	svc.audit = audit
 	createServiceSourceSet(t, repo, types.ProductionSourceSetCollecting)
+	seedServiceAcceptedEvidence(t, svc, repo)
 
 	err := svc.Freeze(sourceServiceContext(7), serviceSetID)
 
 	require.ErrorContains(t, err, "governed audit unavailable")
 }
 
+func TestProductionSourceServiceEnforcesSnapshottedSourceRequirements(t *testing.T) {
+	tests := []struct {
+		name         string
+		requirements types.JSON
+		wantReason   string
+	}{
+		{
+			name:         "minimum accepted evidence",
+			requirements: types.JSON(`{"version":1,"min_accepted_evidence":2,"allowed_source_kinds":["manual"],"require_evidence_section":true,"allow_unsupported_facts":false}`),
+			wantReason:   "min_accepted_evidence_not_met",
+		},
+		{
+			name:         "forbidden accepted source kind",
+			requirements: types.JSON(`{"version":1,"min_accepted_evidence":1,"allowed_source_kinds":["upload"],"require_evidence_section":true,"allow_unsupported_facts":false}`),
+			wantReason:   "source_kind_not_allowed",
+		},
+		{
+			name:         "evidence section disabled",
+			requirements: types.JSON(`{"version":1,"min_accepted_evidence":1,"allowed_source_kinds":["manual"],"require_evidence_section":false,"allow_unsupported_facts":false}`),
+			wantReason:   "evidence_section_required",
+		},
+		{
+			name:         "unsupported facts enabled",
+			requirements: types.JSON(`{"version":1,"min_accepted_evidence":1,"allowed_source_kinds":["manual"],"require_evidence_section":true,"allow_unsupported_facts":true}`),
+			wantReason:   "unsupported_facts_not_allowed",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			svc, repo, db, _, _ := newProductionSourceServiceFixture(t)
+			documentTypeID := "22222222-2222-4222-8222-222222222223"
+			require.NoError(t, db.Create(&types.ProductionDocumentType{
+				ID: documentTypeID, TenantID: 7, Code: "governed-source", Name: "Governed source", SchemaVersion: 1,
+				BlockSchema: types.JSON(`{}`), SourceRequirements: test.requirements, SkillBindings: types.JSON(`{}`),
+				QualityRules: types.JSON(`{}`), ReviewPolicy: types.JSON(`{}`), PublicationPolicy: types.JSON(`{}`),
+				Status: types.ProductionDocumentTypeActive, CreatedBy: "owner",
+			}).Error)
+			require.NoError(t, repo.CreateSet(context.Background(), &types.ProductionSourceSet{
+				ID: serviceSetID, TenantID: 7, ProjectID: serviceProjectID, DocumentTypeID: documentTypeID,
+				Status: types.ProductionSourceSetCollecting, CreatedBy: "author",
+			}))
+			createServiceSourceItem(t, repo, types.ProductionSourceItemAccepted)
+			_, err := svc.AttachEvidence(sourceServiceContext(7), serviceItemID, interfaces.CreateEvidenceSnapshotInput{
+				SnapshotType: types.ProductionEvidenceSnapshotText, InlineContent: types.JSON(`"evidence"`),
+			})
+			require.NoError(t, err)
+
+			err = svc.Freeze(sourceServiceContext(7), serviceSetID)
+
+			require.ErrorIs(t, err, types.ErrProductionDocumentSourceSetInvalid)
+			require.ErrorContains(t, err, test.wantReason)
+			persisted, getErr := repo.GetSet(context.Background(), 7, serviceSetID)
+			require.NoError(t, getErr)
+			require.Equal(t, types.ProductionSourceSetCollecting, persisted.Status)
+		})
+	}
+}
+
 func TestProductionSourceDirectServiceAuditFailureRollsBackFreeze(t *testing.T) {
 	svc, repo, db, _, _ := newProductionSourceServiceFixture(t)
 	svc.audit = NewAuditLogService(apprepository.NewAuditLogRepository(db))
 	createServiceSourceSet(t, repo, types.ProductionSourceSetCollecting)
+	seedServiceAcceptedEvidence(t, svc, repo)
 	require.NoError(t, installServiceAuditFailureTrigger(db))
 
 	err := svc.Freeze(sourceServiceContext(7), serviceSetID)
@@ -722,6 +801,7 @@ func TestProductionSourceNestedUnitOfWorkIsAtomicInsideOuterTransaction(t *testi
 		svc, repo, db, _, _ := newProductionSourceServiceFixture(t)
 		svc.audit = NewAuditLogService(apprepository.NewAuditLogRepository(db))
 		createServiceSourceSet(t, repo, types.ProductionSourceSetCollecting)
+		seedServiceAcceptedEvidence(t, svc, repo)
 		require.NoError(t, installServiceAuditFailureTrigger(db))
 		var serviceErr error
 
@@ -744,6 +824,7 @@ func TestProductionSourceNestedUnitOfWorkIsAtomicInsideOuterTransaction(t *testi
 		svc, repo, db, _, _ := newProductionSourceServiceFixture(t)
 		svc.audit = NewAuditLogService(apprepository.NewAuditLogRepository(db))
 		createServiceSourceSet(t, repo, types.ProductionSourceSetCollecting)
+		seedServiceAcceptedEvidence(t, svc, repo)
 
 		err := database.WithTransactionContext(sourceServiceContext(7), db, func(txCtx context.Context) error {
 			return svc.Freeze(txCtx, serviceSetID)

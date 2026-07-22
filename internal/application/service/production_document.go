@@ -126,8 +126,18 @@ func validateProductionDocumentType(
 	documentTypeID string,
 	schemaVersion int,
 ) error {
+	return validateBoundProductionDocumentType(documentType, documentTypeID, schemaVersion, false)
+}
+
+func validateBoundProductionDocumentType(
+	documentType *types.ProductionDocumentType,
+	documentTypeID string,
+	schemaVersion int,
+	allowRetired bool,
+) error {
 	if documentType == nil || documentType.ID != documentTypeID ||
-		documentType.Status != types.ProductionDocumentTypeActive ||
+		(documentType.Status != types.ProductionDocumentTypeActive &&
+			(!allowRetired || documentType.Status != types.ProductionDocumentTypeRetired)) ||
 		(schemaVersion > 0 && documentType.SchemaVersion != schemaVersion) {
 		return types.ErrProductionDocumentTypeInactive
 	}
@@ -418,11 +428,17 @@ func (s *productionDocumentService) AppendVersion(
 	if err != nil {
 		return nil, err
 	}
-	if err := validateProductionDocumentType(
+	principal, internal := types.ProductionInternalPrincipalFromContext(ctx)
+	if err := validateBoundProductionDocumentType(
 		documentType,
 		document.DocumentTypeID,
 		document.DocumentTypeSchemaVersion,
+		internal,
 	); err != nil {
+		return nil, err
+	}
+	documentTypeConfig, err := productionDocumentTypeConfig(documentType)
+	if err != nil {
 		return nil, err
 	}
 
@@ -441,7 +457,6 @@ func (s *productionDocumentService) AppendVersion(
 		return nil, err
 	}
 	versionID := uuid.NewString()
-	principal, internal := types.ProductionInternalPrincipalFromContext(ctx)
 	if internal {
 		if input.VersionID == "" || input.VersionID != productionRunVersionID(principal.RunID) {
 			return nil, types.ErrProductionForbidden
@@ -469,7 +484,7 @@ func (s *productionDocumentService) AppendVersion(
 	if err != nil {
 		return nil, err
 	}
-	validation := ValidateProductionVersion(version, acceptedEvidence)
+	validation := ValidateProductionVersion(version, acceptedEvidence, documentTypeConfig.BlockSchema, documentTypeConfig.QualityRules)
 	if len(validation.Errors) != 0 {
 		return nil, &ProductionDocumentValidationError{Issues: validation.Errors}
 	}

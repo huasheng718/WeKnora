@@ -293,6 +293,22 @@ func (s *productionProjectService) RequireProjectRole(
 	return types.ErrProductionForbidden
 }
 
+func (s *productionProjectService) HasLiveRoleAssignee(
+	ctx context.Context,
+	tenantID uint64,
+	projectID string,
+	role types.ProductionRole,
+) (bool, error) {
+	contextTenantID, _, err := productionCaller(ctx)
+	if err != nil || contextTenantID != tenantID || !role.IsValid() {
+		return false, types.ErrProductionForbidden
+	}
+	if _, _, err := productionMembership(ctx, s.members, tenantID); err != nil {
+		return false, err
+	}
+	return s.repo.HasLiveRoleAssignee(ctx, tenantID, projectID, role)
+}
+
 func (s *productionProjectService) emitRoleAudit(
 	ctx context.Context,
 	tenantID uint64,

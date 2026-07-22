@@ -80,7 +80,7 @@ func (s *ProductionReleaseService) Preflight(
 	pageSize int,
 ) (*types.ProductionReleasePreflight, error) {
 	tenantID, actorID, err := productionCaller(ctx)
-	if err != nil || s == nil || s.documents == nil || s.reviews == nil || s.authorizer == nil ||
+	if err != nil || s == nil || s.documents == nil || s.documentTypes == nil || s.reviews == nil || s.authorizer == nil ||
 		s.members == nil || s.kbs == nil || s.storage == nil || s.models == nil {
 		if err != nil {
 			return nil, err
@@ -108,6 +108,9 @@ func (s *ProductionReleaseService) Preflight(
 		return nil, types.ErrProductionReviewScopeInvalid
 	}
 	if err := s.authorizer.RequireProjectRole(ctx, document.ProjectID, types.ProductionRolePublisher); err != nil {
+		return nil, err
+	}
+	if err := s.requireBoundPublicationPolicy(ctx, tenantID, document); err != nil {
 		return nil, err
 	}
 	reviewReader, ok := s.reviews.(productionApprovedReviewRepository)
@@ -203,31 +206,33 @@ type ProductionProjectionCleanupScheduler interface {
 }
 
 type ProductionReleaseService struct {
-	releases   interfaces.ProductionReleaseRepository
-	documents  interfaces.ProductionDocumentRepository
-	reviews    interfaces.ProductionReviewRepository
-	authorizer interfaces.ProductionProjectAuthorizer
-	members    interfaces.TenantMemberService
-	tenants    interfaces.TenantRepository
-	kbs        interfaces.KnowledgeBaseService
-	storage    interfaces.StorageBackendResolver
-	models     interfaces.ModelService
-	registry   interfaces.RetrieveEngineRegistry
-	ownership  retriever.TenantStoreOwnership
-	builder    productionProjectionBuilder
-	knowledge  interfaces.KnowledgeService
-	graph      ProductionGraphReadiness
-	wiki       ProductionWikiLifecycleEnqueuer
-	cleanup    ProductionProjectionCleanupScheduler
-	tasks      interfaces.TaskEnqueuer
-	uow        interfaces.ProductionUnitOfWork
-	audit      interfaces.AuditLogService
-	now        func() time.Time
+	releases      interfaces.ProductionReleaseRepository
+	documents     interfaces.ProductionDocumentRepository
+	documentTypes interfaces.ProductionDocumentTypeRepository
+	reviews       interfaces.ProductionReviewRepository
+	authorizer    interfaces.ProductionProjectAuthorizer
+	members       interfaces.TenantMemberService
+	tenants       interfaces.TenantRepository
+	kbs           interfaces.KnowledgeBaseService
+	storage       interfaces.StorageBackendResolver
+	models        interfaces.ModelService
+	registry      interfaces.RetrieveEngineRegistry
+	ownership     retriever.TenantStoreOwnership
+	builder       productionProjectionBuilder
+	knowledge     interfaces.KnowledgeService
+	graph         ProductionGraphReadiness
+	wiki          ProductionWikiLifecycleEnqueuer
+	cleanup       ProductionProjectionCleanupScheduler
+	tasks         interfaces.TaskEnqueuer
+	uow           interfaces.ProductionUnitOfWork
+	audit         interfaces.AuditLogService
+	now           func() time.Time
 }
 
 func NewProductionReleaseService(
 	releases interfaces.ProductionReleaseRepository,
 	documents interfaces.ProductionDocumentRepository,
+	documentTypes interfaces.ProductionDocumentTypeRepository,
 	reviews interfaces.ProductionReviewRepository,
 	authorizer interfaces.ProductionProjectAuthorizer,
 	members interfaces.TenantMemberService,
@@ -247,7 +252,7 @@ func NewProductionReleaseService(
 	audit interfaces.AuditLogService,
 ) *ProductionReleaseService {
 	return &ProductionReleaseService{
-		releases: releases, documents: documents, reviews: reviews, authorizer: authorizer,
+		releases: releases, documents: documents, documentTypes: documentTypes, reviews: reviews, authorizer: authorizer,
 		members: members, tenants: tenants, kbs: kbs, storage: storage, models: models, registry: registry, ownership: ownership,
 		builder: builder, knowledge: knowledge, graph: graph, wiki: wiki, cleanup: cleanup,
 		tasks: tasks, uow: uow, audit: audit, now: time.Now,
@@ -256,7 +261,7 @@ func NewProductionReleaseService(
 
 func (s *ProductionReleaseService) Prepare(ctx context.Context, documentID, versionID string, kbIDs []string) (*types.ProductionRelease, error) {
 	tenantID, actorID, err := productionCaller(ctx)
-	if err != nil || s == nil || s.releases == nil || s.documents == nil || s.reviews == nil ||
+	if err != nil || s == nil || s.releases == nil || s.documents == nil || s.documentTypes == nil || s.reviews == nil ||
 		s.authorizer == nil || s.members == nil || s.kbs == nil || s.storage == nil || s.models == nil || s.uow == nil || s.audit == nil {
 		if err != nil {
 			return nil, err
@@ -282,6 +287,9 @@ func (s *ProductionReleaseService) Prepare(ctx context.Context, documentID, vers
 		return nil, types.ErrProductionReviewScopeInvalid
 	}
 	if err := s.authorizer.RequireProjectRole(ctx, document.ProjectID, types.ProductionRolePublisher); err != nil {
+		return nil, err
+	}
+	if err := s.requireBoundPublicationPolicy(ctx, tenantID, document); err != nil {
 		return nil, err
 	}
 	reviewReader, ok := s.reviews.(productionApprovedReviewRepository)
@@ -375,6 +383,44 @@ func (s *ProductionReleaseService) Prepare(ctx context.Context, documentID, vers
 		return selected, nil
 	}
 	return release, nil
+}
+
+func (s *ProductionReleaseService) requireBoundPublicationPolicy(
+	ctx context.Context,
+	tenantID uint64,
+	document *types.ProductionDocument,
+) error {
+	if document == nil || document.DocumentTypeID == "" || document.DocumentTypeSchemaVersion < 1 {
+		return errors.Join(types.ErrProductionReleaseInvalid, errors.New("publication_document_type_binding_invalid"))
+	}
+	documentType, err := s.documentTypes.GetByID(ctx, tenantID, document.DocumentTypeID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return errors.Join(types.ErrProductionReleaseInvalid, errors.New("publication_document_type_binding_invalid"))
+		}
+		return err
+	}
+	if documentType == nil || documentType.ID != document.DocumentTypeID || documentType.TenantID != tenantID ||
+		documentType.SchemaVersion != document.DocumentTypeSchemaVersion ||
+		(documentType.Status != types.ProductionDocumentTypeActive && documentType.Status != types.ProductionDocumentTypeRetired) {
+		return errors.Join(types.ErrProductionReleaseInvalid, errors.New("publication_document_type_binding_invalid"))
+	}
+	var policy types.ProductionPublicationPolicyV1
+	if err := decodeProductionJSON(documentType.PublicationPolicy, &policy, true); err != nil || policy.Version != 1 {
+		return errors.Join(types.ErrProductionReleaseInvalid, errors.New("publication_policy_invalid"))
+	}
+	switch {
+	case policy.TargetType != "knowledge_base":
+		return errors.Join(types.ErrProductionReleaseInvalid, errors.New("publication_target_type_invalid"))
+	case policy.Chunking != "inherit_target":
+		return errors.Join(types.ErrProductionReleaseInvalid, errors.New("publication_chunking_mode_invalid"))
+	case policy.KnowledgeGraph != "inherit_target":
+		return errors.Join(types.ErrProductionReleaseInvalid, errors.New("publication_knowledge_graph_mode_invalid"))
+	case !policy.RequireApprovedReview:
+		return errors.Join(types.ErrProductionReleaseInvalid, errors.New("publication_approved_review_required"))
+	default:
+		return nil
+	}
 }
 
 func equivalentPreparedProductionRelease(existing, candidate *types.ProductionRelease) bool {

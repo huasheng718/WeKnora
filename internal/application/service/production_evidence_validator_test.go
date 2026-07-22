@@ -45,22 +45,87 @@ func productionIssueCodes(issues []ProductionValidationIssue) []string {
 	return codes
 }
 
-func TestProductionEvidenceValidatorRequiresExplicitKnownTemplateContext(t *testing.T) {
+func validateLegacyProductionVersion(
+	version *types.ProductionDocumentVersion,
+	acceptedEvidence map[string]struct{},
+) ProductionValidationResult {
+	code := "software-development-baseline"
+	if version != nil && version.DocumentTypeCode != "" {
+		code = version.DocumentTypeCode
+	}
+	config, ok := legacyProductionDocumentTypeConfig(code)
+	if !ok {
+		return ProductionValidationResult{Errors: []ProductionValidationIssue{{
+			Code: "document_type_code_unknown", Message: "legacy production fixture code is unknown",
+		}}}
+	}
+	return ValidateProductionVersion(version, acceptedEvidence, config.BlockSchema, config.QualityRules)
+}
+
+func TestValidateProductionVersionUsesSnapshotGovernanceAndQualityRules(t *testing.T) {
+	blockSchema := types.ProductionBlockSchemaV1{
+		Version: 1, RequiredSections: []string{"Snapshot Required"},
+		AllowedBlockTypes: []string{"heading", "paragraph"},
+	}
+	qualityRules := types.ProductionQualityRulesV1{
+		Version: 1, RequireEvidenceForFacts: true, BlockNeedsConfirmation: true,
+		Gates: []string{"section_completeness", "fact_evidence", "no_unconfirmed"},
+	}
+	version := &types.ProductionDocumentVersion{Blocks: []*types.ProductionDocumentBlock{
+		productionValidationBlock("factual", "paragraph", 0, `"unsupported fact"`, `{"factual":true}`, `[]`),
+		productionValidationBlock("confirmation", "paragraph", 1, `"pending"`, `{"needs_confirmation":true}`, `[]`),
+	}}
+
+	result := ValidateProductionVersion(version, nil, blockSchema, qualityRules)
+
+	require.Equal(t, []string{
+		"required_section_missing", "factual_evidence_required", "needs_confirmation_blocked",
+	}, productionIssueCodes(result.Errors))
+}
+
+func TestValidateProductionVersionAppliesEverySnapshotTypeSpecificQualityGate(t *testing.T) {
+	tests := []struct {
+		gate    string
+		heading string
+	}{
+		{gate: "sop_exception_path", heading: "异常处理"},
+		{gate: "policy_approval_control", heading: "审批控制"},
+		{gate: "product_scope_boundary", heading: "限制条件"},
+		{gate: "faq_effective_date", heading: "来源与生效日期"},
+		{gate: "incident_timeline", heading: "诊断过程"},
+	}
+	for _, test := range tests {
+		t.Run(test.gate, func(t *testing.T) {
+			blockSchema := types.ProductionBlockSchemaV1{Version: 1, RequiredSections: []string{"Present"}, AllowedBlockTypes: []string{"heading"}}
+			qualityRules := types.ProductionQualityRulesV1{Version: 1, Gates: []string{test.gate}}
+			version := &types.ProductionDocumentVersion{Blocks: []*types.ProductionDocumentBlock{
+				productionValidationBlock("present", "heading", 0, `"Present"`, `{}`, `[]`),
+			}}
+
+			result := ValidateProductionVersion(version, nil, blockSchema, qualityRules)
+
+			require.Equal(t, []string{"required_section_missing"}, productionIssueCodes(result.Errors))
+			require.Equal(t, test.heading, result.Errors[0].Section)
+		})
+	}
+}
+
+func TestProductionEvidenceValidatorLegacyAdapterRequiresKnownFixtureCode(t *testing.T) {
 	missing := productionBaselineVersion()
 	missing.DocumentTypeCode = ""
 	unknown := productionBaselineVersion()
 	unknown.DocumentTypeCode = "unknown"
 
-	require.Equal(t, []string{"document_type_code_required"}, productionIssueCodes(ValidateProductionVersion(missing, nil).Errors))
-	require.Equal(t, []string{"document_type_code_unknown"}, productionIssueCodes(ValidateProductionVersion(unknown, nil).Errors))
-	require.Equal(t, []string{"version_required"}, productionIssueCodes(ValidateProductionVersion(nil, nil).Errors))
+	require.Empty(t, validateLegacyProductionVersion(missing, nil).Errors)
+	require.Equal(t, []string{"document_type_code_unknown"}, productionIssueCodes(validateLegacyProductionVersion(unknown, nil).Errors))
+	require.Equal(t, []string{"version_required"}, productionIssueCodes(validateLegacyProductionVersion(nil, nil).Errors))
 }
 
 func TestProductionEvidenceValidatorRejectsMissingRequiredSection(t *testing.T) {
 	version := productionBaselineVersion()
 	version.Blocks = version.Blocks[:len(version.Blocks)-1]
 
-	result := ValidateProductionVersion(version, nil)
+	result := validateLegacyProductionVersion(version, nil)
 	require.Equal(t, []string{"required_section_missing"}, productionIssueCodes(result.Errors))
 	require.Equal(t, "证据清单", result.Errors[0].Section)
 }
@@ -73,7 +138,7 @@ func TestProductionEvidenceValidatorRejectsDuplicateLogicalIDsUnknownAndDuplicat
 		productionValidationBlock("fact-a", "paragraph", position+1, `"confirmed later"`, `{"factual":true,"needs_confirmation":true}`, `[]`),
 	)
 
-	result := ValidateProductionVersion(version, map[string]struct{}{})
+	result := validateLegacyProductionVersion(version, map[string]struct{}{})
 	require.Equal(t, []string{
 		"duplicate_logical_block_id",
 		"unknown_evidence_id",
@@ -90,11 +155,11 @@ func TestProductionEvidenceValidatorRequiresEvidenceOrExplicitConfirmationForFac
 		productionValidationBlock("fact-a", "paragraph", len(version.Blocks), `"fact"`, `{"factual":true}`, `[]`),
 	)
 
-	result := ValidateProductionVersion(version, nil)
+	result := validateLegacyProductionVersion(version, nil)
 	require.Equal(t, []string{"factual_evidence_required"}, productionIssueCodes(result.Errors))
 
 	version.Blocks[len(version.Blocks)-1].Attributes = types.JSON(`{"factual":true,"needs_confirmation":true}`)
-	require.Empty(t, ValidateProductionVersion(version, nil).Errors)
+	require.Empty(t, validateLegacyProductionVersion(version, nil).Errors)
 }
 
 func TestValidateProductionVersionRejectsRawFactAndAcceptsNormalizedFactualParagraph(t *testing.T) {
@@ -102,25 +167,25 @@ func TestValidateProductionVersionRejectsRawFactAndAcceptsNormalizedFactualParag
 	rawFact.Blocks = append(rawFact.Blocks,
 		productionValidationBlock("raw-fact", "fact", len(rawFact.Blocks), `{"text":"claim"}`, `{}`, `[]`),
 	)
-	require.Contains(t, productionIssueCodes(ValidateProductionVersion(rawFact, nil).Errors), "unsupported_block_type")
+	require.Contains(t, productionIssueCodes(validateLegacyProductionVersion(rawFact, nil).Errors), "unsupported_block_type")
 
 	withoutEvidence := productionBaselineVersion()
 	withoutEvidence.Blocks = append(withoutEvidence.Blocks,
 		productionValidationBlock("factual", "paragraph", len(withoutEvidence.Blocks), `"claim"`, `{"factual":true}`, `[]`),
 	)
-	require.Equal(t, []string{"factual_evidence_required"}, productionIssueCodes(ValidateProductionVersion(withoutEvidence, nil).Errors))
+	require.Equal(t, []string{"factual_evidence_required"}, productionIssueCodes(validateLegacyProductionVersion(withoutEvidence, nil).Errors))
 
 	withEvidence := productionBaselineVersion()
 	withEvidence.Blocks = append(withEvidence.Blocks,
 		productionValidationBlock("factual", "paragraph", len(withEvidence.Blocks), `"claim"`, `{"factual":true}`, `["e-1"]`),
 	)
-	require.Empty(t, ValidateProductionVersion(withEvidence, map[string]struct{}{"e-1": {}}).Errors)
+	require.Empty(t, validateLegacyProductionVersion(withEvidence, map[string]struct{}{"e-1": {}}).Errors)
 
 	withConfirmation := productionBaselineVersion()
 	withConfirmation.Blocks = append(withConfirmation.Blocks,
 		productionValidationBlock("factual", "paragraph", len(withConfirmation.Blocks), `"claim"`, `{"factual":true,"needs_confirmation":true}`, `[]`),
 	)
-	require.Empty(t, ValidateProductionVersion(withConfirmation, nil).Errors)
+	require.Empty(t, validateLegacyProductionVersion(withConfirmation, nil).Errors)
 }
 
 func TestProductionEvidenceValidatorClassifiesClaimCapableBlocksWithoutProducerOptIn(t *testing.T) {
@@ -136,7 +201,7 @@ func TestProductionEvidenceValidatorClassifiesClaimCapableBlocksWithoutProducerO
 		productionValidationBlock("image", "image", position+6, `{"alt":"x","url":"https://example.com/x.png"}`, `{}`, `[]`),
 	)
 
-	result := ValidateProductionVersion(version, nil)
+	result := validateLegacyProductionVersion(version, nil)
 	require.Equal(t, 4, strings.Count(strings.Join(productionIssueCodes(result.Errors), ","), "factual_evidence_required"))
 	require.Contains(t, productionIssueCodes(result.Errors), "unsupported_block_type")
 }
@@ -149,7 +214,7 @@ func TestProductionEvidenceValidatorAcceptsGovernedEvidenceOrExplicitConfirmatio
 		productionValidationBlock("confirmation", "table", position+1, `{"headers":["claim"],"rows":[]}`, `{"needs_confirmation":true}`, `[]`),
 	)
 
-	result := ValidateProductionVersion(version, map[string]struct{}{"e-1": {}})
+	result := validateLegacyProductionVersion(version, map[string]struct{}{"e-1": {}})
 	require.NotContains(t, productionIssueCodes(result.Errors), "factual_evidence_required")
 	require.Empty(t, result.Errors)
 }
@@ -167,7 +232,7 @@ func TestProductionEvidenceValidatorUsesRendererSafeImageURLPolicy(t *testing.T)
 				"image", "image", len(version.Blocks), `{"alt":"x","url":"`+imageURL+`"}`, `{}`, `[]`,
 			))
 
-			require.Contains(t, productionIssueCodes(ValidateProductionVersion(version, nil).Errors), "invalid_block_content")
+			require.Contains(t, productionIssueCodes(validateLegacyProductionVersion(version, nil).Errors), "invalid_block_content")
 		})
 	}
 
@@ -175,7 +240,7 @@ func TestProductionEvidenceValidatorUsesRendererSafeImageURLPolicy(t *testing.T)
 	valid.Blocks = append(valid.Blocks, productionValidationBlock(
 		"image", "image", len(valid.Blocks), `{"alt":"x","url":"https://example.com/a.png"}`, `{}`, `[]`,
 	))
-	require.Empty(t, ValidateProductionVersion(valid, nil).Errors)
+	require.Empty(t, validateLegacyProductionVersion(valid, nil).Errors)
 }
 
 func TestProductionEvidenceValidatorRejectsMalformedAndUnsupportedBlocksInStableOrder(t *testing.T) {
@@ -189,8 +254,8 @@ func TestProductionEvidenceValidatorRejectsMalformedAndUnsupportedBlocksInStable
 		productionValidationBlock("c", "paragraph", position+1, `"x"`, `{}`, `{"id":"e-1"}`),
 	)
 
-	first := ValidateProductionVersion(version, nil)
-	second := ValidateProductionVersion(version, nil)
+	first := validateLegacyProductionVersion(version, nil)
+	second := validateLegacyProductionVersion(version, nil)
 	require.Equal(t, first, second)
 	require.Equal(t, []string{
 		"nil_block",
@@ -210,9 +275,9 @@ func TestProductionEvidenceValidatorIssueOrderDoesNotDependOnLoadedBlockOrder(t 
 		productionValidationBlock("b", "paragraph", 101, `{"bad":true}`, `{}`, `[]`),
 		productionValidationBlock("a", "paragraph", 100, `"fact"`, `{"factual":true}`, `[]`),
 	)
-	first := ValidateProductionVersion(version, nil)
+	first := validateLegacyProductionVersion(version, nil)
 	version.Blocks[len(version.Blocks)-1], version.Blocks[len(version.Blocks)-2] = version.Blocks[len(version.Blocks)-2], version.Blocks[len(version.Blocks)-1]
-	second := ValidateProductionVersion(version, nil)
+	second := validateLegacyProductionVersion(version, nil)
 	require.Equal(t, first, second)
 }
 
@@ -222,9 +287,9 @@ func TestProductionEvidenceValidatorRejectsMalformedIdentityProvenanceAndAttribu
 	block.AIProvenance = types.JSON(`{"broken"`)
 	version.Blocks = append(version.Blocks, block)
 
-	first := ValidateProductionVersion(version, nil)
+	first := validateLegacyProductionVersion(version, nil)
 	for range 20 {
-		require.Equal(t, first, ValidateProductionVersion(version, nil))
+		require.Equal(t, first, validateLegacyProductionVersion(version, nil))
 	}
 	require.Equal(t, []string{
 		"logical_block_id_required",

@@ -258,11 +258,19 @@ func validateProductionAppendDependencies(
 	db *gorm.DB,
 	document *types.ProductionDocument,
 	sourceSetID string,
+	allowRetired bool,
 ) error {
 	typeQuery := db.Where(
-		"id = ? AND tenant_id = ? AND schema_version = ? AND status = ?",
-		document.DocumentTypeID, document.TenantID, document.DocumentTypeSchemaVersion, types.ProductionDocumentTypeActive,
+		"id = ? AND tenant_id = ? AND schema_version = ?",
+		document.DocumentTypeID, document.TenantID, document.DocumentTypeSchemaVersion,
 	)
+	if allowRetired {
+		typeQuery = typeQuery.Where("status IN ?", []types.ProductionDocumentTypeStatus{
+			types.ProductionDocumentTypeActive, types.ProductionDocumentTypeRetired,
+		})
+	} else {
+		typeQuery = typeQuery.Where("status = ?", types.ProductionDocumentTypeActive)
+	}
 	if db.Dialector.Name() == "postgres" {
 		typeQuery = typeQuery.Clauses(clause.Locking{Strength: "SHARE"})
 	}
@@ -324,7 +332,7 @@ func lockProductionCreateDependencies(
 			return types.ErrProductionDocumentSourceSetInvalid
 		}
 	}
-	return validateProductionAppendDependencies(db, document, sourceSetID)
+	return validateProductionAppendDependencies(db, document, sourceSetID, false)
 }
 
 func prepareProductionBlocks(version *types.ProductionDocumentVersion, blocks []*types.ProductionDocumentBlock) error {
@@ -407,7 +415,10 @@ func (r *productionDocumentRepository) AppendVersion(
 			return err
 		}
 
-		if err := validateProductionAppendDependencies(db, document, version.SourceSetID); err != nil {
+		principal, internal := types.ProductionInternalPrincipalFromContext(txCtx)
+		allowRetired := internal && principal.Matches(document.TenantID, document.ProjectID, principal.RunID) &&
+			version.Origin == types.ProductionDocumentOriginAI && version.CreatedBy == types.ProductionSystemActorID
+		if err := validateProductionAppendDependencies(db, document, version.SourceSetID, allowRetired); err != nil {
 			return err
 		}
 		version.TenantID = document.TenantID

@@ -195,24 +195,20 @@ func productionIssue(code, message string, block *types.ProductionDocumentBlock)
 	return issue
 }
 
-func ValidateProductionVersion(version *types.ProductionDocumentVersion, acceptedEvidence map[string]struct{}) ProductionValidationResult {
+func ValidateProductionVersion(
+	version *types.ProductionDocumentVersion,
+	acceptedEvidence map[string]struct{},
+	blockSchema types.ProductionBlockSchemaV1,
+	qualityRules types.ProductionQualityRulesV1,
+) ProductionValidationResult {
 	result := ProductionValidationResult{Errors: []ProductionValidationIssue{}, Warnings: []ProductionValidationIssue{}}
 	if version == nil {
 		result.Errors = append(result.Errors, ProductionValidationIssue{Code: "version_required", Message: "production document version is required"})
 		return result
 	}
-	template, knownTemplate := BuiltinProductionTemplate(version.DocumentTypeCode)
-	if version.DocumentTypeCode == "" {
-		result.Errors = append(result.Errors, ProductionValidationIssue{Code: "document_type_code_required", Message: "document type code validation context is required"})
-		return result
-	}
-	if !knownTemplate {
-		result.Errors = append(result.Errors, ProductionValidationIssue{Code: "document_type_code_unknown", Message: fmt.Sprintf("unknown production document type code %q", version.DocumentTypeCode)})
-		return result
-	}
 
 	blocks := productionSortedBlocks(version.Blocks)
-	presentSections := make(map[string]struct{}, len(template.RequiredSections))
+	presentSections := make(map[string]struct{}, len(blockSchema.RequiredSections))
 	for _, block := range blocks {
 		if block == nil || block.BlockType != "heading" {
 			continue
@@ -222,12 +218,40 @@ func ValidateProductionVersion(version *types.ProductionDocumentVersion, accepte
 			presentSections[strings.TrimSpace(heading)] = struct{}{}
 		}
 	}
-	for _, section := range template.RequiredSections {
+	gates := make(map[string]struct{}, len(qualityRules.Gates))
+	for _, gate := range qualityRules.Gates {
+		gates[gate] = struct{}{}
+	}
+	appendMissingSection := func(section string) {
 		if _, present := presentSections[section]; !present {
 			result.Errors = append(result.Errors, ProductionValidationIssue{
 				Code: "required_section_missing", Message: fmt.Sprintf("required section %q is missing", section), Section: section,
 			})
 		}
+	}
+	if _, enabled := gates["section_completeness"]; enabled {
+		for _, section := range blockSchema.RequiredSections {
+			appendMissingSection(section)
+		}
+	}
+	for _, gate := range []struct {
+		name    string
+		heading string
+	}{
+		{name: "sop_exception_path", heading: "异常处理"},
+		{name: "policy_approval_control", heading: "审批控制"},
+		{name: "product_scope_boundary", heading: "限制条件"},
+		{name: "faq_effective_date", heading: "来源与生效日期"},
+		{name: "incident_timeline", heading: "诊断过程"},
+	} {
+		if _, enabled := gates[gate.name]; enabled {
+			appendMissingSection(gate.heading)
+		}
+	}
+
+	allowedBlockTypes := make(map[string]struct{}, len(blockSchema.AllowedBlockTypes))
+	for _, blockType := range blockSchema.AllowedBlockTypes {
+		allowedBlockTypes[blockType] = struct{}{}
 	}
 
 	logicalIDs := make(map[string]struct{}, len(blocks))
@@ -253,12 +277,12 @@ func ValidateProductionVersion(version *types.ProductionDocumentVersion, accepte
 		if block.Position < 0 {
 			result.Errors = append(result.Errors, productionIssue("block_position_invalid", "block position must not be negative", block))
 		}
+		_, blockTypeAllowed := allowedBlockTypes[block.BlockType]
 		contentErr := productionValidateBlockContent(block)
-		if contentErr != nil {
+		if !blockTypeAllowed {
+			result.Errors = append(result.Errors, productionIssue("unsupported_block_type", fmt.Sprintf("unsupported block type %q", block.BlockType), block))
+		} else if contentErr != nil {
 			code := "invalid_block_content"
-			if strings.HasPrefix(contentErr.Error(), "unsupported block type") {
-				code = "unsupported_block_type"
-			}
 			result.Errors = append(result.Errors, productionIssue(code, contentErr.Error(), block))
 		}
 		attributes, attributesErr := productionParseAttributes(block.Attributes)
@@ -296,8 +320,13 @@ func ValidateProductionVersion(version *types.ProductionDocumentVersion, accepte
 			}
 		}
 		claimCapable := block.BlockType == "paragraph" || block.BlockType == "list" || block.BlockType == "table" || block.BlockType == "quote"
-		if claimCapable && !hasAcceptedEvidence && !attributes.NeedsConfirmation {
+		_, factEvidenceGate := gates["fact_evidence"]
+		if factEvidenceGate && qualityRules.RequireEvidenceForFacts && claimCapable && !hasAcceptedEvidence && !attributes.NeedsConfirmation {
 			result.Errors = append(result.Errors, productionIssue("factual_evidence_required", "claim-capable block requires accepted evidence or needs_confirmation=true", block))
+		}
+		_, noUnconfirmedGate := gates["no_unconfirmed"]
+		if noUnconfirmedGate && qualityRules.BlockNeedsConfirmation && attributes.NeedsConfirmation {
+			result.Errors = append(result.Errors, productionIssue("needs_confirmation_blocked", "needs_confirmation blocks are not allowed", block))
 		}
 	}
 	return result

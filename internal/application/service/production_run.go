@@ -366,7 +366,8 @@ func newProductionRun(
 		"id": documentType.ID, "code": documentType.Code, "name": documentType.Name,
 		"schema_version": documentType.SchemaVersion, "block_schema": productionJSONValue(documentType.BlockSchema),
 		"source_requirements": productionJSONValue(documentType.SourceRequirements),
-		"skill_bindings":      productionJSONValue(documentType.SkillBindings), "quality_rules": productionJSONValue(documentType.QualityRules),
+		"skill_bindings":      productionJSONValue(documentType.SkillBindings), "workflow_plan": productionJSONValue(documentType.WorkflowPlan),
+		"quality_rules": productionJSONValue(documentType.QualityRules),
 		"review_policy": productionJSONValue(documentType.ReviewPolicy), "publication_policy": productionJSONValue(documentType.PublicationPolicy),
 	})
 	projectID := sourceSet.ProjectID

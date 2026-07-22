@@ -195,6 +195,10 @@ func (a *productionAnnotationAuthorizerStub) RequireProjectRole(_ context.Contex
 	return a.err
 }
 
+func (a *productionAnnotationAuthorizerStub) HasLiveRoleAssignee(context.Context, uint64, string, types.ProductionRole) (bool, error) {
+	return true, a.err
+}
+
 func newProductionAnnotationFixture(t *testing.T) (*productionAnnotationService, *productionAnnotationReviewRepoStub, *productionAnnotationAuthorizerStub) {
 	t.Helper()
 	documents := &productionAnnotationDocumentRepoStub{

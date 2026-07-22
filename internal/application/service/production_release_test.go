@@ -312,6 +312,21 @@ type productionReleaseReviewsStub struct {
 	review *types.ProductionReviewRequest
 }
 
+type productionReleaseDocumentTypeRepoStub struct {
+	interfaces.ProductionDocumentTypeRepository
+	documentType *types.ProductionDocumentType
+	requestedID  string
+}
+
+func (s *productionReleaseDocumentTypeRepoStub) GetByID(_ context.Context, tenantID uint64, documentTypeID string) (*types.ProductionDocumentType, error) {
+	s.requestedID = documentTypeID
+	if s.documentType == nil || s.documentType.TenantID != tenantID || s.documentType.ID != documentTypeID {
+		return nil, gorm.ErrRecordNotFound
+	}
+	copy := *s.documentType
+	return &copy, nil
+}
+
 func (s *productionReleaseReviewsStub) GetApprovedReviewForVersion(context.Context, uint64, string, string) (*types.ProductionReviewRequest, error) {
 	return s.review, nil
 }
@@ -320,6 +335,10 @@ type productionReleaseAuthorizerStub struct{ err error }
 
 func (s productionReleaseAuthorizerStub) RequireProjectRole(context.Context, string, ...types.ProductionRole) error {
 	return s.err
+}
+
+func (s productionReleaseAuthorizerStub) HasLiveRoleAssignee(context.Context, uint64, string, types.ProductionRole) (bool, error) {
+	return true, s.err
 }
 
 type productionReleaseMembershipStub struct {
@@ -718,8 +737,12 @@ func newProductionReleaseServiceFixture(t *testing.T) (*ProductionReleaseService
 	knowledgeRepo := &productionReleaseKnowledgeRepoStub{knowledge: knowledge}
 	service := &ProductionReleaseService{
 		releases: repo,
-		documents: &productionReleaseDocumentsStub{document: &types.ProductionDocument{ID: "document-1", TenantID: 7, ProjectID: "project-1", LatestApprovedVersionID: productionStringPtr("version-3")},
+		documents: &productionReleaseDocumentsStub{document: &types.ProductionDocument{ID: "document-1", TenantID: 7, ProjectID: "project-1", DocumentTypeID: "type-1", DocumentTypeSchemaVersion: 1, LatestApprovedVersionID: productionStringPtr("version-3")},
 			version: &types.ProductionDocumentVersion{ID: "version-3", DocumentID: "document-1", TenantID: 7, ProjectID: "project-1", FrozenAt: productionTimePtr(time.Now())}},
+		documentTypes: &productionReleaseDocumentTypeRepoStub{documentType: &types.ProductionDocumentType{
+			ID: "type-1", TenantID: 7, SchemaVersion: 1, Status: types.ProductionDocumentTypeActive,
+			PublicationPolicy: types.JSON(`{"version":1,"target_type":"knowledge_base","chunking":"inherit_target","knowledge_graph":"inherit_target","require_approved_review":true}`),
+		}},
 		reviews:    &productionReleaseReviewsStub{review: &types.ProductionReviewRequest{ID: "review-1", TenantID: 7, ProjectID: "project-1", DocumentID: "document-1", VersionID: "version-3", Status: types.ProductionReviewApproved}},
 		authorizer: productionReleaseAuthorizerStub{}, members: productionReleaseMembershipStub{role: types.TenantRoleContributor},
 		tenants: productionReleaseTenantRepoStub{tenant: &types.Tenant{
@@ -748,6 +771,91 @@ func configuredProductionReleaseTargetKB() *types.KnowledgeBase {
 		IndexingStrategy:      types.IndexingStrategy{VectorEnabled: true, GraphEnabled: true},
 		ExtractConfig:         &types.ExtractConfig{Enabled: true},
 	}
+}
+
+func TestProductionReleasePrepareEnforcesExactBoundPublicationPolicy(t *testing.T) {
+	tests := []struct {
+		name       string
+		policy     types.JSON
+		wantReason string
+	}{
+		{
+			name:       "non knowledge base target",
+			policy:     types.JSON(`{"version":1,"target_type":"wiki","chunking":"inherit_target","knowledge_graph":"inherit_target","require_approved_review":true}`),
+			wantReason: "publication_target_type_invalid",
+		},
+		{
+			name:       "chunking override",
+			policy:     types.JSON(`{"version":1,"target_type":"knowledge_base","chunking":"fixed","knowledge_graph":"inherit_target","require_approved_review":true}`),
+			wantReason: "publication_chunking_mode_invalid",
+		},
+		{
+			name:       "knowledge graph override",
+			policy:     types.JSON(`{"version":1,"target_type":"knowledge_base","chunking":"inherit_target","knowledge_graph":"disabled","require_approved_review":true}`),
+			wantReason: "publication_knowledge_graph_mode_invalid",
+		},
+		{
+			name:       "approved review disabled",
+			policy:     types.JSON(`{"version":1,"target_type":"knowledge_base","chunking":"inherit_target","knowledge_graph":"inherit_target","require_approved_review":false}`),
+			wantReason: "publication_approved_review_required",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			svc, repo, _ := newProductionReleaseServiceFixture(t)
+			svc.kbs = productionReleaseKBStub{kb: configuredProductionReleaseTargetKB()}
+			document := svc.documents.(*productionReleaseDocumentsStub).document
+			document.DocumentTypeID = "type-bound"
+			document.DocumentTypeSchemaVersion = 4
+			svc.documentTypes = &productionReleaseDocumentTypeRepoStub{documentType: &types.ProductionDocumentType{
+				ID: "type-bound", TenantID: 7, SchemaVersion: 4, Status: types.ProductionDocumentTypeActive,
+				PublicationPolicy: test.policy,
+			}}
+
+			release, err := svc.Prepare(productionReleaseContext(), "document-1", "version-3", []string{"kb-1"})
+
+			require.Nil(t, release)
+			require.ErrorIs(t, err, types.ErrProductionReleaseInvalid)
+			require.ErrorContains(t, err, test.wantReason)
+			require.Nil(t, repo.release)
+		})
+	}
+}
+
+func TestProductionReleasePrepareUsesRetiredExactBoundPublicationPolicy(t *testing.T) {
+	svc, _, _ := newProductionReleaseServiceFixture(t)
+	svc.kbs = productionReleaseKBStub{kb: configuredProductionReleaseTargetKB()}
+	document := svc.documents.(*productionReleaseDocumentsStub).document
+	document.DocumentTypeID = "type-bound"
+	document.DocumentTypeSchemaVersion = 4
+	typesRepo := &productionReleaseDocumentTypeRepoStub{documentType: &types.ProductionDocumentType{
+		ID: "type-bound", TenantID: 7, SchemaVersion: 4, Status: types.ProductionDocumentTypeRetired,
+		PublicationPolicy: types.JSON(`{"version":1,"target_type":"knowledge_base","chunking":"inherit_target","knowledge_graph":"inherit_target","require_approved_review":true}`),
+	}}
+	svc.documentTypes = typesRepo
+
+	release, err := svc.Prepare(productionReleaseContext(), "document-1", "version-3", []string{"kb-1"})
+
+	require.NoError(t, err)
+	require.NotNil(t, release)
+	require.Equal(t, "type-bound", typesRepo.requestedID)
+}
+
+func TestProductionReleasePrepareNormalizesMissingDocumentTypeBinding(t *testing.T) {
+	svc, repo, _ := newProductionReleaseServiceFixture(t)
+	svc.kbs = productionReleaseKBStub{kb: configuredProductionReleaseTargetKB()}
+	document := svc.documents.(*productionReleaseDocumentsStub).document
+	document.DocumentTypeID = "missing-type"
+	document.DocumentTypeSchemaVersion = 4
+	svc.documentTypes = &productionReleaseDocumentTypeRepoStub{}
+
+	release, err := svc.Prepare(productionReleaseContext(), "document-1", "version-3", []string{"kb-1"})
+
+	require.Nil(t, release)
+	require.ErrorIs(t, err, types.ErrProductionReleaseInvalid)
+	require.ErrorContains(t, err, "publication_document_type_binding_invalid")
+	require.Nil(t, repo.release)
 }
 
 func TestProductionReleasePreflightReturnsRenderedSnapshotAndOnlyWritableTargets(t *testing.T) {
@@ -884,7 +992,10 @@ func TestProductionReleasePrepareSnapshotsImmutableTargetProcessingConfig(t *tes
 	svc, repo, _ := newProductionReleaseServiceFixture(t)
 	version := &types.ProductionDocumentVersion{ID: "version-3", DocumentID: "document-1", TenantID: 7, ProjectID: "project-1", FrozenAt: productionTimePtr(time.Now())}
 	review := &types.ProductionReviewRequest{ID: "review-1", TenantID: 7, ProjectID: "project-1", DocumentID: "document-1", VersionID: "version-3", Status: types.ProductionReviewApproved}
-	svc.documents = &productionReleaseDocumentsStub{document: &types.ProductionDocument{ID: "document-1", TenantID: 7, ProjectID: "project-1", LatestApprovedVersionID: productionStringPtr("version-3")}, version: version}
+	svc.documents = &productionReleaseDocumentsStub{document: &types.ProductionDocument{
+		ID: "document-1", TenantID: 7, ProjectID: "project-1", DocumentTypeID: "type-1",
+		DocumentTypeSchemaVersion: 1, LatestApprovedVersionID: productionStringPtr("version-3"),
+	}, version: version}
 	svc.reviews = &productionReleaseReviewsStub{review: review}
 	svc.models = productionReleaseModelStub{}
 	svc.kbs = productionReleaseKBStub{kb: &types.KnowledgeBase{ID: "kb-1", TenantID: 7, CreatorID: "00000000-0000-4000-8000-000000000007", Type: types.KnowledgeBaseTypeDocument,

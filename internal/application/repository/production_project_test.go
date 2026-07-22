@@ -302,6 +302,35 @@ func TestProductionProjectRepositoryScopesRoleOperationsByProjectTenant(t *testi
 	require.Empty(t, roles)
 }
 
+func TestProductionProjectRepositoryRequiresLiveTenantMemberForRoleAvailability(t *testing.T) {
+	repo, db := newProductionRepoTestDB(t)
+	require.NoError(t, db.AutoMigrate(&types.TenantMember{}))
+	seedProductionProject(t, db, "project-1", 7)
+	now := time.Now().UTC()
+	for _, member := range []*types.TenantMember{
+		{UserID: "active-reviewer", TenantID: 7, Role: types.TenantRoleContributor, Status: types.TenantMemberStatusActive, JoinedAt: now},
+		{UserID: "suspended-reviewer", TenantID: 7, Role: types.TenantRoleContributor, Status: types.TenantMemberStatusSuspended, JoinedAt: now},
+	} {
+		require.NoError(t, db.Create(member).Error)
+	}
+	for _, member := range []*types.ProductionProjectMember{
+		{ProjectID: "project-1", UserID: "active-reviewer", Role: types.ProductionRoleBusinessReviewer, AssignedBy: "owner-1"},
+		{ProjectID: "project-1", UserID: "suspended-reviewer", Role: types.ProductionRoleEngineeringReviewer, AssignedBy: "owner-1"},
+	} {
+		require.NoError(t, db.Create(member).Error)
+	}
+
+	available, err := repo.HasLiveRoleAssignee(context.Background(), 7, "project-1", types.ProductionRoleBusinessReviewer)
+	require.NoError(t, err)
+	require.True(t, available)
+	available, err = repo.HasLiveRoleAssignee(context.Background(), 7, "project-1", types.ProductionRoleEngineeringReviewer)
+	require.NoError(t, err)
+	require.False(t, available)
+	available, err = repo.HasLiveRoleAssignee(context.Background(), 8, "project-1", types.ProductionRoleBusinessReviewer)
+	require.NoError(t, err)
+	require.False(t, available)
+}
+
 func TestProductionProjectRepositoryAssignRoleRejectsNilMember(t *testing.T) {
 	repo, _ := newProductionRepoTestDB(t)
 	var err error

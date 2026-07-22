@@ -44,6 +44,10 @@ func (a *productionDocumentAuthorizerStub) RequireProjectRole(_ context.Context,
 	return a.err
 }
 
+func (a *productionDocumentAuthorizerStub) HasLiveRoleAssignee(context.Context, uint64, string, types.ProductionRole) (bool, error) {
+	return true, a.err
+}
+
 func newProductionDocumentServiceFixture(t *testing.T) (*productionDocumentService, interfaces.ProductionDocumentRepository, *gorm.DB, *productionDocumentAuthorizerStub) {
 	return newProductionDocumentServiceFixtureWithEvidenceDigest(t, "")
 }
@@ -427,6 +431,41 @@ func TestProductionDocumentServiceBindsInternalPrincipalToAIProvenance(t *testin
 	})
 	require.NoError(t, err)
 	version, err = svc.AppendVersion(exactCtx, document.ID, input)
+	require.NoError(t, err)
+	require.NotNil(t, version)
+	require.Equal(t, int64(2), countServiceRows(t, db, &types.ProductionDocumentVersion{}))
+}
+
+func TestProductionDocumentServiceInternalAppendUsesRetiredExactBoundType(t *testing.T) {
+	svc, _, db, authorizer := newProductionDocumentServiceFixture(t)
+	document := createServiceDocument(t, svc)
+	require.NoError(t, db.Model(&types.ProductionDocumentType{}).Where("id = ?", documentServiceTypeID).
+		Update("status", types.ProductionDocumentTypeRetired).Error)
+
+	runID := "77000000-0000-4000-8000-000000000002"
+	blocks := governedServiceBlocks(governedServiceParagraph("claim", `"governed claim"`))
+	for index := range blocks {
+		blocks[index].AIProvenance = types.JSON(`{"run_id":"` + runID + `"}`)
+	}
+	human, humanErr := svc.AppendVersion(productionDocumentContext(7), document.ID, interfaces.AppendProductionVersionInput{
+		ParentVersionID: *document.CurrentVersionID, SourceSetID: documentServiceSetID,
+		Origin: types.ProductionDocumentOriginHuman, Blocks: blocks,
+	})
+	require.Nil(t, human)
+	require.ErrorIs(t, humanErr, types.ErrProductionDocumentTypeInactive)
+
+	authorizer.err = types.ErrProductionForbidden
+	ctx, err := types.WithProductionInternalPrincipal(context.Background(), types.ProductionInternalPrincipal{
+		ActorID: types.ProductionSystemActorID, ActorKind: types.ProductionInternalActorWorker,
+		TenantID: 7, ProjectID: documentServiceProjectID, RunID: runID,
+	})
+	require.NoError(t, err)
+
+	version, err := svc.AppendVersion(ctx, document.ID, interfaces.AppendProductionVersionInput{
+		VersionID: productionRunVersionID(runID), ParentVersionID: *document.CurrentVersionID,
+		SourceSetID: documentServiceSetID, Origin: types.ProductionDocumentOriginAI, Blocks: blocks,
+	})
+
 	require.NoError(t, err)
 	require.NotNil(t, version)
 	require.Equal(t, int64(2), countServiceRows(t, db, &types.ProductionDocumentVersion{}))

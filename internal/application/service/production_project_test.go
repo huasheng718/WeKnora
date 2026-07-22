@@ -109,6 +109,17 @@ func (r *productionProjectRepoStub) ListRoles(_ context.Context, tenantID uint64
 	return append([]types.ProductionRole(nil), r.roles[tenantID][projectID][userID]...), nil
 }
 
+func (r *productionProjectRepoStub) HasLiveRoleAssignee(_ context.Context, tenantID uint64, projectID string, role types.ProductionRole) (bool, error) {
+	for _, roles := range r.roles[tenantID][projectID] {
+		for _, assigned := range roles {
+			if assigned == role {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
 func (r *productionProjectRepoStub) addProject(project *types.ProductionProject) {
 	if r.projects[project.TenantID] == nil {
 		r.projects[project.TenantID] = map[string]*types.ProductionProject{}

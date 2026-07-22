@@ -376,6 +376,51 @@ func TestProductionReviewSubmissionFreezesCanonicalPolicyAndMaterializesSteps(t 
 	require.Equal(t, productionReviewAuthorID, fixture.audit.entries[0].ActorUserID)
 }
 
+func TestProductionReviewSubmissionRequiresEveryConfiguredReviewerAvailability(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *productionReviewFixture)
+	}{
+		{
+			name: "missing project role assignment",
+			mutate: func(t *testing.T, fixture *productionReviewFixture) {
+				require.NoError(t, fixture.db.Where(
+					"project_id = ? AND user_id = ? AND role = ?",
+					productionReviewProjectID, productionReviewEngineeringID, types.ProductionRoleEngineeringReviewer,
+				).Delete(&types.ProductionProjectMember{}).Error)
+			},
+		},
+		{
+			name: "suspended tenant assignee",
+			mutate: func(t *testing.T, fixture *productionReviewFixture) {
+				require.NoError(t, fixture.db.Model(&types.TenantMember{}).Where(
+					"tenant_id = ? AND user_id = ?", productionReviewTenantID, productionReviewEngineeringID,
+				).UpdateColumn("status", types.TenantMemberStatusSuspended).Error)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newProductionReviewFixture(t)
+			fixture.svc.projects = NewProductionProjectService(
+				apprepository.NewProductionProjectRepository(fixture.db), fixture.members, nil,
+			)
+			test.mutate(t, fixture)
+
+			request, err := fixture.svc.Submit(
+				productionReviewServiceContext(productionReviewAuthorID, types.TenantRoleContributor),
+				productionReviewDocumentID, productionReviewVersionID,
+			)
+
+			require.Nil(t, request)
+			require.ErrorIs(t, err, types.ErrProductionReviewPolicyInvalid)
+			require.ErrorContains(t, err, "reviewer_role_unavailable:engineering_reviewer")
+			require.Zero(t, countServiceRows(t, fixture.db, &types.ProductionReviewRequest{}))
+		})
+	}
+}
+
 func TestProductionReviewGetRequiresTenantScopedProjectAccess(t *testing.T) {
 	fixture := newProductionReviewFixture(t)
 	request := fixture.submit(t)
@@ -475,7 +520,7 @@ func TestProductionReviewSubmissionRequiresExactCurrentVersion(t *testing.T) {
 	require.ErrorIs(t, err, types.ErrProductionReviewScopeInvalid)
 }
 
-func TestProductionReviewSubmissionRejectsTypeRetiredAfterInitialRead(t *testing.T) {
+func TestProductionReviewSubmissionUsesExactTypeRetiredAfterInitialRead(t *testing.T) {
 	fixture := newProductionReviewFixture(t)
 	fixture.svc.documentTypes = &retiringProductionDocumentTypeRepository{
 		ProductionDocumentTypeRepository: fixture.svc.documentTypes,
@@ -487,9 +532,10 @@ func TestProductionReviewSubmissionRejectsTypeRetiredAfterInitialRead(t *testing
 		productionReviewDocumentID, productionReviewVersionID,
 	)
 
-	require.Nil(t, request)
-	require.ErrorIs(t, err, types.ErrProductionDocumentTypeInactive)
-	require.Zero(t, countServiceRows(t, fixture.db, &types.ProductionReviewRequest{}))
+	require.NoError(t, err)
+	require.NotNil(t, request)
+	require.Equal(t, types.JSON(`{"steps":["business_reviewer","engineering_reviewer"]}`), request.PolicySnapshot)
+	require.Equal(t, int64(1), countServiceRows(t, fixture.db, &types.ProductionReviewRequest{}))
 }
 
 func TestProductionReviewRevokedSubmitterRoleAtMutationBoundaryCannotSubmit(t *testing.T) {

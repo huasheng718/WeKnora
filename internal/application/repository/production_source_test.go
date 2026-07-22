@@ -111,6 +111,34 @@ func TestProductionSourceRepositoryScopesEveryLookupByTenant(t *testing.T) {
 	require.ErrorIs(t, repo.DecideItem(context.Background(), 8, sourceItemID, types.ProductionSourceItemAccepted), gorm.ErrRecordNotFound)
 }
 
+func TestProductionSourceRepositoryListsAcceptedEvidenceAndKindsBeforeFreeze(t *testing.T) {
+	repo, _ := newProductionSourceRepoTestDB(t)
+	createProductionSourceSet(t, repo, types.ProductionSourceSetCollecting)
+	createProductionSourceItem(t, repo, types.ProductionSourceItemAccepted)
+	require.NoError(t, repo.CreateEvidence(context.Background(), 7, sourceItemID, &types.ProductionEvidenceSnapshot{
+		ID: evidenceID, SnapshotType: types.ProductionEvidenceSnapshotText,
+		InlineContent: types.JSON(`"snapshot"`), ContentDigest: testDigest, RedactionMetadata: types.JSON(`{}`),
+	}))
+	uploadID := "44444444-4444-4444-8444-444444444445"
+	require.NoError(t, repo.CreateItem(context.Background(), 7, sourceSetID, &types.ProductionSourceItem{
+		ID: uploadID, SourceKind: types.ProductionSourceKindUpload, Title: "Upload", MimeType: "text/plain",
+		ContentDigest: testDigest, CapturedAt: time.Now().UTC(), Metadata: types.JSON(`{}`),
+		Status: types.ProductionSourceItemAccepted,
+	}))
+
+	evidence, err := repo.ListAcceptedEvidence(context.Background(), 7, sourceProjectID, sourceSetID)
+	require.NoError(t, err)
+	require.Len(t, evidence, 1)
+	require.Equal(t, evidenceID, evidence[0].ID)
+	kinds, err := repo.ListAcceptedSourceKinds(context.Background(), 7, sourceProjectID, sourceSetID)
+	require.NoError(t, err)
+	require.Equal(t, []types.ProductionSourceKind{types.ProductionSourceKindManual, types.ProductionSourceKindUpload}, kinds)
+
+	foreignKinds, err := repo.ListAcceptedSourceKinds(context.Background(), 8, sourceProjectID, sourceSetID)
+	require.NoError(t, err)
+	require.Empty(t, foreignKinds)
+}
+
 func TestProductionSourceRepositoryListsSetsByTenantAndProject(t *testing.T) {
 	repo, _ := newProductionSourceRepoTestDB(t)
 	createProductionSourceSet(t, repo, types.ProductionSourceSetReady)

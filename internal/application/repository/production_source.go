@@ -227,14 +227,28 @@ func (r *productionSourceRepository) ListAcceptedEvidence(
 		Select("evidence.*").
 		Joins("JOIN production_source_items AS item ON item.id = evidence.source_item_id").
 		Joins("JOIN production_source_sets AS source_set ON source_set.id = item.source_set_id").
-		Where(
-			"source_set.id = ? AND source_set.tenant_id = ? AND source_set.project_id = ? AND source_set.status = ?",
-			sourceSetID, tenantID, projectID, types.ProductionSourceSetFrozen,
-		).
+		Where("source_set.id = ? AND source_set.tenant_id = ? AND source_set.project_id = ?", sourceSetID, tenantID, projectID).
 		Where("item.status = ?", types.ProductionSourceItemAccepted).
 		Order("evidence.id ASC").
 		Find(&evidence).Error
 	return evidence, err
+}
+
+func (r *productionSourceRepository) ListAcceptedSourceKinds(
+	ctx context.Context,
+	tenantID uint64,
+	projectID, sourceSetID string,
+) ([]types.ProductionSourceKind, error) {
+	kinds := make([]types.ProductionSourceKind, 0)
+	err := database.DBFromContext(ctx, r.db).WithContext(ctx).
+		Table("production_source_items AS item").
+		Distinct("item.source_kind").
+		Joins("JOIN production_source_sets AS source_set ON source_set.id = item.source_set_id").
+		Where("source_set.id = ? AND source_set.tenant_id = ? AND source_set.project_id = ?", sourceSetID, tenantID, projectID).
+		Where("item.status = ?", types.ProductionSourceItemAccepted).
+		Order("item.source_kind ASC").
+		Pluck("item.source_kind", &kinds).Error
+	return kinds, err
 }
 
 func (r *productionSourceRepository) DecideItem(

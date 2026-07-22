@@ -39,6 +39,7 @@ type CreateEvidenceSnapshotInput struct {
 
 type ProductionProjectAuthorizer interface {
 	RequireProjectRole(ctx context.Context, projectID string, roles ...types.ProductionRole) error
+	HasLiveRoleAssignee(ctx context.Context, tenantID uint64, projectID string, role types.ProductionRole) (bool, error)
 }
 
 type ProductionSourceRepository interface {
@@ -49,6 +50,7 @@ type ProductionSourceRepository interface {
 	GetItem(ctx context.Context, tenantID uint64, itemID string) (*types.ProductionSourceItem, *types.ProductionSourceSet, error)
 	GetEvidence(ctx context.Context, tenantID uint64, evidenceID string) (*types.ProductionEvidenceSnapshot, *types.ProductionSourceItem, *types.ProductionSourceSet, error)
 	ListAcceptedEvidence(ctx context.Context, tenantID uint64, projectID, sourceSetID string) ([]*types.ProductionEvidenceSnapshot, error)
+	ListAcceptedSourceKinds(ctx context.Context, tenantID uint64, projectID, sourceSetID string) ([]types.ProductionSourceKind, error)
 	DecideItem(ctx context.Context, tenantID uint64, itemID string, decision types.ProductionSourceItemStatus) error
 	CreateEvidence(ctx context.Context, tenantID uint64, itemID string, evidence *types.ProductionEvidenceSnapshot) error
 	Freeze(ctx context.Context, tenantID uint64, sourceSetID string) error

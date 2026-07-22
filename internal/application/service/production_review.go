@@ -223,16 +223,14 @@ func (s *productionReviewService) Submit(
 			version.FrozenAt == nil {
 			return types.ErrProductionReviewScopeInvalid
 		}
-		documentType, loadErr := s.documentTypes.GetActiveByIDForReview(
-			txCtx, tenantID, liveDocument.DocumentTypeID, liveDocument.DocumentTypeSchemaVersion,
-		)
+		documentType, loadErr := s.documentTypes.GetByID(txCtx, tenantID, liveDocument.DocumentTypeID)
 		if loadErr != nil {
 			return loadErr
 		}
-		if loadErr = validateProductionDocumentType(
-			documentType, liveDocument.DocumentTypeID, liveDocument.DocumentTypeSchemaVersion,
-		); loadErr != nil {
-			return loadErr
+		if documentType == nil || documentType.ID != liveDocument.DocumentTypeID || documentType.TenantID != tenantID ||
+			documentType.SchemaVersion != liveDocument.DocumentTypeSchemaVersion ||
+			(documentType.Status != types.ProductionDocumentTypeActive && documentType.Status != types.ProductionDocumentTypeRetired) {
+			return types.ErrProductionDocumentTypeInactive
 		}
 		blocking, loadErr := s.reviews.CountOpenBlocking(txCtx, tenantID, versionID)
 		if loadErr != nil {
@@ -254,6 +252,20 @@ func (s *productionReviewService) Submit(
 		steps, policyErr := materializeProductionReviewPolicy(documentType.ReviewPolicy, request)
 		if policyErr != nil {
 			return policyErr
+		}
+		for _, step := range steps {
+			available, availabilityErr := s.projects.HasLiveRoleAssignee(
+				txCtx, tenantID, liveDocument.ProjectID, step.RequiredRole,
+			)
+			if availabilityErr != nil {
+				return availabilityErr
+			}
+			if !available {
+				return errors.Join(
+					types.ErrProductionReviewPolicyInvalid,
+					fmt.Errorf("reviewer_role_unavailable:%s", step.RequiredRole),
+				)
+			}
 		}
 		request.Steps = steps
 		if createErr := s.reviews.CreateCurrentReview(txCtx, request, steps); createErr != nil {

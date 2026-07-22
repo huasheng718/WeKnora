@@ -89,7 +89,7 @@ func (v *ProductionValidator) Validate(ctx context.Context, run *types.Productio
 		accepted[copy.ID] = struct{}{}
 		evidenceByID[copy.ID] = &copy
 	}
-	validation := ValidateProductionVersion(version, accepted)
+	validation := ValidateProductionVersion(version, accepted, documentType.BlockSchema, documentType.QualityRules)
 	if len(validation.Errors) != 0 {
 		return &ProductionDocumentValidationError{Issues: validation.Errors}
 	}
