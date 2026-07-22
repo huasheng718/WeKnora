@@ -38,7 +38,7 @@ func (r *productionDocumentTypeRepository) Create(
 func (r *productionDocumentTypeRepository) DeriveDraft(
 	ctx context.Context,
 	tenantID uint64,
-	baseID string,
+	baseID, actorID string,
 	draft *types.ProductionDocumentType,
 ) (*types.ProductionDocumentType, error) {
 	if draft == nil {
@@ -46,7 +46,7 @@ func (r *productionDocumentTypeRepository) DeriveDraft(
 	}
 	var lastErr error
 	for range productionDocumentTypeDeriveMaxAttempts {
-		derived, err := r.deriveDraftAttempt(ctx, tenantID, baseID, draft)
+		derived, err := r.deriveDraftAttempt(ctx, tenantID, baseID, actorID, draft)
 		if err == nil {
 			return derived, nil
 		}
@@ -61,12 +61,38 @@ func (r *productionDocumentTypeRepository) DeriveDraft(
 func (r *productionDocumentTypeRepository) deriveDraftAttempt(
 	ctx context.Context,
 	tenantID uint64,
-	baseID string,
+	baseID, actorID string,
 	draft *types.ProductionDocumentType,
 ) (*types.ProductionDocumentType, error) {
 	var derived types.ProductionDocumentType
 	err := database.WithTransactionContext(ctx, r.db, func(txCtx context.Context) error {
 		db := database.DBFromContext(txCtx, r.db).WithContext(txCtx)
+		membershipQuery := db.Where(
+			"tenant_id = ? AND user_id = ? AND status = ? AND role IN ?",
+			tenantID, actorID, types.TenantMemberStatusActive,
+			[]types.TenantRole{types.TenantRoleAdmin, types.TenantRoleOwner},
+		)
+		if db.Dialector.Name() == "postgres" {
+			var membership types.TenantMember
+			if err := membershipQuery.Clauses(clause.Locking{Strength: "UPDATE"}).First(&membership).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return types.ErrProductionForbidden
+				}
+				return err
+			}
+		} else {
+			// SQLite has one writer. Reserve it through the authorized membership
+			// row so authorization cannot change before the derived row is inserted.
+			result := membershipQuery.Model(&types.TenantMember{}).
+				UpdateColumn("updated_at", gorm.Expr("updated_at"))
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return types.ErrProductionForbidden
+			}
+		}
+
 		var base types.ProductionDocumentType
 		baseQuery := db.Where(
 			"tenant_id = ? AND id = ? AND status IN ?",

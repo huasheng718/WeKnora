@@ -85,6 +85,10 @@ func newProductionDocumentTypeRepoTestDB(
 ) (interfaces.ProductionDocumentTypeRepository, *gorm.DB) {
 	t.Helper()
 	_, db := newProductionRepoTestDB(t)
+	require.NoError(t, db.AutoMigrate(&types.TenantMember{}))
+	require.NoError(t, db.Create(&types.TenantMember{
+		UserID: "author-1", TenantID: 7, Role: types.TenantRoleAdmin, Status: types.TenantMemberStatusActive,
+	}).Error)
 	return NewProductionDocumentTypeRepository(db), db
 }
 
@@ -293,7 +297,7 @@ func TestDocumentTypeRepositoryDerivesDraftWithImmutableLineageAndNextVersion(t 
 	draft.Origin = types.ProductionDocumentTypeOriginBuiltin
 	clientTemplate := "client-template"
 	draft.TemplateKey = &clientTemplate
-	derived, err := repo.DeriveDraft(context.Background(), 7, retired.ID, draft)
+	derived, err := repo.DeriveDraft(context.Background(), 7, retired.ID, "author-1", draft)
 
 	require.NoError(t, err)
 	require.Equal(t, "sop", derived.Code)
@@ -311,10 +315,71 @@ func TestDocumentTypeRepositoryDeriveRejectsCrossTenantBase(t *testing.T) {
 	base.Status = types.ProductionDocumentTypeActive
 	require.NoError(t, db.Create(base).Error)
 
-	derived, err := repo.DeriveDraft(context.Background(), 7, base.ID, validDerivedProductionDocumentType("derived-cross-tenant", 7))
+	derived, err := repo.DeriveDraft(context.Background(), 7, base.ID, "author-1", validDerivedProductionDocumentType("derived-cross-tenant", 7))
 
 	require.Nil(t, derived)
 	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+}
+
+func TestDocumentTypeRepositoryDeriveRejectsDraftBase(t *testing.T) {
+	repo, db := newProductionDocumentTypeRepoTestDB(t)
+	base := productionDocumentType("base-draft", 7, "sop", 1)
+	base.Status = types.ProductionDocumentTypeDraft
+	require.NoError(t, db.Create(base).Error)
+
+	derived, err := repo.DeriveDraft(
+		context.Background(), 7, base.ID, "author-1",
+		validDerivedProductionDocumentType("derived-from-draft", 7),
+	)
+
+	require.Nil(t, derived)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	var count int64
+	require.NoError(t, db.Model(&types.ProductionDocumentType{}).
+		Where("tenant_id = ? AND id = ?", 7, "derived-from-draft").Count(&count).Error)
+	require.Zero(t, count)
+}
+
+func TestDocumentTypeRepositoryDeriveRevalidatesActiveAdminInsideWriteTransaction(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		revoke func(*gorm.DB) error
+	}{
+		{
+			name: "demoted",
+			revoke: func(db *gorm.DB) error {
+				return db.Model(&types.TenantMember{}).
+					Where("tenant_id = ? AND user_id = ?", 7, "author-1").
+					Update("role", types.TenantRoleContributor).Error
+			},
+		},
+		{
+			name: "removed",
+			revoke: func(db *gorm.DB) error {
+				return db.Where("tenant_id = ? AND user_id = ?", 7, "author-1").
+					Delete(&types.TenantMember{}).Error
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			repo, db := newProductionDocumentTypeRepoTestDB(t)
+			base := productionDocumentType("base-reauth", 7, "sop", 1)
+			base.Status = types.ProductionDocumentTypeActive
+			require.NoError(t, db.Create(base).Error)
+			require.NoError(t, test.revoke(db))
+
+			derived, err := repo.DeriveDraft(
+				context.Background(), 7, base.ID, "author-1", validDerivedProductionDocumentType("derived-reauth", 7),
+			)
+
+			require.Nil(t, derived)
+			require.ErrorIs(t, err, types.ErrProductionForbidden)
+			var count int64
+			require.NoError(t, db.Model(&types.ProductionDocumentType{}).
+				Where("tenant_id = ? AND id = ?", 7, "derived-reauth").Count(&count).Error)
+			require.Zero(t, count)
+		})
+	}
 }
 
 func TestDocumentTypeRepositoryDeriveConcurrentRequestsAllocateConsecutiveVersions(t *testing.T) {
@@ -336,6 +401,10 @@ func TestDocumentTypeRepositoryDeriveConcurrentRequestsAllocateConsecutiveVersio
 	require.NoError(t, db.Exec(`ALTER TABLE production_document_types ADD COLUMN template_key VARCHAR(255)`).Error)
 	require.NoError(t, db.Exec(`ALTER TABLE production_document_types ADD COLUMN origin VARCHAR(16) NOT NULL DEFAULT 'custom'`).Error)
 	require.NoError(t, db.Exec(`CREATE UNIQUE INDEX uq_production_document_types_live_template_version ON production_document_types (tenant_id, template_key, schema_version) WHERE template_key IS NOT NULL AND deleted_at IS NULL`).Error)
+	require.NoError(t, db.AutoMigrate(&types.TenantMember{}))
+	require.NoError(t, db.Create(&types.TenantMember{
+		UserID: "author-1", TenantID: 7, Role: types.TenantRoleAdmin, Status: types.TenantMemberStatusActive,
+	}).Error)
 	repo := NewProductionDocumentTypeRepository(db)
 	base := productionDocumentType("base-concurrent", 7, "sop", 1)
 	base.Status = types.ProductionDocumentTypeActive
@@ -351,7 +420,7 @@ func TestDocumentTypeRepositoryDeriveConcurrentRequestsAllocateConsecutiveVersio
 			ready.Done()
 			<-start
 			derived, deriveErr := repo.DeriveDraft(
-				context.Background(), 7, base.ID,
+				context.Background(), 7, base.ID, "author-1",
 				validDerivedProductionDocumentType(fmt.Sprintf("derived-concurrent-%d", index), 7),
 			)
 			results <- derived
@@ -379,6 +448,10 @@ func TestDocumentTypeRepositoryDerivePostgresLocksCodeBeforeVersionAllocation(t 
 	require.NoError(t, err)
 
 	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT \* FROM "tenant_members" WHERE .*tenant_id = \$1 AND user_id = \$2 AND status = \$3 AND role IN \(\$4,\$5\).*FOR UPDATE`).
+		WithArgs(uint64(7), "author-1", types.TenantMemberStatusActive, types.TenantRoleAdmin, types.TenantRoleOwner, 1).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "tenant_id", "role", "status"}).
+			AddRow(1, "author-1", 7, string(types.TenantRoleAdmin), string(types.TenantMemberStatusActive)))
 	mock.ExpectQuery(`SELECT \* FROM "production_document_types" WHERE .*tenant_id = \$1 AND id = \$2 AND status IN \(\$3,\$4\).*FOR UPDATE`).
 		WithArgs(uint64(7), "base-postgres", types.ProductionDocumentTypeActive, types.ProductionDocumentTypeRetired, 1).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "code", "schema_version", "status", "origin", "template_key"}).
@@ -402,7 +475,7 @@ func TestDocumentTypeRepositoryDerivePostgresLocksCodeBeforeVersionAllocation(t 
 	mock.ExpectCommit()
 
 	derived, err := NewProductionDocumentTypeRepository(db).DeriveDraft(
-		context.Background(), 7, "base-postgres", validDerivedProductionDocumentType("derived-postgres", 7),
+		context.Background(), 7, "base-postgres", "author-1", validDerivedProductionDocumentType("derived-postgres", 7),
 	)
 
 	require.NoError(t, err)
@@ -424,6 +497,9 @@ func TestDocumentTypeRepositoryDeriveRetriesUniqueConflictInsideBoundedOperation
 
 	expectAttempt := func(nextVersion int, insertErr error) {
 		mock.ExpectBegin()
+		mock.ExpectQuery(`SELECT \* FROM "tenant_members" WHERE .*FOR UPDATE`).
+			WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "tenant_id", "role", "status"}).
+				AddRow(1, "author-1", 7, string(types.TenantRoleAdmin), string(types.TenantMemberStatusActive)))
 		mock.ExpectQuery(`SELECT \* FROM "production_document_types" WHERE .*FOR UPDATE`).
 			WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "code", "schema_version", "status"}).
 				AddRow("base-retry", 7, "sop", 4, string(types.ProductionDocumentTypeActive)))
@@ -446,7 +522,7 @@ func TestDocumentTypeRepositoryDeriveRetriesUniqueConflictInsideBoundedOperation
 	expectAttempt(6, nil)
 
 	derived, err := NewProductionDocumentTypeRepository(db).DeriveDraft(
-		context.Background(), 7, "base-retry", validDerivedProductionDocumentType("derived-retry", 7),
+		context.Background(), 7, "base-retry", "author-1", validDerivedProductionDocumentType("derived-retry", 7),
 	)
 
 	require.NoError(t, err)

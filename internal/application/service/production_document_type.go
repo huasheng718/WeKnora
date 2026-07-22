@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -89,7 +90,9 @@ func canonicalProductionDocumentTypeConfig(
 	}
 	workflow, err := canonicalProductionWorkflowPlan(config.Canonical.WorkflowPlan, config.Canonical.SkillBindings)
 	if err != nil {
-		return types.ProductionDocumentTypeConfigInput{}, err
+		return types.ProductionDocumentTypeConfigInput{}, fmt.Errorf(
+			"%w: workflow_plan: %v", types.ErrProductionDocumentTypeConfigInvalid, err,
+		)
 	}
 	config.Canonical.WorkflowPlan = workflow
 	return config.Canonical, nil
@@ -124,7 +127,7 @@ func (s *productionDocumentTypeService) DeriveDraft(
 		PublicationPolicy: config.PublicationPolicy, Status: types.ProductionDocumentTypeDraft,
 		Origin: types.ProductionDocumentTypeOriginCustom, CreatedBy: userID,
 	}
-	derived, err := s.repo.DeriveDraft(ctx, tenantID, baseID, draft)
+	derived, err := s.repo.DeriveDraft(ctx, tenantID, baseID, userID, draft)
 	if err != nil {
 		return nil, err
 	}

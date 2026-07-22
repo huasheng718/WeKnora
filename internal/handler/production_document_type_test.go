@@ -216,4 +216,35 @@ func TestDocumentTypeHandlerDeriveRejectsMalformedBaseIDBeforeServiceAccess(t *t
 	require.Zero(t, service.deriveCalls)
 }
 
+func TestDocumentTypeHandlerMapsInvalidConfigToBadRequest(t *testing.T) {
+	tests := []struct {
+		name, pattern, path, body string
+		handler                   func(*ProductionDocumentTypeHandler) gin.HandlerFunc
+	}{
+		{
+			name: "create", pattern: "/production/document-types", path: "/production/document-types",
+			body:    productionDocumentTypeRequestBody(t, "baseline", "Baseline", 1),
+			handler: func(h *ProductionDocumentTypeHandler) gin.HandlerFunc { return h.Create },
+		},
+		{
+			name: "derive", pattern: "/production/document-types/:id/drafts",
+			path:    "/production/document-types/" + productionDocumentTypeID + "/drafts",
+			body:    productionDocumentTypeDeriveRequestBody(),
+			handler: func(h *ProductionDocumentTypeHandler) gin.HandlerFunc { return h.DeriveDraft },
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service := &productionDocumentTypeServiceStub{err: types.ErrProductionDocumentTypeConfigInvalid}
+			h := NewProductionDocumentTypeHandler(service)
+
+			response := performProductionHandlerRequest(
+				http.MethodPost, test.pattern, test.path, test.body, test.handler(h),
+			)
+
+			require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+		})
+	}
+}
+
 var _ interfaces.ProductionDocumentTypeService = (*productionDocumentTypeServiceStub)(nil)

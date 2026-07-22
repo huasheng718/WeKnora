@@ -4,12 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 
+	apprepository "github.com/Tencent/WeKnora/internal/application/repository"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 type productionDocumentTypeRepoStub struct {
@@ -50,7 +54,7 @@ func (r *productionDocumentTypeRepoStub) Create(_ context.Context, documentType 
 func (r *productionDocumentTypeRepoStub) DeriveDraft(
 	_ context.Context,
 	tenantID uint64,
-	baseID string,
+	baseID, _ string,
 	draft *types.ProductionDocumentType,
 ) (*types.ProductionDocumentType, error) {
 	if r.deriveErr != nil {
@@ -415,6 +419,40 @@ func TestDocumentTypeServiceDeriveRejectsStrictConfigAndAuditsOnlySuccessfulWrit
 	require.Empty(t, audit.entries)
 }
 
+func TestDocumentTypeServiceClassifiesUnboundWorkflowAsInvalidConfigWithoutMutation(t *testing.T) {
+	unboundWorkflow := types.JSON(`{"version":1,"steps":[{"provider_type":"skill","provider_id":"unbound-skill","tool_name":"load_instructions","request":{"source_item_id":"71000000-0000-4000-8000-000000000005"}}]}`)
+
+	t.Run("create", func(t *testing.T) {
+		svc, repo, _, audit := newProductionDocumentTypeServiceFixture(types.TenantRoleAdmin)
+		input := productionDocumentTypeInput()
+		input.WorkflowPlan = unboundWorkflow
+
+		created, err := svc.CreateDocumentType(ctxForUser(7, "actor"), 7, input)
+
+		require.Nil(t, created)
+		require.ErrorIs(t, err, types.ErrProductionDocumentTypeConfigInvalid)
+		require.Nil(t, repo.created)
+		require.Empty(t, audit.entries)
+	})
+
+	t.Run("derive", func(t *testing.T) {
+		svc, repo, _, audit := newProductionDocumentTypeServiceFixture(types.TenantRoleAdmin)
+		repo.add(&types.ProductionDocumentType{
+			ID: "base-1", TenantID: 7, Code: "sop", SchemaVersion: 1,
+			Status: types.ProductionDocumentTypeActive,
+		})
+		input := productionDocumentTypeDeriveInput()
+		input.WorkflowPlan = unboundWorkflow
+
+		derived, err := svc.DeriveDraft(ctxForUser(7, "actor"), 7, "base-1", input)
+
+		require.Nil(t, derived)
+		require.ErrorIs(t, err, types.ErrProductionDocumentTypeConfigInvalid)
+		require.Nil(t, repo.derived)
+		require.Empty(t, audit.entries)
+	})
+}
+
 func TestDocumentTypeServiceCreateCanonicalizesConfigsAndForcesCustomLineage(t *testing.T) {
 	svc, repo, _, _ := newProductionDocumentTypeServiceFixture(types.TenantRoleAdmin)
 
@@ -425,4 +463,90 @@ func TestDocumentTypeServiceCreateCanonicalizesConfigsAndForcesCustomLineage(t *
 	require.Equal(t, types.ProductionDocumentTypeOriginCustom, created.Origin)
 	require.Nil(t, created.TemplateKey)
 	require.Equal(t, types.JSON(`{"allowed_block_types":["paragraph"],"required_sections":["Scope"],"version":1}`), created.BlockSchema)
+}
+
+type revokingProductionDocumentTypeRepo struct {
+	interfaces.ProductionDocumentTypeRepository
+	db     *gorm.DB
+	revoke func(*gorm.DB) error
+}
+
+func (r *revokingProductionDocumentTypeRepo) DeriveDraft(
+	ctx context.Context,
+	tenantID uint64,
+	baseID, actorID string,
+	draft *types.ProductionDocumentType,
+) (*types.ProductionDocumentType, error) {
+	if err := r.revoke(r.db); err != nil {
+		return nil, err
+	}
+	return r.ProductionDocumentTypeRepository.DeriveDraft(ctx, tenantID, baseID, actorID, draft)
+}
+
+func TestDocumentTypeServiceDeriveRejectsMembershipRevokedAfterPreflightWithoutAudit(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		revoke func(*gorm.DB) error
+	}{
+		{
+			name: "demoted",
+			revoke: func(db *gorm.DB) error {
+				return db.Model(&types.TenantMember{}).
+					Where("tenant_id = ? AND user_id = ?", 7, "actor").
+					Update("role", types.TenantRoleContributor).Error
+			},
+		},
+		{
+			name: "removed",
+			revoke: func(db *gorm.DB) error {
+				return db.Where("tenant_id = ? AND user_id = ?", 7, "actor").
+					Delete(&types.TenantMember{}).Error
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared&_busy_timeout=5000", t.Name())
+			db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+			require.NoError(t, err)
+			sqlDB, err := db.DB()
+			require.NoError(t, err)
+			sqlDB.SetMaxOpenConns(1)
+			t.Cleanup(func() { _ = sqlDB.Close() })
+			require.NoError(t, db.AutoMigrate(&types.ProductionDocumentType{}, &types.TenantMember{}))
+			require.NoError(t, db.Create(&types.TenantMember{
+				UserID: "actor", TenantID: 7, Role: types.TenantRoleAdmin, Status: types.TenantMemberStatusActive,
+			}).Error)
+			input := productionDocumentTypeDeriveInput()
+			base := &types.ProductionDocumentType{
+				ID: "base-reauth", TenantID: 7, Code: "sop", Name: "SOP", SchemaVersion: 1,
+				BlockSchema: input.BlockSchema, SourceRequirements: input.SourceRequirements,
+				SkillBindings: input.SkillBindings, WorkflowPlan: input.WorkflowPlan,
+				QualityRules: input.QualityRules, ReviewPolicy: input.ReviewPolicy,
+				PublicationPolicy: input.PublicationPolicy, Status: types.ProductionDocumentTypeActive,
+				Origin: types.ProductionDocumentTypeOriginCustom, CreatedBy: "actor",
+			}
+			require.NoError(t, db.Create(base).Error)
+
+			realRepo := apprepository.NewProductionDocumentTypeRepository(db)
+			repo := &revokingProductionDocumentTypeRepo{
+				ProductionDocumentTypeRepository: realRepo, db: db, revoke: test.revoke,
+			}
+			members := newProductionMemberServiceStub()
+			members.add(7, "actor", types.TenantRoleAdmin)
+			audit := &productionAuditServiceStub{}
+			svc := NewProductionDocumentTypeService(repo, members, audit)
+
+			derived, err := svc.DeriveDraft(
+				ctxForUser(7, "actor"), 7, base.ID, productionDocumentTypeDeriveInput(),
+			)
+
+			require.Nil(t, derived)
+			require.ErrorIs(t, err, types.ErrProductionForbidden)
+			require.Empty(t, audit.entries)
+			var count int64
+			require.NoError(t, db.Model(&types.ProductionDocumentType{}).
+				Where("tenant_id = ? AND id <> ?", 7, base.ID).Count(&count).Error)
+			require.Zero(t, count)
+		})
+	}
 }
