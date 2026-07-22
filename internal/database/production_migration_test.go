@@ -24,6 +24,180 @@ func mustReadMigration(t *testing.T, path string) string {
 	return string(contents)
 }
 
+func openSQLiteThroughProductionMigrationFive(t *testing.T) *sql.DB {
+	t.Helper()
+
+	db, err := sql.Open("sqlite3", t.TempDir()+"/runtime-compat.db")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	for version, name := range []string{
+		"init",
+		"knowledge_production_foundation",
+		"knowledge_production_documents",
+		"knowledge_production_runs",
+		"knowledge_production_reviews",
+		"knowledge_production_publication",
+	} {
+		migration := fmt.Sprintf("../../migrations/sqlite/%06d_%s.up.sql", version, name)
+		_, err = db.Exec(mustReadMigration(t, migration))
+		require.NoError(t, err, migration)
+	}
+	return db
+}
+
+func openSQLiteThroughProductionMigrationEight(t *testing.T) *sql.DB {
+	t.Helper()
+
+	db := openSQLiteThroughProductionMigrationFive(t)
+	for _, migration := range []string{
+		"../../migrations/sqlite/000006_tenant_api_principal_config.up.sql",
+		"../../migrations/sqlite/000007_system_admin_and_settings.up.sql",
+		"../../migrations/sqlite/000008_knowledge_base_processing_config.up.sql",
+	} {
+		_, err := db.Exec(mustReadMigration(t, migration))
+		require.NoError(t, err, migration)
+	}
+	return db
+}
+
+func TestSQLiteTenantAPIPrincipalConfigMigrationUpAndDown(t *testing.T) {
+	db := openSQLiteThroughProductionMigrationFive(t)
+	require.Empty(t, sqliteColumnTypeIfPresent(t, db, "tenants", "api_principal_config"))
+
+	_, err := db.Exec(mustReadMigration(t, "../../migrations/sqlite/000006_tenant_api_principal_config.up.sql"))
+	require.NoError(t, err)
+	require.Equal(t, "text", sqliteColumnType(t, db, "tenants", "api_principal_config"))
+	_, err = db.Exec(`INSERT INTO tenants (name, retriever_engines, business, api_principal_config) VALUES ('QA', '[]', '', '{}')`)
+	require.NoError(t, err)
+
+	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000006_tenant_api_principal_config.down.sql"))
+	require.NoError(t, err)
+	require.Empty(t, sqliteColumnTypeIfPresent(t, db, "tenants", "api_principal_config"))
+}
+
+func TestSQLiteSystemAdminAndSettingsMigrationUpAndDown(t *testing.T) {
+	db := openSQLiteThroughProductionMigrationFive(t)
+	require.Empty(t, sqliteColumnTypeIfPresent(t, db, "users", "is_system_admin"))
+	require.Empty(t, sqliteMasterSQL(t, db, "table", "system_settings"))
+
+	_, err := db.Exec(mustReadMigration(t, "../../migrations/sqlite/000007_system_admin_and_settings.up.sql"))
+	require.NoError(t, err)
+	require.Equal(t, "boolean", sqliteColumnType(t, db, "users", "is_system_admin"))
+	require.NotEmpty(t, sqliteMasterSQL(t, db, "index", "idx_users_is_system_admin"))
+	require.NotEmpty(t, sqliteMasterSQL(t, db, "table", "system_settings"))
+	require.NotEmpty(t, sqliteMasterSQL(t, db, "index", "idx_system_settings_category"))
+	_, err = db.Exec(`INSERT INTO users (id, username, email, password_hash, is_system_admin) VALUES ('user-1', 'qa', 'qa@example.test', 'hash', 0)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO system_settings (key, value, value_type, category) VALUES ('auth.registration_mode', '"self_serve"', 'string', 'auth')`)
+	require.NoError(t, err)
+
+	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000007_system_admin_and_settings.down.sql"))
+	require.NoError(t, err)
+	require.Empty(t, sqliteMasterSQL(t, db, "table", "system_settings"))
+	require.Empty(t, sqliteColumnTypeIfPresent(t, db, "users", "is_system_admin"))
+}
+
+func TestSQLiteKnowledgeBaseProcessingConfigMigrationAndSchemaParity(t *testing.T) {
+	db := openSQLiteThroughProductionMigrationFive(t)
+	for _, migration := range []string{
+		"../../migrations/sqlite/000006_tenant_api_principal_config.up.sql",
+		"../../migrations/sqlite/000007_system_admin_and_settings.up.sql",
+	} {
+		_, err := db.Exec(mustReadMigration(t, migration))
+		require.NoError(t, err, migration)
+	}
+	require.Empty(t, sqliteColumnTypeIfPresent(t, db, "knowledge_bases", "wiki_config"))
+	require.Empty(t, sqliteColumnTypeIfPresent(t, db, "knowledge_bases", "indexing_strategy"))
+
+	_, err := db.Exec(mustReadMigration(t, "../../migrations/sqlite/000008_knowledge_base_processing_config.up.sql"))
+	require.NoError(t, err)
+	for _, column := range []string{
+		"id", "name", "type", "is_temporary", "description", "tenant_id", "creator_id",
+		"chunking_config", "image_processing_config", "embedding_model_id", "summary_model_id",
+		"vlm_config", "asr_config", "storage_provider_config", "storage_backend_id", "cos_config",
+		"vector_store_id", "extract_config", "faq_config", "question_generation_config", "wiki_config",
+		"indexing_strategy", "created_at", "updated_at", "deleted_at",
+	} {
+		require.NotEmpty(t, sqliteColumnTypeIfPresent(t, db, "knowledge_bases", column), column)
+	}
+	_, err = db.Exec(`INSERT INTO knowledge_bases (id, name, tenant_id, embedding_model_id, summary_model_id) VALUES ('kb-1', 'QA', 1, '', '')`)
+	require.NoError(t, err)
+	var strategy string
+	require.NoError(t, db.QueryRow(`SELECT indexing_strategy FROM knowledge_bases WHERE id = 'kb-1'`).Scan(&strategy))
+	require.JSONEq(t, `{"vector_enabled":true,"keyword_enabled":true,"wiki_enabled":false,"graph_enabled":false}`, strategy)
+
+	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000008_knowledge_base_processing_config.down.sql"))
+	require.NoError(t, err)
+	require.Empty(t, sqliteColumnTypeIfPresent(t, db, "knowledge_bases", "wiki_config"))
+	require.Empty(t, sqliteColumnTypeIfPresent(t, db, "knowledge_bases", "indexing_strategy"))
+}
+
+func TestSQLiteTaskQueueAndDeadLettersMigrationUpAndDown(t *testing.T) {
+	db := openSQLiteThroughProductionMigrationEight(t)
+	require.Empty(t, sqliteMasterSQL(t, db, "table", "task_pending_ops"))
+	require.Empty(t, sqliteMasterSQL(t, db, "table", "task_dead_letters"))
+
+	_, err := db.Exec(mustReadMigration(t, "../../migrations/sqlite/000009_task_queue_and_dead_letters.up.sql"))
+	require.NoError(t, err)
+	for _, column := range []string{
+		"id", "tenant_id", "task_type", "scope", "scope_id", "op", "dedup_key",
+		"payload", "fail_count", "enqueued_at", "claimed_at",
+	} {
+		require.NotEmpty(t, sqliteColumnTypeIfPresent(t, db, "task_pending_ops", column), column)
+	}
+	for _, column := range []string{
+		"id", "tenant_id", "task_type", "scope", "scope_id", "related_id",
+		"payload", "last_error", "fail_count", "failed_at",
+	} {
+		require.NotEmpty(t, sqliteColumnTypeIfPresent(t, db, "task_dead_letters", column), column)
+	}
+	for _, index := range []string{
+		"idx_task_pending_ops_scope",
+		"idx_task_pending_ops_tenant",
+		"idx_task_dead_letters_scope",
+		"idx_task_dead_letters_tenant",
+		"idx_task_dead_letters_task_type",
+	} {
+		require.NotEmpty(t, sqliteMasterSQL(t, db, "index", index), index)
+	}
+
+	_, err = db.Exec(`INSERT INTO task_pending_ops
+		(tenant_id, task_type, scope, scope_id, op, dedup_key, payload)
+		VALUES (1, 'wiki:ingest', 'knowledge_base', 'kb-1', 'ingest', 'doc-1', '{}')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO task_dead_letters
+		(tenant_id, task_type, scope, scope_id, related_id, payload, fail_count)
+		VALUES (1, 'wiki:ingest', 'knowledge_base', 'kb-1', 'doc-1', '{}', 3)`)
+	require.NoError(t, err)
+
+	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000009_task_queue_and_dead_letters.down.sql"))
+	require.NoError(t, err)
+	require.Empty(t, sqliteMasterSQL(t, db, "table", "task_pending_ops"))
+	require.Empty(t, sqliteMasterSQL(t, db, "table", "task_dead_letters"))
+}
+
+func TestSQLiteKnowledgePendingSubtasksMigrationUpAndDown(t *testing.T) {
+	db := openSQLiteThroughProductionMigrationEight(t)
+	_, err := db.Exec(mustReadMigration(t, "../../migrations/sqlite/000009_task_queue_and_dead_letters.up.sql"))
+	require.NoError(t, err)
+	require.Empty(t, sqliteColumnTypeIfPresent(t, db, "knowledges", "pending_subtasks_count"))
+
+	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000010_knowledge_pending_subtasks.up.sql"))
+	require.NoError(t, err)
+	require.Equal(t, "integer", sqliteColumnType(t, db, "knowledges", "pending_subtasks_count"))
+	_, err = db.Exec(`INSERT INTO knowledges
+		(id, tenant_id, knowledge_base_id, type, title, source)
+		VALUES ('knowledge-1', 1, 'kb-1', 'file', 'QA', '/tmp/qa')`)
+	require.NoError(t, err)
+	var pendingSubtasks int
+	require.NoError(t, db.QueryRow(`SELECT pending_subtasks_count FROM knowledges WHERE id = 'knowledge-1'`).Scan(&pendingSubtasks))
+	require.Zero(t, pendingSubtasks)
+
+	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000010_knowledge_pending_subtasks.down.sql"))
+	require.NoError(t, err)
+	require.Empty(t, sqliteColumnTypeIfPresent(t, db, "knowledges", "pending_subtasks_count"))
+}
+
 func TestProductionFoundationMigrationsDeclareRequiredTables(t *testing.T) {
 	postgres := mustReadMigration(t, "../../migrations/versioned/000070_knowledge_production_foundation.up.sql")
 	sqlite := mustReadMigration(t, "../../migrations/sqlite/000001_knowledge_production_foundation.up.sql")
