@@ -79,6 +79,20 @@ export default {
       createSource: "创建来源集失败。", createDocument: "创建文档失败。", loadProjectsTitle: "无法加载项目",
       loadProjects: "加载生产项目失败。", loadProjectSummary: "加载项目摘要失败。", loadWorkbenchTitle: "无法加载项目工作台", loadWorkbench: "加载项目工作台失败。"
     },
+    documentWorkbench: {
+      untitled: "未命名文档", outline: "文档大纲", evidence: "证据", editor: "块编辑器", annotations: "标注", versions: "版本", aiRuns: "AI 运行",
+      ai: "AI", notes: "标注", history: "版本", openContext: "打开大纲与证据", openTools: "打开运行、标注与版本", blockToolbar: "块工具栏",
+      noBlocks: "暂无内容块", emptyBlock: "空内容块", structuredBlock: "结构化内容", noEvidence: "暂无已接受证据", noAnnotations: "暂无标注", noRuns: "暂无 AI 运行",
+      addBlock: "新增内容块", moveUp: "上移", moveDown: "下移", annotate: "添加标注", deleteBlock: "删除内容块", linkedEvidence: "已关联 {count} 条证据",
+      annotationPlaceholder: "记录问题或修改建议", addAnnotation: "添加标注", resolve: "解决", selectModel: "选择模型", startRun: "开始运行", approve: "批准", reject: "拒绝",
+      current: "当前", noChangeSummary: "无变更说明", changeSummary: "版本变更说明", saveVersion: "保存新版本", loading: "正在加载文档工作台", notFound: "文档不存在或无权访问。",
+      conflict: "文档已产生更新，请载入最新版本后继续。", reloadLatest: "载入最新版本", archivedDocument: "该文档已归档，当前为只读模式。", historicalReadonly: "历史版本为只读模式。",
+      loadFailed: "加载文档工作台失败。", noVersion: "文档没有可用版本。", saveFailed: "保存版本失败。", saved: "新版本已保存。", runFailed: "启动 AI 运行失败。",
+      decisionFailed: "处理工具审批失败。", annotationFailed: "处理标注失败。", invalidBlock: "内容块无效。", invalidStructuredBlock: "请输入有效的 JSON 结构。",
+      blockTypes: { heading: "标题", paragraph: "正文", callout: "提示", code: "代码", list: "列表", table: "表格", image: "图片" },
+      severity: { info: "提示", warning: "警告", blocking: "阻断" },
+      runTypes: { collect: "采集", write: "撰写", rewrite: "改写", validate: "校验" },
+    },
     messages: { projectCreated: "项目已创建。", sourceCreated: "来源集已创建。", documentCreated: "文档已创建。" },
   },
   newUserGuide: {

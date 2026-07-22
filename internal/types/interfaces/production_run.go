@@ -57,6 +57,7 @@ type ProductionToolCallPatch struct {
 type ProductionRunRepository interface {
 	Create(ctx context.Context, run *types.ProductionRun) error
 	Get(ctx context.Context, tenantID uint64, runID string) (*types.ProductionRun, error)
+	ListDocumentRuns(ctx context.Context, tenantID uint64, documentID string, limit int) ([]*types.ProductionRun, error)
 	Claim(ctx context.Context, tenantID uint64, runID string, expected ProductionRunCAS, leaseTTL time.Duration) (*types.ProductionRun, bool, error)
 	Transition(ctx context.Context, tenantID uint64, runID string, expected ProductionRunCAS, to types.ProductionRunStatus, patch ProductionRunPatch) (*types.ProductionRun, bool, error)
 	MarkWakeupEnqueued(ctx context.Context, tenantID uint64, runID string, attempt, currentStep, wakeupVersion int) (bool, error)
@@ -112,5 +113,7 @@ type ProductionRunService interface {
 	StartDocumentRun(ctx context.Context, documentID string, input StartProductionDocumentRunInput) (*types.ProductionRun, error)
 	StartSourceSetCollection(ctx context.Context, sourceSetID string, input StartProductionSourceSetCollectionInput) (*types.ProductionRun, error)
 	GetRun(ctx context.Context, runID string) (*types.ProductionRun, error)
+	ListDocumentRuns(ctx context.Context, documentID string) ([]*types.ProductionRun, error)
+	ListToolCalls(ctx context.Context, runID string) ([]*types.ProductionToolCall, error)
 	DecideToolCall(ctx context.Context, callID string, decision ProductionToolDecision) (*types.ProductionToolCall, error)
 }

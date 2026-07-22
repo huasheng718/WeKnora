@@ -148,6 +148,48 @@ func (s *productionRunService) GetRun(ctx context.Context, runID string) (*types
 	return run, nil
 }
 
+func (s *productionRunService) ListDocumentRuns(ctx context.Context, documentID string) ([]*types.ProductionRun, error) {
+	tenantID, _, err := productionCaller(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !canonicalProductionUUID(documentID) {
+		return nil, errors.New("document id must be a canonical UUID")
+	}
+	document, err := s.documents.GetDocument(ctx, tenantID, documentID)
+	if err != nil {
+		return nil, err
+	}
+	if document == nil || document.ID != documentID || document.TenantID != tenantID {
+		return nil, errProductionToolScope
+	}
+	if err := requireProductionDocumentReader(ctx, s.projects, document.ProjectID); err != nil {
+		return nil, err
+	}
+	return s.runs.ListDocumentRuns(ctx, tenantID, documentID, 50)
+}
+
+func (s *productionRunService) ListToolCalls(ctx context.Context, runID string) ([]*types.ProductionToolCall, error) {
+	tenantID, _, err := productionCaller(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !canonicalProductionUUID(runID) {
+		return nil, errors.New("run id must be a canonical UUID")
+	}
+	run, err := s.runs.Get(ctx, tenantID, runID)
+	if err != nil {
+		return nil, err
+	}
+	if run == nil || run.ID != runID || run.TenantID != tenantID {
+		return nil, errProductionToolScope
+	}
+	if err := requireProductionDocumentReader(ctx, s.projects, run.ProjectID); err != nil {
+		return nil, err
+	}
+	return s.runs.ListToolCalls(ctx, tenantID, runID)
+}
+
 func (s *productionRunService) DecideToolCall(
 	ctx context.Context,
 	callID string,

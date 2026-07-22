@@ -57,6 +57,7 @@ type ProductionSourceRepository interface {
 type ProductionSourceService interface {
 	CreateSet(ctx context.Context, input CreateProductionSourceSetInput) (*types.ProductionSourceSet, error)
 	ListSets(ctx context.Context, projectID string) ([]*types.ProductionSourceSet, error)
+	ListEvidence(ctx context.Context, sourceSetID string) ([]*types.ProductionEvidenceSnapshot, error)
 	AddItem(ctx context.Context, sourceSetID string, input CreateProductionSourceItemInput) (*types.ProductionSourceItem, error)
 	DecideItem(ctx context.Context, itemID string, decision types.ProductionSourceItemStatus) error
 	AttachEvidence(ctx context.Context, itemID string, evidence CreateEvidenceSnapshotInput) (*types.ProductionEvidenceSnapshot, error)

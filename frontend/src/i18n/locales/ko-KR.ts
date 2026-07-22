@@ -79,6 +79,20 @@ export default {
       createSource: "소스 세트를 만들지 못했습니다.", createDocument: "문서를 만들지 못했습니다.", loadProjectsTitle: "프로젝트를 불러올 수 없음",
       loadProjects: "프로덕션 프로젝트를 불러오지 못했습니다.", loadProjectSummary: "프로젝트 요약을 불러오지 못했습니다.", loadWorkbenchTitle: "프로젝트 워크벤치를 불러올 수 없음", loadWorkbench: "프로젝트 워크벤치를 불러오지 못했습니다."
     },
+    documentWorkbench: {
+      untitled: "제목 없는 문서", outline: "개요", evidence: "증거", editor: "블록 편집기", annotations: "주석", versions: "버전", aiRuns: "AI 실행",
+      ai: "AI", notes: "주석", history: "버전", openContext: "개요 및 증거 열기", openTools: "실행, 주석 및 버전 열기", blockToolbar: "블록 도구 모음",
+      noBlocks: "콘텐츠 블록 없음", emptyBlock: "빈 블록", structuredBlock: "구조화 콘텐츠", noEvidence: "승인된 증거 없음", noAnnotations: "주석 없음", noRuns: "AI 실행 없음",
+      addBlock: "블록 추가", moveUp: "위로", moveDown: "아래로", annotate: "주석 추가", deleteBlock: "블록 삭제", linkedEvidence: "증거 {count}개 연결됨",
+      annotationPlaceholder: "문제 또는 변경 제안 기록", addAnnotation: "주석 추가", resolve: "해결", selectModel: "모델 선택", startRun: "실행 시작", approve: "승인", reject: "거부",
+      current: "현재", noChangeSummary: "변경 요약 없음", changeSummary: "버전 변경 요약", saveVersion: "새 버전 저장", loading: "문서 워크벤치 로드 중", notFound: "문서가 없거나 접근 권한이 없습니다.",
+      conflict: "새 문서 버전이 있습니다. 계속하기 전에 다시 불러오세요.", reloadLatest: "최신 버전 불러오기", archivedDocument: "보관된 문서이며 읽기 전용입니다.", historicalReadonly: "이전 버전은 읽기 전용입니다.",
+      loadFailed: "문서 워크벤치를 불러오지 못했습니다.", noVersion: "사용 가능한 문서 버전이 없습니다.", saveFailed: "버전을 저장하지 못했습니다.", saved: "새 버전이 저장되었습니다.", runFailed: "AI 실행을 시작하지 못했습니다.",
+      decisionFailed: "도구 승인을 처리하지 못했습니다.", annotationFailed: "주석을 처리하지 못했습니다.", invalidBlock: "콘텐츠 블록이 올바르지 않습니다.", invalidStructuredBlock: "유효한 JSON 구조를 입력하세요.",
+      blockTypes: { heading: "제목", paragraph: "본문", callout: "강조", code: "코드", list: "목록", table: "표", image: "이미지" },
+      severity: { info: "정보", warning: "경고", blocking: "차단" },
+      runTypes: { collect: "수집", write: "작성", rewrite: "재작성", validate: "검증" },
+    },
     messages: { projectCreated: "프로젝트가 생성되었습니다.", sourceCreated: "소스 세트가 생성되었습니다.", documentCreated: "문서가 생성되었습니다." },
   },
   newUserGuide: {

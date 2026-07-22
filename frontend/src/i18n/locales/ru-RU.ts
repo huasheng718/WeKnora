@@ -79,6 +79,20 @@ export default {
       createSource: 'Не удалось создать набор источников.', createDocument: 'Не удалось создать документ.', loadProjectsTitle: 'Не удалось загрузить проекты',
       loadProjects: 'Не удалось загрузить производственные проекты.', loadProjectSummary: 'Не удалось загрузить сводку проекта.', loadWorkbenchTitle: 'Не удалось загрузить рабочую область', loadWorkbench: 'Не удалось загрузить рабочую область проекта.'
     },
+    documentWorkbench: {
+      untitled: 'Документ без названия', outline: 'Структура', evidence: 'Доказательства', editor: 'Редактор блоков', annotations: 'Аннотации', versions: 'Версии', aiRuns: 'Запуски ИИ',
+      ai: 'ИИ', notes: 'Аннотации', history: 'Версии', openContext: 'Открыть структуру и доказательства', openTools: 'Открыть запуски, аннотации и версии', blockToolbar: 'Панель блока',
+      noBlocks: 'Нет блоков содержимого', emptyBlock: 'Пустой блок', structuredBlock: 'Структурированные данные', noEvidence: 'Нет принятых доказательств', noAnnotations: 'Нет аннотаций', noRuns: 'Нет запусков ИИ',
+      addBlock: 'Добавить блок', moveUp: 'Переместить вверх', moveDown: 'Переместить вниз', annotate: 'Добавить аннотацию', deleteBlock: 'Удалить блок', linkedEvidence: 'Связано доказательств: {count}',
+      annotationPlaceholder: 'Опишите проблему или изменение', addAnnotation: 'Добавить', resolve: 'Закрыть', selectModel: 'Выберите модель', startRun: 'Запустить', approve: 'Одобрить', reject: 'Отклонить',
+      current: 'Текущая', noChangeSummary: 'Нет описания изменений', changeSummary: 'Описание изменений версии', saveVersion: 'Сохранить новую версию', loading: 'Загрузка документа', notFound: 'Документ не существует или у вас нет доступа.',
+      conflict: 'Доступна новая версия документа. Перезагрузите её перед продолжением.', reloadLatest: 'Загрузить последнюю', archivedDocument: 'Документ архивирован и доступен только для чтения.', historicalReadonly: 'Исторические версии доступны только для чтения.',
+      loadFailed: 'Не удалось загрузить рабочую область документа.', noVersion: 'У документа нет доступной версии.', saveFailed: 'Не удалось сохранить версию.', saved: 'Новая версия сохранена.', runFailed: 'Не удалось запустить ИИ.',
+      decisionFailed: 'Не удалось обработать решение по инструменту.', annotationFailed: 'Не удалось обработать аннотацию.', invalidBlock: 'Недопустимый блок содержимого.', invalidStructuredBlock: 'Введите корректную структуру JSON.',
+      blockTypes: { heading: 'Заголовок', paragraph: 'Абзац', callout: 'Выноска', code: 'Код', list: 'Список', table: 'Таблица', image: 'Изображение' },
+      severity: { info: 'Информация', warning: 'Предупреждение', blocking: 'Блокирует' },
+      runTypes: { collect: 'Сбор', write: 'Создание', rewrite: 'Переработка', validate: 'Проверка' },
+    },
     messages: { projectCreated: 'Проект создан.', sourceCreated: 'Набор источников создан.', documentCreated: 'Документ создан.' },
   },
   newUserGuide: {

@@ -92,6 +92,34 @@ func (h *ProductionRunHandler) Get(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": run})
 }
 
+func (h *ProductionRunHandler) ListDocumentRuns(c *gin.Context) {
+	documentID := strings.TrimSpace(c.Param("id"))
+	if !isProductionUUID(documentID) {
+		c.Error(apperrors.NewValidationError("document id must be a canonical UUID"))
+		return
+	}
+	runs, err := h.service.ListDocumentRuns(c.Request.Context(), documentID)
+	if err != nil {
+		handleProductionServiceError(c, err, "failed to list production document runs")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": runs})
+}
+
+func (h *ProductionRunHandler) ListToolCalls(c *gin.Context) {
+	runID := strings.TrimSpace(c.Param("id"))
+	if !isProductionUUID(runID) {
+		c.Error(apperrors.NewValidationError("run id must be a canonical UUID"))
+		return
+	}
+	calls, err := h.service.ListToolCalls(c.Request.Context(), runID)
+	if err != nil {
+		handleProductionServiceError(c, err, "failed to list production tool calls")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": calls})
+}
+
 func (h *ProductionRunHandler) DecideToolCall(c *gin.Context) {
 	callID := strings.TrimSpace(c.Param("id"))
 	var request productionToolDecisionRequest

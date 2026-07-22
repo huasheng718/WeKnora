@@ -207,6 +207,24 @@ func (r *productionRunRepository) Create(ctx context.Context, run *types.Product
 	)
 }
 
+func (r *productionRunRepository) ListDocumentRuns(
+	ctx context.Context,
+	tenantID uint64,
+	documentID string,
+	limit int,
+) ([]*types.ProductionRun, error) {
+	if limit < 1 || limit > 50 {
+		limit = 50
+	}
+	runs := make([]*types.ProductionRun, 0)
+	err := database.DBFromContext(ctx, r.db).WithContext(ctx).
+		Where("tenant_id = ? AND document_id = ?", tenantID, documentID).
+		Order("created_at DESC, id DESC").
+		Limit(limit).
+		Find(&runs).Error
+	return runs, err
+}
+
 func (r *productionRunRepository) Get(
 	ctx context.Context,
 	tenantID uint64,

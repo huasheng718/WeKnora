@@ -44,6 +44,20 @@ func (h *ProductionSourceHandler) ListSets(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": sets})
 }
 
+func (h *ProductionSourceHandler) ListEvidence(c *gin.Context) {
+	sourceSetID := strings.TrimSpace(c.Param("id"))
+	if !isProductionUUID(sourceSetID) {
+		c.Error(apperrors.NewValidationError("source set id must be a canonical UUID"))
+		return
+	}
+	evidence, err := h.service.ListEvidence(c.Request.Context(), sourceSetID)
+	if err != nil {
+		handleProductionServiceError(c, err, "failed to list production evidence")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": evidence})
+}
+
 func (h *ProductionSourceHandler) CreateSet(c *gin.Context) {
 	projectID := strings.TrimSpace(c.Param("id"))
 	if !isProductionUUID(projectID) {

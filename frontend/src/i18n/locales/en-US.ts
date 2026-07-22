@@ -79,6 +79,20 @@ export default {
       createSource: 'Failed to create the source set.', createDocument: 'Failed to create the document.', loadProjectsTitle: 'Projects could not be loaded',
       loadProjects: 'Failed to load production projects.', loadProjectSummary: 'Failed to load project summary data.', loadWorkbenchTitle: 'Project workbench could not be loaded', loadWorkbench: 'Failed to load the project workbench.'
     },
+    documentWorkbench: {
+      untitled: 'Untitled document', outline: 'Outline', evidence: 'Evidence', editor: 'Block editor', annotations: 'Annotations', versions: 'Versions', aiRuns: 'AI runs',
+      ai: 'AI', notes: 'Notes', history: 'History', openContext: 'Open outline and evidence', openTools: 'Open runs, annotations, and versions', blockToolbar: 'Block toolbar',
+      noBlocks: 'No content blocks', emptyBlock: 'Empty block', structuredBlock: 'Structured content', noEvidence: 'No accepted evidence', noAnnotations: 'No annotations', noRuns: 'No AI runs',
+      addBlock: 'Add block', moveUp: 'Move up', moveDown: 'Move down', annotate: 'Add annotation', deleteBlock: 'Delete block', linkedEvidence: '{count} evidence links',
+      annotationPlaceholder: 'Record an issue or suggested change', addAnnotation: 'Add annotation', resolve: 'Resolve', selectModel: 'Select model', startRun: 'Start run', approve: 'Approve', reject: 'Reject',
+      current: 'Current', noChangeSummary: 'No change summary', changeSummary: 'Version change summary', saveVersion: 'Save new version', loading: 'Loading document workbench', notFound: 'The document does not exist or you no longer have access.',
+      conflict: 'A newer document version is available. Reload it before continuing.', reloadLatest: 'Reload latest', archivedDocument: 'This document is archived and read-only.', historicalReadonly: 'Historical versions are read-only.',
+      loadFailed: 'Failed to load the document workbench.', noVersion: 'The document has no available version.', saveFailed: 'Failed to save the version.', saved: 'New version saved.', runFailed: 'Failed to start the AI run.',
+      decisionFailed: 'Failed to process the tool decision.', annotationFailed: 'Failed to process the annotation.', invalidBlock: 'The content block is invalid.', invalidStructuredBlock: 'Enter valid structured JSON.',
+      blockTypes: { heading: 'Heading', paragraph: 'Paragraph', callout: 'Callout', code: 'Code', list: 'List', table: 'Table', image: 'Image' },
+      severity: { info: 'Info', warning: 'Warning', blocking: 'Blocking' },
+      runTypes: { collect: 'Collect', write: 'Write', rewrite: 'Rewrite', validate: 'Validate' },
+    },
     messages: { projectCreated: 'Project created.', sourceCreated: 'Source set created.', documentCreated: 'Document created.' },
   },
   newUserGuide: {

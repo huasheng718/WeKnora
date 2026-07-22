@@ -98,6 +98,30 @@ func (s *productionSourceService) ListSets(
 	return s.repo.ListSets(ctx, tenantID, projectID)
 }
 
+func (s *productionSourceService) ListEvidence(
+	ctx context.Context,
+	sourceSetID string,
+) ([]*types.ProductionEvidenceSnapshot, error) {
+	tenantID, _, err := productionCaller(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireProductionSourceID(sourceSetID, "source set id"); err != nil {
+		return nil, err
+	}
+	sourceSet, err := s.repo.GetSet(ctx, tenantID, sourceSetID)
+	if err != nil {
+		return nil, err
+	}
+	if sourceSet == nil || sourceSet.ID != sourceSetID || sourceSet.TenantID != tenantID {
+		return nil, types.ErrProductionForbidden
+	}
+	if err := requireProductionDocumentReader(ctx, s.projects, sourceSet.ProjectID); err != nil {
+		return nil, err
+	}
+	return s.repo.ListAcceptedEvidence(ctx, tenantID, sourceSet.ProjectID, sourceSetID)
+}
+
 func (s *productionSourceService) CreateSet(
 	ctx context.Context,
 	input interfaces.CreateProductionSourceSetInput,

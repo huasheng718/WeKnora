@@ -84,6 +84,9 @@ type productionRouterSourceService struct {
 func (s *productionRouterSourceService) ListSets(context.Context, string) ([]*types.ProductionSourceSet, error) {
 	return []*types.ProductionSourceSet{}, s.err
 }
+func (s *productionRouterSourceService) ListEvidence(context.Context, string) ([]*types.ProductionEvidenceSnapshot, error) {
+	return []*types.ProductionEvidenceSnapshot{}, s.err
+}
 
 func (s *productionRouterSourceService) CreateSet(context.Context, interfaces.CreateProductionSourceSetInput) (*types.ProductionSourceSet, error) {
 	return nil, s.err
@@ -172,6 +175,12 @@ func (s *productionRouterRunService) StartSourceSetCollection(context.Context, s
 }
 func (s *productionRouterRunService) GetRun(context.Context, string) (*types.ProductionRun, error) {
 	return &types.ProductionRun{}, nil
+}
+func (s *productionRouterRunService) ListDocumentRuns(context.Context, string) ([]*types.ProductionRun, error) {
+	return []*types.ProductionRun{}, nil
+}
+func (s *productionRouterRunService) ListToolCalls(context.Context, string) ([]*types.ProductionToolCall, error) {
+	return []*types.ProductionToolCall{}, nil
 }
 func (s *productionRouterRunService) DecideToolCall(context.Context, string, interfaces.ProductionToolDecision) (*types.ProductionToolCall, error) {
 	return &types.ProductionToolCall{}, nil
@@ -457,6 +466,7 @@ func TestProductionFoundationRoutesAreRegistered(t *testing.T) {
 		{http.MethodPost, "/api/v1/production/projects/:id/source-sets"},
 		{http.MethodPut, "/api/v1/production/source-items/:id/decision"},
 		{http.MethodPost, "/api/v1/production/source-sets/:id/freeze"},
+		{http.MethodGet, "/api/v1/production/source-sets/:id/evidence"},
 		{http.MethodGet, "/api/v1/production/projects/:id/documents"},
 		{http.MethodPost, "/api/v1/production/projects/:id/documents"},
 		{http.MethodGet, "/api/v1/production/documents/:id"},
@@ -464,8 +474,10 @@ func TestProductionFoundationRoutesAreRegistered(t *testing.T) {
 		{http.MethodGet, "/api/v1/production/documents/:id/versions/:version_id"},
 		{http.MethodPost, "/api/v1/production/documents/:id/versions"},
 		{http.MethodPost, "/api/v1/production/documents/:id/runs"},
+		{http.MethodGet, "/api/v1/production/documents/:id/runs"},
 		{http.MethodPost, "/api/v1/production/source-sets/:id/collect"},
 		{http.MethodGet, "/api/v1/production/runs/:id"},
+		{http.MethodGet, "/api/v1/production/runs/:id/tool-calls"},
 		{http.MethodPost, "/api/v1/production/tool-calls/:id/decision"},
 	} {
 		assertProductionRoute(t, engine, route.method, route.path)

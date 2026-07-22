@@ -124,7 +124,7 @@ const router = createRouter({
         {
           path: "knowledge-production/documents/:documentId",
           name: "productionDocument",
-          component: () => import("../views/platform/RoutePlaceholder.vue"),
+          component: () => import("../views/production/ProductionDocumentWorkbench.vue"),
         },
         {
           path: "knowledge-bases/:kbId",

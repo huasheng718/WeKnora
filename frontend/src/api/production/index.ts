@@ -135,6 +135,19 @@ export interface ProductionSourceItem {
   created_at: ProductionTimestamp
 }
 
+export interface ProductionEvidenceSnapshot {
+  id: string
+  source_item_id: string
+  snapshot_type: 'text' | 'json' | 'file' | 'tool_result'
+  storage_path?: string
+  inline_content?: ProductionJSON
+  content_digest: string
+  redaction_metadata: ProductionJSON
+  captured_by_run_id?: string
+  captured_by_tool_call_id?: string
+  created_at: ProductionTimestamp
+}
+
 export interface CreateProductionSourceSetInput {
   document_type_id: string
   time_range_start?: ProductionTimestamp
@@ -506,6 +519,10 @@ export function freezeProductionSourceSet(id: string, command: ProductionCommand
   return post<ProductionResponse<void>>(`/api/v1/production/source-sets/${id}/freeze`, undefined, productionCommandConfig(command))
 }
 
+export function listProductionEvidence(sourceSetId: string) {
+  return get<ProductionResponse<ProductionEvidenceSnapshot[]>>(`/api/v1/production/source-sets/${sourceSetId}/evidence`)
+}
+
 export function createProductionDocument(projectId: string, command: ProductionCommand<CreateProductionDocumentInput>) {
   return post<ProductionResponse<ProductionDocument>>(`/api/v1/production/projects/${projectId}/documents`, command.payload, productionCommandConfig(command))
 }
@@ -545,6 +562,14 @@ export function startProductionCollection(id: string, command: ProductionCommand
 
 export function getProductionRun(id: string) {
   return get<ProductionResponse<ProductionRun>>(`/api/v1/production/runs/${id}`)
+}
+
+export function listProductionDocumentRuns(documentId: string) {
+  return get<ProductionResponse<ProductionRun[]>>(`/api/v1/production/documents/${documentId}/runs`)
+}
+
+export function listProductionRunToolCalls(runId: string) {
+  return get<ProductionResponse<ProductionToolCall[]>>(`/api/v1/production/runs/${runId}/tool-calls`)
 }
 
 export function decideProductionToolCall(id: string, command: ProductionCommand<DecideProductionToolCallInput>) {
