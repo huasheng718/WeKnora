@@ -15,6 +15,7 @@ import (
 
 var (
 	ErrTenantNotFound           = errors.New("tenant not found")
+	ErrTenantNotActive          = errors.New("tenant is not active")
 	ErrTenantNotProvisioning    = errors.New("tenant is not awaiting activation")
 	ErrProvisioningUserMismatch = errors.New("registration user does not belong to tenant")
 	ErrTenantHasKnowledgeBase   = errors.New("tenant has associated knowledge bases")
@@ -99,7 +100,8 @@ func (r *tenantRepository) SearchTenants(ctx context.Context, keyword string, te
 	var tenants []*types.Tenant
 	var total int64
 
-	query := database.DBFromContext(ctx, r.db).WithContext(ctx).Model(&types.Tenant{})
+	query := database.DBFromContext(ctx, r.db).WithContext(ctx).Model(&types.Tenant{}).
+		Where("status = ?", types.TenantStatusActive)
 
 	// Build search conditions
 	if tenantID > 0 && keyword != "" {
@@ -144,11 +146,29 @@ func (r *tenantRepository) UpdateTenant(ctx context.Context, tenant *types.Tenan
 // /auth/me still lists the defunct tenant (name lookup fails → UI shows
 // "#<id>").
 func (r *tenantRepository) DeleteTenant(ctx context.Context, id uint64) error {
-	return database.DBFromContext(ctx, r.db).WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return database.WithTransactionContext(ctx, r.db, func(txCtx context.Context) error {
+		tx := database.DBFromContext(txCtx, r.db).WithContext(txCtx)
+		status, err := lockTenantStatus(tx, id, false)
+		if errors.Is(err, ErrTenantNotFound) {
+			return ErrTenantNotActive
+		}
+		if err != nil {
+			return err
+		}
+		if status != types.TenantStatusActive {
+			return ErrTenantNotActive
+		}
 		if err := tx.Where("tenant_id = ?", id).Delete(&types.TenantMember{}).Error; err != nil {
 			return err
 		}
-		return tx.Where("id = ?", id).Delete(&types.Tenant{}).Error
+		result := tx.Where("id = ? AND status = ?", id, types.TenantStatusActive).Delete(&types.Tenant{})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrTenantNotActive
+		}
+		return nil
 	})
 }
 
@@ -159,6 +179,16 @@ func (r *tenantRepository) DeleteTenant(ctx context.Context, id uint64) error {
 func (r *tenantRepository) PurgeProvisionedTenant(ctx context.Context, id uint64) error {
 	return database.WithTransactionContext(ctx, r.db, func(txCtx context.Context) error {
 		tx := database.DBFromContext(txCtx, r.db).WithContext(txCtx)
+		status, err := lockTenantStatus(tx, id, true)
+		if errors.Is(err, ErrTenantNotFound) {
+			return ErrTenantNotProvisioning
+		}
+		if err != nil {
+			return err
+		}
+		if status != types.TenantStatusProvisioning {
+			return ErrTenantNotProvisioning
+		}
 		if err := tx.Unscoped().Where("tenant_id = ?", id).Delete(&types.ProductionDocumentType{}).Error; err != nil {
 			return err
 		}
@@ -186,32 +216,20 @@ func (r *tenantRepository) PurgeProvisionedTenant(ctx context.Context, id uint64
 func (r *tenantRepository) PurgeProvisionedRegistration(ctx context.Context, tenantID uint64, userID string) error {
 	return database.WithTransactionContext(ctx, r.db, func(txCtx context.Context) error {
 		tx := database.DBFromContext(txCtx, r.db).WithContext(txCtx)
-		locking := func(query *gorm.DB) *gorm.DB {
-			switch tx.Dialector.Name() {
-			case "postgres", "mysql":
-				return query.Clauses(clause.Locking{Strength: "UPDATE"})
-			default:
-				return query
-			}
-		}
-		var tenantState struct {
-			Status string `gorm:"column:status"`
-		}
-		result := locking(tx.Unscoped().Model(&types.Tenant{}).Select("status")).
-			Where("id = ?", tenantID).Take(&tenantState)
-		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+		status, err := lockTenantStatus(tx, tenantID, true)
+		if errors.Is(err, ErrTenantNotFound) {
 			return ErrTenantNotProvisioning
 		}
-		if result.Error != nil {
-			return result.Error
+		if err != nil {
+			return err
 		}
-		if tenantState.Status != types.TenantStatusProvisioning {
+		if status != types.TenantStatusProvisioning {
 			return ErrTenantNotProvisioning
 		}
 		var userState struct {
 			ID string `gorm:"column:id"`
 		}
-		result = tx.Unscoped().Model(&types.User{}).Select("id").
+		result := tx.Unscoped().Model(&types.User{}).Select("id").
 			Where("id = ? AND tenant_id = ?", userID, tenantID).Take(&userState)
 		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
 			return ErrProvisioningUserMismatch
@@ -247,6 +265,28 @@ func (r *tenantRepository) PurgeProvisionedRegistration(ctx context.Context, ten
 	})
 }
 
+func lockTenantStatus(tx *gorm.DB, id uint64, unscoped bool) (string, error) {
+	query := tx.Model(&types.Tenant{}).Select("status")
+	if unscoped {
+		query = query.Unscoped()
+	}
+	switch tx.Dialector.Name() {
+	case "postgres", "mysql":
+		query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	var state struct {
+		Status string `gorm:"column:status"`
+	}
+	result := query.Where("id = ?", id).Take(&state)
+	if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+		return "", ErrTenantNotFound
+	}
+	if result.Error != nil {
+		return "", result.Error
+	}
+	return state.Status, nil
+}
+
 func (r *tenantRepository) AdjustStorageUsed(ctx context.Context, tenantID uint64, delta int64) error {
 	return database.DBFromContext(ctx, r.db).WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var tenant types.Tenant
@@ -266,10 +306,9 @@ func (r *tenantRepository) AdjustStorageUsed(ctx context.Context, tenantID uint6
 	})
 }
 
-// BulkSetStorageQuota writes quotaBytes to storage_quota for every
-// tenant in one statement. We don't WHERE-filter (the action is
-// "apply globally"), so the affected count equals the row count of
-// the tenants table.
+// BulkSetStorageQuota writes quotaBytes to storage_quota for every active
+// tenant in one statement. Provisioning rows retain their creation-time
+// snapshot until activation finishes.
 //
 // No transaction here: the operation is a single statement and we
 // don't want to hold a long lock just to update a single column. If
@@ -279,7 +318,7 @@ func (r *tenantRepository) AdjustStorageUsed(ctx context.Context, tenantID uint6
 func (r *tenantRepository) BulkSetStorageQuota(ctx context.Context, quotaBytes int64) (int64, error) {
 	res := database.DBFromContext(ctx, r.db).WithContext(ctx).
 		Model(&types.Tenant{}).
-		Where("1 = 1"). // GORM refuses unconditional UPDATEs without an explicit WHERE
+		Where("status = ?", types.TenantStatusActive).
 		Update("storage_quota", quotaBytes)
 	if res.Error != nil {
 		return 0, res.Error

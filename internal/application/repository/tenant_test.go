@@ -3,14 +3,19 @@ package repository
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 // setupTestDB creates an in-memory SQLite database with tenant table.
@@ -56,6 +61,203 @@ func TestDeleteTenant_SoftDeletesMemberships(t *testing.T) {
 	var rawMemberCount int64
 	require.NoError(t, db.Unscoped().Model(&types.TenantMember{}).Count(&rawMemberCount).Error)
 	assert.Equal(t, int64(1), rawMemberCount)
+}
+
+func TestDeleteTenantRejectsProvisioningBeforeChildMutation(t *testing.T) {
+	fixture := seedRegistrationPurgeFixture(
+		t, newRegistrationPurgeDB(t), "pending-delete", types.TenantStatusProvisioning,
+	)
+	require.NoError(t, fixture.db.Exec(`
+		CREATE TRIGGER reject_pending_membership_soft_delete
+		BEFORE UPDATE OF deleted_at ON tenant_members
+		WHEN OLD.tenant_id = `+fmt.Sprint(fixture.tenant.ID)+`
+		BEGIN
+			SELECT RAISE(ABORT, 'pending membership delete attempted');
+		END
+	`).Error)
+
+	err := fixture.tenantRepo.DeleteTenant(context.Background(), fixture.tenant.ID)
+	require.ErrorIs(t, err, ErrTenantNotActive)
+	require.NotContains(t, err.Error(), "pending membership delete attempted")
+	fixture.assertResourceCounts(t, 1)
+}
+
+func TestDeleteTenantActivePreservesRegistrationResources(t *testing.T) {
+	fixture := seedRegistrationPurgeFixture(
+		t, newRegistrationPurgeDB(t), "active-delete", types.TenantStatusActive,
+	)
+
+	require.NoError(t, fixture.tenantRepo.DeleteTenant(context.Background(), fixture.tenant.ID))
+
+	for name, query := range map[string]*gorm.DB{
+		"tenant":     fixture.db.Model(&types.Tenant{}).Where("id = ?", fixture.tenant.ID),
+		"membership": fixture.db.Model(&types.TenantMember{}).Where("tenant_id = ?", fixture.tenant.ID),
+	} {
+		t.Run("hidden "+name, func(t *testing.T) {
+			var count int64
+			require.NoError(t, query.Count(&count).Error)
+			assert.Zero(t, count)
+		})
+	}
+	fixture.assertResourceCounts(t, 1)
+}
+
+func TestSearchTenantsReturnsOnlyActiveRowsWithAccuratePagination(t *testing.T) {
+	db := setupTestDB(t)
+	repo := NewTenantRepository(db)
+	base := time.Now().Add(-time.Hour)
+	for index, status := range []string{
+		types.TenantStatusActive,
+		types.TenantStatusProvisioning,
+		types.TenantStatusActive,
+		types.TenantStatusProvisioning,
+		types.TenantStatusActive,
+	} {
+		require.NoError(t, db.Create(&types.Tenant{
+			Name:      fmt.Sprintf("tenant-%d", index),
+			Status:    status,
+			CreatedAt: base.Add(time.Duration(index) * time.Minute),
+		}).Error)
+	}
+
+	first, total, err := repo.SearchTenants(context.Background(), "tenant", 0, 1, 2)
+	require.NoError(t, err)
+	require.Equal(t, int64(3), total)
+	require.Len(t, first, 2)
+	for _, tenant := range first {
+		require.Equal(t, types.TenantStatusActive, tenant.Status)
+	}
+
+	second, total, err := repo.SearchTenants(context.Background(), "tenant", 0, 2, 2)
+	require.NoError(t, err)
+	require.Equal(t, int64(3), total)
+	require.Len(t, second, 1)
+	require.Equal(t, types.TenantStatusActive, second[0].Status)
+
+	var pending types.Tenant
+	require.NoError(t, db.Where("status = ?", types.TenantStatusProvisioning).First(&pending).Error)
+	items, total, err := repo.SearchTenants(context.Background(), "", pending.ID, 1, 20)
+	require.NoError(t, err)
+	require.Empty(t, items)
+	require.Zero(t, total)
+}
+
+func TestBulkSetStorageQuotaUpdatesOnlyActiveTenants(t *testing.T) {
+	db := setupTestDB(t)
+	repo := NewTenantRepository(db)
+	active := &types.Tenant{Name: "active-quota", Status: types.TenantStatusActive, StorageQuota: 10}
+	pending := &types.Tenant{Name: "pending-quota", Status: types.TenantStatusProvisioning, StorageQuota: 20}
+	require.NoError(t, db.Create(active).Error)
+	require.NoError(t, db.Create(pending).Error)
+
+	affected, err := repo.BulkSetStorageQuota(context.Background(), 99)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), affected)
+
+	require.NoError(t, db.First(active, active.ID).Error)
+	require.Equal(t, int64(99), active.StorageQuota)
+	require.NoError(t, db.First(pending, pending.ID).Error)
+	require.Equal(t, int64(20), pending.StorageQuota)
+}
+
+func TestDeleteTenantAndRegistrationPurgeDoNotOrphanPendingRegistration(t *testing.T) {
+	dsn := fmt.Sprintf("file:%s/tenant-lifecycle.db?_busy_timeout=5000&_journal_mode=WAL", t.TempDir())
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(4)
+	require.NoError(t, db.AutoMigrate(
+		&types.Tenant{},
+		&types.User{},
+		&types.TenantMember{},
+		&types.StorageBackend{},
+		&types.ProductionDocumentType{},
+	))
+	fixture := seedRegistrationPurgeFixture(t, db, "concurrent", types.TenantStatusProvisioning)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var deleteErr, purgeErr error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		deleteErr = fixture.tenantRepo.DeleteTenant(context.Background(), fixture.tenant.ID)
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		purgeErr = fixture.tenantRepo.PurgeProvisionedRegistration(
+			context.Background(), fixture.tenant.ID, fixture.user.ID,
+		)
+	}()
+	close(start)
+	wg.Wait()
+
+	require.ErrorIs(t, deleteErr, ErrTenantNotActive)
+	require.NoError(t, purgeErr)
+	fixture.assertResourceCounts(t, 0)
+}
+
+func TestDeleteTenantPostgresLocksTenantBeforeMemberships(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err)
+	repo := NewTenantRepository(db)
+	const tenantID uint64 = 17
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT "status" FROM "tenants" WHERE id = \$1 AND "tenants"\."deleted_at" IS NULL LIMIT \$2 FOR UPDATE`).
+		WithArgs(tenantID, 1).
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow(types.TenantStatusActive))
+	mock.ExpectExec(`UPDATE "tenant_members" SET "deleted_at"=\$1 WHERE tenant_id = \$2 AND "tenant_members"\."deleted_at" IS NULL`).
+		WithArgs(sqlmock.AnyArg(), tenantID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE "tenants" SET "deleted_at"=\$1 WHERE \(id = \$2 AND status = \$3\) AND "tenants"\."deleted_at" IS NULL`).
+		WithArgs(sqlmock.AnyArg(), tenantID, types.TenantStatusActive).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	require.NoError(t, repo.DeleteTenant(context.Background(), tenantID))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPurgeProvisionedTenantPostgresLocksTenantBeforeChildren(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err)
+	repo := NewTenantRepository(db)
+	const tenantID uint64 = 23
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT "status" FROM "tenants" WHERE id = \$1 LIMIT \$2 FOR UPDATE`).
+		WithArgs(tenantID, 1).
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow(types.TenantStatusProvisioning))
+	mock.ExpectExec(`DELETE FROM "production_document_types" WHERE tenant_id = \$1`).
+		WithArgs(tenantID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`DELETE FROM "storage_backends" WHERE tenant_id = \$1`).
+		WithArgs(tenantID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`DELETE FROM "tenant_members" WHERE tenant_id = \$1`).
+		WithArgs(tenantID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`DELETE FROM "tenants" WHERE id = \$1 AND status = \$2`).
+		WithArgs(tenantID, types.TenantStatusProvisioning).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	require.NoError(t, repo.PurgeProvisionedTenant(context.Background(), tenantID))
+	require.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestPurgeProvisionedTenantHardDeletesAllProvisioningRows(t *testing.T) {
@@ -185,9 +387,18 @@ func TestPurgeProvisionedTenantRejectsActiveTenant(t *testing.T) {
 		UserID: "owner", TenantID: tenant.ID, Role: types.TenantRoleOwner,
 		Status: types.TenantMemberStatusActive,
 	}).Error)
+	require.NoError(t, db.Exec(`
+		CREATE TRIGGER reject_active_tenant_purge_child_delete
+		BEFORE DELETE ON tenant_members
+		WHEN OLD.tenant_id = `+fmt.Sprint(tenant.ID)+`
+		BEGIN
+			SELECT RAISE(ABORT, 'active purge child delete attempted');
+		END
+	`).Error)
 
 	err := repo.PurgeProvisionedTenant(context.Background(), tenant.ID)
 	require.ErrorIs(t, err, ErrTenantNotProvisioning)
+	require.NotContains(t, err.Error(), "active purge child delete attempted")
 
 	var tenantCount int64
 	require.NoError(t, db.Unscoped().Model(&types.Tenant{}).Where("id = ?", tenant.ID).Count(&tenantCount).Error)

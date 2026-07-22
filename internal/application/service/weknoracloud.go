@@ -126,6 +126,9 @@ func (s *weKnoraCloudService) updateTenantCredentials(ctx context.Context, tenan
 	if err != nil {
 		return err
 	}
+	if tenant == nil || tenant.Status != types.TenantStatusActive {
+		return tenantLifecycleConflict("modified")
+	}
 	if tenant.Credentials == nil {
 		tenant.Credentials = &types.CredentialsConfig{}
 	}

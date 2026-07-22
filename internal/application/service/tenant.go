@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	apprepo "github.com/Tencent/WeKnora/internal/application/repository"
 	werrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -184,6 +185,7 @@ func (s *tenantService) ListTenants(ctx context.Context) ([]*types.Tenant, error
 		return nil, err
 	}
 
+	tenants = activeTenants(tenants)
 	logger.Infof(ctx, "Tenant list retrieved successfully, total: %d", len(tenants))
 	return tenants, nil
 }
@@ -196,6 +198,14 @@ func (s *tenantService) UpdateTenant(ctx context.Context, tenant *types.Tenant) 
 	}
 
 	logger.Infof(ctx, "Updating tenant, ID: %d, name: %s", tenant.ID, tenant.Name)
+	persisted, err := s.repo.GetTenantByID(ctx, tenant.ID)
+	if err != nil {
+		return nil, err
+	}
+	if persisted.Status != types.TenantStatusActive {
+		return nil, tenantLifecycleConflict("modified")
+	}
+	tenant.Status = persisted.Status
 
 	if err := s.validateStorageBucketUniqueness(ctx, tenant); err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
@@ -246,6 +256,9 @@ func (s *tenantService) DeleteTenant(ctx context.Context, id uint64) error {
 
 	err = s.repo.DeleteTenant(ctx, id)
 	if err != nil {
+		if errors.Is(err, apprepo.ErrTenantNotActive) {
+			return tenantLifecycleConflict("deleted")
+		}
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"tenant_id": id,
 		})
@@ -298,8 +311,23 @@ func (s *tenantService) ListAllTenants(ctx context.Context) ([]*types.Tenant, er
 		return nil, err
 	}
 
+	tenants = activeTenants(tenants)
 	logger.Infof(ctx, "All tenants list retrieved successfully, total: %d", len(tenants))
 	return tenants, nil
+}
+
+func activeTenants(tenants []*types.Tenant) []*types.Tenant {
+	active := make([]*types.Tenant, 0, len(tenants))
+	for _, tenant := range tenants {
+		if tenant != nil && tenant.Status == types.TenantStatusActive {
+			active = append(active, tenant)
+		}
+	}
+	return active
+}
+
+func tenantLifecycleConflict(action string) error {
+	return werrors.NewConflictError("Workspace cannot be " + action + " in its current state")
 }
 
 // BulkSetStorageQuota delegates to the repository. Validation is

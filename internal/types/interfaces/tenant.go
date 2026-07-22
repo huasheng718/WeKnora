@@ -35,8 +35,8 @@ type TenantService interface {
 	PurgeProvisionedRegistration(ctx context.Context, tenantID uint64, userID string) error
 	// ListAllTenants lists all tenants (for users with cross-tenant access permission)
 	ListAllTenants(ctx context.Context) ([]*types.Tenant, error)
-	// BulkSetStorageQuota overwrites every tenant's storage_quota with
-	// quotaBytes. Returns how many rows were affected. Used by the
+	// BulkSetStorageQuota overwrites every active tenant's storage_quota
+	// with quotaBytes. Returns how many rows were affected. Used by the
 	// SystemAdmin "apply default to all tenants" action; bypasses the
 	// per-tenant whitelist on PUT /tenants/:id (which intentionally
 	// forbids storage_quota edits for Owners). quotaBytes must be > 0;
