@@ -140,6 +140,7 @@ import {
   type ProductionVersionDiff,
 } from './models/documentBlocks'
 import { createLatestRequestCoordinator } from './models/latestRequestCoordinator'
+import { resolveAppendVersionFailure } from './models/appendVersionFailure'
 import {
   canCreateProductionAnnotation,
   canResolveProductionAnnotation,
@@ -211,7 +212,6 @@ const annotationStatusCommands = new Map<string, ProductionCommand<{ status: 're
 let annotationCommand: PendingAnnotationSubmission | null = null
 
 function responseError(response: { message?: string }, fallback: string) { return new Error(response.message || fallback) }
-function isConflictError(cause: unknown) { return typeof cause === 'object' && cause !== null && 'response' in cause && (cause as { response?: { status?: number } }).response?.status === 409 }
 function stableCommand<T>(current: { signature: string; command: ProductionCommand<T> } | null, signature: string, payload: T) {
   return current?.signature === signature ? current : { signature, command: createProductionCommand(payload) }
 }
@@ -308,7 +308,9 @@ async function saveVersion() {
     appendCommand = null
     await loadWorkbench(response.data.id)
   } catch (cause) {
-    conflict.value = isConflictError(cause)
+    const failure = resolveAppendVersionFailure(cause, appendCommand)
+    conflict.value = failure.conflict
+    appendCommand = failure.command
     pageError.value = conflict.value ? '' : cause instanceof Error ? cause.message : t('production.documentWorkbench.saveFailed')
   } finally { saving.value = false }
 }
