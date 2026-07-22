@@ -74,6 +74,21 @@ export default {
     documentStatus: { draft: "草稿", annotating: "标注中", in_review: "审核中", approved: "已通过", publishing: "发布中", published: "已发布", archived: "已归档" },
     reviews: { unavailableTitle: "此处暂不提供审核记录", unavailable: "请打开具体文档查看和处理受治理审核。" },
     releases: { unavailableTitle: "此处暂不提供发布记录", unavailable: "请打开具体文档查看和处理发布状态。" },
+    reviewConsole: {
+      title: "审核", frozen: "已冻结版本", notFrozen: "版本需先冻结", openBlocking: "{count} 条未解决阻断标注", submit: "提交审核", empty: "暂无审核申请。",
+      status: { pending: "待处理", approved: "已通过", rejected: "已拒绝", obsolete: "已过期", cancelled: "已取消", changes_requested: "需修改" },
+      roles: { project_owner: "项目负责人", author: "作者", business_reviewer: "业务审核人", engineering_reviewer: "工程审核人", compliance_reviewer: "合规审核人", publisher: "发布人", observer: "观察者" },
+      decision: { pending: "待处理", approved: "已通过", rejected: "已拒绝", cancelled: "已取消", changes_requested: "需修改" },
+      actions: { approved: "通过", changes_requested: "要求修改", rejected: "拒绝", reject: "拒绝审核", cancel: "取消审核" },
+      gates: { blocking_annotations: "请先处理阻断标注。", version_not_frozen: "请先冻结该版本。", historical_version: "只能提交当前版本。", review_pending: "已有待处理审核。", author_role_required: "提交审核需要作者项目角色。" },
+      unassigned: "未分配", loadMore: "加载更多", loadFailed: "加载审核记录失败。", commandFailed: "审核操作失败。", defaultComment: "无补充说明。", confirm: { reject: "拒绝审核？", cancel: "取消审核？", body: "该决定将写入受治理审核记录。" }, versionDiff: "版本差异",
+    },
+    releaseConsole: {
+      title: "发布", history: "发布历史", newRelease: "新建发布", empty: "暂无发布记录。", selectDocument: "选择已通过的文档", dialogTitle: "发布已通过版本",
+      targets: "知识库目标", selected: "已选择 {count} 项", ready: "就绪", notReady: "未就绪", loadMore: "加载更多", snapshot: "发布快照", confirmSnapshot: "我确认此冻结发布快照。", publish: "发布", loadFailed: "加载发布数据失败。", commandFailed: "发布操作失败。",
+      status: { building: "构建中", ready: "就绪", active: "已激活", failed: "失败", rolled_back: "已回滚", cleanup_pending: "等待清理", cleaned: "已清理" },
+      actions: { activate: "激活", retry: "重试", rollback: "回滚" }, activeHead: "当前激活目标", lock: "头锁版本 {lock}", rollbackTitle: "回滚发布？", rollbackBody: "此操作会变更当前发布目标，并记录到审计历史。",
+    },
     errors: {
       createProject: "创建项目失败。", loadSourcesTitle: "无法加载来源集", loadDocumentsTitle: "无法加载文档",
       createSource: "创建来源集失败。", createDocument: "创建文档失败。", loadProjectsTitle: "无法加载项目",

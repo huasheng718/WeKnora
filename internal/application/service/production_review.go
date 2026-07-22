@@ -13,10 +13,59 @@ import (
 
 type ProductionReviewService interface {
 	Submit(ctx context.Context, documentID, versionID string) (*types.ProductionReviewRequest, error)
+	List(ctx context.Context, documentID string, offset, limit int) ([]*types.ProductionReviewRequest, int64, error)
 	Get(ctx context.Context, reviewID string) (*types.ProductionReviewRequest, error)
 	Decide(ctx context.Context, stepID string, decision types.ProductionReviewDecision, comment string) error
 	Reject(ctx context.Context, reviewID, reason string) error
 	Cancel(ctx context.Context, reviewID, reason string) error
+}
+
+type productionReviewHistoryRepository interface {
+	ListReviews(context.Context, uint64, string, int, int) ([]*types.ProductionReviewRequest, int64, error)
+}
+
+func (s *productionReviewService) List(
+	ctx context.Context,
+	documentID string,
+	offset int,
+	limit int,
+) ([]*types.ProductionReviewRequest, int64, error) {
+	tenantID, _, err := productionCaller(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := requireProductionSourceID(documentID, "document id"); err != nil {
+		return nil, 0, err
+	}
+	if offset < 0 || limit < 1 || limit > types.ProductionReleaseMaxTargets {
+		return nil, 0, types.ErrProductionReviewScopeInvalid
+	}
+	document, err := s.documents.GetDocument(ctx, tenantID, documentID)
+	if err != nil {
+		return nil, 0, err
+	}
+	if document == nil || document.ID != documentID || document.TenantID != tenantID || document.ProjectID == "" {
+		return nil, 0, types.ErrProductionReviewScopeInvalid
+	}
+	if s.projects == nil {
+		return nil, 0, types.ErrProductionForbidden
+	}
+	if err := s.projects.RequireProjectRole(ctx, document.ProjectID,
+		types.ProductionRoleProjectOwner,
+		types.ProductionRoleAuthor,
+		types.ProductionRoleBusinessReviewer,
+		types.ProductionRoleEngineeringReviewer,
+		types.ProductionRoleComplianceReviewer,
+		types.ProductionRolePublisher,
+		types.ProductionRoleObserver,
+	); err != nil {
+		return nil, 0, err
+	}
+	history, ok := s.reviews.(productionReviewHistoryRepository)
+	if !ok {
+		return nil, 0, errors.New("production review history lookup is unavailable")
+	}
+	return history.ListReviews(ctx, tenantID, documentID, offset, limit)
 }
 
 func (s *productionReviewService) Get(

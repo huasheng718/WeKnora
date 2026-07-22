@@ -13,6 +13,13 @@ export interface ProductionResponse<T> {
   message?: string
 }
 
+export interface ProductionPagedResponse<T> extends ProductionResponse<T[]> {
+	page: number
+	page_size: number
+	total: number
+	has_more: boolean
+}
+
 export type ProductionProjectStatus = 'active' | 'archived'
 export type ProductionProjectRole =
   | 'project_owner'
@@ -455,6 +462,8 @@ export interface ProductionReleaseTarget {
   cleaned_at?: ProductionTimestamp
   created_at: ProductionTimestamp
   updated_at: ProductionTimestamp
+  head_lock_version?: number
+  is_active?: boolean
 }
 
 export interface ProductionRelease {
@@ -473,6 +482,25 @@ export interface ProductionRelease {
   created_at: ProductionTimestamp
   updated_at: ProductionTimestamp
   targets?: ProductionReleaseTarget[]
+}
+
+export interface ProductionReleasePreflightTarget {
+  knowledge_base_id: string
+  knowledge_base_name: string
+  ready: boolean
+  reason?: string
+  config_snapshot?: ProductionJSON
+}
+
+export interface ProductionReleasePreflight {
+  document_id: string
+  version_id: string
+  rendered_markdown: string
+  targets: ProductionReleasePreflightTarget[]
+  page: number
+  page_size: number
+  total: number
+  has_more: boolean
 }
 
 export function listProductionProjects() {
@@ -596,6 +624,12 @@ export function getProductionReview(id: string) {
   return get<ProductionResponse<ProductionReview>>(`/api/v1/production/reviews/${id}`)
 }
 
+export function listProductionDocumentReviews(documentId: string, page = 1, pageSize = 100) {
+  return get<ProductionPagedResponse<ProductionReview>>(`/api/v1/production/documents/${documentId}/reviews`, {
+    params: { page, page_size: pageSize },
+  })
+}
+
 export function decideProductionReviewStep(reviewId: string, stepId: string, command: ProductionCommand<DecideProductionReviewStepInput>) {
   return post<ProductionResponse<void>>(`/api/v1/production/reviews/${reviewId}/steps/${stepId}/decision`, command.payload, productionCommandConfig(command))
 }
@@ -610,6 +644,18 @@ export function cancelProductionReview(id: string, command: ProductionCommand<{ 
 
 export function createProductionRelease(documentId: string, command: ProductionCommand<{ version_id: string; target_knowledge_base_ids: string[] }>) {
   return post<ProductionResponse<ProductionRelease>>(`/api/v1/production/documents/${documentId}/releases`, command.payload, productionCommandConfig(command))
+}
+
+export function listProductionDocumentReleases(documentId: string, page = 1, pageSize = 100) {
+  return get<ProductionPagedResponse<ProductionRelease>>(`/api/v1/production/documents/${documentId}/releases`, {
+    params: { page, page_size: pageSize },
+  })
+}
+
+export function getProductionReleasePreflight(documentId: string, versionId: string, page = 1, pageSize = 100) {
+  return get<ProductionResponse<ProductionReleasePreflight>>(`/api/v1/production/documents/${documentId}/release-preflight`, {
+    params: { version_id: versionId, page, page_size: pageSize },
+  })
 }
 
 export function getProductionReleaseTarget(id: string) {

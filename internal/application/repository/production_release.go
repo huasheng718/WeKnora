@@ -390,6 +390,55 @@ func (r *productionReleaseRepository) GetRelease(
 	return loadProductionReleaseTargets(db, tenantID, &release)
 }
 
+func (r *productionReleaseRepository) ListReleases(
+	ctx context.Context,
+	tenantID uint64,
+	documentID string,
+	offset int,
+	limit int,
+) ([]*types.ProductionRelease, int64, error) {
+	if err := requireProductionReleaseTenantContext(ctx, tenantID); err != nil {
+		return nil, 0, err
+	}
+	if err := requireProductionReleaseIdentity("document_id", documentID); err != nil {
+		return nil, 0, err
+	}
+	if offset < 0 || limit < 1 || limit > types.ProductionReleaseMaxTargets {
+		return nil, 0, types.ErrProductionReleaseInvalid
+	}
+	db := database.DBFromContext(ctx, r.db).WithContext(ctx)
+	var total int64
+	if err := db.Model(&types.ProductionRelease{}).
+		Where("tenant_id = ? AND document_id = ?", tenantID, documentID).Count(&total).Error; err != nil {
+		return nil, 0, translateProductionReleaseTargetReadError(err)
+	}
+	var releases []*types.ProductionRelease
+	if err := db.Where("tenant_id = ? AND document_id = ?", tenantID, documentID).
+		Order("created_at DESC, id DESC").Offset(offset).Limit(limit).Find(&releases).Error; err != nil {
+		return nil, 0, translateProductionReleaseTargetReadError(err)
+	}
+	var heads []*types.ProductionProjectionHead
+	if err := db.Where("tenant_id = ? AND document_id = ?", tenantID, documentID).Find(&heads).Error; err != nil {
+		return nil, 0, translateProductionReleaseTargetReadError(err)
+	}
+	headByKB := make(map[string]*types.ProductionProjectionHead, len(heads))
+	for _, head := range heads {
+		headByKB[head.TargetKnowledgeBaseID] = head
+	}
+	for _, release := range releases {
+		if _, err := loadProductionReleaseTargets(db, tenantID, release); err != nil {
+			return nil, 0, err
+		}
+		for _, target := range release.Targets {
+			if head := headByKB[target.TargetKnowledgeBaseID]; head != nil {
+				target.HeadLockVersion = head.LockVersion
+				target.IsActive = head.ActiveReleaseTargetID == target.ID
+			}
+		}
+	}
+	return releases, total, nil
+}
+
 func (r *productionReleaseRepository) GetLatestReleaseForVersion(
 	ctx context.Context,
 	tenantID uint64,

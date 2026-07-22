@@ -21,13 +21,29 @@ type productionReleaseServiceStub struct {
 		versionID  string
 		kbIDs      []string
 	}
-	targetID     string
-	expectedLock int
-	prepareErr   error
-	targetErr    error
-	activateErr  error
-	retryErr     error
-	rollbackErr  error
+	targetID          string
+	expectedLock      int
+	prepareErr        error
+	targetErr         error
+	activateErr       error
+	retryErr          error
+	rollbackErr       error
+	listedDocumentID  string
+	listOffset        int
+	listLimit         int
+	preflightPage     int
+	preflightPageSize int
+}
+
+func (s *productionReleaseServiceStub) List(_ context.Context, documentID string, offset, limit int) ([]*types.ProductionRelease, int64, error) {
+	s.listedDocumentID, s.listOffset, s.listLimit = documentID, offset, limit
+	return []*types.ProductionRelease{{ID: productionProjectID, DocumentID: documentID}}, 1, nil
+}
+
+func (s *productionReleaseServiceStub) Preflight(_ context.Context, documentID, versionID string, page, pageSize int) (*types.ProductionReleasePreflight, error) {
+	s.listedDocumentID, s.prepared.versionID = documentID, versionID
+	s.preflightPage, s.preflightPageSize = page, pageSize
+	return &types.ProductionReleasePreflight{DocumentID: documentID, VersionID: versionID, Page: page, PageSize: pageSize}, nil
 }
 
 func (s *productionReleaseServiceStub) Prepare(_ context.Context, documentID, versionID string, kbIDs []string) (*types.ProductionRelease, error) {
@@ -99,6 +115,29 @@ func TestProductionReleaseHandlerCreatesAndOperatesOnTargets(t *testing.T) {
 	)
 	require.Equal(t, http.StatusOK, rollback.Code, rollback.Body.String())
 	require.Equal(t, 2, service.expectedLock)
+}
+
+func TestProductionReleaseHandlerListsHistoryAndRunsPagedPreflight(t *testing.T) {
+	service := &productionReleaseServiceStub{}
+	h := NewProductionReleaseHandler(service)
+	history := performProductionHandlerRequest(
+		http.MethodGet, "/production/documents/:id/releases",
+		"/production/documents/"+productionProjectID+"/releases?page=1&page_size=10", "", h.List,
+	)
+	require.Equal(t, http.StatusOK, history.Code, history.Body.String())
+	require.Equal(t, 0, service.listOffset)
+	require.Equal(t, 10, service.listLimit)
+	require.Contains(t, history.Body.String(), `"total":1`)
+
+	preflight := performProductionHandlerRequest(
+		http.MethodGet, "/production/documents/:id/release-preflight",
+		"/production/documents/"+productionProjectID+"/release-preflight?version_id="+productionDocumentTypeID+"&page=2&page_size=25",
+		"", h.Preflight,
+	)
+	require.Equal(t, http.StatusOK, preflight.Code, preflight.Body.String())
+	require.Equal(t, productionDocumentTypeID, service.prepared.versionID)
+	require.Equal(t, 2, service.preflightPage)
+	require.Equal(t, 25, service.preflightPageSize)
 }
 
 func TestProductionReleaseHandlerRejectsInvalidRequestsAndMapsGovernanceErrors(t *testing.T) {

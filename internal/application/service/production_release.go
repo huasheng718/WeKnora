@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -26,6 +27,166 @@ type productionProjectionBuilder interface {
 
 type productionApprovedReviewRepository interface {
 	GetApprovedReviewForVersion(ctx context.Context, tenantID uint64, documentID, versionID string) (*types.ProductionReviewRequest, error)
+}
+
+type productionReleaseHistoryRepository interface {
+	ListReleases(context.Context, uint64, string, int, int) ([]*types.ProductionRelease, int64, error)
+}
+
+func (s *ProductionReleaseService) List(ctx context.Context, documentID string, offset, limit int) ([]*types.ProductionRelease, int64, error) {
+	tenantID, _, err := productionCaller(ctx)
+	if err != nil || s == nil || s.documents == nil || s.authorizer == nil || s.releases == nil {
+		if err != nil {
+			return nil, 0, err
+		}
+		return nil, 0, types.ErrProductionForbidden
+	}
+	if strings.TrimSpace(documentID) == "" {
+		return nil, 0, types.ErrProductionReleaseInvalid
+	}
+	if offset < 0 || limit < 1 || limit > types.ProductionReleaseMaxTargets {
+		return nil, 0, types.ErrProductionReleaseInvalid
+	}
+	document, err := s.documents.GetDocument(ctx, tenantID, documentID)
+	if err != nil {
+		return nil, 0, err
+	}
+	if document == nil || document.ID != documentID || document.TenantID != tenantID || document.ProjectID == "" {
+		return nil, 0, types.ErrProductionReviewScopeInvalid
+	}
+	if err := s.authorizer.RequireProjectRole(ctx, document.ProjectID,
+		types.ProductionRoleProjectOwner,
+		types.ProductionRoleAuthor,
+		types.ProductionRoleBusinessReviewer,
+		types.ProductionRoleEngineeringReviewer,
+		types.ProductionRoleComplianceReviewer,
+		types.ProductionRolePublisher,
+		types.ProductionRoleObserver,
+	); err != nil {
+		return nil, 0, err
+	}
+	history, ok := s.releases.(productionReleaseHistoryRepository)
+	if !ok {
+		return nil, 0, errors.New("production release history lookup is unavailable")
+	}
+	return history.ListReleases(ctx, tenantID, documentID, offset, limit)
+}
+
+func (s *ProductionReleaseService) Preflight(
+	ctx context.Context,
+	documentID string,
+	versionID string,
+	page int,
+	pageSize int,
+) (*types.ProductionReleasePreflight, error) {
+	tenantID, actorID, err := productionCaller(ctx)
+	if err != nil || s == nil || s.documents == nil || s.reviews == nil || s.authorizer == nil ||
+		s.members == nil || s.kbs == nil || s.storage == nil || s.models == nil {
+		if err != nil {
+			return nil, err
+		}
+		return nil, errors.New("production release dependencies are unavailable")
+	}
+	if page < 1 || pageSize < 1 || pageSize > types.ProductionReleaseMaxTargets || page-1 > int(^uint(0)>>1)/pageSize {
+		return nil, types.ErrProductionReleaseInvalid
+	}
+	if strings.TrimSpace(documentID) == "" || strings.TrimSpace(versionID) == "" {
+		return nil, types.ErrProductionReleaseInvalid
+	}
+	document, err := s.documents.GetDocument(ctx, tenantID, documentID)
+	if err != nil {
+		return nil, err
+	}
+	version, err := s.documents.GetVersion(ctx, tenantID, versionID)
+	if err != nil {
+		return nil, err
+	}
+	if document == nil || version == nil || document.ID != documentID || version.ID != versionID ||
+		document.TenantID != tenantID || version.TenantID != tenantID || document.ProjectID != version.ProjectID ||
+		version.DocumentID != document.ID || version.FrozenAt == nil || document.LatestApprovedVersionID == nil ||
+		*document.LatestApprovedVersionID != version.ID {
+		return nil, types.ErrProductionReviewScopeInvalid
+	}
+	if err := s.authorizer.RequireProjectRole(ctx, document.ProjectID, types.ProductionRolePublisher); err != nil {
+		return nil, err
+	}
+	reviewReader, ok := s.reviews.(productionApprovedReviewRepository)
+	if !ok {
+		return nil, errors.New("approved production review lookup is unavailable")
+	}
+	review, err := reviewReader.GetApprovedReviewForVersion(ctx, tenantID, documentID, versionID)
+	if err != nil {
+		return nil, err
+	}
+	if review == nil || review.Status != types.ProductionReviewApproved || review.TenantID != tenantID ||
+		review.ProjectID != document.ProjectID || review.DocumentID != documentID || review.VersionID != versionID {
+		return nil, types.ErrProductionReviewScopeInvalid
+	}
+	rendered, err := RenderProductionMarkdown(version)
+	if err != nil {
+		return nil, err
+	}
+	kbs, err := s.kbs.ListKnowledgeBases(ctx)
+	if err != nil {
+		return nil, err
+	}
+	sort.SliceStable(kbs, func(i, j int) bool {
+		if kbs[i] == nil {
+			return false
+		}
+		if kbs[j] == nil {
+			return true
+		}
+		if kbs[i].Name == kbs[j].Name {
+			return kbs[i].ID < kbs[j].ID
+		}
+		return kbs[i].Name < kbs[j].Name
+	})
+	result := &types.ProductionReleasePreflight{
+		DocumentID: documentID, VersionID: versionID, RenderedMarkdown: rendered,
+		Targets: make([]*types.ProductionReleasePreflightTarget, 0, pageSize),
+		Page:    page, PageSize: pageSize, Total: len(kbs),
+	}
+	start := (page - 1) * pageSize
+	if start >= len(kbs) {
+		return result, nil
+	}
+	end := start + pageSize
+	if end > len(kbs) {
+		end = len(kbs)
+	}
+	result.HasMore = end < len(kbs)
+	for _, candidate := range kbs[start:end] {
+		if candidate == nil || strings.TrimSpace(candidate.ID) == "" {
+			continue
+		}
+		kb, writableErr := s.requireWritableTargetKB(ctx, tenantID, actorID, candidate.ID)
+		if writableErr != nil {
+			if errors.Is(writableErr, types.ErrProductionForbidden) || errors.Is(writableErr, apprepository.ErrKnowledgeBaseNotFound) {
+				continue
+			}
+			return nil, writableErr
+		}
+		target := &types.ProductionReleasePreflightTarget{
+			KnowledgeBaseID: kb.ID, KnowledgeBaseName: kb.Name,
+		}
+		snapshot, snapshotErr := s.snapshotTargetProcessingConfig(ctx, tenantID, kb)
+		if snapshotErr != nil {
+			target.Reason = "processing_configuration_unavailable"
+			result.Targets = append(result.Targets, target)
+			continue
+		}
+		canonical, _, canonicalErr := types.CanonicalProductionReleaseTargetConfig(snapshot)
+		if canonicalErr != nil {
+			target.Reason = "processing_configuration_unavailable"
+			result.Targets = append(result.Targets, target)
+			continue
+		}
+		target.Ready = true
+		target.ConfigSnapshot = canonical
+		result.Targets = append(result.Targets, target)
+	}
+	return result, nil
 }
 
 type ProductionGraphReadiness interface {

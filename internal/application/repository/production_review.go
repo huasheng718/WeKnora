@@ -936,6 +936,39 @@ func (r *productionReviewRepository) GetReview(ctx context.Context, tenantID uin
 	return &request, nil
 }
 
+func (r *productionReviewRepository) ListReviews(
+	ctx context.Context,
+	tenantID uint64,
+	documentID string,
+	offset int,
+	limit int,
+) ([]*types.ProductionReviewRequest, int64, error) {
+	if err := requireProductionReviewTenantContext(ctx, tenantID); err != nil {
+		return nil, 0, err
+	}
+	if err := requireProductionReviewUUID("document id", documentID); err != nil {
+		return nil, 0, err
+	}
+	if offset < 0 || limit < 1 || limit > types.ProductionReleaseMaxTargets {
+		return nil, 0, types.ErrProductionReviewScopeInvalid
+	}
+	db := database.DBFromContext(ctx, r.db).WithContext(ctx)
+	var total int64
+	if err := db.Model(&types.ProductionReviewRequest{}).
+		Where("tenant_id = ? AND document_id = ?", tenantID, documentID).Count(&total).Error; err != nil {
+		return nil, 0, translateProductionReviewError(err)
+	}
+	var requests []*types.ProductionReviewRequest
+	err := db.
+		Preload("Steps", func(db *gorm.DB) *gorm.DB { return db.Order("sequence ASC") }).
+		Where("tenant_id = ? AND document_id = ?", tenantID, documentID).
+		Order("created_at DESC, id DESC").Offset(offset).Limit(limit).Find(&requests).Error
+	if err != nil {
+		return nil, 0, translateProductionReviewError(err)
+	}
+	return requests, total, nil
+}
+
 func (r *productionReviewRepository) GetApprovedReviewForVersion(
 	ctx context.Context,
 	tenantID uint64,

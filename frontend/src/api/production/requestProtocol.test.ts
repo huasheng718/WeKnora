@@ -141,3 +141,20 @@ test('production document workbench clients use authorized evidence and run deta
     ['get', '/api/v1/production/runs/run-1/tool-calls'],
   ])
 })
+
+test('production review and release workbenches use authorized history and preflight routes', async () => {
+  requests.length = 0
+
+  await production.listProductionDocumentReviews('document-1', 2, 25)
+  await production.listProductionDocumentReleases('document-1', 3, 10)
+  await production.getProductionReleasePreflight('document-1', 'version-1', 4, 50)
+
+  assert.deepEqual(requests.map(request => [request.method, request.url]), [
+    ['get', '/api/v1/production/documents/document-1/reviews'],
+    ['get', '/api/v1/production/documents/document-1/releases'],
+    ['get', '/api/v1/production/documents/document-1/release-preflight'],
+  ])
+  assert.deepEqual(requests[0].params, { page: 2, page_size: 25 })
+  assert.deepEqual(requests[1].params, { page: 3, page_size: 10 })
+  assert.deepEqual(requests[2].params, { version_id: 'version-1', page: 4, page_size: 50 })
+})

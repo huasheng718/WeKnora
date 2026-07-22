@@ -343,6 +343,7 @@ func (s productionReleaseTenantRepoStub) GetTenantByID(context.Context, uint64) 
 type productionReleaseKBStub struct {
 	interfaces.KnowledgeBaseService
 	kb  *types.KnowledgeBase
+	kbs []*types.KnowledgeBase
 	err error
 }
 
@@ -364,6 +365,16 @@ func (s productionReleaseKBStub) GetKnowledgeBaseByIDOnly(context.Context, strin
 	}
 	copy := *s.kb
 	return &copy, nil
+}
+
+func (s productionReleaseKBStub) ListKnowledgeBases(context.Context) ([]*types.KnowledgeBase, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if s.kbs != nil {
+		return s.kbs, nil
+	}
+	return []*types.KnowledgeBase{s.kb}, nil
 }
 
 type productionReleaseKBRepositoryBoundary struct {
@@ -737,6 +748,67 @@ func configuredProductionReleaseTargetKB() *types.KnowledgeBase {
 		IndexingStrategy:      types.IndexingStrategy{VectorEnabled: true, GraphEnabled: true},
 		ExtractConfig:         &types.ExtractConfig{Enabled: true},
 	}
+}
+
+func TestProductionReleasePreflightReturnsRenderedSnapshotAndOnlyWritableTargets(t *testing.T) {
+	service, _, _ := newProductionReleaseServiceFixture(t)
+	version := service.documents.(*productionReleaseDocumentsStub).version
+	version.Blocks = []*types.ProductionDocumentBlock{{
+		ID: "block-1", VersionID: version.ID, LogicalBlockID: "intro", BlockType: "heading", Position: 0,
+		Content: types.JSON(`"Release snapshot"`), Attributes: types.JSON(`{"level":1}`),
+	}}
+	writable := configuredProductionReleaseTargetKB()
+	writable.Name = "Production KB"
+	foreign := *writable
+	foreign.ID = "kb-foreign"
+	foreign.TenantID = 8
+	service.kbs = productionReleaseKBStub{kb: writable, kbs: []*types.KnowledgeBase{writable, &foreign}}
+
+	preflightService, ok := any(service).(interface {
+		Preflight(context.Context, string, string, int, int) (*types.ProductionReleasePreflight, error)
+	})
+	require.True(t, ok)
+	result, err := preflightService.Preflight(productionReleaseContext(), "document-1", "version-3", 1, 100)
+	require.NoError(t, err)
+	require.Contains(t, result.RenderedMarkdown, "Release snapshot")
+	require.Len(t, result.Targets, 1)
+	require.Equal(t, writable.ID, result.Targets[0].KnowledgeBaseID)
+	require.True(t, result.Targets[0].Ready)
+	require.NotEmpty(t, result.Targets[0].ConfigSnapshot)
+	require.Equal(t, 2, result.Total)
+	require.False(t, result.HasMore)
+}
+
+func TestProductionReleasePreflightKeepsWritableTargetWithGenericReadinessFailure(t *testing.T) {
+	service, _, _ := newProductionReleaseServiceFixture(t)
+	broken := configuredProductionReleaseTargetKB()
+	broken.Name = "Needs configuration"
+	broken.EmbeddingModelID = ""
+	service.kbs = productionReleaseKBStub{kb: broken, kbs: []*types.KnowledgeBase{broken}}
+
+	preflightService := any(service).(interface {
+		Preflight(context.Context, string, string, int, int) (*types.ProductionReleasePreflight, error)
+	})
+	result, err := preflightService.Preflight(productionReleaseContext(), "document-1", "version-3", 1, 100)
+	require.NoError(t, err)
+	require.Len(t, result.Targets, 1)
+	require.False(t, result.Targets[0].Ready)
+	require.Equal(t, "processing_configuration_unavailable", result.Targets[0].Reason)
+	require.Empty(t, result.Targets[0].ConfigSnapshot)
+}
+
+func TestProductionReleasePreflightRejectsPaginationBeforeKBReadiness(t *testing.T) {
+	service, _, _ := newProductionReleaseServiceFixture(t)
+	counting := &productionReleaseCountingKBStub{kb: configuredProductionReleaseTargetKB()}
+	service.kbs = counting
+	preflightService := any(service).(interface {
+		Preflight(context.Context, string, string, int, int) (*types.ProductionReleasePreflight, error)
+	})
+	_, err := preflightService.Preflight(
+		productionReleaseContext(), "document-1", "version-3", 1, types.ProductionReleaseMaxTargets+1,
+	)
+	require.ErrorIs(t, err, types.ErrProductionReleaseInvalid)
+	require.Zero(t, counting.calls)
 }
 
 func TestProductionReleasePrepareRequiresPublisherAndOwnedWritableKB(t *testing.T) {

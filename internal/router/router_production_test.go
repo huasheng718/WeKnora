@@ -121,6 +121,13 @@ type productionRouterRunService struct{}
 
 type productionRouterReleaseService struct{}
 
+func (*productionRouterReleaseService) List(context.Context, string, int, int) ([]*types.ProductionRelease, int64, error) {
+	return []*types.ProductionRelease{}, 0, nil
+}
+func (*productionRouterReleaseService) Preflight(context.Context, string, string, int, int) (*types.ProductionReleasePreflight, error) {
+	return &types.ProductionReleasePreflight{}, nil
+}
+
 func (*productionRouterReleaseService) Prepare(context.Context, string, string, []string) (*types.ProductionRelease, error) {
 	return &types.ProductionRelease{}, nil
 }
@@ -151,6 +158,9 @@ type productionRouterReviewService struct {
 
 func (*productionRouterReviewService) Submit(context.Context, string, string) (*types.ProductionReviewRequest, error) {
 	return &types.ProductionReviewRequest{}, nil
+}
+func (*productionRouterReviewService) List(context.Context, string, int, int) ([]*types.ProductionReviewRequest, int64, error) {
+	return []*types.ProductionReviewRequest{}, 0, nil
 }
 func (*productionRouterReviewService) Get(context.Context, string) (*types.ProductionReviewRequest, error) {
 	return &types.ProductionReviewRequest{}, nil
@@ -386,6 +396,7 @@ func TestProductionReviewRoutesAreRegistered(t *testing.T) {
 		{http.MethodPost, "/api/v1/production/documents/:id/annotations"},
 		{http.MethodPut, "/api/v1/production/annotations/:id/status"},
 		{http.MethodPost, "/api/v1/production/documents/:id/reviews"},
+		{http.MethodGet, "/api/v1/production/documents/:id/reviews"},
 		{http.MethodGet, "/api/v1/production/reviews/:id"},
 		{http.MethodPost, "/api/v1/production/reviews/:id/steps/:step_id/decision"},
 		{http.MethodPost, "/api/v1/production/reviews/:id/reject"},
@@ -400,6 +411,8 @@ func TestProductionReleaseRoutesAreRegistered(t *testing.T) {
 
 	for _, route := range []struct{ method, path string }{
 		{http.MethodPost, "/api/v1/production/documents/:id/releases"},
+		{http.MethodGet, "/api/v1/production/documents/:id/releases"},
+		{http.MethodGet, "/api/v1/production/documents/:id/release-preflight"},
 		{http.MethodGet, "/api/v1/production/release-targets/:id"},
 		{http.MethodPost, "/api/v1/production/release-targets/:id/activate"},
 		{http.MethodPost, "/api/v1/production/release-targets/:id/retry"},

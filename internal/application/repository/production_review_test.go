@@ -182,6 +182,28 @@ func productionReviewSteps(requestID string, start int) []*types.ProductionRevie
 	}
 }
 
+func TestProductionReviewRepositoryListsDocumentHistoryNewestFirstAndTenantScoped(t *testing.T) {
+	repo, _ := newProductionReviewRepoFixture(t)
+	first := productionReviewRequest(reviewID(80), reviewVersionOne)
+	second := productionReviewRequest(reviewID(81), reviewVersionTwo)
+	require.NoError(t, repo.CreateReview(productionReviewContext(reviewTenantID, reviewAuthorID), first, productionReviewSteps(first.ID, 80)))
+	require.NoError(t, repo.CreateReview(productionReviewContext(reviewTenantID, reviewAuthorID), second, productionReviewSteps(second.ID, 90)))
+
+	historyRepo, ok := repo.(interface {
+		ListReviews(context.Context, uint64, string, int, int) ([]*types.ProductionReviewRequest, int64, error)
+	})
+	require.True(t, ok)
+	history, total, err := historyRepo.ListReviews(productionReviewTenantContext(reviewTenantID), reviewTenantID, reviewDocumentID, 0, 1)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), total)
+	require.Len(t, history, 1)
+	require.Equal(t, second.ID, history[0].ID)
+	require.Len(t, history[0].Steps, 2)
+
+	_, _, err = historyRepo.ListReviews(productionReviewTenantContext(8), reviewTenantID, reviewDocumentID, 0, 1)
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
+}
+
 func TestProductionReviewRepositoryCreatesAndResolvesNormalizedAnnotation(t *testing.T) {
 	repo, db := newProductionReviewRepoFixture(t)
 	category := types.ProductionQualityTagMissingEvidence

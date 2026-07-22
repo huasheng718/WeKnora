@@ -74,6 +74,21 @@ export default {
     documentStatus: { draft: 'Черновик', annotating: 'Аннотирование', in_review: 'На проверке', approved: 'Одобрен', publishing: 'Публикация', published: 'Опубликован', archived: 'В архиве' },
     reviews: { unavailableTitle: 'Проверки здесь недоступны', unavailable: 'Откройте документ, чтобы просмотреть управляемую проверку.' },
     releases: { unavailableTitle: 'Публикации здесь недоступны', unavailable: 'Откройте документ, чтобы просмотреть статус публикации.' },
+    reviewConsole: {
+      title: 'Проверка', frozen: 'Зафиксированная версия', notFrozen: 'Сначала зафиксируйте версию', openBlocking: 'Открытых блокирующих аннотаций: {count}', submit: 'Отправить на проверку', empty: 'Запросов на проверку пока нет.',
+      status: { pending: 'Ожидает', approved: 'Одобрено', rejected: 'Отклонено', obsolete: 'Устарело', cancelled: 'Отменено', changes_requested: 'Запрошены изменения' },
+      roles: { project_owner: 'Владелец проекта', author: 'Автор', business_reviewer: 'Бизнес-рецензент', engineering_reviewer: 'Технический рецензент', compliance_reviewer: 'Рецензент по соответствию', publisher: 'Публикатор', observer: 'Наблюдатель' },
+      decision: { pending: 'Ожидает', approved: 'Одобрено', rejected: 'Отклонено', cancelled: 'Отменено', changes_requested: 'Запрошены изменения' },
+      actions: { approved: 'Одобрить', changes_requested: 'Запросить изменения', rejected: 'Отклонить', reject: 'Отклонить проверку', cancel: 'Отменить проверку' },
+      gates: { blocking_annotations: 'Сначала устраните блокирующие аннотации.', version_not_frozen: 'Зафиксируйте эту версию перед отправкой.', historical_version: 'Можно отправить только текущую версию.', review_pending: 'Проверка уже ожидает решения.', author_role_required: 'Для отправки нужна проектная роль автора.' },
+      unassigned: 'Не назначен', loadMore: 'Загрузить ещё', loadFailed: 'Не удалось загрузить проверки.', commandFailed: 'Не удалось выполнить команду проверки.', defaultComment: 'Без дополнительного комментария.', confirm: { reject: 'Отклонить проверку?', cancel: 'Отменить проверку?', body: 'Решение будет записано в управляемую историю проверки.' }, versionDiff: 'Различия версии',
+    },
+    releaseConsole: {
+      title: 'Публикация', history: 'История публикаций', newRelease: 'Новая публикация', empty: 'Публикаций пока нет.', selectDocument: 'Выберите одобренный документ', dialogTitle: 'Опубликовать одобренную версию',
+      targets: 'Целевые базы знаний', selected: 'Выбрано: {count}', ready: 'Готово', notReady: 'Не готово', loadMore: 'Загрузить ещё', snapshot: 'Снимок публикации', confirmSnapshot: 'Я подтверждаю этот зафиксированный снимок публикации.', publish: 'Опубликовать', loadFailed: 'Не удалось загрузить данные публикации.', commandFailed: 'Не удалось выполнить публикацию.',
+      status: { building: 'Сборка', ready: 'Готово', active: 'Активно', failed: 'Ошибка', rolled_back: 'Откат выполнен', cleanup_pending: 'Ожидает очистки', cleaned: 'Очищено' },
+      actions: { activate: 'Активировать', retry: 'Повторить', rollback: 'Откатить' }, activeHead: 'Активная цель', lock: 'Блокировка головы {lock}', rollbackTitle: 'Откатить публикацию?', rollbackBody: 'Это изменит активную цель публикации и будет записано в историю аудита.',
+    },
     errors: {
       createProject: 'Не удалось создать проект.', loadSourcesTitle: 'Не удалось загрузить источники', loadDocumentsTitle: 'Не удалось загрузить документы',
       createSource: 'Не удалось создать набор источников.', createDocument: 'Не удалось создать документ.', loadProjectsTitle: 'Не удалось загрузить проекты',

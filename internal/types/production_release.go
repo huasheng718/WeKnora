@@ -137,6 +137,25 @@ type ProductionRelease struct {
 	Targets              []*ProductionReleaseTarget `json:"targets,omitempty" gorm:"-"`
 }
 
+type ProductionReleasePreflightTarget struct {
+	KnowledgeBaseID   string `json:"knowledge_base_id"`
+	KnowledgeBaseName string `json:"knowledge_base_name"`
+	Ready             bool   `json:"ready"`
+	Reason            string `json:"reason,omitempty"`
+	ConfigSnapshot    JSON   `json:"config_snapshot,omitempty"`
+}
+
+type ProductionReleasePreflight struct {
+	DocumentID       string                              `json:"document_id"`
+	VersionID        string                              `json:"version_id"`
+	RenderedMarkdown string                              `json:"rendered_markdown"`
+	Targets          []*ProductionReleasePreflightTarget `json:"targets"`
+	Page             int                                 `json:"page"`
+	PageSize         int                                 `json:"page_size"`
+	Total            int                                 `json:"total"`
+	HasMore          bool                                `json:"has_more"`
+}
+
 func (ProductionRelease) TableName() string { return "production_releases" }
 
 type ProductionReleaseTarget struct {
@@ -164,6 +183,8 @@ type ProductionReleaseTarget struct {
 	CleanedAt             *time.Time                    `json:"cleaned_at,omitempty"`
 	CreatedAt             time.Time                     `json:"created_at"`
 	UpdatedAt             time.Time                     `json:"updated_at"`
+	HeadLockVersion       int                           `json:"head_lock_version,omitempty" gorm:"-"`
+	IsActive              bool                          `json:"is_active" gorm:"-"`
 }
 
 func (ProductionReleaseTarget) TableName() string { return "production_release_targets" }

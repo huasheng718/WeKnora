@@ -73,10 +73,37 @@ func (h *ProductionReviewHandler) ListAnnotations(c *gin.Context) {
 // ProductionReviewService is the governed review surface exposed over HTTP.
 type ProductionReviewService interface {
 	Submit(context.Context, string, string) (*types.ProductionReviewRequest, error)
+	List(context.Context, string, int, int) ([]*types.ProductionReviewRequest, int64, error)
 	Get(context.Context, string) (*types.ProductionReviewRequest, error)
 	Decide(context.Context, string, types.ProductionReviewDecision, string) error
 	Reject(context.Context, string, string) error
 	Cancel(context.Context, string, string) error
+}
+
+func (h *ProductionReviewHandler) List(c *gin.Context) {
+	documentID := strings.TrimSpace(c.Param("id"))
+	if !isProductionUUID(documentID) {
+		c.Error(apperrors.NewValidationError("document id must be a canonical UUID"))
+		return
+	}
+	page, pageSize, ok := parseListPagination(c)
+	if !ok {
+		return
+	}
+	if page-1 > int(^uint(0)>>1)/pageSize {
+		c.Error(apperrors.NewValidationError("page is too large"))
+		return
+	}
+	offset := (page - 1) * pageSize
+	rows, total, err := h.reviews.List(c.Request.Context(), documentID, offset, pageSize)
+	if err != nil {
+		handleProductionReviewServiceError(c, err, "failed to list production reviews")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true, "data": rows, "total": total, "page": page, "page_size": pageSize,
+		"has_more": int64(offset+len(rows)) < total,
+	})
 }
 
 // ProductionReviewHandler exposes annotation and review governance without

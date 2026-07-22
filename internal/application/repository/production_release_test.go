@@ -606,6 +606,51 @@ func TestProductionReleaseRepositoryGetsReleaseByTenantAndHydratesTargets(t *tes
 	require.ErrorIs(t, err, types.ErrProductionForbidden)
 }
 
+func TestProductionReleaseRepositoryListsDocumentHistoryWithProjectionHeadMetadata(t *testing.T) {
+	repo, db := newProductionReleaseRepoFixture(t, nil)
+	first := productionRelease(releaseIDOne, reviewVersionOne, reviewID(700))
+	second := productionRelease(releaseIDTwo, reviewVersionTwo, reviewID(710))
+	require.NoError(t, repo.CreateRelease(productionReleaseContext(reviewTenantID, reviewAuthorID), first,
+		[]*types.ProductionReleaseTarget{productionReleaseTarget(releaseTarget1, releaseKBOne, releaseKnowledge1)}))
+	require.NoError(t, repo.CreateRelease(productionReleaseContext(reviewTenantID, reviewAuthorID), second,
+		[]*types.ProductionReleaseTarget{productionReleaseTarget(releaseTarget2, releaseKBOne, releaseKnowledge2)}))
+	changed, err := repo.TransitionTarget(
+		productionReleaseContext(reviewTenantID, reviewAuthorID), releaseTarget1,
+		types.ReleaseTargetBuilding, types.ReleaseTargetReady, nil,
+	)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.NoError(t, db.Exec(`
+INSERT INTO production_projection_heads
+    (tenant_id, document_id, target_knowledge_base_id, active_release_target_id, lock_version, updated_at)
+VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+`, reviewTenantID, reviewDocumentID, releaseKBOne, releaseTarget1).Error)
+	for range 3 {
+		require.NoError(t, db.Exec(`
+UPDATE production_projection_heads
+SET lock_version = lock_version + 1, updated_at = CURRENT_TIMESTAMP
+WHERE tenant_id = ? AND document_id = ? AND target_knowledge_base_id = ?
+`, reviewTenantID, reviewDocumentID, releaseKBOne).Error)
+	}
+
+	historyRepo, ok := repo.(interface {
+		ListReleases(context.Context, uint64, string, int, int) ([]*types.ProductionRelease, int64, error)
+	})
+	require.True(t, ok)
+	history, total, err := historyRepo.ListReleases(productionReleaseContext(reviewTenantID, reviewAuthorID), reviewTenantID, reviewDocumentID, 0, 2)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), total)
+	require.Len(t, history, 2)
+	require.Equal(t, second.ID, history[0].ID)
+	require.Equal(t, 4, history[0].Targets[0].HeadLockVersion)
+	require.False(t, history[0].Targets[0].IsActive)
+	require.Equal(t, 4, history[1].Targets[0].HeadLockVersion)
+	require.True(t, history[1].Targets[0].IsActive)
+
+	_, _, err = historyRepo.ListReleases(productionReleaseContext(8, reviewAuthorID), reviewTenantID, reviewDocumentID, 0, 2)
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
+}
+
 func TestProductionReleaseTargetFailureReasonIsBoundedSanitizedAndClearedOnRetry(t *testing.T) {
 	repo, _ := newProductionReleaseRepoFixture(t, nil)
 	require.NoError(t, repo.CreateRelease(

@@ -299,6 +299,24 @@ func (fixture *productionReviewFixture) submit(t *testing.T) *types.ProductionRe
 	return request
 }
 
+func TestProductionReviewServiceListsAuthorizedDocumentHistory(t *testing.T) {
+	fixture := newProductionReviewFixture(t)
+	created := fixture.submit(t)
+	historyService, ok := any(fixture.svc).(interface {
+		List(context.Context, string, int, int) ([]*types.ProductionReviewRequest, int64, error)
+	})
+	require.True(t, ok)
+	history, total, err := historyService.List(
+		productionReviewServiceContext(productionReviewAuthorID, types.TenantRoleContributor),
+		productionReviewDocumentID, 0, 20,
+	)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), total)
+	require.Len(t, history, 1)
+	require.Equal(t, created.ID, history[0].ID)
+	require.Len(t, history[0].Steps, 2)
+}
+
 func TestBlockingAnnotationPreventsReviewSubmission(t *testing.T) {
 	fixture := newProductionReviewFixture(t)
 	require.NoError(t, fixture.db.Create(&types.ProductionAnnotation{

@@ -19,10 +19,64 @@ const productionReleaseHTTPBodyMaxBytes int64 = 64 << 10
 // ProductionReleaseService is the governed publication surface exposed over HTTP.
 type ProductionReleaseService interface {
 	Prepare(context.Context, string, string, []string) (*types.ProductionRelease, error)
+	List(context.Context, string, int, int) ([]*types.ProductionRelease, int64, error)
+	Preflight(context.Context, string, string, int, int) (*types.ProductionReleasePreflight, error)
 	GetTarget(context.Context, string) (*types.ProductionReleaseTarget, error)
 	Activate(context.Context, string, int) error
 	Retry(context.Context, string) error
 	Rollback(context.Context, string, int) error
+}
+
+func productionReleaseListPage(c *gin.Context) (int, int, int, bool) {
+	page, pageSize, ok := parseListPagination(c)
+	if !ok {
+		return 0, 0, 0, false
+	}
+	if page-1 > int(^uint(0)>>1)/pageSize {
+		c.Error(apperrors.NewValidationError("page is too large"))
+		return 0, 0, 0, false
+	}
+	return page, pageSize, (page - 1) * pageSize, true
+}
+
+func (h *ProductionReleaseHandler) List(c *gin.Context) {
+	documentID := strings.TrimSpace(c.Param("id"))
+	if !isProductionUUID(documentID) {
+		c.Error(apperrors.NewValidationError("document id must be a canonical UUID"))
+		return
+	}
+	page, pageSize, offset, ok := productionReleaseListPage(c)
+	if !ok {
+		return
+	}
+	rows, total, err := h.service.List(c.Request.Context(), documentID, offset, pageSize)
+	if err != nil {
+		handleProductionReleaseServiceError(c, err, "failed to list production releases")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true, "data": rows, "total": total, "page": page, "page_size": pageSize,
+		"has_more": int64(offset+len(rows)) < total,
+	})
+}
+
+func (h *ProductionReleaseHandler) Preflight(c *gin.Context) {
+	documentID := strings.TrimSpace(c.Param("id"))
+	versionID := strings.TrimSpace(c.Query("version_id"))
+	if !isProductionUUID(documentID) || !isProductionUUID(versionID) {
+		c.Error(apperrors.NewValidationError("document id and version_id must be canonical UUIDs"))
+		return
+	}
+	page, pageSize, _, ok := productionReleaseListPage(c)
+	if !ok {
+		return
+	}
+	result, err := h.service.Preflight(c.Request.Context(), documentID, versionID, page, pageSize)
+	if err != nil {
+		handleProductionReleaseServiceError(c, err, "failed to prepare production release preview")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": result})
 }
 
 // ProductionReleaseHandler exposes release preparation and target lifecycle commands.

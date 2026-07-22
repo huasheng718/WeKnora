@@ -84,10 +84,14 @@
           </div>
         </t-tab-panel>
         <t-tab-panel value="releases" :label="t('production.tabs.releases')">
-          <div class="tab-content tab-state">
-            <t-icon name="send" size="30px" />
-            <strong>{{ t('production.releases.unavailableTitle') }}</strong>
-            <span>{{ t('production.releases.unavailable') }}</span>
+          <div class="tab-content release-console">
+            <div class="release-selector">
+              <t-select v-model="releaseDocumentId" :placeholder="t('production.releaseConsole.selectDocument')" :disabled="!publishableDocuments.length">
+                <t-option v-for="row in publishableDocuments" :key="row.id" :value="row.id" :label="row.title" />
+              </t-select>
+            </div>
+            <ProductionReleaseStatus :documents="documents" :can-publish="canPublish" @publish="openReleaseDialog" />
+            <ProductionReleaseDialog v-if="releaseDocument" v-model="releaseDialogVisible" :document-id="releaseDocument.id" :version-id="releaseDocument.latest_approved_version_id ?? ''" @created="onReleaseCreated" />
           </div>
         </t-tab-panel>
       </t-tabs>
@@ -113,7 +117,10 @@ import { useProductionStore } from '@/stores/production'
 import { createLatestRequestCoordinator } from './models/latestRequestCoordinator'
 import { canEditProductionProject, workbenchViewState } from './models/productionViewModel'
 import ProductionDocumentList from './components/ProductionDocumentList.vue'
+import ProductionReleaseDialog from './components/ProductionReleaseDialog.vue'
+import ProductionReleaseStatus from './components/ProductionReleaseStatus.vue'
 import ProductionSourcePanel from './components/ProductionSourcePanel.vue'
+import { canPublishProductionRelease } from './models/releaseActions'
 
 const { t, locale } = useI18n()
 const route = useRoute()
@@ -124,6 +131,8 @@ const activeTab = ref('sources')
 const loading = ref(false)
 const loaded = ref(false)
 const pageError = ref('')
+const releaseDialogVisible = ref(false)
+const releaseDocumentId = ref('')
 const loadCoordinator = createLatestRequestCoordinator()
 
 const projectId = computed(() => typeof route.params.projectId === 'string' ? route.params.projectId : '')
@@ -134,6 +143,9 @@ const documentTypes = computed(() => Object.values(store.documentTypesById))
 const canEdit = computed(() => project.value
   ? canEditProductionProject(auth.currentTenantRole as TenantRole | '', project.value)
   : false)
+const publishableDocuments = computed(() => documents.value.filter(row => !!row.latest_approved_version_id))
+const releaseDocument = computed(() => publishableDocuments.value.find(row => row.id === releaseDocumentId.value) ?? publishableDocuments.value[0] ?? null)
+const canPublish = computed(() => !!project.value && canPublishProductionRelease(auth.currentTenantRole as TenantRole | '', project.value.current_user_roles ?? []))
 const viewState = computed(() => workbenchViewState({
   loading: loading.value,
   loaded: loaded.value,
@@ -155,6 +167,15 @@ function onSourceCreated(sourceSet: ProductionSourceSet) {
 
 function onDocumentCreated(document: ProductionDocument) {
   store.upsertDocument(document)
+}
+
+function openReleaseDialog() {
+  if (!releaseDocumentId.value && releaseDocument.value) releaseDocumentId.value = releaseDocument.value.id
+  if (releaseDocument.value && canPublish.value) releaseDialogVisible.value = true
+}
+
+function onReleaseCreated() {
+  releaseDialogVisible.value = false
 }
 
 async function loadWorkbench() {
@@ -217,6 +238,7 @@ onBeforeUnmount(() => loadCoordinator.invalidate())
 .tab-content { min-height: 320px; padding: 26px 0 0; }
 .tab-state { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; color: var(--td-text-color-secondary); border-bottom: 1px solid var(--td-component-stroke); text-align: center; }
 .tab-state strong { color: var(--td-text-color-primary); font-size: 16px; }
+.release-selector { width: min(420px, 100%); margin-bottom: 14px; }
 .workbench-loading { padding-top: 32px; }
 .workbench-state { min-height: 420px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: var(--td-text-color-secondary); text-align: center; }
 .workbench-state > div { display: flex; flex-direction: column; gap: 4px; }

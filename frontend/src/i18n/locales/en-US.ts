@@ -74,6 +74,21 @@ export default {
     documentStatus: { draft: 'Draft', annotating: 'Annotating', in_review: 'In review', approved: 'Approved', publishing: 'Publishing', published: 'Published', archived: 'Archived' },
     reviews: { unavailableTitle: 'Reviews are not available here', unavailable: 'Open a document to view and manage its governed review.' },
     releases: { unavailableTitle: 'Releases are not available here', unavailable: 'Open a document to view and manage its publication status.' },
+    reviewConsole: {
+      title: 'Review', frozen: 'Frozen version', notFrozen: 'Version must be frozen', openBlocking: '{count} open blocking annotations', submit: 'Submit for review', empty: 'No review requests yet.',
+      status: { pending: 'Pending', approved: 'Approved', rejected: 'Rejected', obsolete: 'Obsolete', cancelled: 'Cancelled', changes_requested: 'Changes requested' },
+      roles: { project_owner: 'Project owner', author: 'Author', business_reviewer: 'Business reviewer', engineering_reviewer: 'Engineering reviewer', compliance_reviewer: 'Compliance reviewer', publisher: 'Publisher', observer: 'Observer' },
+      decision: { pending: 'Pending', approved: 'Approved', rejected: 'Rejected', cancelled: 'Cancelled', changes_requested: 'Changes requested' },
+      actions: { approved: 'Approve', changes_requested: 'Request changes', rejected: 'Reject', reject: 'Reject review', cancel: 'Cancel review' },
+      gates: { blocking_annotations: 'Resolve blocking annotations first.', version_not_frozen: 'Freeze this version before submitting.', historical_version: 'Only the current version can be submitted.', review_pending: 'A review is already pending.', author_role_required: 'An authoring project role is required to submit.' },
+      unassigned: 'Unassigned', loadMore: 'Load more', loadFailed: 'Failed to load reviews.', commandFailed: 'Review command failed.', defaultComment: 'No additional comment.', confirm: { reject: 'Reject review?', cancel: 'Cancel review?', body: 'This decision is recorded in the governed review history.' }, versionDiff: 'Version difference',
+    },
+    releaseConsole: {
+      title: 'Publication', history: 'Publication history', newRelease: 'New publication', empty: 'No publications yet.', selectDocument: 'Select an approved document', dialogTitle: 'Publish approved version',
+      targets: 'Knowledge base targets', selected: '{count} selected', ready: 'Ready', notReady: 'Not ready', loadMore: 'Load more', snapshot: 'Publication snapshot', confirmSnapshot: 'I confirm this frozen publication snapshot.', publish: 'Publish', loadFailed: 'Failed to load publication data.', commandFailed: 'Publication command failed.',
+      status: { building: 'Building', ready: 'Ready', active: 'Active', failed: 'Failed', rolled_back: 'Rolled back', cleanup_pending: 'Cleanup pending', cleaned: 'Cleaned' },
+      actions: { activate: 'Activate', retry: 'Retry', rollback: 'Rollback' }, activeHead: 'Active target', lock: 'Head lock {lock}', rollbackTitle: 'Rollback publication?', rollbackBody: 'This changes the active publication target and is recorded in the audit history.',
+    },
     errors: {
       createProject: 'Failed to create the project.', loadSourcesTitle: 'Source sets could not be loaded', loadDocumentsTitle: 'Documents could not be loaded',
       createSource: 'Failed to create the source set.', createDocument: 'Failed to create the document.', loadProjectsTitle: 'Projects could not be loaded',

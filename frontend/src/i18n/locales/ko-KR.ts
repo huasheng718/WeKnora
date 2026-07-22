@@ -74,6 +74,21 @@ export default {
     documentStatus: { draft: "초안", annotating: "주석 작성 중", in_review: "검토 중", approved: "승인됨", publishing: "게시 중", published: "게시됨", archived: "보관됨" },
     reviews: { unavailableTitle: "여기에서는 검토를 볼 수 없음", unavailable: "문서를 열어 관리 검토를 확인하고 처리하세요." },
     releases: { unavailableTitle: "여기에서는 릴리스를 볼 수 없음", unavailable: "문서를 열어 게시 상태를 확인하고 처리하세요." },
+    reviewConsole: {
+      title: "검토", frozen: "고정된 버전", notFrozen: "버전을 먼저 고정하세요", openBlocking: "미해결 차단 주석 {count}개", submit: "검토 제출", empty: "검토 요청이 없습니다.",
+      status: { pending: "대기", approved: "승인됨", rejected: "거부됨", obsolete: "사용 안 함", cancelled: "취소됨", changes_requested: "변경 요청" },
+      roles: { project_owner: "프로젝트 책임자", author: "작성자", business_reviewer: "비즈니스 검토자", engineering_reviewer: "엔지니어링 검토자", compliance_reviewer: "컴플라이언스 검토자", publisher: "게시자", observer: "관찰자" },
+      decision: { pending: "대기", approved: "승인됨", rejected: "거부됨", cancelled: "취소됨", changes_requested: "변경 요청" },
+      actions: { approved: "승인", changes_requested: "변경 요청", rejected: "거부", reject: "검토 거부", cancel: "검토 취소" },
+      gates: { blocking_annotations: "차단 주석을 먼저 해결하세요.", version_not_frozen: "제출 전에 이 버전을 고정하세요.", historical_version: "현재 버전만 제출할 수 있습니다.", review_pending: "이미 대기 중인 검토가 있습니다.", author_role_required: "제출하려면 작성 프로젝트 역할이 필요합니다." },
+      unassigned: "미배정", loadMore: "더 보기", loadFailed: "검토를 불러오지 못했습니다.", commandFailed: "검토 작업에 실패했습니다.", defaultComment: "추가 의견 없음.", confirm: { reject: "검토를 거부할까요?", cancel: "검토를 취소할까요?", body: "이 결정은 관리 검토 기록에 저장됩니다." }, versionDiff: "버전 차이",
+    },
+    releaseConsole: {
+      title: "게시", history: "게시 이력", newRelease: "새 게시", empty: "게시 이력이 없습니다.", selectDocument: "승인된 문서를 선택하세요", dialogTitle: "승인된 버전 게시",
+      targets: "지식 베이스 대상", selected: "{count}개 선택됨", ready: "준비됨", notReady: "준비되지 않음", loadMore: "더 보기", snapshot: "게시 스냅샷", confirmSnapshot: "이 고정 게시 스냅샷을 확인했습니다.", publish: "게시", loadFailed: "게시 데이터를 불러오지 못했습니다.", commandFailed: "게시 작업에 실패했습니다.",
+      status: { building: "빌드 중", ready: "준비됨", active: "활성", failed: "실패", rolled_back: "롤백됨", cleanup_pending: "정리 대기", cleaned: "정리됨" },
+      actions: { activate: "활성화", retry: "재시도", rollback: "롤백" }, activeHead: "활성 대상", lock: "헤드 잠금 {lock}", rollbackTitle: "게시를 롤백할까요?", rollbackBody: "이 작업은 활성 게시 대상을 변경하고 감사 이력에 기록됩니다.",
+    },
     errors: {
       createProject: "프로젝트를 만들지 못했습니다.", loadSourcesTitle: "소스 세트를 불러올 수 없음", loadDocumentsTitle: "문서를 불러올 수 없음",
       createSource: "소스 세트를 만들지 못했습니다.", createDocument: "문서를 만들지 못했습니다.", loadProjectsTitle: "프로젝트를 불러올 수 없음",

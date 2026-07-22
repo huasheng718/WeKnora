@@ -56,7 +56,8 @@
           <t-tabs v-model="rightTab" class="right-tabs">
             <t-tab-panel value="ai" :label="t('production.documentWorkbench.ai')"><ProductionAIRunPanel :runs="runs" :tool-calls="toolCalls" :models="models" :can-edit="canEdit" @start="startRun" @decide="decideTool" @select-run="loadToolCalls" /></t-tab-panel>
             <t-tab-panel value="annotations" :label="t('production.documentWorkbench.notes')"><ProductionAnnotationPanel v-model:body="annotationDraft.body" v-model:severity="annotationDraft.severity" :annotations="annotations" :can-annotate="canCreateAnnotation" :can-resolve="canResolveAnnotation" :submitting="annotationSubmitting" @create="createAnnotation" @resolve="resolveAnnotation" /></t-tab-panel>
-            <t-tab-panel value="versions" :label="t('production.documentWorkbench.history')"><ProductionVersionPanel :versions="versions" :selected-version-id="selectedVersionId" :current-version-id="document.current_version_id ?? ''" :diff="versionDiff" @select="selectVersion" @reload="loadWorkbench(selectedVersionId)" /></t-tab-panel>
+            <t-tab-panel value="review" :label="t('production.tabs.reviews')"><ProductionReviewPanel :document-id="document.id" :version-id="selectedVersionId" :frozen="!!versionDetail?.frozen_at" :current="selectedVersionId === document.current_version_id" :open-blocking="openBlocking" :tenant-role="auth.currentTenantRole as TenantRole | ''" :project-roles="projectRoles" @changed="loadWorkbench(selectedVersionId)" /></t-tab-panel>
+            <t-tab-panel value="versions" :label="t('production.documentWorkbench.history')"><ProductionVersionDiffPanel :diff="versionDiff" /><ProductionVersionPanel :versions="versions" :selected-version-id="selectedVersionId" :current-version-id="document.current_version_id ?? ''" :diff="versionDiff" @select="selectVersion" @reload="loadWorkbench(selectedVersionId)" /></t-tab-panel>
           </t-tabs>
         </aside>
       </div>
@@ -69,7 +70,8 @@
         <t-tabs v-model="rightTab">
           <t-tab-panel value="ai" :label="t('production.documentWorkbench.ai')"><ProductionAIRunPanel :runs="runs" :tool-calls="toolCalls" :models="models" :can-edit="canEdit" @start="startRun" @decide="decideTool" @select-run="loadToolCalls" /></t-tab-panel>
           <t-tab-panel value="annotations" :label="t('production.documentWorkbench.notes')"><ProductionAnnotationPanel v-model:body="annotationDraft.body" v-model:severity="annotationDraft.severity" :annotations="annotations" :can-annotate="canCreateAnnotation" :can-resolve="canResolveAnnotation" :submitting="annotationSubmitting" @create="createAnnotation" @resolve="resolveAnnotation" /></t-tab-panel>
-          <t-tab-panel value="versions" :label="t('production.documentWorkbench.history')"><ProductionVersionPanel :versions="versions" :selected-version-id="selectedVersionId" :current-version-id="document.current_version_id ?? ''" :diff="versionDiff" @select="selectVersion" @reload="loadWorkbench(selectedVersionId)" /></t-tab-panel>
+          <t-tab-panel value="review" :label="t('production.tabs.reviews')"><ProductionReviewPanel :document-id="document.id" :version-id="selectedVersionId" :frozen="!!versionDetail?.frozen_at" :current="selectedVersionId === document.current_version_id" :open-blocking="openBlocking" :tenant-role="auth.currentTenantRole as TenantRole | ''" :project-roles="projectRoles" @changed="loadWorkbench(selectedVersionId)" /></t-tab-panel>
+          <t-tab-panel value="versions" :label="t('production.documentWorkbench.history')"><ProductionVersionDiffPanel :diff="versionDiff" /><ProductionVersionPanel :versions="versions" :selected-version-id="selectedVersionId" :current-version-id="document.current_version_id ?? ''" :diff="versionDiff" @select="selectVersion" @reload="loadWorkbench(selectedVersionId)" /></t-tab-panel>
         </t-tabs>
       </t-drawer>
     </template>
@@ -119,6 +121,8 @@ import ProductionAnnotationPanel from './components/ProductionAnnotationPanel.vu
 import ProductionBlockEditor from './components/ProductionBlockEditor.vue'
 import ProductionEvidencePanel from './components/ProductionEvidencePanel.vue'
 import ProductionOutline from './components/ProductionOutline.vue'
+import ProductionReviewPanel from './components/ProductionReviewPanel.vue'
+import ProductionVersionDiffPanel from './components/ProductionVersionDiff.vue'
 import ProductionVersionPanel from './components/ProductionVersionPanel.vue'
 import {
   buildAnnotationSubmission,
@@ -191,6 +195,7 @@ const canCreateAnnotation = computed(() => !!selectedPersistedBlock.value && can
   projectRoles.value,
 ))
 const canSave = computed(() => canEdit.value && !saving.value && draftBlocks.value.length > 0)
+const openBlocking = computed(() => annotations.value.filter(row => row.status === 'open' && row.severity === 'blocking').length)
 const saveHint = computed(() => canEdit.value ? t('production.documentWorkbench.saveVersion') : readOnlyMessage.value)
 const readOnlyMessage = computed(() => {
   if (project.value?.status === 'archived') return t('production.permissions.archivedReadonly')

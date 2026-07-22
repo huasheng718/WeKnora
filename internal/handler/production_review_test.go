@@ -75,6 +75,17 @@ type productionReviewServiceStub struct {
 	cancelledReason     string
 	review              *types.ProductionReviewRequest
 	err                 error
+	listedDocumentID    string
+	listOffset          int
+	listLimit           int
+}
+
+func (s *productionReviewServiceStub) List(_ context.Context, documentID string, offset, limit int) ([]*types.ProductionReviewRequest, int64, error) {
+	s.listedDocumentID, s.listOffset, s.listLimit = documentID, offset, limit
+	if s.err != nil {
+		return nil, 0, s.err
+	}
+	return []*types.ProductionReviewRequest{{ID: productionReviewRequestID, DocumentID: documentID}}, 21, nil
 }
 
 func (s *productionReviewServiceStub) Submit(_ context.Context, documentID, versionID string) (*types.ProductionReviewRequest, error) {
@@ -129,11 +140,28 @@ func productionReviewHandlerEngine(annotation *productionReviewAnnotationService
 	engine.GET("/documents/:id/annotations", h.ListAnnotations)
 	engine.PUT("/annotations/:id/status", h.UpdateAnnotationStatus)
 	engine.POST("/documents/:id/reviews", h.Submit)
+	engine.GET("/documents/:id/reviews", h.List)
 	engine.GET("/reviews/:id", h.Get)
 	engine.POST("/reviews/:id/steps/:step_id/decision", h.Decide)
 	engine.POST("/reviews/:id/reject", h.Reject)
 	engine.POST("/reviews/:id/cancel", h.Cancel)
 	return engine
+}
+
+func TestProductionReviewHandlerListsBoundedDocumentHistory(t *testing.T) {
+	reviews := &productionReviewServiceStub{}
+	response := productionReviewHandlerRequest(
+		productionReviewHandlerEngine(&productionReviewAnnotationServiceStub{}, reviews),
+		http.MethodGet,
+		"/documents/"+productionReviewDocumentID+"/reviews?page=2&page_size=20",
+		"",
+	)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.Equal(t, productionReviewDocumentID, reviews.listedDocumentID)
+	require.Equal(t, 20, reviews.listOffset)
+	require.Equal(t, 20, reviews.listLimit)
+	require.Contains(t, response.Body.String(), `"total":21`)
+	require.Contains(t, response.Body.String(), `"has_more":false`)
 }
 
 func productionReviewHandlerRequest(engine *gin.Engine, method, path, body string) *httptest.ResponseRecorder {
