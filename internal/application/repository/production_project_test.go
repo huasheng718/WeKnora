@@ -36,6 +36,9 @@ func newProductionRepoTestDB(t *testing.T) (interfaces.ProductionProjectReposito
 	))
 	require.NoError(t, err)
 	require.NoError(t, db.Exec(string(migration)).Error)
+	require.NoError(t, db.Exec(`ALTER TABLE production_document_types ADD COLUMN template_key VARCHAR(255)`).Error)
+	require.NoError(t, db.Exec(`ALTER TABLE production_document_types ADD COLUMN origin VARCHAR(16) NOT NULL DEFAULT 'custom'`).Error)
+	require.NoError(t, db.Exec(`CREATE UNIQUE INDEX uq_production_document_types_live_template_version ON production_document_types (tenant_id, template_key, schema_version) WHERE template_key IS NOT NULL AND deleted_at IS NULL`).Error)
 
 	return NewProductionProjectRepository(db), db
 }

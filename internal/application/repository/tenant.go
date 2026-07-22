@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/Tencent/WeKnora/internal/database"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -28,13 +29,13 @@ func NewTenantRepository(db *gorm.DB) interfaces.TenantRepository {
 
 // CreateTenant creates tenant
 func (r *tenantRepository) CreateTenant(ctx context.Context, tenant *types.Tenant) error {
-	return r.db.WithContext(ctx).Create(tenant).Error
+	return database.DBFromContext(ctx, r.db).WithContext(ctx).Create(tenant).Error
 }
 
 // GetTenantByID gets tenant by ID
 func (r *tenantRepository) GetTenantByID(ctx context.Context, id uint64) (*types.Tenant, error) {
 	var tenant types.Tenant
-	if err := r.db.WithContext(ctx).Where("id = ?", id).First(&tenant).Error; err != nil {
+	if err := database.DBFromContext(ctx, r.db).WithContext(ctx).Where("id = ?", id).First(&tenant).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, ErrTenantNotFound
 		}
@@ -52,7 +53,7 @@ func (r *tenantRepository) GetTenantsByIDs(ctx context.Context, ids []uint64) (m
 		return map[uint64]*types.Tenant{}, nil
 	}
 	var tenants []*types.Tenant
-	if err := r.db.WithContext(ctx).Where("id IN ?", ids).Find(&tenants).Error; err != nil {
+	if err := database.DBFromContext(ctx, r.db).WithContext(ctx).Where("id IN ?", ids).Find(&tenants).Error; err != nil {
 		return nil, err
 	}
 	out := make(map[uint64]*types.Tenant, len(tenants))
@@ -67,7 +68,7 @@ func (r *tenantRepository) GetTenantsByIDs(ctx context.Context, ids []uint64) (m
 // ListTenants lists all tenants
 func (r *tenantRepository) ListTenants(ctx context.Context) ([]*types.Tenant, error) {
 	var tenants []*types.Tenant
-	if err := r.db.WithContext(ctx).Order("created_at DESC").Find(&tenants).Error; err != nil {
+	if err := database.DBFromContext(ctx, r.db).WithContext(ctx).Order("created_at DESC").Find(&tenants).Error; err != nil {
 		return nil, err
 	}
 	return tenants, nil
@@ -78,7 +79,7 @@ func (r *tenantRepository) SearchTenants(ctx context.Context, keyword string, te
 	var tenants []*types.Tenant
 	var total int64
 
-	query := r.db.WithContext(ctx).Model(&types.Tenant{})
+	query := database.DBFromContext(ctx, r.db).WithContext(ctx).Model(&types.Tenant{})
 
 	// Build search conditions
 	if tenantID > 0 && keyword != "" {
@@ -115,7 +116,7 @@ func (r *tenantRepository) SearchTenants(ctx context.Context, keyword string, te
 
 // UpdateTenant updates tenant.
 func (r *tenantRepository) UpdateTenant(ctx context.Context, tenant *types.Tenant) error {
-	return r.db.WithContext(ctx).Model(&types.Tenant{}).Where("id = ?", tenant.ID).Updates(tenant).Error
+	return database.DBFromContext(ctx, r.db).WithContext(ctx).Model(&types.Tenant{}).Where("id = ?", tenant.ID).Updates(tenant).Error
 }
 
 // DeleteTenant soft-deletes the tenant and every active membership row
@@ -123,7 +124,7 @@ func (r *tenantRepository) UpdateTenant(ctx context.Context, tenant *types.Tenan
 // /auth/me still lists the defunct tenant (name lookup fails → UI shows
 // "#<id>").
 func (r *tenantRepository) DeleteTenant(ctx context.Context, id uint64) error {
-	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return database.DBFromContext(ctx, r.db).WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Where("tenant_id = ?", id).Delete(&types.TenantMember{}).Error; err != nil {
 			return err
 		}
@@ -132,7 +133,7 @@ func (r *tenantRepository) DeleteTenant(ctx context.Context, id uint64) error {
 }
 
 func (r *tenantRepository) AdjustStorageUsed(ctx context.Context, tenantID uint64, delta int64) error {
-	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return database.DBFromContext(ctx, r.db).WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var tenant types.Tenant
 		// 使用悲观锁确保并发安全
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&tenant, tenantID).Error; err != nil {
@@ -161,7 +162,7 @@ func (r *tenantRepository) AdjustStorageUsed(ctx context.Context, tenantID uint6
 // the new default via the system-setting resolver in the handler —
 // no risk of the new tenant being skipped.
 func (r *tenantRepository) BulkSetStorageQuota(ctx context.Context, quotaBytes int64) (int64, error) {
-	res := r.db.WithContext(ctx).
+	res := database.DBFromContext(ctx, r.db).WithContext(ctx).
 		Model(&types.Tenant{}).
 		Where("1 = 1"). // GORM refuses unconditional UPDATEs without an explicit WHERE
 		Update("storage_quota", quotaBytes)

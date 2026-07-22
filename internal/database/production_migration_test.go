@@ -58,6 +58,80 @@ func TestSQLiteTemporaryDocumentsIncrementalMigrationUpAndDown(t *testing.T) {
 	require.Empty(t, sqliteMasterSQL(t, db, "table", "temporary_documents"))
 }
 
+func TestProductionBuiltinDocumentTypeMigrationSQLiteBackfillsAndRollsBack(t *testing.T) {
+	db := openSQLiteThroughProductionMigrationFive(t)
+	for _, tenant := range []string{"Tenant A", "Tenant B"} {
+		_, err := db.Exec(`INSERT INTO tenants (name, retriever_engines, business) VALUES (?, '[]', 'qa')`, tenant)
+		require.NoError(t, err)
+	}
+	_, err := db.Exec(`INSERT INTO production_document_types
+		(id, tenant_id, code, name, description, schema_version, status, created_by)
+		VALUES ('custom-faq', 2, 'faq', 'Tenant FAQ', 'keep me', 1, 'active', 'owner-2')`)
+	require.NoError(t, err)
+
+	up := mustReadMigration(t, "../../migrations/sqlite/000012_production_builtin_document_types.up.sql")
+	_, err = db.Exec(up)
+	require.NoError(t, err)
+	seedStart := strings.Index(up, "WITH builtin_definitions")
+	require.GreaterOrEqual(t, seedStart, 0)
+	_, err = db.Exec(up[seedStart:])
+	require.NoError(t, err)
+
+	for tenantID, builtinCount := range map[int]int{1: 5, 2: 4} {
+		var got int
+		require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM production_document_types WHERE tenant_id = ? AND origin = 'builtin' AND deleted_at IS NULL`, tenantID).Scan(&got))
+		require.Equal(t, builtinCount, got)
+	}
+	var total int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM production_document_types WHERE tenant_id = 2 AND deleted_at IS NULL`).Scan(&total))
+	require.Equal(t, 5, total)
+	var customName, customDescription, customOrigin string
+	var customTemplate sql.NullString
+	require.NoError(t, db.QueryRow(`SELECT name, description, origin, template_key FROM production_document_types WHERE id = 'custom-faq'`).Scan(&customName, &customDescription, &customOrigin, &customTemplate))
+	require.Equal(t, "Tenant FAQ", customName)
+	require.Equal(t, "keep me", customDescription)
+	require.Equal(t, "custom", customOrigin)
+	require.False(t, customTemplate.Valid)
+
+	_, err = db.Exec(`UPDATE production_document_types SET origin = 'custom' WHERE tenant_id = 1 AND code = 'sop'`)
+	require.ErrorContains(t, err, "immutable")
+	_, err = db.Exec(`UPDATE production_document_types SET template_key = 'changed' WHERE tenant_id = 1 AND code = 'sop'`)
+	require.ErrorContains(t, err, "immutable")
+	require.NotEmpty(t, sqliteMasterSQL(t, db, "index", "uq_production_document_types_live_template_version"))
+
+	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000012_production_builtin_document_types.down.sql"))
+	require.NoError(t, err)
+	require.Empty(t, sqliteColumnTypeIfPresent(t, db, "production_document_types", "origin"))
+	require.Empty(t, sqliteColumnTypeIfPresent(t, db, "production_document_types", "template_key"))
+	require.Empty(t, sqliteMasterSQL(t, db, "index", "uq_production_document_types_live_template_version"))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM production_document_types`).Scan(&total))
+	require.Equal(t, 1, total)
+}
+
+func TestProductionBuiltinDocumentTypeMigrationPostgreSQLParity(t *testing.T) {
+	up := mustReadMigration(t, "../../migrations/versioned/000076_production_builtin_document_types.up.sql")
+	down := mustReadMigration(t, "../../migrations/versioned/000076_production_builtin_document_types.down.sql")
+	_, err := pg_query.Parse(up)
+	require.NoError(t, err)
+	_, err = pg_query.Parse(down)
+	require.NoError(t, err)
+	for _, fragment := range []string{
+		"ADD COLUMN origin", "ADD COLUMN template_key", "chk_production_document_types_origin",
+		"chk_production_document_types_builtin_template_key", "uq_production_document_types_live_template_version",
+		"uuid_generate_v4()::varchar(36)", "system:builtin-document-types",
+		"NEW.origin IS DISTINCT FROM OLD.origin", "NEW.template_key IS DISTINCT FROM OLD.template_key",
+		"sop", "policy_process", "product_service_guide", "faq", "incident_playbook",
+	} {
+		require.Contains(t, up, fragment)
+	}
+	deleteAt := strings.Index(down, "DELETE FROM production_document_types")
+	dropColumnsAt := strings.Index(down, "DROP COLUMN origin")
+	require.GreaterOrEqual(t, deleteAt, 0)
+	require.Greater(t, dropColumnsAt, deleteAt)
+	require.Contains(t, down, "DROP INDEX IF EXISTS uq_production_document_types_live_template_version")
+	require.Contains(t, down, "CREATE OR REPLACE FUNCTION prevent_active_production_document_type_definition_update")
+}
+
 var productionSQLiteFoundationMigrationNames = []string{
 	"init",
 	"knowledge_production_foundation",

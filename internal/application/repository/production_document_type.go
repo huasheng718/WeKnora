@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/Tencent/WeKnora/internal/database"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -30,6 +31,59 @@ func (r *productionDocumentTypeRepository) Create(
 	return translateProductionWriteError(
 		database.DBFromContext(ctx, r.db).WithContext(ctx).Create(documentType).Error,
 	)
+}
+
+func (r *productionDocumentTypeRepository) SeedBuiltins(
+	ctx context.Context,
+	tenantID uint64,
+	actor string,
+	definitions []types.ProductionDocumentType,
+) error {
+	db := database.DBFromContext(ctx, r.db).WithContext(ctx)
+	for index := range definitions {
+		definition := definitions[index]
+		var collisionCount int64
+		if err := db.Model(&types.ProductionDocumentType{}).
+			Where("tenant_id = ? AND deleted_at IS NULL AND (code = ? OR template_key = ?)", tenantID, definition.Code, definition.Code).
+			Count(&collisionCount).Error; err != nil {
+			return err
+		}
+		if collisionCount > 0 {
+			continue
+		}
+		templateKey := definition.Code
+		definition.TenantID = tenantID
+		definition.CreatedBy = actor
+		definition.SchemaVersion = 1
+		definition.Status = types.ProductionDocumentTypeActive
+		definition.Origin = types.ProductionDocumentTypeOriginBuiltin
+		definition.TemplateKey = &templateKey
+		if err := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&definition).Error; err != nil {
+			return translateProductionWriteError(err)
+		}
+	}
+
+	for _, definition := range definitions {
+		var templateCount int64
+		if err := db.Model(&types.ProductionDocumentType{}).
+			Where("tenant_id = ? AND template_key = ? AND schema_version = ? AND deleted_at IS NULL", tenantID, definition.Code, 1).
+			Count(&templateCount).Error; err != nil {
+			return err
+		}
+		if templateCount > 0 {
+			continue
+		}
+		var codeCollisionCount int64
+		if err := db.Model(&types.ProductionDocumentType{}).
+			Where("tenant_id = ? AND code = ? AND deleted_at IS NULL", tenantID, definition.Code).
+			Count(&codeCollisionCount).Error; err != nil {
+			return err
+		}
+		if codeCollisionCount == 0 {
+			return fmt.Errorf("production built-in document type %q was not seeded", definition.Code)
+		}
+	}
+	return nil
 }
 
 func (r *productionDocumentTypeRepository) Activate(

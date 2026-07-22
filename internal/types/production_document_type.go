@@ -14,15 +14,27 @@ var ErrProductionDocumentTypeImmutable = errors.New("active production document 
 // ProductionDocumentTypeStatus is the lifecycle state of a document-type version.
 type ProductionDocumentTypeStatus string
 
+// ProductionDocumentTypeOrigin identifies whether a definition was installed
+// from the governed built-in catalog or authored by a tenant.
+type ProductionDocumentTypeOrigin string
+
 const (
 	ProductionDocumentTypeDraft   ProductionDocumentTypeStatus = "draft"
 	ProductionDocumentTypeActive  ProductionDocumentTypeStatus = "active"
 	ProductionDocumentTypeRetired ProductionDocumentTypeStatus = "retired"
+
+	ProductionDocumentTypeOriginBuiltin ProductionDocumentTypeOrigin = "builtin"
+	ProductionDocumentTypeOriginCustom  ProductionDocumentTypeOrigin = "custom"
 )
 
 // IsValid reports whether s is a defined document-type state.
 func (s ProductionDocumentTypeStatus) IsValid() bool {
 	return s == ProductionDocumentTypeDraft || s == ProductionDocumentTypeActive || s == ProductionDocumentTypeRetired
+}
+
+// IsValid reports whether o is a defined document-type origin.
+func (o ProductionDocumentTypeOrigin) IsValid() bool {
+	return o == ProductionDocumentTypeOriginBuiltin || o == ProductionDocumentTypeOriginCustom
 }
 
 // ProductionDocumentType defines a versioned document schema and its quality,
@@ -42,6 +54,8 @@ type ProductionDocumentType struct {
 	ReviewPolicy       JSON                         `json:"review_policy" gorm:"type:jsonb;not null;default:'{}'"`
 	PublicationPolicy  JSON                         `json:"publication_policy" gorm:"type:jsonb;not null;default:'{}'"`
 	Status             ProductionDocumentTypeStatus `json:"status" gorm:"type:varchar(20);not null;default:'draft'"`
+	Origin             ProductionDocumentTypeOrigin `json:"origin" gorm:"type:varchar(16);not null;default:'custom'"`
+	TemplateKey        *string                      `json:"template_key,omitempty" gorm:"type:varchar(255)"`
 	CreatedBy          string                       `json:"created_by" gorm:"type:varchar(36);not null"`
 	CreatedAt          time.Time                    `json:"created_at"`
 	UpdatedAt          time.Time                    `json:"updated_at"`

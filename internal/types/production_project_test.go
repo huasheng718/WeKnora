@@ -60,6 +60,20 @@ func TestProductionDocumentTypeStatusValidation(t *testing.T) {
 	}
 }
 
+func TestProductionDocumentTypeOriginValidation(t *testing.T) {
+	require.True(t, ProductionDocumentTypeOriginBuiltin.IsValid())
+	require.True(t, ProductionDocumentTypeOriginCustom.IsValid())
+	require.False(t, ProductionDocumentTypeOrigin("").IsValid())
+	require.False(t, ProductionDocumentTypeOrigin("system").IsValid())
+
+	templateKey := "sop"
+	documentType := ProductionDocumentType{
+		Origin:      ProductionDocumentTypeOriginBuiltin,
+		TemplateKey: &templateKey,
+	}
+	require.Equal(t, "sop", *documentType.TemplateKey)
+}
+
 func TestProductionConflictSentinel(t *testing.T) {
 	require.Error(t, ErrProductionConflict)
 }

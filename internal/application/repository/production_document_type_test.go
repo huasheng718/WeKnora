@@ -2,9 +2,11 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/Tencent/WeKnora/internal/database"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/stretchr/testify/require"
@@ -12,6 +14,64 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
+
+func productionBuiltinSeedDefinitions(tenantID uint64) []types.ProductionDocumentType {
+	codes := []string{"sop", "policy_process", "product_service_guide", "faq", "incident_playbook"}
+	definitions := make([]types.ProductionDocumentType, 0, len(codes))
+	for index, code := range codes {
+		definition := productionDocumentType("builtin-"+code, tenantID, code, 1)
+		definition.Name = code
+		definition.Status = types.ProductionDocumentTypeActive
+		definition.BlockSchema = types.JSON(`{"allowed_block_types":["paragraph"],"required_sections":["section"],"version":1}`)
+		definition.ReviewPolicy = types.JSON(`{"steps":["business_reviewer"]}`)
+		definition.ID = string(rune('a'+index)) + "0000000-0000-4000-8000-000000000000"
+		definitions = append(definitions, *definition)
+	}
+	return definitions
+}
+
+func TestProductionDocumentTypeRepositorySeedsBuiltinsAndSkipsOnlyCodeCollision(t *testing.T) {
+	_, db := newProductionDocumentTypeRepoTestDB(t)
+
+	customFAQ := productionDocumentType("custom-faq", 7, "faq", 2)
+	customFAQ.Name = "Tenant FAQ"
+	customFAQ.Status = types.ProductionDocumentTypeRetired
+	require.NoError(t, db.Create(customFAQ).Error)
+	repo := NewProductionDocumentTypeRepository(db).(*productionDocumentTypeRepository)
+
+	require.NoError(t, repo.SeedBuiltins(context.Background(), 7, "system:builtin-document-types", productionBuiltinSeedDefinitions(7)))
+	require.NoError(t, repo.SeedBuiltins(context.Background(), 7, "system:builtin-document-types", productionBuiltinSeedDefinitions(7)))
+
+	var rows []types.ProductionDocumentType
+	require.NoError(t, db.Where("tenant_id = ? AND deleted_at IS NULL", 7).Order("code").Find(&rows).Error)
+	require.Len(t, rows, 5)
+	for _, row := range rows {
+		if row.Code == "faq" {
+			require.Equal(t, "Tenant FAQ", row.Name)
+			require.Equal(t, types.ProductionDocumentTypeOriginCustom, row.Origin)
+			require.Nil(t, row.TemplateKey)
+			continue
+		}
+		require.Equal(t, types.ProductionDocumentTypeOriginBuiltin, row.Origin)
+		require.NotNil(t, row.TemplateKey)
+		require.Equal(t, row.Code, *row.TemplateKey)
+		require.Equal(t, "system:builtin-document-types", row.CreatedBy)
+	}
+}
+
+func TestProductionDocumentTypeRepositorySeedsJoinTransactionContext(t *testing.T) {
+	_, db := newProductionDocumentTypeRepoTestDB(t)
+	repo := NewProductionDocumentTypeRepository(db).(*productionDocumentTypeRepository)
+
+	err := database.WithTransactionContext(context.Background(), db, func(txCtx context.Context) error {
+		require.NoError(t, repo.SeedBuiltins(txCtx, 9, "system:builtin-document-types", productionBuiltinSeedDefinitions(9)))
+		return errors.New("rollback probe")
+	})
+	require.ErrorContains(t, err, "rollback probe")
+	var count int64
+	require.NoError(t, db.Model(&types.ProductionDocumentType{}).Where("tenant_id = ?", 9).Count(&count).Error)
+	require.Zero(t, count)
+}
 
 func newProductionDocumentTypeRepoTestDB(
 	t *testing.T,
