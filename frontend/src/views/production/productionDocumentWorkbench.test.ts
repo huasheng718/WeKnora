@@ -61,3 +61,13 @@ test('icon-only controls are labelled and AI runs are keyboard buttons', () => {
   assert.match(runs, /<button[^>]*class="run-row"/)
   assert.doesNotMatch(runs, /\{\{\s*(?:run\.status|call\.approval_status)\s*\}\}/)
 })
+
+test('annotation mutations are scoped to the current document lifecycle', () => {
+  const workbench = source('./ProductionDocumentWorkbench.vue')
+  assert.match(workbench, /createScopedMutationCoordinator\(\)/)
+  assert.match(workbench, /annotationMutationCoordinator\.start\(requestedDocumentId\)/)
+  assert.match(workbench, /annotationMutationCoordinator\.isCurrent\(mutation,\s*documentId\.value\)/)
+  assert.match(workbench, /watch\(documentId,[\s\S]*annotationMutationCoordinator\.invalidate\(\)/)
+  assert.match(workbench, /watch\(documentId,[\s\S]*annotationSubmitting\.value = false/)
+  assert.match(workbench, /onBeforeUnmount\(\(\) => annotationMutationCoordinator\.invalidate\(\)\)/)
+})

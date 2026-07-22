@@ -141,6 +141,7 @@ import {
   canResolveProductionAnnotation,
 } from './models/productionAccess'
 import { canEditProductionProject } from './models/productionViewModel'
+import { createScopedMutationCoordinator } from './models/scopedMutationCoordinator'
 
 const { t } = useI18n()
 const route = useRoute()
@@ -149,6 +150,7 @@ const auth = useAuthStore()
 const store = useProductionStore()
 const loadCoordinator = createLatestRequestCoordinator()
 const toolCoordinator = createLatestRequestCoordinator()
+const annotationMutationCoordinator = createScopedMutationCoordinator()
 
 const loading = ref(false)
 const loaded = ref(false)
@@ -351,20 +353,29 @@ function canResolveAnnotation(annotation: ProductionAnnotation) {
 async function createAnnotation() {
   if (!document.value || !versionDetail.value || !selectedPersistedBlock.value
     || !canCreateAnnotation.value || !annotationDraft.body.trim() || annotationSubmitting.value) return
+  const requestedDocumentId = document.value.id
+  const mutation = annotationMutationCoordinator.start(requestedDocumentId)
   annotationSubmitting.value = true
   annotationCommand = buildAnnotationSubmission(annotationDraft, {
     versionId: versionDetail.value.id,
     blockId: selectedPersistedBlock.value.id,
     logicalBlockId: selectedPersistedBlock.value.logical_block_id,
   }, annotationCommand)
+  const command = annotationCommand.command
   try {
-    const response = await createProductionAnnotation(document.value.id, annotationCommand.command)
+    const response = await createProductionAnnotation(requestedDocumentId, command)
     if (!response.success || !response.data) throw responseError(response, t('production.documentWorkbench.annotationFailed'))
+    if (!annotationMutationCoordinator.isCurrent(mutation, documentId.value)) return
     annotations.value = [response.data, ...annotations.value]
     Object.assign(annotationDraft, completeAnnotationDraft(annotationDraft))
     annotationCommand = null
-  } catch (cause) { pageError.value = cause instanceof Error ? cause.message : t('production.documentWorkbench.annotationFailed') }
-  finally { annotationSubmitting.value = false }
+  } catch (cause) {
+    if (annotationMutationCoordinator.isCurrent(mutation, documentId.value)) {
+      pageError.value = cause instanceof Error ? cause.message : t('production.documentWorkbench.annotationFailed')
+    }
+  } finally {
+    if (annotationMutationCoordinator.isCurrent(mutation, documentId.value)) annotationSubmitting.value = false
+  }
 }
 
 async function resolveAnnotation(id: string) {
@@ -385,15 +396,18 @@ function backToProject() { router.push(project.value ? { name: 'productionProjec
 watch(documentId, () => {
   loadCoordinator.invalidate()
   toolCoordinator.invalidate()
+  annotationMutationCoordinator.invalidate()
   loaded.value = false
   document.value = null
   annotationDraft.body = ''
+  annotationSubmitting.value = false
   annotationCommand = null
   loadWorkbench()
 })
 onMounted(() => loadWorkbench())
 onBeforeUnmount(() => loadCoordinator.invalidate())
 onBeforeUnmount(() => toolCoordinator.invalidate())
+onBeforeUnmount(() => annotationMutationCoordinator.invalidate())
 </script>
 
 <style scoped>
