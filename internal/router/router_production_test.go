@@ -259,6 +259,9 @@ func (s *productionRouterProjectService) RemoveRole(context.Context, string, str
 func (s *productionRouterProjectService) RequireProjectRole(context.Context, string, ...types.ProductionRole) error {
 	return nil
 }
+func (s *productionRouterProjectService) HasLiveRoleAssignee(context.Context, uint64, string, types.ProductionRole) (bool, error) {
+	return true, nil
+}
 
 func newProductionRouteTestEngine(
 	projectHandler *handler.ProductionProjectHandler,

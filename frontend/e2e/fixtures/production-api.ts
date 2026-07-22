@@ -1,4 +1,4 @@
-import { expect, type APIResponse, type Page } from '@playwright/test'
+import { expect, type APIResponse, type Locator, type Page } from '@playwright/test'
 
 type JsonRecord = Record<string, unknown>
 
@@ -139,6 +139,25 @@ export async function loginQaIdentity(page: Page, identity: QaIdentity): Promise
     if (!token || !user.id) throw new Error('login did not persist the authenticated identity')
     return { token, userId: user.id }
   })
+}
+
+export async function openProductionDocumentTypes(page: Page): Promise<Locator> {
+  await page.goto('/platform/knowledge-production/document-types')
+  await dismissQaOnboarding(page)
+  await expect(page).toHaveURL(/\/platform\/knowledge-production\/document-types$/)
+  await expect(page.getByRole('heading', { name: '文档类型管理' })).toBeVisible()
+  const table = page.locator('section[aria-label="文档类型管理"] table')
+  await expect(table.locator('tbody tr')).toHaveCount(5)
+  return table
+}
+
+export async function dismissQaOnboarding(page: Page): Promise<void> {
+  const onboarding = page.getByRole('dialog', { name: '欢迎使用 WeKnora' })
+  await onboarding.waitFor({ state: 'visible', timeout: 1_000 }).catch(() => undefined)
+  if (await onboarding.isVisible()) {
+    await onboarding.getByRole('button', { name: '跳过引导' }).last().click()
+    await expect(onboarding).toBeHidden()
+  }
 }
 
 export async function createProjectThroughUi(page: Page, projectName: string): Promise<string> {
