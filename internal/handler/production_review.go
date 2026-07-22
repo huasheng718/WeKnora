@@ -67,6 +67,7 @@ func (h *ProductionReviewHandler) ListAnnotations(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"success": true, "data": result.Data, "total": result.Total,
 		"page": result.Page, "page_size": result.PageSize,
+		"has_more": int64((result.Page-1)*result.PageSize+len(result.Data)) < result.Total,
 	})
 }
 

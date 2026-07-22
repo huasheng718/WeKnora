@@ -140,6 +140,7 @@ import {
   type ProductionVersionDiff,
 } from './models/documentBlocks'
 import { createLatestRequestCoordinator } from './models/latestRequestCoordinator'
+import { loadProductionAnnotationPages, productionAnnotationPageSize } from './models/annotationPages'
 import { resolveAppendVersionFailure } from './models/appendVersionFailure'
 import {
   canCreateProductionAnnotation,
@@ -244,14 +245,18 @@ async function loadWorkbench(preferredVersionId = '') {
     const runId = runRows.some(row => row.id === activeRunId.value) ? activeRunId.value : runRows[0]?.id || ''
     const [evidenceResponse, annotationResponse, toolResponse, comparisonResponse] = await Promise.all([
       listProductionEvidence(detailResponse.data.source_set_id),
-      listProductionAnnotations(requestedDocumentId, { version_id: versionId, page_size: 100 }),
+      loadProductionAnnotationPages(page => listProductionAnnotations(requestedDocumentId, {
+        version_id: versionId,
+        page,
+        page_size: productionAnnotationPageSize,
+      })),
       runId ? listProductionRunToolCalls(runId) : Promise.resolve({ success: true, data: [] as ProductionToolCall[] }),
       detailResponse.data.parent_version_id
         ? getProductionDocumentVersion(requestedDocumentId, detailResponse.data.parent_version_id).catch(() => null)
         : Promise.resolve(null),
     ])
-    if (!evidenceResponse.success || !annotationResponse.success || !toolResponse.success) throw new Error(t('production.documentWorkbench.loadFailed'))
-    return { documentRow, projects: projectsResponse.data ?? [], versionRows, detail: detailResponse.data, comparison: comparisonResponse?.success ? comparisonResponse.data ?? null : null, evidenceRows: evidenceResponse.data ?? [], annotationRows: annotationResponse.data ?? [], runRows, toolRows: toolResponse.data ?? [], availableModels, runId }
+    if (!evidenceResponse.success || !toolResponse.success) throw new Error(t('production.documentWorkbench.loadFailed'))
+    return { documentRow, projects: projectsResponse.data ?? [], versionRows, detail: detailResponse.data, comparison: comparisonResponse?.success ? comparisonResponse.data ?? null : null, evidenceRows: evidenceResponse.data ?? [], annotationRows: annotationResponse, runRows, toolRows: toolResponse.data ?? [], availableModels, runId }
   }, {
     success: result => {
       document.value = result.documentRow

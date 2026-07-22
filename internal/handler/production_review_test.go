@@ -197,6 +197,7 @@ func TestProductionReviewHandlerExposesApprovedActions(t *testing.T) {
 	require.Equal(t, 2, annotations.listed.Page)
 	require.Equal(t, 10, annotations.listed.PageSize)
 	require.Contains(t, list.Body.String(), `"total":1`)
+	require.Contains(t, list.Body.String(), `"has_more":false`)
 	require.Equal(t, productionReviewDocumentID, annotations.created.DocumentID)
 	require.Equal(t, productionReviewVersionID, annotations.created.VersionID)
 	require.Equal(t, types.JSON(`{"path":"/title"}`), annotations.created.Anchor)

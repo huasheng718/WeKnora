@@ -18,6 +18,8 @@ test('document workbench coordinates real document evidence annotation and run r
     'listProductionRunToolCalls',
   ]) assert.match(workbench, new RegExp(api))
   assert.match(workbench, /createLatestRequestCoordinator\(\)/)
+  assert.match(workbench, /loadProductionAnnotationPages\(page => listProductionAnnotations/)
+  assert.match(workbench, /page_size:\s*productionAnnotationPageSize/)
   assert.match(workbench, /onBeforeUnmount\(\(\) => loadCoordinator\.invalidate\(\)\)/)
   assert.doesNotMatch(workbench, /\bmock\b/i)
 })

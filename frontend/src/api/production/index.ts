@@ -379,11 +379,7 @@ export interface ListProductionAnnotationsQuery {
   page_size?: number
 }
 
-export interface ProductionAnnotationListResponse extends ProductionResponse<ProductionAnnotation[]> {
-  total: number
-  page: number
-  page_size: number
-}
+export interface ProductionAnnotationListResponse extends ProductionPagedResponse<ProductionAnnotation> {}
 
 export interface ProductionReview {
   id: string
