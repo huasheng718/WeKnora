@@ -74,6 +74,7 @@ export interface AssignProductionProjectRoleInput {
 }
 
 export type ProductionDocumentTypeStatus = 'draft' | 'active' | 'retired'
+export type ProductionDocumentTypeOrigin = 'builtin' | 'custom'
 
 export interface ProductionDocumentType {
   id: string
@@ -90,6 +91,8 @@ export interface ProductionDocumentType {
   review_policy: ProductionJSON
   publication_policy: ProductionJSON
   status: ProductionDocumentTypeStatus
+  origin: ProductionDocumentTypeOrigin
+  template_key?: string | null
   created_by: string
   created_at: ProductionTimestamp
   updated_at: ProductionTimestamp
@@ -105,6 +108,18 @@ export interface CreateProductionDocumentTypeInput {
   source_requirements: ProductionJSON
   skill_bindings: ProductionJSON
   workflow_plan?: ProductionJSON
+  quality_rules: ProductionJSON
+  review_policy: ProductionJSON
+  publication_policy: ProductionJSON
+}
+
+export interface DeriveProductionDocumentTypeInput {
+  name: string
+  description?: string
+  block_schema: ProductionJSON
+  source_requirements: ProductionJSON
+  skill_bindings: ProductionJSON
+  workflow_plan: ProductionJSON
   quality_rules: ProductionJSON
   review_policy: ProductionJSON
   publication_policy: ProductionJSON
@@ -521,6 +536,10 @@ export function listProductionDocumentTypes() {
 
 export function createProductionDocumentType(command: ProductionCommand<CreateProductionDocumentTypeInput>) {
   return post<ProductionResponse<ProductionDocumentType>>('/api/v1/production/document-types', command.payload, productionCommandConfig(command))
+}
+
+export function deriveProductionDocumentType(id: string, command: ProductionCommand<DeriveProductionDocumentTypeInput>) {
+  return post<ProductionResponse<ProductionDocumentType>>(`/api/v1/production/document-types/${id}/drafts`, command.payload, productionCommandConfig(command))
 }
 
 export function activateProductionDocumentType(id: string, command: ProductionCommand<void>) {

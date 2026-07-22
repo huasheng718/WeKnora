@@ -1,6 +1,9 @@
 import type {
   CreateProductionDocumentTypeInput,
+  DeriveProductionDocumentTypeInput,
   ProductionDocumentType,
+  ProductionDocumentTypeOrigin,
+  ProductionDocumentTypeStatus,
   ProductionJSON,
 } from '@/api/production'
 import type { TenantRole } from '@/api/tenant/members'
@@ -34,6 +37,20 @@ export type ParsedDocumentTypeDraft =
   | { ok: true; payload: CreateProductionDocumentTypeInput }
   | { ok: false; reason: 'required' | 'schema_version' | 'invalid_json'; field: DocumentTypeDraftField }
 
+export type ParsedDerivedDocumentTypeDraft =
+  | { ok: true; payload: DeriveProductionDocumentTypeInput }
+  | { ok: false; reason: 'required' | 'invalid_json'; field: DocumentTypeDraftField }
+
+export interface DocumentTypeConfigurationSummary {
+  sections: string[]
+  sourceKinds: string[]
+  minimumEvidence: number | null
+  requiresEvidenceSection: boolean
+  reviewSteps: string[]
+  publicationTarget: string
+  requiresApprovedReview: boolean
+}
+
 const JSON_FIELDS = [
   ['blockSchema', 'block_schema'],
   ['sourceRequirements', 'source_requirements'],
@@ -46,6 +63,22 @@ const JSON_FIELDS = [
 
 export function canManageProductionDocumentTypes(role: TenantRole | ''): boolean {
   return role === 'admin' || role === 'owner'
+}
+
+export function canDeriveProductionDocumentType(
+  role: TenantRole | '',
+  status: ProductionDocumentTypeStatus,
+): boolean {
+  return canManageProductionDocumentTypes(role) && status !== 'draft'
+}
+
+export function documentTypeOriginBadge(origin: ProductionDocumentTypeOrigin): {
+  theme: 'primary' | 'default'
+  textKey: 'production.documentTypes.origin.builtin' | 'production.documentTypes.origin.custom'
+} {
+  return origin === 'builtin'
+    ? { theme: 'primary', textKey: 'production.documentTypes.origin.builtin' }
+    : { theme: 'default', textKey: 'production.documentTypes.origin.custom' }
 }
 
 export function documentTypeListViewState(input: DocumentTypeListStateInput): DocumentTypeListViewState {
@@ -65,14 +98,8 @@ export function parseDocumentTypeDraft(form: DocumentTypeDraftForm): ParsedDocum
     return { ok: false, reason: 'schema_version', field: 'schemaVersion' }
   }
 
-  const parsed = {} as Record<(typeof JSON_FIELDS)[number][1], ProductionJSON>
-  for (const [formField, apiField] of JSON_FIELDS) {
-    try {
-      parsed[apiField] = JSON.parse(form[formField].trim() || '{}') as ProductionJSON
-    } catch {
-      return { ok: false, reason: 'invalid_json', field: formField }
-    }
-  }
+  const parsed = parseDocumentTypeJSONFields(form)
+  if (!parsed.ok) return parsed
 
   return {
     ok: true,
@@ -81,15 +108,96 @@ export function parseDocumentTypeDraft(form: DocumentTypeDraftForm): ParsedDocum
       name,
       description: form.description.trim(),
       schema_version: schemaVersion,
-      block_schema: parsed.block_schema,
-      source_requirements: parsed.source_requirements,
-      skill_bindings: parsed.skill_bindings,
-      workflow_plan: parsed.workflow_plan,
-      quality_rules: parsed.quality_rules,
-      review_policy: parsed.review_policy,
-      publication_policy: parsed.publication_policy,
+      block_schema: parsed.values.block_schema,
+      source_requirements: parsed.values.source_requirements,
+      skill_bindings: parsed.values.skill_bindings,
+      workflow_plan: parsed.values.workflow_plan,
+      quality_rules: parsed.values.quality_rules,
+      review_policy: parsed.values.review_policy,
+      publication_policy: parsed.values.publication_policy,
     },
   }
+}
+
+export function parseDerivedDocumentTypeDraft(form: DocumentTypeDraftForm): ParsedDerivedDocumentTypeDraft {
+  const name = form.name.trim()
+  if (!name) return { ok: false, reason: 'required', field: 'name' }
+
+  const parsed = parseDocumentTypeJSONFields(form)
+  if (!parsed.ok) return parsed
+
+  return {
+    ok: true,
+    payload: {
+      name,
+      description: form.description.trim(),
+      block_schema: parsed.values.block_schema,
+      source_requirements: parsed.values.source_requirements,
+      skill_bindings: parsed.values.skill_bindings,
+      workflow_plan: parsed.values.workflow_plan,
+      quality_rules: parsed.values.quality_rules,
+      review_policy: parsed.values.review_policy,
+      publication_policy: parsed.values.publication_policy,
+    },
+  }
+}
+
+export function prefillDerivedDocumentTypeForm(item: ProductionDocumentType): DocumentTypeDraftForm {
+  return {
+    code: item.code,
+    name: item.name,
+    description: item.description,
+    schemaVersion: item.schema_version,
+    blockSchema: formatDocumentTypeJSON(item.block_schema),
+    sourceRequirements: formatDocumentTypeJSON(item.source_requirements),
+    skillBindings: formatDocumentTypeJSON(item.skill_bindings),
+    workflowPlan: formatDocumentTypeJSON(item.workflow_plan),
+    qualityRules: formatDocumentTypeJSON(item.quality_rules),
+    reviewPolicy: formatDocumentTypeJSON(item.review_policy),
+    publicationPolicy: formatDocumentTypeJSON(item.publication_policy),
+  }
+}
+
+export function formatDocumentTypeJSON(value: ProductionJSON): string {
+  return JSON.stringify(value, null, 2)
+}
+
+export function documentTypeConfigurationSummary(item: ProductionDocumentType): DocumentTypeConfigurationSummary {
+  const blockSchema = jsonObject(item.block_schema)
+  const sources = jsonObject(item.source_requirements)
+  const review = jsonObject(item.review_policy)
+  const publication = jsonObject(item.publication_policy)
+  return {
+    sections: stringList(blockSchema.required_sections),
+    sourceKinds: stringList(sources.allowed_source_kinds),
+    minimumEvidence: typeof sources.min_accepted_evidence === 'number' ? sources.min_accepted_evidence : null,
+    requiresEvidenceSection: sources.require_evidence_section === true,
+    reviewSteps: stringList(review.steps),
+    publicationTarget: typeof publication.target_type === 'string' ? publication.target_type : '',
+    requiresApprovedReview: publication.require_approved_review === true,
+  }
+}
+
+function parseDocumentTypeJSONFields(form: DocumentTypeDraftForm):
+  | { ok: true; values: Record<(typeof JSON_FIELDS)[number][1], ProductionJSON> }
+  | { ok: false; reason: 'invalid_json'; field: DocumentTypeDraftField } {
+  const values = {} as Record<(typeof JSON_FIELDS)[number][1], ProductionJSON>
+  for (const [formField, apiField] of JSON_FIELDS) {
+    try {
+      values[apiField] = JSON.parse(form[formField].trim() || '{}') as ProductionJSON
+    } catch {
+      return { ok: false, reason: 'invalid_json', field: formField }
+    }
+  }
+  return { ok: true, values }
+}
+
+function jsonObject(value: ProductionJSON): Record<string, ProductionJSON> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : {}
+}
+
+function stringList(value: ProductionJSON | undefined): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
 }
 
 export function sortDocumentTypeVersions(items: ProductionDocumentType[]): ProductionDocumentType[] {

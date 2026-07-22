@@ -80,7 +80,15 @@ test('document type management copy is complete in every locale', () => {
     'manage', 'title', 'description', 'create', 'emptyTitle', 'emptyEditable', 'emptyReadonly',
     'loadFailedTitle', 'loadFailed', 'readonlyHint', 'activate', 'activateTitle', 'activateBody',
     'created', 'activated', 'createFailed', 'activateFailed', 'invalidJson',
+    'viewConfiguration', 'configurationTitle', 'deriveDraft', 'deriveTitle',
+    'derived', 'deriveFailed', 'deriveRetryHint', 'generatedVersion', 'baseVersion',
+    'lineageTitle', 'summaryTitle', 'rawConfigurationTitle', 'notConfigured',
   ]
+  const requiredNestedKeys = {
+    origin: ['builtin', 'custom'],
+    fields: ['origin', 'templateKey'],
+    summaries: ['sections', 'sources', 'review', 'publication'],
+  }
 
   for (const check of localeChecks) {
     const production = (check.locale as Record<string, unknown>).production as Record<string, unknown>
@@ -89,7 +97,23 @@ test('document type management copy is complete in every locale', () => {
     for (const key of requiredKeys) {
       assert.equal(typeof documentTypes?.[key], 'string', `${check.name} is missing production.documentTypes.${key}`)
     }
+    for (const [group, keys] of Object.entries(requiredNestedKeys)) {
+      const values = documentTypes?.[group] as Record<string, unknown> | undefined
+      for (const key of keys) {
+        assert.equal(typeof values?.[key], 'string', `${check.name} is missing production.documentTypes.${group}.${key}`)
+      }
+    }
   }
+
+  const documentTypePaths = localeChecks.map((check) => {
+    const production = (check.locale as Record<string, unknown>).production as Record<string, unknown>
+    return collectStrings(production.documentTypes as LocaleValue).map(({ path }) => path).sort()
+  })
+  for (let index = 1; index < documentTypePaths.length; index += 1) {
+    assert.deepEqual(documentTypePaths[index], documentTypePaths[0], `${localeChecks[index].name} document type keys differ from zh-CN`)
+  }
+
+  assert.match(zhCN.production.documentTypes.deriveRetryHint, /输入未变化/, 'zh-CN retry copy must describe unchanged-input command reuse')
 })
 
 test('public documentation uses workspace terminology', () => {

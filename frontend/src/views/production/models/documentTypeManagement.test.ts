@@ -3,9 +3,14 @@ import test from 'node:test'
 
 import type { ProductionDocumentType } from '@/api/production'
 import {
+  canDeriveProductionDocumentType,
   canManageProductionDocumentTypes,
+  documentTypeConfigurationSummary,
   documentTypeListViewState,
+  documentTypeOriginBadge,
+  parseDerivedDocumentTypeDraft,
   parseDocumentTypeDraft,
+  prefillDerivedDocumentTypeForm,
   sortDocumentTypeVersions,
 } from './documentTypeManagement'
 
@@ -25,6 +30,8 @@ function documentType(code: string, schemaVersion: number, updatedAt: string): P
     review_policy: {},
     publication_policy: {},
     status: 'draft',
+    origin: 'custom',
+    template_key: null,
     created_by: 'user-1',
     created_at: updatedAt,
     updated_at: updatedAt,
@@ -38,6 +45,52 @@ test('only tenant admin and owner can manage document types', () => {
   assert.equal(canManageProductionDocumentTypes('contributor'), false)
   assert.equal(canManageProductionDocumentTypes('viewer'), false)
   assert.equal(canManageProductionDocumentTypes(''), false)
+})
+
+test('only tenant admin and owner can derive active or retired document types', () => {
+  assert.equal(canDeriveProductionDocumentType('owner', 'active'), true)
+  assert.equal(canDeriveProductionDocumentType('admin', 'retired'), true)
+  assert.equal(canDeriveProductionDocumentType('admin', 'draft'), false)
+  assert.equal(canDeriveProductionDocumentType('contributor', 'active'), false)
+  assert.equal(canDeriveProductionDocumentType('viewer', 'retired'), false)
+})
+
+test('document type origin badge distinguishes governed built-ins from custom definitions', () => {
+  assert.deepEqual(documentTypeOriginBadge('builtin'), {
+    theme: 'primary',
+    textKey: 'production.documentTypes.origin.builtin',
+  })
+  assert.deepEqual(documentTypeOriginBadge('custom'), {
+    theme: 'default',
+    textKey: 'production.documentTypes.origin.custom',
+  })
+})
+
+test('document type configuration summary exposes readable governance facts', () => {
+  const item = documentType('sop', 1, '2026-07-22T00:00:00Z')
+  item.block_schema = { version: 1, required_sections: ['Scope', 'Steps'], allowed_block_types: ['heading'] }
+  item.source_requirements = {
+    version: 1,
+    min_accepted_evidence: 2,
+    allowed_source_kinds: ['upload', 'mcp'],
+    require_evidence_section: true,
+  }
+  item.review_policy = { steps: ['business_reviewer', 'compliance_reviewer'] }
+  item.publication_policy = {
+    version: 1,
+    target_type: 'knowledge_base',
+    require_approved_review: true,
+  }
+
+  assert.deepEqual(documentTypeConfigurationSummary(item), {
+    sections: ['Scope', 'Steps'],
+    sourceKinds: ['upload', 'mcp'],
+    minimumEvidence: 2,
+    requiresEvidenceSection: true,
+    reviewSteps: ['business_reviewer', 'compliance_reviewer'],
+    publicationTarget: 'knowledge_base',
+    requiresApprovedReview: true,
+  })
 })
 
 test('document type list state makes load errors and empty data explicit', () => {
@@ -98,6 +151,52 @@ test('parseDocumentTypeDraft validates required identity and schema version', ()
   assert.deepEqual(parseDocumentTypeDraft({ ...base, code: ' ' }), { ok: false, reason: 'required', field: 'code' })
   assert.deepEqual(parseDocumentTypeDraft({ ...base, name: '' }), { ok: false, reason: 'required', field: 'name' })
   assert.deepEqual(parseDocumentTypeDraft({ ...base, schemaVersion: 0 }), { ok: false, reason: 'schema_version', field: 'schemaVersion' })
+})
+
+test('derived draft form prefills all editable JSON and omits lineage from the command payload', () => {
+  const item = documentType('sop', 4, '2026-07-22T00:00:00Z')
+  item.name = 'Standard operating procedure'
+  item.description = 'Governed steps'
+  item.origin = 'builtin'
+  item.template_key = 'sop'
+  item.block_schema = { required_sections: ['Scope'], version: 1 }
+  item.source_requirements = { min_accepted_evidence: 1, version: 1 }
+  item.skill_bindings = { skills: [], version: 1 }
+  item.workflow_plan = { steps: [], version: 1 }
+  item.quality_rules = { gates: ['section_completeness'], version: 1 }
+  item.review_policy = { steps: ['business_reviewer'] }
+  item.publication_policy = { target_type: 'knowledge_base', version: 1 }
+
+  const form = prefillDerivedDocumentTypeForm(item)
+  assert.equal(form.code, 'sop')
+  assert.equal(form.name, 'Standard operating procedure')
+  assert.equal(form.description, 'Governed steps')
+  assert.equal(form.blockSchema, JSON.stringify(item.block_schema, null, 2))
+  assert.equal(form.sourceRequirements, JSON.stringify(item.source_requirements, null, 2))
+  assert.equal(form.skillBindings, JSON.stringify(item.skill_bindings, null, 2))
+  assert.equal(form.workflowPlan, JSON.stringify(item.workflow_plan, null, 2))
+  assert.equal(form.qualityRules, JSON.stringify(item.quality_rules, null, 2))
+  assert.equal(form.reviewPolicy, JSON.stringify(item.review_policy, null, 2))
+  assert.equal(form.publicationPolicy, JSON.stringify(item.publication_policy, null, 2))
+
+  form.code = 'client-must-not-change-code'
+  form.schemaVersion = 999
+  const result = parseDerivedDocumentTypeDraft(form)
+  assert.equal(result.ok, true)
+  if (!result.ok) return
+  assert.deepEqual(result.payload, {
+    name: 'Standard operating procedure',
+    description: 'Governed steps',
+    block_schema: item.block_schema,
+    source_requirements: item.source_requirements,
+    skill_bindings: item.skill_bindings,
+    workflow_plan: item.workflow_plan,
+    quality_rules: item.quality_rules,
+    review_policy: item.review_policy,
+    publication_policy: item.publication_policy,
+  })
+  assert.equal('code' in result.payload, false)
+  assert.equal('schema_version' in result.payload, false)
 })
 
 test('document type versions group by code and newest schema version first', () => {
