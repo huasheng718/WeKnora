@@ -52,13 +52,18 @@ func (p *PluginSearch) runQueryExpansion(ctx context.Context, chatManage *types.
 				defer wgExp.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
+				vectorThreshold, keywordThreshold := t.RecallThresholds(
+					chatManage.VectorThreshold,
+					expKwTh,
+				)
 				paramsExp := types.SearchParams{
 					QueryText:             q,
-					VectorThreshold:       chatManage.VectorThreshold,
-					KeywordThreshold:      expKwTh,
+					VectorThreshold:       vectorThreshold,
+					KeywordThreshold:      keywordThreshold,
 					MatchCount:            expTopK,
 					TagIDs:                t.TagIDs,
 					ExcludeKnowledgeIDs:   append([]string(nil), t.ExcludeKnowledgeIDs...),
+					ScopeTagIDs:           t.ScopeTagIDs,
 					DisableVectorMatch:    false,
 					DisableKeywordsMatch:  false,
 					SkipContextEnrichment: true, // Pipeline handles context assembly in merge stage

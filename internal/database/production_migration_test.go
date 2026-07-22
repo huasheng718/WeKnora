@@ -24,6 +24,39 @@ func mustReadMigration(t *testing.T, path string) string {
 	return string(contents)
 }
 
+func TestPostgreSQLMigrationVersionsAreUnique(t *testing.T) {
+	entries, err := os.ReadDir("../../migrations/versioned")
+	require.NoError(t, err)
+
+	versions := make(map[string]string)
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".up.sql") {
+			continue
+		}
+		version, _, found := strings.Cut(entry.Name(), "_")
+		require.True(t, found, entry.Name())
+		if previous, exists := versions[version]; exists {
+			t.Fatalf("PostgreSQL migration version %s is used by both %s and %s", version, previous, entry.Name())
+		}
+		versions[version] = entry.Name()
+	}
+}
+
+func TestSQLiteTemporaryDocumentsIncrementalMigrationUpAndDown(t *testing.T) {
+	db, err := sql.Open("sqlite3", t.TempDir()+"/temporary-documents.db")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+
+	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000011_temporary_documents.up.sql"))
+	require.NoError(t, err)
+	require.NotEmpty(t, sqliteMasterSQL(t, db, "table", "temporary_documents"))
+	require.NotEmpty(t, sqliteMasterSQL(t, db, "index", "idx_temporary_documents_scope"))
+
+	_, err = db.Exec(mustReadMigration(t, "../../migrations/sqlite/000011_temporary_documents.down.sql"))
+	require.NoError(t, err)
+	require.Empty(t, sqliteMasterSQL(t, db, "table", "temporary_documents"))
+}
+
 func openSQLiteThroughProductionMigrationFive(t *testing.T) *sql.DB {
 	t.Helper()
 

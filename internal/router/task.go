@@ -47,6 +47,7 @@ type AsynqTaskParams struct {
 	ProductionRun        interfaces.TaskHandler `name:"productionRun"`
 	ProductionProjection interfaces.TaskHandler `name:"productionProjection"`
 	ProductionRelease    *service.ProductionReleaseService
+	TemporaryDocument    interfaces.TemporaryDocumentService
 	DeadLetterRepo       interfaces.TaskDeadLetterRepository
 	SpanTracker          service.SpanTracker
 	ResourceCleaner      interfaces.ResourceCleaner
@@ -309,6 +310,7 @@ func RunAsynqServer(params AsynqTaskParams) *asynq.ServeMux {
 
 	// Register document processing handler
 	mux.HandleFunc(types.TypeDocumentProcess, params.KnowledgeService.ProcessDocument)
+	mux.HandleFunc(types.TypeTemporaryDocumentProcess, params.TemporaryDocument.Process)
 
 	// Register manual knowledge processing handler (cleanup + re-indexing)
 	mux.HandleFunc(types.TypeManualProcess, params.KnowledgeService.ProcessManualUpdate)

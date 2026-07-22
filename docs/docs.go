@@ -648,6 +648,12 @@ const docTemplate = `{
                         "in": "query"
                     },
                     {
+                        "type": "string",
+                        "description": "带知识库归属的标签范围（JSON）",
+                        "name": "tag_scopes",
+                        "in": "query"
+                    },
+                    {
                         "type": "integer",
                         "description": "返回数量上限（默认6）",
                         "name": "limit",
@@ -15086,8 +15092,31 @@ const docTemplate = `{
                     "description": "ASR model ID for audio transcription (optional)",
                     "type": "string"
                 },
+                "attachment_image_understanding": {
+                    "description": "AttachmentImageUnderstanding enables VLM OCR fallback for image-only /\nscanned documents (PDF/PPT whose pages are images). Disabled by default\nbecause it materially increases parse latency; only triggers when the\nextracted text is below a threshold and a VLM model is configured.",
+                    "type": "boolean"
+                },
+                "attachment_ocr_max_pages": {
+                    "description": "AttachmentOCRMaxPages caps how many pages of a scanned / image-only\ndocument this agent sends to the VLM for OCR. 0 falls back to the global\ndefault (WEKNORA_CHAT_ATTACHMENT_OCR_MAX_PAGES). More pages means higher\ncoverage but slower parsing and more VLM cost.",
+                    "type": "integer"
+                },
+                "attachment_parse_wait_timeout_sec": {
+                    "description": "AttachmentParseWaitTimeoutSec bounds, in seconds, how long a chat turn\nwaits for this agent's still-parsing attachments before proceeding with\nonly the finished ones. 0 falls back to the global default\n(WEKNORA_CHAT_ATTACHMENT_WAIT_TIMEOUT_SEC).",
+                    "type": "integer"
+                },
                 "audio_upload_enabled": {
                     "description": "Whether audio upload (ASR transcription) is enabled for this agent (default: false)",
+                    "type": "boolean"
+                },
+                "chat_parser_engine_rules": {
+                    "description": "===== Chat Attachment Parsing Settings =====\nChatParserEngineRules selects parser engines for session-scoped chat\nattachments by file type. Takes precedence over the tenant-level\nParserEngineConfig.ChatParserEngineRules; an explicit per-request\nparser_engine still overrides both.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_types.ParserEngineRule"
+                    }
+                },
+                "citation_enabled": {
+                    "description": "Whether final answers include knowledge/web source citations. Nil defaults to true\nso agents saved before this option was introduced keep their existing behavior.",
                     "type": "boolean"
                 },
                 "context_template": {
@@ -16813,7 +16842,7 @@ const docTemplate = `{
             ],
             "x-enum-comments": {
                 "MatchTypeDataAnalysis": "数据分析匹配类型",
-                "MatchTypeDirectLoad": "直接加载匹配类型",
+                "MatchTypeDirectLoad": "Deprecated: reserved to preserve serialized enum values",
                 "MatchTypeParentChunk": "父Chunk匹配类型",
                 "MatchTypeRelationChunk": "关系Chunk匹配类型",
                 "MatchTypeWebSearch": "网络搜索匹配类型"
@@ -16827,7 +16856,7 @@ const docTemplate = `{
                 "关系Chunk匹配类型",
                 "",
                 "网络搜索匹配类型",
-                "直接加载匹配类型",
+                "Deprecated: reserved to preserve serialized enum values",
                 "数据分析匹配类型"
             ],
             "x-enum-varnames": [
@@ -17003,6 +17032,10 @@ const docTemplate = `{
                     "description": "Extracted text content (for small text files)",
                     "type": "string"
                 },
+                "content_mode": {
+                    "description": "full or selected_chunks",
+                    "type": "string"
+                },
                 "file_name": {
                     "description": "Original filename",
                     "type": "string"
@@ -17015,6 +17048,10 @@ const docTemplate = `{
                     "description": "File extension (e.g., \".pdf\", \".docx\")",
                     "type": "string"
                 },
+                "id": {
+                    "description": "Temporary document ID for session-scoped uploads",
+                    "type": "string"
+                },
                 "is_truncated": {
                     "description": "Whether content was truncated",
                     "type": "boolean"
@@ -17023,9 +17060,17 @@ const docTemplate = `{
                     "description": "Total line count (for text files)",
                     "type": "integer"
                 },
-                "url": {
-                    "description": "Storage URL (provider://path)",
-                    "type": "string"
+                "selected_chunks": {
+                    "description": "Chunks included in this message prompt",
+                    "type": "integer"
+                },
+                "token_count": {
+                    "description": "Approximate tokens in the parsed document",
+                    "type": "integer"
+                },
+                "total_chunks": {
+                    "description": "Total parsed chunks",
+                    "type": "integer"
                 }
             }
         },
@@ -17450,6 +17495,13 @@ const docTemplate = `{
         "github_com_Tencent_WeKnora_internal_types.ParserEngineConfig": {
             "type": "object",
             "properties": {
+                "chat_parser_engine_rules": {
+                    "description": "ChatParserEngineRules selects parser engines for session-scoped chat\ndocuments. Knowledge bases keep their own rules in ChunkingConfig.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_types.ParserEngineRule"
+                    }
+                },
                 "mineru_api_key": {
                     "description": "MinerU 云 API Key",
                     "type": "string"
@@ -18099,6 +18151,12 @@ const docTemplate = `{
                 },
                 "query_text": {
                     "type": "string"
+                },
+                "scope_tag_ids": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
                 },
                 "skip_context_enrichment": {
                     "description": "SkipContextEnrichment skips fetching parent, nearby, and relation chunks\nin processSearchResults. Used by the chat pipeline where context assembly\nis handled separately in the merge stage.",
@@ -18992,7 +19050,7 @@ const docTemplate = `{
                     "type": "boolean"
                 },
                 "preferences": {
-                    "description": "Per-user UI/feature preferences (memory toggle, future knobs).\nStored as JSON (jsonb on Postgres, TEXT on SQLite) via the\ndriver.Valuer / sql.Scanner methods on UserPreferences.",
+                    "description": "Per-user UI/feature preferences.\nStored as JSON (jsonb on Postgres, TEXT on SQLite) via the\ndriver.Valuer / sql.Scanner methods on UserPreferences.",
                     "allOf": [
                         {
                             "$ref": "#/definitions/github_com_Tencent_WeKnora_internal_types.UserPreferences"
@@ -19062,10 +19120,6 @@ const docTemplate = `{
         "github_com_Tencent_WeKnora_internal_types.UserPreferences": {
             "type": "object",
             "properties": {
-                "enable_memory": {
-                    "description": "EnableMemory mirrors the \"开启记忆功能\" switch in General Settings.\nnil  = preference never set (treat as feature default = false)\n*false / *true = user explicitly set the toggle.",
-                    "type": "boolean"
-                },
                 "last_active_tenant_id": {
                     "description": "LastActiveTenantID remembers the last workspace the user actively\nswitched into, so a fresh login (new device, cleared browser, new\nrefresh token) lands them back in that workspace instead of always\nbouncing to their home workspace. Login / RefreshToken validate that\nthe workspace still exists and the user still has an active membership\n(or CanAccessAllTenants) before honouring this preference; an\ninvalid pointer is best-effort cleared and the user falls back to\nhome.\n\nnil  = no preference (use user.TenantID, i.e. home)\n*0   = \"clear preference\" sentinel for the partial-update endpoint\n       (UpdateUserPreferences turns this into nil). Otherwise treat\n       a stored *0 the same as nil.\n*N   = preferred workspace id.",
                     "type": "integer"
@@ -19259,7 +19313,8 @@ const docTemplate = `{
                 "ollama",
                 "baidu",
                 "searxng",
-                "keenable"
+                "keenable",
+                "zhipu"
             ],
             "x-enum-varnames": [
                 "WebSearchProviderTypeBing",
@@ -19269,7 +19324,8 @@ const docTemplate = `{
                 "WebSearchProviderTypeOllama",
                 "WebSearchProviderTypeBaidu",
                 "WebSearchProviderTypeSearxng",
-                "WebSearchProviderTypeKeenable"
+                "WebSearchProviderTypeKeenable",
+                "WebSearchProviderTypeZhipu"
             ]
         },
         "github_com_Tencent_WeKnora_internal_types.WikiConfig": {
@@ -20555,7 +20611,7 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "appSecret": {
-                    "description": "AppSecret 用于 LKEAP Rerank 等需要第二段密钥的场景（对应模型 Parameters.AppSecret）。",
+                    "description": "AppSecret 用于 LKEAP / Volcengine Rerank 等需要第二段密钥的场景（对应模型 Parameters.AppSecret）。",
                     "type": "string"
                 },
                 "baseUrl": {
@@ -20792,7 +20848,7 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "appSecret": {
-                    "description": "AppSecret 用于 LKEAP Rerank 等需要第二段密钥的场景（对应模型 Parameters.AppSecret）。",
+                    "description": "AppSecret 用于 LKEAP / Volcengine Rerank 等需要第二段密钥的场景（对应模型 Parameters.AppSecret）。",
                     "type": "string"
                 },
                 "baseUrl": {
@@ -21502,9 +21558,6 @@ const docTemplate = `{
         "internal_handler.updateMyPreferencesRequest": {
             "type": "object",
             "properties": {
-                "enable_memory": {
-                    "type": "boolean"
-                },
                 "last_active_tenant_id": {
                     "description": "LastActiveTenantID lets the SPA persist \"after a fresh login,\ndrop me back into this workspace\" across devices. Send a positive\nworkspace id to set / replace, or 0 to clear. Membership is validated\nat next login, not here. Nil = field omitted from the PATCH and\nstays untouched.",
                     "type": "integer"
@@ -21542,6 +21595,13 @@ const docTemplate = `{
                     "description": "Selected custom agent ID (backend resolves shared agent and its workspace from share relation)",
                     "type": "string"
                 },
+                "attachment_ids": {
+                    "description": "Pre-uploaded session-scoped document IDs",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
                 "attachment_uploads": {
                     "description": "Attached files (documents, audio, etc.)",
                     "type": "array",
@@ -21555,10 +21615,6 @@ const docTemplate = `{
                 },
                 "disable_title": {
                     "description": "Whether to disable auto title generation",
-                    "type": "boolean"
-                },
-                "enable_memory": {
-                    "description": "EnableMemory is the per-request override for the memory feature.\nPointer + omitempty so the request can distinguish three states:\n  nil   = client did not specify; backend falls back to the calling\n          user's persisted preference (user.preferences.enable_memory),\n          defaulting to false if that's also unset. This is the path\n          used by the normal logged-in chat UI now that the toggle is\n          stored server-side per user.\n  *true / *false = explicit override. Embedded mode forces *false so a\n          user's personal memory setting doesn't leak into a widget\n          context; older clients that still send a literal bool also\n          land here (back-compat).",
                     "type": "boolean"
                 },
                 "images": {

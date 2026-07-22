@@ -58,6 +58,20 @@ func TestQueueDefinitionsAreUniqueAndConsumable(t *testing.T) {
 	}
 }
 
+func TestChatAttachmentQueueIsIsolatedAndPrioritized(t *testing.T) {
+	queue, ok := QueueForTaskType(TypeTemporaryDocumentProcess)
+	if !ok || queue != QueueChatAttachment {
+		t.Fatalf("temporary document parsing must use %q, got %q", QueueChatAttachment, queue)
+	}
+	coreWeights := QueueWeightsForPool(WorkerPoolCore)
+	if coreWeights[QueueChatAttachment] <= coreWeights[QueueDefault] {
+		t.Fatalf("chat attachment queue must outweigh default queue in core pool: %+v", coreWeights)
+	}
+	if QueueWeightsForSharedPool()[QueueChatAttachment] <= 0 {
+		t.Fatalf("chat attachment queue must be eligible for shared burst capacity")
+	}
+}
+
 func TestQueueMaintenanceKeepsLegacyPhysicalName(t *testing.T) {
 	if QueueMaintenance != "low" {
 		t.Fatalf("maintenance queue must keep legacy Redis name during rolling upgrades, got %q", QueueMaintenance)
@@ -73,7 +87,7 @@ func TestEveryAsynqTaskTypeHasADeclaredQueue(t *testing.T) {
 		TypeImageMultimodal, TypeKnowledgePostProcess, TypeManualProcess,
 		TypeDataSourceSync, TypeProductionCollect, TypeProductionWrite,
 		TypeProductionValidate, TypeProductionBuild, TypeProductionActivate,
-		TypeProductionCleanup, TypeWikiIngest, TypeWikiFinalize,
+		TypeProductionCleanup, TypeWikiIngest, TypeWikiFinalize, TypeTemporaryDocumentProcess,
 	}
 	for _, taskType := range taskTypes {
 		if _, ok := QueueForTaskType(taskType); !ok {
