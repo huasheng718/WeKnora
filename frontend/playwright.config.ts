@@ -1,9 +1,9 @@
 import { defineConfig, devices } from '@playwright/test'
 import { validateProductionQaEnvironment } from './e2e/fixtures/qa-environment'
 
-const port = Number(process.env.PLAYWRIGHT_PORT ?? 5177)
-const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? `http://127.0.0.1:${port}`
 const qa = validateProductionQaEnvironment(process.env)
+const baseURL = qa.frontendURL
+const port = new URL(baseURL).port
 const backendPort = new URL(qa.backendURL).port
 
 export default defineConfig({

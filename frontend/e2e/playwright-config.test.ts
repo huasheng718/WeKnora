@@ -12,6 +12,8 @@ test('Playwright uses bundled Chromium with one retry and an ephemeral QA backen
   assert.match(config, /retries:\s*1/)
   assert.doesNotMatch(config, /channel:\s*['"]chrome['"]/)
   assert.match(config, /validateProductionQaEnvironment/)
+  assert.match(config, /const baseURL = qa\.frontendURL/)
+  assert.doesNotMatch(config, /const baseURL = process\.env\.PLAYWRIGHT_BASE_URL/)
   assert.match(config, /run-qa-backend\.sh/)
   assert.match(config, /globalTeardown:\s*['"]\.\/e2e\/qa-teardown\.ts['"]/)
   assert.match(backendLauncher, /go run -tags sqlite_fts5 \.\/cmd\/server/)

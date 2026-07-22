@@ -2,12 +2,12 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { productionReleaseConfigRows } from './releaseConfigRows'
 
-test('release preview maps every persisted processing setting without defaults', () => {
+test('release preview maps the exact ready snapshot backend contract without defaults', () => {
   assert.deepEqual(productionReleaseConfigRows({
     chunking: {
       strategy: 'recursive',
       chunk_size: 768,
-      overlap: 96,
+      chunk_overlap: 96,
       separators: ['\n\n', '\n', '。'],
     },
     embedding_model_id: 'embedding-real-1',
@@ -34,7 +34,7 @@ test('release preview maps every persisted processing setting without defaults',
 
 test('release preview preserves explicit false and zero values', () => {
   const rows = productionReleaseConfigRows({
-    chunking: { strategy: 'fixed', chunk_size: 0, overlap: 0, separators: [] },
+    chunking: { strategy: 'fixed', chunk_size: 0, chunk_overlap: 0, separators: [] },
     embedding_model_id: 'embedding-zero',
     graph: { enabled: false, model_id: '', extract_config: {} },
   })
