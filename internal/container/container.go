@@ -191,6 +191,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 
 	// Business service layer
 	logger.Debugf(ctx, "[Container] Registering business services...")
+	must(container.Provide(service.NewProductionBuiltinCatalog))
 	must(container.Provide(service.NewTenantService))
 	must(container.Provide(service.NewTenantAPIKeyService))
 	must(container.Provide(service.NewTenantMemberService))

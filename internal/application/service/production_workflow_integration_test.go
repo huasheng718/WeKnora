@@ -102,6 +102,8 @@ func openProductionWorkflowE2EDB(t *testing.T, path string, migrate bool) *gorm.
 		require.NoError(t, readErr)
 		require.NoError(t, db.Exec(string(migration)).Error)
 	}
+	require.NoError(t, db.Exec(`ALTER TABLE production_document_types ADD COLUMN template_key VARCHAR(255)`).Error)
+	require.NoError(t, db.Exec(`ALTER TABLE production_document_types ADD COLUMN origin VARCHAR(16) NOT NULL DEFAULT 'custom'`).Error)
 	require.NoError(t, db.AutoMigrate(&types.AuditLog{}))
 	return db
 }

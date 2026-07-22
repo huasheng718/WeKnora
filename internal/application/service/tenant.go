@@ -21,13 +21,26 @@ type ListTenantsParams struct {
 
 // tenantService implements the TenantService interface
 type tenantService struct {
-	repo        interfaces.TenantRepository // Repository for tenant data operations
-	storageRepo interfaces.StorageBackendRepository
+	repo          interfaces.TenantRepository // Repository for tenant data operations
+	storageRepo   interfaces.StorageBackendRepository
+	documentTypes interfaces.ProductionDocumentTypeRepository
+	uow           interfaces.ProductionUnitOfWork
+	catalog       *ProductionBuiltinCatalog
 }
 
+const systemActor = "system:builtin-document-types"
+
 // NewTenantService creates a new tenant service instance
-func NewTenantService(repo interfaces.TenantRepository, storageRepo interfaces.StorageBackendRepository) interfaces.TenantService {
-	return &tenantService{repo: repo, storageRepo: storageRepo}
+func NewTenantService(
+	repo interfaces.TenantRepository,
+	storageRepo interfaces.StorageBackendRepository,
+	documentTypes interfaces.ProductionDocumentTypeRepository,
+	uow interfaces.ProductionUnitOfWork,
+	catalog *ProductionBuiltinCatalog,
+) interfaces.TenantService {
+	return &tenantService{
+		repo: repo, storageRepo: storageRepo, documentTypes: documentTypes, uow: uow, catalog: catalog,
+	}
 }
 
 // CreateTenant creates a new tenant
@@ -54,17 +67,25 @@ func (s *tenantService) CreateTenant(ctx context.Context, tenant *types.Tenant) 
 		return nil, err
 	}
 
+	if s.uow == nil || s.documentTypes == nil || s.catalog == nil {
+		return nil, errors.New("tenant provisioning dependencies are required")
+	}
+
 	logger.Info(ctx, "Saving tenant information to database")
-	if err := s.repo.CreateTenant(ctx, tenant); err != nil {
+	if err := s.uow.WithinTransaction(ctx, func(txCtx context.Context) error {
+		if err := s.repo.CreateTenant(txCtx, tenant); err != nil {
+			return err
+		}
+		if err := s.createDefaultStorageBackend(txCtx, tenant); err != nil {
+			return err
+		}
+		return s.documentTypes.SeedBuiltins(
+			txCtx, tenant.ID, systemActor, s.catalog.Rows(tenant.ID, systemActor),
+		)
+	}); err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"tenant_name": tenant.Name,
 		})
-		return nil, err
-	}
-	if err := s.createDefaultStorageBackend(ctx, tenant); err != nil {
-		// No related rows exist yet, so rolling the tenant back is safe and
-		// avoids leaving a workspace that cannot bind new knowledge bases.
-		_ = s.repo.DeleteTenant(ctx, tenant.ID)
 		return nil, err
 	}
 
@@ -73,8 +94,11 @@ func (s *tenantService) CreateTenant(ctx context.Context, tenant *types.Tenant) 
 }
 
 func (s *tenantService) createDefaultStorageBackend(ctx context.Context, tenant *types.Tenant) error {
-	if s.storageRepo == nil || tenant == nil {
-		return nil
+	if s.storageRepo == nil {
+		return errors.New("storage backend repository is required")
+	}
+	if tenant == nil {
+		return errors.New("tenant is required")
 	}
 	provider := ""
 	if tenant.StorageEngineConfig != nil {
@@ -93,7 +117,6 @@ func (s *tenantService) createDefaultStorageBackend(ctx context.Context, tenant 
 	}
 	tenant.DefaultStorageBackendID = &backend.ID
 	if err := s.repo.UpdateTenant(ctx, tenant); err != nil {
-		_ = s.storageRepo.Delete(ctx, tenant.ID, backend.ID)
 		return err
 	}
 	return nil

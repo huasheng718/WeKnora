@@ -43,6 +43,15 @@ func (r *productionDocumentTypeRepoStub) Create(_ context.Context, documentType 
 	return nil
 }
 
+func (*productionDocumentTypeRepoStub) SeedBuiltins(
+	context.Context,
+	uint64,
+	string,
+	[]types.ProductionDocumentType,
+) error {
+	return nil
+}
+
 func (r *productionDocumentTypeRepoStub) Activate(_ context.Context, tenantID uint64, code string, schemaVersion int) (*types.ProductionDocumentType, error) {
 	if r.activateErr != nil {
 		return nil, r.activateErr
