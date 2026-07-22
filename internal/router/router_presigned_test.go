@@ -39,6 +39,9 @@ func (s *stubTenantService) GetTenantByID(ctx context.Context, id uint64) (*type
 func (s *stubTenantService) CreateTenant(context.Context, *types.Tenant) (*types.Tenant, error) {
 	panic("unexpected")
 }
+func (s *stubTenantService) ActivateProvisionedTenant(context.Context, uint64) (*types.Tenant, error) {
+	panic("unexpected")
+}
 
 func (s *stubTenantService) GetTenantsByIDs(context.Context, []uint64) (map[uint64]*types.Tenant, error) {
 	panic("unexpected")

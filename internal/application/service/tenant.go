@@ -56,7 +56,7 @@ func (s *tenantService) CreateTenant(ctx context.Context, tenant *types.Tenant) 
 
 	// New tenants do not receive an API key by default. Integrations create
 	// keys explicitly through tenant_api_keys.
-	tenant.Status = "active"
+	tenant.Status = types.TenantStatusProvisioning
 	tenant.CreatedAt = time.Now()
 	tenant.UpdatedAt = time.Now()
 
@@ -90,6 +90,25 @@ func (s *tenantService) CreateTenant(ctx context.Context, tenant *types.Tenant) 
 	}
 
 	logger.Infof(ctx, "Tenant created successfully, ID: %d, name: %s", tenant.ID, tenant.Name)
+	return tenant, nil
+}
+
+func (s *tenantService) ActivateProvisionedTenant(ctx context.Context, id uint64) (*types.Tenant, error) {
+	if id == 0 {
+		return nil, errors.New("tenant ID cannot be 0")
+	}
+	tenant, err := s.repo.GetTenantByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if tenant.Status != types.TenantStatusProvisioning {
+		return nil, errors.New("tenant is not awaiting activation")
+	}
+	if err := s.repo.ActivateProvisionedTenant(ctx, id); err != nil {
+		return nil, err
+	}
+	tenant.Status = types.TenantStatusActive
+	tenant.UpdatedAt = time.Now()
 	return tenant, nil
 }
 
@@ -136,13 +155,25 @@ func (s *tenantService) GetTenantByID(ctx context.Context, id uint64) (*types.Te
 		})
 		return nil, err
 	}
+	if tenant.Status != types.TenantStatusActive {
+		return nil, errors.New("tenant is not active")
+	}
 
 	return tenant, nil
 }
 
 // GetTenantsByIDs batches GetTenantByID; returns a map keyed by tenant ID.
 func (s *tenantService) GetTenantsByIDs(ctx context.Context, ids []uint64) (map[uint64]*types.Tenant, error) {
-	return s.repo.GetTenantsByIDs(ctx, ids)
+	tenants, err := s.repo.GetTenantsByIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	for id, tenant := range tenants {
+		if tenant == nil || tenant.Status != types.TenantStatusActive {
+			delete(tenants, id)
+		}
+	}
+	return tenants, nil
 }
 
 // ListTenants retrieves a list of all tenants
@@ -291,7 +322,7 @@ func (s *tenantService) SearchTenants(ctx context.Context, keyword string, tenan
 // GetTenantByIDForUser gets a tenant by ID with permission check
 // This method verifies that the user has permission to access the tenant
 func (s *tenantService) GetTenantByIDForUser(ctx context.Context, tenantID uint64, userID string) (*types.Tenant, error) {
-	tenant, err := s.repo.GetTenantByID(ctx, tenantID)
+	tenant, err := s.GetTenantByID(ctx, tenantID)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"tenant_id": tenantID,

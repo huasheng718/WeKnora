@@ -69,7 +69,7 @@ func TestPurgeProvisionedTenantHardDeletesAllProvisioningRows(t *testing.T) {
 	repo := NewTenantRepository(db)
 	ctx := context.Background()
 
-	tenant := &types.Tenant{Name: "failed-provisioning", Status: "active"}
+	tenant := &types.Tenant{Name: "failed-provisioning", Status: types.TenantStatusProvisioning}
 	require.NoError(t, db.Create(tenant).Error)
 	member := &types.TenantMember{
 		UserID: "failed-owner", TenantID: tenant.ID,
@@ -131,7 +131,7 @@ func TestPurgeProvisionedTenantRollsBackEveryDeleteWhenFinalDeleteFails(t *testi
 		&types.ProductionDocumentType{},
 	))
 	repo := NewTenantRepository(db)
-	tenant := &types.Tenant{Name: "atomic-purge", Status: "active"}
+	tenant := &types.Tenant{Name: "atomic-purge", Status: types.TenantStatusProvisioning}
 	require.NoError(t, db.Create(tenant).Error)
 	require.NoError(t, db.Create(&types.TenantMember{
 		UserID: "owner", TenantID: tenant.ID, Role: types.TenantRoleOwner,
@@ -172,4 +172,26 @@ func TestPurgeProvisionedTenantRollsBackEveryDeleteWhenFinalDeleteFails(t *testi
 			assert.Equal(t, int64(1), count, "earlier deletes must roll back with the final failure")
 		})
 	}
+}
+
+func TestPurgeProvisionedTenantRejectsActiveTenant(t *testing.T) {
+	db := setupTestDB(t)
+	require.NoError(t, db.AutoMigrate(&types.StorageBackend{}, &types.ProductionDocumentType{}))
+	repo := NewTenantRepository(db)
+	tenant := &types.Tenant{Name: "active-workspace", Status: types.TenantStatusActive}
+	require.NoError(t, db.Create(tenant).Error)
+	require.NoError(t, db.Create(&types.TenantMember{
+		UserID: "owner", TenantID: tenant.ID, Role: types.TenantRoleOwner,
+		Status: types.TenantMemberStatusActive,
+	}).Error)
+
+	err := repo.PurgeProvisionedTenant(context.Background(), tenant.ID)
+	require.ErrorIs(t, err, ErrTenantNotProvisioning)
+
+	var tenantCount int64
+	require.NoError(t, db.Unscoped().Model(&types.Tenant{}).Where("id = ?", tenant.ID).Count(&tenantCount).Error)
+	assert.Equal(t, int64(1), tenantCount)
+	var memberCount int64
+	require.NoError(t, db.Unscoped().Model(&types.TenantMember{}).Where("tenant_id = ?", tenant.ID).Count(&memberCount).Error)
+	assert.Equal(t, int64(1), memberCount)
 }

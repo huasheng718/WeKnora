@@ -43,8 +43,10 @@ func (s *tenantPolicySettingService) GetInt(_ context.Context, _ string, _ strin
 
 type tenantPolicyUserService struct {
 	interfaces.UserService
-	user      *types.User
-	updateErr error
+	user             *types.User
+	updateErr        error
+	updateErrs       []error
+	updatedTenantIDs []uint64
 }
 
 func (s *tenantPolicyUserService) GetCurrentUser(context.Context) (*types.User, error) {
@@ -55,21 +57,36 @@ func (s *tenantPolicyUserService) BuildLoginMemberships(context.Context, *types.
 	return []types.Membership{}
 }
 
-func (s *tenantPolicyUserService) UpdateUser(context.Context, *types.User) error {
+func (s *tenantPolicyUserService) UpdateUser(_ context.Context, user *types.User) error {
+	s.updatedTenantIDs = append(s.updatedTenantIDs, user.TenantID)
+	if len(s.updateErrs) >= len(s.updatedTenantIDs) {
+		return s.updateErrs[len(s.updatedTenantIDs)-1]
+	}
 	return s.updateErr
 }
 
 type tenantPolicyTenantService struct {
 	interfaces.TenantService
-	createCalls int
-	deleteCalls int
-	purgeCalls  int
+	createCalls   int
+	activateCalls int
+	deleteCalls   int
+	purgeCalls    int
+	activateErr   error
 }
 
 func (s *tenantPolicyTenantService) CreateTenant(_ context.Context, tenant *types.Tenant) (*types.Tenant, error) {
 	s.createCalls++
 	tenant.ID = 99
+	tenant.Status = types.TenantStatusProvisioning
 	return tenant, nil
+}
+
+func (s *tenantPolicyTenantService) ActivateProvisionedTenant(_ context.Context, id uint64) (*types.Tenant, error) {
+	s.activateCalls++
+	if s.activateErr != nil {
+		return nil, s.activateErr
+	}
+	return &types.Tenant{ID: id, Name: "provisioned", Status: types.TenantStatusActive}, nil
 }
 
 func (s *tenantPolicyTenantService) DeleteTenant(context.Context, uint64) error {
@@ -86,6 +103,7 @@ type tenantProvisioningMemberService struct {
 	interfaces.TenantMemberService
 	ensureErr   error
 	lists       [][]*types.TenantMember
+	listErrs    []error
 	listCalls   int
 	removeCalls int
 }
@@ -100,6 +118,9 @@ func (s *tenantProvisioningMemberService) EnsureOwner(_ context.Context, userID 
 func (s *tenantProvisioningMemberService) ListByUser(context.Context, string) ([]*types.TenantMember, error) {
 	index := s.listCalls
 	s.listCalls++
+	if index < len(s.listErrs) && s.listErrs[index] != nil {
+		return nil, s.listErrs[index]
+	}
 	if index >= len(s.lists) {
 		return nil, nil
 	}
@@ -155,7 +176,7 @@ func TestCreateTenantAllowsCrossTenantSuperuserWhenSelfServiceDisabled(t *testin
 	gin.SetMode(gin.TestMode)
 	tenants := &tenantPolicyTenantService{}
 	h := &TenantHandler{
-		service: tenants,
+		service: tenants, memberService: &tenantProvisioningMemberService{},
 		userService: &tenantPolicyUserService{user: &types.User{
 			ID:                  "super-user",
 			TenantID:            1,
@@ -177,6 +198,51 @@ func TestCreateTenantAllowsCrossTenantSuperuserWhenSelfServiceDisabled(t *testin
 	}
 	if tenants.createCalls != 1 {
 		t.Fatalf("CreateTenant called %d times, want 1", tenants.createCalls)
+	}
+}
+
+func TestCreateTenantPurgesProvisioningWhenMemberServiceUnavailable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tenants := &tenantPolicyTenantService{}
+	h := &TenantHandler{
+		service: tenants,
+		userService: &tenantPolicyUserService{user: &types.User{
+			ID: "regular", TenantID: 1,
+		}},
+		config:           &config.Config{Tenant: &config.TenantConfig{}},
+		systemSettingSvc: &tenantPolicySettingService{enabled: true},
+	}
+
+	w := runSelfServiceTenantCreate(t, h)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if tenants.activateCalls != 0 || tenants.purgeCalls != 1 {
+		t.Fatalf("calls: activate=%d purge=%d, want 0/1", tenants.activateCalls, tenants.purgeCalls)
+	}
+}
+
+func TestCreateTenantPurgesProvisioningWhenQuotaRecountFails(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tenants := &tenantPolicyTenantService{}
+	members := &tenantProvisioningMemberService{
+		lists:    [][]*types.TenantMember{{}},
+		listErrs: []error{nil, errors.New("quota recount failed")},
+	}
+	h := &TenantHandler{
+		service: tenants, memberService: members,
+		userService:      &tenantPolicyUserService{user: &types.User{ID: "regular", TenantID: 1}},
+		config:           &config.Config{Tenant: &config.TenantConfig{MaxOwnedPerUser: 1}},
+		systemSettingSvc: &tenantPolicySettingService{enabled: true},
+	}
+
+	w := runSelfServiceTenantCreate(t, h)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if tenants.activateCalls != 0 || members.removeCalls != 1 || tenants.purgeCalls != 1 {
+		t.Fatalf("calls: activate=%d remove=%d purge=%d, want 0/1/1",
+			tenants.activateCalls, members.removeCalls, tenants.purgeCalls)
 	}
 }
 
@@ -274,5 +340,62 @@ func TestCreateTenantPurgesProvisioningWhenDefaultTenantUpdateFails(t *testing.T
 	}
 	if tenants.purgeCalls != 1 || tenants.deleteCalls != 0 {
 		t.Fatalf("rollback calls: purge=%d delete=%d, want 1/0", tenants.purgeCalls, tenants.deleteCalls)
+	}
+	if got := h.userService.(*tenantPolicyUserService).user.TenantID; got != 0 {
+		t.Fatalf("in-memory tenant ID = %d, want reset to 0", got)
+	}
+}
+
+func TestCreateTenantActivatesBeforeReturningSuccess(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tenants := &tenantPolicyTenantService{}
+	members := &tenantProvisioningMemberService{}
+	h := &TenantHandler{
+		service: tenants, memberService: members,
+		userService: &tenantPolicyUserService{user: &types.User{
+			ID: "super", TenantID: 1, CanAccessAllTenants: true,
+		}},
+		config:           &config.Config{Tenant: &config.TenantConfig{}},
+		systemSettingSvc: &tenantPolicySettingService{enabled: true},
+	}
+
+	w := runSelfServiceTenantCreate(t, h)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if tenants.activateCalls != 1 {
+		t.Fatalf("ActivateProvisionedTenant calls = %d, want 1", tenants.activateCalls)
+	}
+	if !strings.Contains(w.Body.String(), `"status":"active"`) {
+		t.Fatalf("response does not contain active tenant: %s", w.Body.String())
+	}
+}
+
+func TestCreateTenantActivationFailureRestoresTenantlessUserAndPurges(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tenants := &tenantPolicyTenantService{activateErr: errors.New("activation failed")}
+	members := &tenantProvisioningMemberService{lists: [][]*types.TenantMember{{}, {{Role: types.TenantRoleOwner}}}}
+	users := &tenantPolicyUserService{user: &types.User{ID: "tenantless", TenantID: 0}}
+	h := &TenantHandler{
+		service: tenants, memberService: members, userService: users,
+		config:           &config.Config{Tenant: &config.TenantConfig{}},
+		systemSettingSvc: &tenantPolicySettingService{enabled: true},
+	}
+
+	w := runSelfServiceTenantCreate(t, h)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if tenants.activateCalls != 1 {
+		t.Fatalf("ActivateProvisionedTenant calls = %d, want 1", tenants.activateCalls)
+	}
+	if users.user.TenantID != 0 {
+		t.Fatalf("in-memory tenant ID = %d, want 0", users.user.TenantID)
+	}
+	if len(users.updatedTenantIDs) != 2 || users.updatedTenantIDs[0] != 99 || users.updatedTenantIDs[1] != 0 {
+		t.Fatalf("persisted tenant IDs = %v, want [99 0]", users.updatedTenantIDs)
+	}
+	if members.removeCalls != 1 || tenants.purgeCalls != 1 {
+		t.Fatalf("rollback calls: remove=%d purge=%d, want 1/1", members.removeCalls, tenants.purgeCalls)
 	}
 }

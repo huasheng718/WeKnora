@@ -13,6 +13,11 @@ import (
 	"gorm.io/gorm"
 )
 
+const (
+	TenantStatusProvisioning = "provisioning"
+	TenantStatusActive       = "active"
+)
+
 // retrieverEngineMapping maps RETRIEVE_DRIVER values to retriever engine configurations
 var retrieverEngineMapping = map[string][]RetrieverEngineParams{
 	"postgres": {

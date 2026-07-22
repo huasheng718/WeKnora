@@ -11,6 +11,9 @@ import (
 type TenantService interface {
 	// CreateTenant creates a tenant
 	CreateTenant(ctx context.Context, tenant *types.Tenant) (*types.Tenant, error)
+	// ActivateProvisionedTenant atomically transitions a fully provisioned
+	// tenant from provisioning to active.
+	ActivateProvisionedTenant(ctx context.Context, id uint64) (*types.Tenant, error)
 	// GetTenantByID gets a tenant by ID
 	GetTenantByID(ctx context.Context, id uint64) (*types.Tenant, error)
 	// GetTenantsByIDs batches GetTenantByID for multiple IDs in a single
@@ -48,6 +51,8 @@ type TenantService interface {
 type TenantRepository interface {
 	// CreateTenant creates a tenant
 	CreateTenant(ctx context.Context, tenant *types.Tenant) error
+	// ActivateProvisionedTenant atomically transitions provisioning to active.
+	ActivateProvisionedTenant(ctx context.Context, id uint64) error
 	// GetTenantByID gets a tenant by ID
 	GetTenantByID(ctx context.Context, id uint64) (*types.Tenant, error)
 	// GetTenantsByIDs batches GetTenantByID; see TenantService.GetTenantsByIDs.

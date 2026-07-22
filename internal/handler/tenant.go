@@ -352,6 +352,14 @@ func (h *TenantHandler) CreateTenant(c *gin.Context) {
 	// yet still occupies storage_bucket / name uniqueness slots.
 	// Idempotent: EnsureOwner is a no-op when the row already exists,
 	// so cross-tenant superusers create-and-own through the same path.
+	if h.memberService == nil {
+		logger.Errorf(ctx, "Workspace membership service unavailable while finalizing tenant %d", createdTenant.ID)
+		if purgeErr := h.service.PurgeProvisionedTenant(ctx, createdTenant.ID); purgeErr != nil {
+			logger.Errorf(ctx, "Provisioning purge failed for ownerless tenant %d: %v", createdTenant.ID, purgeErr)
+		}
+		c.Error(errors.NewInternalServerError("Failed to finalise workspace ownership"))
+		return
+	}
 	if h.memberService != nil {
 		if _, err := h.memberService.EnsureOwner(ctx, caller.ID, createdTenant.ID); err != nil {
 			logger.Errorf(ctx,
@@ -379,6 +387,16 @@ func (h *TenantHandler) CreateTenant(c *gin.Context) {
 			if listErr != nil {
 				logger.Errorf(ctx, "Post-create quota recount failed for user %s tenant %d: %v",
 					caller.ID, createdTenant.ID, listErr)
+				if removeErr := h.memberService.RemoveMember(ctx, caller.ID, createdTenant.ID); removeErr != nil {
+					logger.Errorf(ctx, "Rollback RemoveMember failed for user %s tenant %d after quota recount error: %v",
+						caller.ID, createdTenant.ID, removeErr)
+				}
+				if purgeErr := h.service.PurgeProvisionedTenant(ctx, createdTenant.ID); purgeErr != nil {
+					logger.Errorf(ctx, "Provisioning purge failed for tenant %d after quota recount error: %v",
+						createdTenant.ID, purgeErr)
+				}
+				c.Error(errors.NewInternalServerError("Failed to verify workspace quota").WithDetails(listErr.Error()))
+				return
 			} else {
 				ownedNow := 0
 				for _, m := range memberships {
@@ -416,13 +434,18 @@ func (h *TenantHandler) CreateTenant(c *gin.Context) {
 	// When a tenantless user creates their first workspace, make it their
 	// default login tenant. Roll the just-created resources back if this
 	// finalisation fails so the user is not left with an unreachable tenant.
-	if caller.TenantID == 0 {
+	assignedDefaultTenant := caller.TenantID == 0
+	if assignedDefaultTenant {
 		caller.TenantID = createdTenant.ID
 		if err := h.userService.UpdateUser(ctx, caller); err != nil {
 			logger.Errorf(ctx, "Failed to set first tenant %d as default for user %s: %v",
 				createdTenant.ID, caller.ID, err)
+			caller.TenantID = 0
 			if h.memberService != nil {
-				_ = h.memberService.RemoveMember(ctx, caller.ID, createdTenant.ID)
+				if removeErr := h.memberService.RemoveMember(ctx, caller.ID, createdTenant.ID); removeErr != nil {
+					logger.Errorf(ctx, "Failed to remove owner membership for user %s tenant %d after default workspace finalization: %v",
+						caller.ID, createdTenant.ID, removeErr)
+				}
 			}
 			if purgeErr := h.service.PurgeProvisionedTenant(ctx, createdTenant.ID); purgeErr != nil {
 				logger.Errorf(ctx, "Provisioning purge failed for tenant %d after default workspace finalization: %v",
@@ -432,6 +455,31 @@ func (h *TenantHandler) CreateTenant(c *gin.Context) {
 			return
 		}
 	}
+
+	activatedTenant, err := h.service.ActivateProvisionedTenant(ctx, createdTenant.ID)
+	if err != nil {
+		logger.Errorf(ctx, "Failed to activate tenant %d after finalization: %v", createdTenant.ID, err)
+		if assignedDefaultTenant {
+			caller.TenantID = 0
+			if rollbackErr := h.userService.UpdateUser(ctx, caller); rollbackErr != nil {
+				logger.Errorf(ctx, "Failed to restore tenantless user %s after tenant %d activation failure: %v",
+					caller.ID, createdTenant.ID, rollbackErr)
+			}
+		}
+		if h.memberService != nil {
+			if removeErr := h.memberService.RemoveMember(ctx, caller.ID, createdTenant.ID); removeErr != nil {
+				logger.Errorf(ctx, "Failed to remove owner membership for user %s tenant %d after activation failure: %v",
+					caller.ID, createdTenant.ID, removeErr)
+			}
+		}
+		if purgeErr := h.service.PurgeProvisionedTenant(ctx, createdTenant.ID); purgeErr != nil {
+			logger.Errorf(ctx, "Provisioning purge failed for tenant %d after activation failure: %v",
+				createdTenant.ID, purgeErr)
+		}
+		c.Error(errors.NewInternalServerError("Failed to finalise workspace activation").WithDetails(err.Error()))
+		return
+	}
+	createdTenant = activatedTenant
 
 	logger.Infof(
 		ctx,

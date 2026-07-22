@@ -94,6 +94,9 @@ func (f *flowTenantSvc) GetTenantByID(context.Context, uint64) (*types.Tenant, e
 func (f *flowTenantSvc) CreateTenant(context.Context, *types.Tenant) (*types.Tenant, error) {
 	return nil, nil
 }
+func (f *flowTenantSvc) ActivateProvisionedTenant(context.Context, uint64) (*types.Tenant, error) {
+	return f.tenant, nil
+}
 func (f *flowTenantSvc) GetTenantsByIDs(context.Context, []uint64) (map[uint64]*types.Tenant, error) {
 	return nil, nil
 }

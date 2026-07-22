@@ -145,6 +145,10 @@ func (f *fakeTenantService) CreateTenant(ctx context.Context, tenant *types.Tena
 	return nil, nil
 }
 
+func (f *fakeTenantService) ActivateProvisionedTenant(context.Context, uint64) (*types.Tenant, error) {
+	return f.tenant, nil
+}
+
 func (f *fakeTenantService) GetTenantsByIDs(ctx context.Context, ids []uint64) (map[uint64]*types.Tenant, error) {
 	return nil, nil
 }

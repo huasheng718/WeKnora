@@ -185,19 +185,43 @@ func (s *userService) Register(ctx context.Context, req *types.RegisterRequest) 
 		return nil, errors.New("failed to create user")
 	}
 
-	// Bootstrap an Owner membership so the registrant has full control over
-	// the tenant their account just created. Failure here only logs — the
-	// user record exists and the auth middleware's orphan-tenant recovery
-	// path will recreate the membership on next login.
-	if createdTenant != nil && s.memberService != nil {
+	// Bootstrap an Owner membership before activation. Missing ownership is
+	// fatal: delete the new user and purge the still-hidden tenant.
+	if createdTenant != nil && s.memberService == nil {
+		logger.Errorf(ctx, "Workspace membership service unavailable while finalizing tenant %d", createdTenant.ID)
+		if cleanupErr := s.userRepo.DeleteUser(ctx, user.ID); cleanupErr != nil {
+			logger.Errorf(ctx, "Failed to delete user %s after owner service failure: %v", user.ID, cleanupErr)
+		}
+		if rollbackErr := s.tenantService.PurgeProvisionedTenant(ctx, createdTenant.ID); rollbackErr != nil {
+			logger.Errorf(ctx, "Failed to roll back tenant %d after owner service failure: %v", createdTenant.ID, rollbackErr)
+		}
+		return nil, errors.New("failed to finalise workspace ownership")
+	}
+
+	if createdTenant != nil {
 		if _, err := s.memberService.EnsureOwner(ctx, user.ID, createdTenant.ID); err != nil {
 			logger.Errorf(ctx, "Failed to create owner membership for user %s tenant %d: %v",
 				user.ID, createdTenant.ID, err)
-			_ = s.userRepo.DeleteUser(ctx, user.ID)
+			if cleanupErr := s.userRepo.DeleteUser(ctx, user.ID); cleanupErr != nil {
+				logger.Errorf(ctx, "Failed to delete user %s after owner finalization failure: %v", user.ID, cleanupErr)
+			}
 			if rollbackErr := s.tenantService.PurgeProvisionedTenant(ctx, createdTenant.ID); rollbackErr != nil {
 				logger.Errorf(ctx, "Failed to roll back tenant %d after owner finalization failure: %v", createdTenant.ID, rollbackErr)
 			}
 			return nil, errors.New("failed to finalise workspace ownership")
+		}
+	}
+
+	if createdTenant != nil {
+		if _, err := s.tenantService.ActivateProvisionedTenant(ctx, createdTenant.ID); err != nil {
+			logger.Errorf(ctx, "Failed to activate tenant %d after registration finalization: %v", createdTenant.ID, err)
+			if cleanupErr := s.userRepo.DeleteUser(ctx, user.ID); cleanupErr != nil {
+				logger.Errorf(ctx, "Failed to delete user %s after tenant activation failure: %v", user.ID, cleanupErr)
+			}
+			if rollbackErr := s.tenantService.PurgeProvisionedTenant(ctx, createdTenant.ID); rollbackErr != nil {
+				logger.Errorf(ctx, "Failed to roll back tenant %d after activation failure: %v", createdTenant.ID, rollbackErr)
+			}
+			return nil, errors.New("failed to finalise workspace activation")
 		}
 	}
 
@@ -389,19 +413,16 @@ func (s *userService) buildMembershipsForUser(
 // middleware's home-tenant auto-promotion or an admin invitation) the
 // next /auth/me-style refresh will upgrade the UI to the real role.
 func synthFallbackMembership(user *types.User, activeTenant *types.Tenant) []types.Membership {
-	if user == nil || user.TenantID == 0 {
+	if user == nil || user.TenantID == 0 || activeTenant == nil ||
+		activeTenant.ID != user.TenantID || activeTenant.Status != types.TenantStatusActive {
 		// Always return a non-nil slice so the login response carries an
 		// empty array rather than `null`, preserving the documented
 		// "always populated" contract on LoginResponse.Memberships.
 		return []types.Membership{}
 	}
-	name := ""
-	if activeTenant != nil && activeTenant.ID == user.TenantID {
-		name = activeTenant.Name
-	}
 	return []types.Membership{{
 		TenantID:   user.TenantID,
-		TenantName: name,
+		TenantName: activeTenant.Name,
 		Role:       types.TenantRoleViewer,
 	}}
 }
@@ -785,7 +806,15 @@ func (s *userService) homeOrFirstMembershipTenant(ctx context.Context, user *typ
 	if user.TenantID == 0 {
 		return s.resolveFirstMembershipTenant(ctx, user)
 	}
-	return user.TenantID
+	if s.tenantService != nil {
+		tenant, err := s.tenantService.GetTenantByID(ctx, user.TenantID)
+		if err == nil && tenant != nil && tenant.Status == types.TenantStatusActive {
+			return user.TenantID
+		}
+		logger.Warnf(ctx, "resolveLoginTenantID: home tenant %d for user %s is unavailable: %v",
+			user.TenantID, user.ID, err)
+	}
+	return s.resolveFirstMembershipTenant(ctx, user)
 }
 
 // resolveFirstMembershipTenant makes a tenantless identity usable when an

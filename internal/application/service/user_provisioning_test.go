@@ -46,18 +46,42 @@ func (r *provisioningUserRepo) DeleteUser(context.Context, string) error {
 
 type provisioningTenantService struct {
 	interfaces.TenantService
-	createCalls int
-	deleteCalls int
-	purgeCalls  int
+	createCalls   int
+	activateCalls int
+	deleteCalls   int
+	purgeCalls    int
+	activateErr   error
+	unavailable   map[uint64]bool
 }
 
 func (s *provisioningTenantService) CreateTenant(context.Context, *types.Tenant) (*types.Tenant, error) {
 	s.createCalls++
-	return &types.Tenant{ID: 99}, nil
+	return &types.Tenant{ID: 99, Name: "personal", Status: types.TenantStatusProvisioning}, nil
+}
+
+func (s *provisioningTenantService) ActivateProvisionedTenant(context.Context, uint64) (*types.Tenant, error) {
+	s.activateCalls++
+	if s.activateErr != nil {
+		return nil, s.activateErr
+	}
+	return &types.Tenant{ID: 99, Name: "personal", Status: types.TenantStatusActive}, nil
 }
 
 func (s *provisioningTenantService) GetTenantByID(_ context.Context, id uint64) (*types.Tenant, error) {
-	return &types.Tenant{ID: id}, nil
+	if s.unavailable[id] {
+		return nil, errors.New("tenant is not active")
+	}
+	return &types.Tenant{ID: id, Name: "active", Status: types.TenantStatusActive}, nil
+}
+
+func (s *provisioningTenantService) GetTenantsByIDs(_ context.Context, ids []uint64) (map[uint64]*types.Tenant, error) {
+	tenants := make(map[uint64]*types.Tenant, len(ids))
+	for _, id := range ids {
+		if !s.unavailable[id] {
+			tenants[id] = &types.Tenant{ID: id, Name: "active", Status: types.TenantStatusActive}
+		}
+	}
+	return tenants, nil
 }
 
 func (s *provisioningTenantService) DeleteTenant(context.Context, uint64) error {
@@ -85,6 +109,15 @@ func (s *provisioningMemberService) EnsureOwner(context.Context, string, uint64)
 		return nil, s.ensureErr
 	}
 	return &types.TenantMember{Role: types.TenantRoleOwner}, nil
+}
+
+func (s *provisioningMemberService) GetMembership(_ context.Context, userID string, tenantID uint64) (*types.TenantMember, error) {
+	for _, member := range s.members {
+		if member != nil && member.UserID == userID && member.TenantID == tenantID {
+			return member, nil
+		}
+	}
+	return nil, nil
 }
 
 func TestUserServiceRegisterTenantlessSkipsTenantCreation(t *testing.T) {
@@ -123,6 +156,122 @@ func TestResolveLoginTenantIDRepairsTenantlessUserWithMembership(t *testing.T) {
 	}
 	if repo.updatedTenant != 42 || user.TenantID != 42 {
 		t.Fatalf("repair was not persisted: repo=%d user=%d", repo.updatedTenant, user.TenantID)
+	}
+}
+
+func TestBuildLoginMembershipsOmitsPendingHomeTenant(t *testing.T) {
+	tenantSvc := &provisioningTenantService{unavailable: map[uint64]bool{42: true}}
+	memberSvc := &provisioningMemberService{members: []*types.TenantMember{
+		{TenantID: 42, Status: types.TenantMemberStatusActive, Role: types.TenantRoleOwner},
+	}}
+	svc := &userService{tenantService: tenantSvc, memberService: memberSvc}
+
+	memberships := svc.BuildLoginMemberships(
+		context.Background(),
+		&types.User{ID: "alice", TenantID: 42},
+		nil,
+	)
+
+	if len(memberships) != 0 {
+		t.Fatalf("memberships = %+v, want empty while tenant is pending", memberships)
+	}
+}
+
+func TestResolveLoginTenantIDRejectsPendingHomeTenant(t *testing.T) {
+	tenantSvc := &provisioningTenantService{unavailable: map[uint64]bool{42: true}}
+	svc := &userService{tenantService: tenantSvc}
+
+	if got := svc.resolveLoginTenantID(context.Background(), &types.User{ID: "alice", TenantID: 42}); got != 0 {
+		t.Fatalf("resolved tenant = %d, want 0 while home tenant is pending", got)
+	}
+}
+
+func TestUserServiceRegisterActivatesProvisionedTenant(t *testing.T) {
+	repo := &provisioningUserRepo{}
+	tenantSvc := &provisioningTenantService{}
+	members := &provisioningMemberService{}
+	svc := &userService{userRepo: repo, tenantService: tenantSvc, memberService: members}
+
+	user, err := svc.Register(context.Background(), &types.RegisterRequest{
+		Username: "alice", Email: "alice@example.com", Password: "supersecret",
+		TenantProvisioning: types.TenantProvisioningCreatePersonal,
+	})
+
+	if err != nil || user == nil {
+		t.Fatalf("Register = (%v, %v), want success", user, err)
+	}
+	if tenantSvc.activateCalls != 1 {
+		t.Fatalf("ActivateProvisionedTenant calls = %d, want 1", tenantSvc.activateCalls)
+	}
+	if repo.deleteCalls != 0 || tenantSvc.purgeCalls != 0 {
+		t.Fatalf("unexpected rollback: user deletes=%d tenant purges=%d", repo.deleteCalls, tenantSvc.purgeCalls)
+	}
+}
+
+func TestUserServiceRegisterPurgesProvisionedTenantWhenActivationFails(t *testing.T) {
+	repo := &provisioningUserRepo{}
+	tenantSvc := &provisioningTenantService{activateErr: errors.New("activation failed")}
+	members := &provisioningMemberService{}
+	svc := &userService{userRepo: repo, tenantService: tenantSvc, memberService: members}
+
+	user, err := svc.Register(context.Background(), &types.RegisterRequest{
+		Username: "alice", Email: "alice@example.com", Password: "supersecret",
+		TenantProvisioning: types.TenantProvisioningCreatePersonal,
+	})
+
+	if err == nil || user != nil {
+		t.Fatalf("Register = (%v, %v), want activation failure", user, err)
+	}
+	if tenantSvc.activateCalls != 1 {
+		t.Fatalf("ActivateProvisionedTenant calls = %d, want 1", tenantSvc.activateCalls)
+	}
+	if repo.deleteCalls != 1 || tenantSvc.purgeCalls != 1 {
+		t.Fatalf("rollback calls: user deletes=%d tenant purges=%d, want 1/1", repo.deleteCalls, tenantSvc.purgeCalls)
+	}
+}
+
+func TestUserServiceRegisterPurgesProvisionedTenantWhenMemberServiceUnavailable(t *testing.T) {
+	repo := &provisioningUserRepo{}
+	tenantSvc := &provisioningTenantService{}
+	svc := &userService{userRepo: repo, tenantService: tenantSvc}
+
+	user, err := svc.Register(context.Background(), &types.RegisterRequest{
+		Username: "alice", Email: "alice@example.com", Password: "supersecret",
+		TenantProvisioning: types.TenantProvisioningCreatePersonal,
+	})
+
+	if err == nil || user != nil {
+		t.Fatalf("Register = (%v, %v), want owner finalization failure", user, err)
+	}
+	if tenantSvc.activateCalls != 0 {
+		t.Fatalf("ActivateProvisionedTenant calls = %d, want 0", tenantSvc.activateCalls)
+	}
+	if repo.deleteCalls != 1 || tenantSvc.purgeCalls != 1 {
+		t.Fatalf("rollback calls: user deletes=%d tenant purges=%d, want 1/1", repo.deleteCalls, tenantSvc.purgeCalls)
+	}
+}
+
+func TestSwitchTenantRejectsPendingTenantAndAllowsItAfterActivation(t *testing.T) {
+	tenantSvc := &provisioningTenantService{unavailable: map[uint64]bool{42: true}}
+	members := &provisioningMemberService{members: []*types.TenantMember{
+		{UserID: "alice", TenantID: 42, Status: types.TenantMemberStatusActive, Role: types.TenantRoleOwner},
+	}}
+	svc := &userService{
+		tenantService: tenantSvc,
+		memberService: members,
+		tokenRepo:     &stubAuthTokenRepo{},
+	}
+	user := &types.User{ID: "alice", TenantID: 1, IsActive: true}
+
+	response, err := svc.SwitchTenant(context.Background(), user, 42, "")
+	if err == nil || response != nil {
+		t.Fatalf("SwitchTenant pending = (%v, %v), want failure", response, err)
+	}
+
+	delete(tenantSvc.unavailable, 42)
+	response, err = svc.SwitchTenant(context.Background(), user, 42, "")
+	if err != nil || response == nil || response.ActiveTenant == nil || response.ActiveTenant.ID != 42 {
+		t.Fatalf("SwitchTenant active = (%v, %v), want tenant 42", response, err)
 	}
 }
 

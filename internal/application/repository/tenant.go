@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/database"
 	"github.com/Tencent/WeKnora/internal/logger"
@@ -14,6 +15,7 @@ import (
 
 var (
 	ErrTenantNotFound         = errors.New("tenant not found")
+	ErrTenantNotProvisioning  = errors.New("tenant is not awaiting activation")
 	ErrTenantHasKnowledgeBase = errors.New("tenant has associated knowledge bases")
 )
 
@@ -30,6 +32,23 @@ func NewTenantRepository(db *gorm.DB) interfaces.TenantRepository {
 // CreateTenant creates tenant
 func (r *tenantRepository) CreateTenant(ctx context.Context, tenant *types.Tenant) error {
 	return database.DBFromContext(ctx, r.db).WithContext(ctx).Create(tenant).Error
+}
+
+func (r *tenantRepository) ActivateProvisionedTenant(ctx context.Context, id uint64) error {
+	result := database.DBFromContext(ctx, r.db).WithContext(ctx).
+		Model(&types.Tenant{}).
+		Where("id = ? AND status = ?", id, types.TenantStatusProvisioning).
+		Updates(map[string]any{
+			"status":     types.TenantStatusActive,
+			"updated_at": time.Now(),
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrTenantNotProvisioning
+	}
+	return nil
 }
 
 // GetTenantByID gets tenant by ID
@@ -148,7 +167,15 @@ func (r *tenantRepository) PurgeProvisionedTenant(ctx context.Context, id uint64
 		if err := tx.Unscoped().Where("tenant_id = ?", id).Delete(&types.TenantMember{}).Error; err != nil {
 			return err
 		}
-		return tx.Unscoped().Where("id = ?", id).Delete(&types.Tenant{}).Error
+		result := tx.Unscoped().Where("id = ? AND status = ?", id, types.TenantStatusProvisioning).
+			Delete(&types.Tenant{})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrTenantNotProvisioning
+		}
+		return nil
 	})
 }
 
