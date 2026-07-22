@@ -35,6 +35,7 @@ import { useUIStore } from '@/stores/ui'
 import { getKnowledgeBaseById } from '@/api/knowledge-base/index'
 import { MessagePlugin } from 'tdesign-vue-next'
 import { useI18n } from 'vue-i18n'
+import { responsiveSidebarCollapsed } from './responsiveSidebar'
 
 let { requestMethod } = useKnowledgeBase()
 const route = useRoute();
@@ -47,7 +48,8 @@ const { t } = useI18n();
 const compactViewport = window.matchMedia('(max-width: 640px)')
 
 const syncCompactSidebar = () => {
-    uiStore.sidebarCollapsed = compactViewport.matches || localStorage.getItem('sidebar_collapsed') === 'true'
+    const persistedPreference = localStorage.getItem('sidebar_collapsed') === 'true'
+    uiStore.sidebarCollapsed = responsiveSidebarCollapsed(compactViewport.matches, persistedPreference)
 }
 
 syncCompactSidebar()

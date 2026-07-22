@@ -101,26 +101,27 @@ async function get<T>(page: Page, token: string, path: string): Promise<T> {
 }
 
 export async function registerQaIdentity(page: Page, identity: QaIdentity): Promise<void> {
-  const response = await page.request.post('/api/v1/auth/register', {
-    data: {
-      username: identity.username,
-      email: identity.email,
-      password: identity.password,
-    },
-  })
-  const body = await responseBody(response)
-  expect(response.status(), JSON.stringify(body)).toBe(201)
-  expect(body.success).toBe(true)
-}
-
-export async function loginQaIdentity(page: Page, identity: QaIdentity): Promise<{ token: string; userId: string }> {
-  const autoSetup = await page.request.post('/api/v1/auth/auto-setup')
-  expect(autoSetup.status(), JSON.stringify(await responseBody(autoSetup))).toBe(403)
   await page.addInitScript(() => {
     localStorage.setItem('weknora_auto_setup_failed', 'true')
   })
   await page.goto('/login')
+  await page.getByRole('button', { name: '创建账户' }).click()
+  await page.getByPlaceholder('输入用户名').fill(identity.username)
   await page.getByPlaceholder('输入邮箱地址').fill(identity.email)
+  await page.getByPlaceholder('输入密码（8-32个字符，包含字母和数字）').fill(identity.password)
+  await page.getByPlaceholder('再次输入密码').fill(identity.password)
+  const [response] = await Promise.all([
+    page.waitForResponse(candidate => candidate.url().endsWith('/api/v1/auth/register')),
+    page.getByRole('button', { name: '注册', exact: true }).click(),
+  ])
+  const body = await responseBody(response)
+  expect(response.status(), JSON.stringify(body)).toBe(201)
+  expect(body.success).toBe(true)
+  await expect(page.getByRole('button', { name: '登录', exact: true })).toBeVisible()
+  await expect(page.getByPlaceholder('输入邮箱地址')).toHaveValue(identity.email)
+}
+
+export async function loginQaIdentity(page: Page, identity: QaIdentity): Promise<{ token: string; userId: string }> {
   await page.getByPlaceholder(/输入密码/).fill(identity.password)
   await Promise.all([
     page.waitForResponse(response => response.url().includes('/api/v1/auth/login') && response.status() === 200),

@@ -47,6 +47,16 @@ test('release dialog settles and suppresses stale confirm mutations after a scop
   assert.match(dialog, /throw new Error\(response\.message \|\| t\('production\.releaseConsole\.loadFailed'\)\)/)
   assert.match(dialog, /catch \(e\) \{ if \(mutationCoordinator\.isCurrent\(mutation, props\.documentId\)\) error\.value =/)
   assert.match(dialog, /mutationCoordinator\.invalidate\(\); preflightCoordinator\.invalidate\(\); loading\.value = false; submitting\.value = false; error\.value = ''/)
+  assert.match(dialog, /throw new Error\(response\.message \|\| t\('production\.releaseConsole\.commandFailed'\)\)/)
+})
+
+test('release dialog stacks long target readiness reasons below the name on mobile', () => {
+  const dialog = source('./components/ProductionReleaseDialog.vue')
+  const mobileStyles = dialog.slice(dialog.indexOf('@media (max-width: 720px)'))
+
+  assert.match(mobileStyles, /\.target-row\s*\{[^}]*grid-template-columns:\s*auto minmax\(0,\s*1fr\)/)
+  assert.match(mobileStyles, /\.target-row\s*>\s*\.t-tag\s*\{[^}]*grid-column:\s*2[^}]*max-width:\s*100%/)
+  assert.match(mobileStyles, /\.config-grid\s*\{[^}]*grid-column:\s*2/)
 })
 
 test('release status uses lifecycle actions, head locks, and rollback confirmation', () => {

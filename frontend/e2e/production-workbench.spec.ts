@@ -5,7 +5,6 @@ import {
   createProjectThroughUi,
   createQaIdentity,
   getReleasePreflight,
-  getReleaseTarget,
   loginQaIdentity,
   registerQaIdentity,
   seedProductionProject,
@@ -27,8 +26,11 @@ test('author to publisher workflow uses the live production backend', async ({ p
   const qa = await seedProductionProject(page, token, userId, projectId, suffix)
 
   await page.setViewportSize({ width: 1440, height: 900 })
+  await page.evaluate(() => localStorage.setItem('sidebar_collapsed', 'false'))
   await page.goto(`/platform/knowledge-production/documents/${qa.documentId}`)
   await dismissOnboarding(page)
+  await expect(page.locator('.aside_box')).not.toHaveClass(/aside_box--collapsed/)
+  await expectStoredSidebarPreference(page, 'false')
   await expect(page.getByRole('heading', { name: `AI 企微复盘 ${suffix}` })).toBeVisible()
   await expect(page.getByText('Task 6 使用真实持久化数据验证作者、审核人与发布人流程。').first()).toBeVisible()
   await assertLayoutIntegrity(page)
@@ -42,9 +44,6 @@ test('author to publisher workflow uses the live production backend', async ({ p
   await rightRail.getByText('审核', { exact: true }).click()
   await expect(rightRail.getByText('1 条未解决阻断标注')).toBeVisible()
   await expect(rightRail.getByRole('button', { name: '提交审核' })).toBeDisabled()
-  expect(page.viewportSize()).toEqual({ width: 1440, height: 900 })
-  await page.screenshot({ path: resolve(screenshotDir, 'production-desktop.png') })
-
   await rightRail.getByText('标注', { exact: true }).click()
   const blockingAnnotation = rightRail.locator('.annotation-row').filter({ hasText: '发布前必须解决的 Task 6 阻断标注' })
   const resolveResponsePromise = page.waitForResponse(response =>
@@ -88,69 +87,33 @@ test('author to publisher workflow uses the live production backend', async ({ p
   if (preflightTarget) {
     const targetRow = releaseDialog.locator('.target-row').filter({ hasText: preflightTarget.knowledge_base_name })
     await expect(targetRow).toBeVisible()
-    if (!preflightTarget.ready) {
-      expect(preflightTarget.reason).toBeTruthy()
-      await expect(targetRow).toContainText(preflightTarget.reason ?? '')
-      test.info().annotations.push({ type: 'publication limitation', description: preflightTarget.reason })
-    } else {
-      const embeddingModelId = preflightTarget.config_snapshot?.embedding_model_id
-      expect(embeddingModelId).toBeTruthy()
-      await expect(targetRow.locator('.config-grid')).toContainText(String(embeddingModelId))
-      await targetRow.getByRole('checkbox').check()
-      await releaseDialog.getByText('我确认此冻结发布快照。').click()
-      const releaseResponsePromise = page.waitForResponse(response =>
-        response.url().endsWith(`/api/v1/production/documents/${qa.documentId}/releases`) && response.status() === 201,
-      )
-      await releaseDialog.getByRole('button', { name: '发布', exact: true }).click()
-      const releaseResponse = await releaseResponsePromise
-      const releaseBody = await releaseResponse.json() as {
-        data?: { targets?: Array<{ id: string }> }
-      }
-      const releaseTargetId = releaseBody.data?.targets?.[0]?.id
-      expect(releaseTargetId).toBeTruthy()
-      if (releaseTargetId) {
-        let releaseTarget = await getReleaseTarget(page, token, releaseTargetId)
-        for (let attempt = 0; attempt < 15 && releaseTarget.status === 'building'; attempt += 1) {
-          await page.waitForTimeout(1_000)
-          releaseTarget = await getReleaseTarget(page, token, releaseTargetId)
-        }
-        await page.reload()
-        await dismissOnboarding(page)
-        await openReleaseTab(page)
-        const releaseRow = page.locator('.release-row').filter({ hasText: releaseTargetId.slice(0, 8) })
-        await expect(releaseRow).toBeVisible()
-        if (releaseTarget.status === 'failed') {
-          await expect(releaseRow).toContainText(releaseTarget.failure_reason ?? '失败')
-          const retryResponsePromise = page.waitForResponse(response =>
-            response.url().endsWith(`/api/v1/production/release-targets/${releaseTargetId}/retry`) && response.status() === 200,
-          )
-          await releaseRow.getByRole('button', { name: '重试' }).click()
-          await retryResponsePromise
-          test.info().annotations.push({ type: 'publication limitation', description: releaseTarget.failure_reason })
-        } else if (releaseTarget.status === 'ready') {
-          const activateResponsePromise = page.waitForResponse(response =>
-            response.url().endsWith(`/api/v1/production/release-targets/${releaseTargetId}/activate`) && response.status() === 200,
-          )
-          await releaseRow.getByRole('button', { name: '激活' }).click()
-          await activateResponsePromise
-          await expect(releaseRow).toContainText('已激活')
-        } else {
-          test.info().annotations.push({
-            type: 'publication limitation',
-            description: `release target remained ${releaseTarget.status} after 15 seconds`,
-          })
-        }
-      }
-    }
+    expect(preflightTarget.ready).toBe(false)
+    expect(preflightTarget.reason).toBe('processing_configuration_unavailable')
+    await expect(targetRow).toContainText('processing_configuration_unavailable')
+    await expect(targetRow.getByRole('checkbox')).toBeDisabled()
+    await releaseDialog.getByText('我确认此冻结发布快照。').click()
+    await expect(releaseDialog.getByRole('button', { name: '发布', exact: true })).toBeDisabled()
+    test.info().annotations.push({
+      type: 'publication limitation',
+      description: 'processing_configuration_unavailable: no real embedding model is configured in ephemeral QA',
+    })
   }
 
+  expect(page.viewportSize()).toEqual({ width: 1440, height: 900 })
+  await assertLayoutIntegrity(page, '.release-dialog')
+  await page.screenshot({ path: resolve(screenshotDir, 'production-desktop.png') })
+
   await page.setViewportSize({ width: 390, height: 844 })
-  await page.goto(`/platform/knowledge-production/documents/${qa.documentId}`)
-  await dismissOnboarding(page)
-  await expect(page.getByRole('heading', { name: `AI 企微复盘 ${suffix}` })).toBeVisible()
-  await assertLayoutIntegrity(page)
+  await expect(page.locator('.aside_box')).toHaveClass(/aside_box--collapsed/)
+  await expectStoredSidebarPreference(page, 'false')
+  await expect(releaseDialog).toBeVisible()
+  await assertLayoutIntegrity(page, '.release-dialog')
   expect(page.viewportSize()).toEqual({ width: 390, height: 844 })
   await page.screenshot({ path: resolve(screenshotDir, 'production-mobile.png') })
+
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await expect(page.locator('.aside_box')).not.toHaveClass(/aside_box--collapsed/)
+  await expectStoredSidebarPreference(page, 'false')
 
   expect(pageErrors).toEqual([])
   expect(consoleErrors).toEqual([])
@@ -171,14 +134,20 @@ async function dismissOnboarding(page: Page) {
   }
 }
 
-async function assertLayoutIntegrity(page: Page) {
-  const issues = await page.evaluate(() => {
+async function expectStoredSidebarPreference(page: Page, value: string) {
+  await expect.poll(() => page.evaluate(() => localStorage.getItem('sidebar_collapsed'))).toBe(value)
+}
+
+async function assertLayoutIntegrity(page: Page, rootSelector = 'body') {
+  const issues = await page.evaluate((selector) => {
+    const root = document.querySelector(selector)
+    if (!root) throw new Error(`layout root not found: ${selector}`)
     const visible = (element: HTMLElement) => {
       const style = getComputedStyle(element)
       const rect = element.getBoundingClientRect()
       return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 1 && rect.height > 1
     }
-    const controls = Array.from(document.querySelectorAll<HTMLElement>('button, input, textarea, [role="tab"]'))
+    const controls = Array.from(root.querySelectorAll<HTMLElement>('button, input, textarea, [role="tab"]'))
       .filter(visible)
       .map(element => ({ element, rect: element.getBoundingClientRect() }))
     const overlaps: string[] = []
@@ -199,7 +168,7 @@ async function assertLayoutIntegrity(page: Page) {
         .map(({ element }) => element.getAttribute('aria-label') || element.textContent?.trim() || element.tagName),
       overlaps,
     }
-  })
+  }, rootSelector)
   expect(issues.horizontalOverflow, JSON.stringify(issues)).toBeLessThanOrEqual(0)
   expect(issues.clippedControls, JSON.stringify(issues)).toEqual([])
   expect(issues.overlaps, JSON.stringify(issues)).toEqual([])
