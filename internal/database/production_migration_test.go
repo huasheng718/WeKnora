@@ -58,21 +58,30 @@ func TestSQLiteTemporaryDocumentsIncrementalMigrationUpAndDown(t *testing.T) {
 	require.Empty(t, sqliteMasterSQL(t, db, "table", "temporary_documents"))
 }
 
+var productionSQLiteFoundationMigrationNames = []string{
+	"init",
+	"knowledge_production_foundation",
+	"knowledge_production_documents",
+	"knowledge_production_runs",
+	"knowledge_production_reviews",
+	"knowledge_production_publication",
+}
+
+func productionSQLiteFoundationMigrationPaths() []string {
+	paths := make([]string, 0, len(productionSQLiteFoundationMigrationNames))
+	for version, name := range productionSQLiteFoundationMigrationNames {
+		paths = append(paths, fmt.Sprintf("../../migrations/sqlite/%06d_%s.up.sql", version, name))
+	}
+	return paths
+}
+
 func openSQLiteThroughProductionMigrationFive(t *testing.T) *sql.DB {
 	t.Helper()
 
 	db, err := sql.Open("sqlite3", t.TempDir()+"/runtime-compat.db")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
-	for version, name := range []string{
-		"init",
-		"knowledge_production_foundation",
-		"knowledge_production_documents",
-		"knowledge_production_runs",
-		"knowledge_production_reviews",
-		"knowledge_production_publication",
-	} {
-		migration := fmt.Sprintf("../../migrations/sqlite/%06d_%s.up.sql", version, name)
+	for _, migration := range productionSQLiteFoundationMigrationPaths() {
 		_, err = db.Exec(mustReadMigration(t, migration))
 		require.NoError(t, err, migration)
 	}
@@ -1574,6 +1583,7 @@ func TestProductionMigrationTestPathsExist(t *testing.T) {
 	require.NoError(t, err)
 
 	paths := regexp.MustCompile(`\.\./\.\./migrations/(?:versioned|sqlite)/[0-9]{6}_[a-z0-9_]+\.(?:up|down)\.sql`).FindAllString(string(contents), -1)
+	paths = append(paths, productionSQLiteFoundationMigrationPaths()...)
 	require.NotEmpty(t, paths)
 	for _, path := range paths {
 		_, err := os.Stat(path)
