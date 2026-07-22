@@ -160,18 +160,22 @@ export class DocumentTypeDerivationLifecycle<TCommand> {
         preserveInput: true as const,
         command: this.command,
         refreshed: false,
+        baseUnavailable: false,
         base,
       }
     }
 
     const items = await refresh()
+    const reconciledBase = items === null ? base : reconcileDocumentTypeDerivationBase(base, items)
+    if (items !== null && !reconciledBase) this.reset()
     return {
       ...failure,
       form,
       preserveInput: true as const,
       command: this.command,
       refreshed: items !== null,
-      base: items === null ? base : reconcileDocumentTypeDerivationBase(base, items),
+      baseUnavailable: items !== null && !reconciledBase,
+      base: reconciledBase,
     }
   }
 

@@ -64,7 +64,7 @@ export default {
       activateTitle: "激活文档类型？", activateBody: "将激活“{name}”v{version}，并退役同 code 的当前生效版本。", drawerTitle: "创建文档类型草稿",
       created: "文档类型草稿已创建。", activated: "文档类型已激活。", createFailed: "创建文档类型失败。", activateFailed: "激活文档类型失败。",
       viewConfiguration: "查看配置", configurationTitle: "文档类型配置", deriveDraft: "派生草稿", deriveTitle: "派生文档类型草稿",
-      derived: "派生草稿已创建。", deriveFailed: "派生文档类型草稿失败。", deriveRetryHint: "输入已保留；输入未变化时，重试将沿用同一命令。",
+      derived: "派生草稿已创建。", deriveFailed: "派生文档类型草稿失败。", deriveRetryHint: "输入已保留；输入未变化时，重试将沿用同一命令。", deriveBaseUnavailable: "基础文档类型已更新或不可用。输入已保留供参考；请关闭此抽屉并从刷新后的列表重新选择。",
       generatedVersion: "由服务器生成", baseVersion: "基础版本", lineageTitle: "血缘与版本", summaryTitle: "治理摘要", rawConfigurationTitle: "原始 JSON 配置",
       notConfigured: "未配置", requiredValue: "必需", notRequiredValue: "非必需",
       invalidJson: "{field} 必须是有效的 JSON。", invalidSchemaVersion: "Schema 版本必须是大于 0 的整数。", required: "请填写{field}。",

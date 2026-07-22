@@ -208,8 +208,14 @@
       :close-on-overlay-click="!submitting"
       :close-btn="!submitting"
     >
+      <t-alert
+        v-if="drawerMode === 'derive' && !deriveBase"
+        class="form-alert"
+        theme="warning"
+        :message="t('production.documentTypes.deriveBaseUnavailable')"
+      />
       <t-alert v-if="formError" class="form-alert" theme="error" :message="formError" />
-      <p v-if="formError && drawerMode === 'derive'" class="retry-hint">{{ t('production.documentTypes.deriveRetryHint') }}</p>
+      <p v-if="formError && deriveRequestFailed && drawerMode === 'derive'" class="retry-hint">{{ t('production.documentTypes.deriveRetryHint') }}</p>
       <section v-if="drawerMode === 'derive' && deriveBase" class="lineage-section" :aria-label="t('production.documentTypes.lineageTitle')">
         <h2>{{ t('production.documentTypes.lineageTitle') }}</h2>
         <dl class="lineage-grid">
@@ -252,7 +258,7 @@
         <t-button variant="outline" :disabled="submitting" @click="drawerVisible = false">
           {{ t('production.actions.cancel') }}
         </t-button>
-        <t-button v-if="pageControls.create" :loading="submitting" @click="submitDraft">
+        <t-button v-if="pageControls.create && (drawerMode === 'create' || deriveBase)" :loading="submitting" @click="submitDraft">
           <template #icon><t-icon name="save" /></template>
           {{ drawerMode === 'derive' ? t('production.documentTypes.deriveDraft') : t('production.documentTypes.create') }}
         </t-button>
@@ -312,6 +318,7 @@ const configurationDrawerVisible = ref(false)
 const inspectedDocumentType = shallowRef<ProductionDocumentType | null>(null)
 const submitting = ref(false)
 const formError = ref('')
+const deriveRequestFailed = ref(false)
 const activatingId = ref('')
 const items = shallowRef<ProductionDocumentType[]>([])
 let draftCommand: { signature: string; command: ProductionCommand<CreateProductionDocumentTypeInput> } | null = null
@@ -368,6 +375,7 @@ function openCreateDrawer() {
   deriveBase.value = null
   Object.assign(form, emptyForm())
   formError.value = ''
+  deriveRequestFailed.value = false
   draftCommand = null
   derivationLifecycle.reset()
   drawerVisible.value = true
@@ -379,6 +387,7 @@ function openDeriveDrawer(item: ProductionDocumentType) {
   deriveBase.value = item
   Object.assign(form, prefillDerivedDocumentTypeForm(item))
   formError.value = ''
+  deriveRequestFailed.value = false
   draftCommand = null
   derivationLifecycle.reset()
   drawerVisible.value = true
@@ -482,7 +491,12 @@ async function submitDraft() {
 }
 
 async function submitDerivedDraft() {
-  if (!deriveBase.value) return
+  deriveRequestFailed.value = false
+  if (!deriveBase.value) {
+    derivationLifecycle.reset()
+    formError.value = t('production.documentTypes.deriveBaseUnavailable')
+    return
+  }
   const base = deriveBase.value
   formError.value = ''
   const parsed = parseDerivedDocumentTypeDraft(form)
@@ -516,6 +530,7 @@ async function submitDerivedDraft() {
       loadDocumentTypes,
     )
     formError.value = failure.message
+    deriveRequestFailed.value = failure.command !== null
     if (failure.status === 409 && failure.refreshed) deriveBase.value = failure.base
   } finally {
     submitting.value = false

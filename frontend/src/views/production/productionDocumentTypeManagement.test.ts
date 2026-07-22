@@ -35,7 +35,21 @@ test('management page coordinates requests, enforces role-aware controls, and cl
   assert.match(source, /activationCommands\.delete\(item\.id\)/)
 })
 
-async function renderManagementTemplate(role: 'owner' | 'admin' | 'contributor' | 'viewer', status: 'draft' | 'active' | 'retired') {
+interface ManagementRenderOptions {
+  drawerVisible?: boolean
+  drawerMode?: 'create' | 'derive'
+  deriveBase?: Record<string, unknown> | null
+  formError?: string
+  deriveRequestFailed?: boolean
+  viewState?: 'empty' | 'ready'
+  documentTypes?: Array<Record<string, unknown>>
+}
+
+async function renderManagementTemplate(
+  role: 'owner' | 'admin' | 'contributor' | 'viewer',
+  status: 'draft' | 'active' | 'retired',
+  options: ManagementRenderOptions = {},
+) {
   const source = readFileSync(pageUrl, 'utf8')
   const descriptor = parse(source, { filename: 'ProductionDocumentTypeManagement.vue' }).descriptor
   assert.ok(descriptor.template)
@@ -53,15 +67,21 @@ async function renderManagementTemplate(role: 'owner' | 'admin' | 'contributor' 
       t: (key: string) => key,
       backToProjects: () => {}, loading: false, loadDocumentTypes: () => {},
       pageControls, openCreateDrawer: () => {},
-      viewState: 'ready', skeletonRows: [], error: '', documentTypes: [item], activeCountLabel: '',
+      viewState: options.viewState ?? 'ready', skeletonRows: [], error: '',
+      documentTypes: options.documentTypes ?? [item], activeCountLabel: '',
       documentTypeOriginBadge: () => ({ theme: 'primary', textKey: 'production.documentTypes.origin.builtin' }),
       statusTheme: () => 'default', formatDate: () => 'date', openConfigurationDrawer: () => {},
       rowControls: (rowStatus: typeof status) => documentTypeControlVisibility(role, rowStatus),
       submitting: false, openDeriveDrawer: () => {}, activatingId: '', confirmActivation: () => {},
       configurationDrawerVisible: false, inspectedDocumentType: null, inspectionSummary: null,
       summaryList: () => '', requirementLabel: () => '', rawConfigFields: [], rawConfiguration: () => '',
-      drawerVisible: false, drawerMode: 'create', formError: '', deriveBase: null,
-      form: {}, jsonFields: [], submitDraft: () => {},
+      drawerVisible: options.drawerVisible ?? false,
+      drawerMode: options.drawerMode ?? 'create',
+      formError: options.formError ?? '',
+      deriveRequestFailed: options.deriveRequestFailed ?? false,
+      deriveBase: options.deriveBase === undefined ? null : options.deriveBase,
+      form: { code: 'sop', name: 'Preserved input', description: 'Unsaved reference' },
+      jsonFields: [], submitDraft: () => {},
     }),
   }))
   const passthrough = defineComponent({ inheritAttrs: false, setup: (_, { slots, attrs }) => () => h('span', attrs, slots.default?.()) })
@@ -112,6 +132,50 @@ test('compiled management template shows only lifecycle-valid admin and owner mu
       assert.doesNotMatch(html, /production\.documentTypes\.activate/)
     }
   }
+})
+
+test('compiled derive drawer preserves input but exposes no submit when refreshed base is unavailable', async () => {
+  const html = await renderManagementTemplate('admin', 'active', {
+    drawerVisible: true,
+    drawerMode: 'derive',
+    deriveBase: null,
+    formError: 'server conflict',
+    viewState: 'empty',
+    documentTypes: [],
+  })
+
+  assert.match(html, /production\.documentTypes\.deriveBaseUnavailable/)
+  assert.match(html, /Preserved input/)
+  assert.match(html, /production\.actions\.cancel/)
+  assert.doesNotMatch(html, /production\.documentTypes\.deriveDraft/)
+})
+
+test('compiled derive drawer shows command reuse hint only after a request failure', async () => {
+  const base = {
+    id: 'type-1', code: 'sop', name: 'SOP', description: '', schema_version: 1,
+    status: 'active', origin: 'builtin', template_key: 'sop', updated_at: '2026-07-22T00:00:00Z',
+  }
+  const validationFailure = await renderManagementTemplate('admin', 'active', {
+    drawerVisible: true,
+    drawerMode: 'derive',
+    deriveBase: base,
+    formError: 'invalid JSON',
+    deriveRequestFailed: false,
+    viewState: 'empty',
+    documentTypes: [],
+  })
+  assert.doesNotMatch(validationFailure, /production\.documentTypes\.deriveRetryHint/)
+
+  const requestFailure = await renderManagementTemplate('admin', 'active', {
+    drawerVisible: true,
+    drawerMode: 'derive',
+    deriveBase: base,
+    formError: 'service unavailable',
+    deriveRequestFailed: true,
+    viewState: 'empty',
+    documentTypes: [],
+  })
+  assert.match(requestFailure, /production\.documentTypes\.deriveRetryHint/)
 })
 
 test('management page exposes built-in inspection and server-owned draft derivation', () => {

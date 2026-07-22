@@ -278,9 +278,38 @@ test('structured 409 preserves form and command while refreshing and reconciling
   assert.equal(result.message, 'a newer version exists')
   assert.equal(result.status, 409)
   assert.equal(result.refreshed, true)
+  assert.equal(result.baseUnavailable, false)
   assert.equal(result.base, refreshedBase)
   assert.equal(refreshes, 1)
   assert.equal(lifecycle.prepare('sop-1', { name: 'Edited SOP' }, () => ({ key: 'new-command' })), command)
+})
+
+test('structured 409 clears an unusable command when the exact base is no longer derivable', async () => {
+  for (const refreshedStatus of [null, 'draft', 'future'] as const) {
+    const lifecycle = new DocumentTypeDerivationLifecycle<{ key: string }>()
+    lifecycle.prepare('base-1', { name: 'Edited SOP' }, () => ({ key: 'stale-command' }))
+    const form = { name: 'Edited SOP' }
+    const base = documentType('sop', 1, '2026-07-22T00:00:00Z')
+    base.id = 'base-1'
+    base.status = 'active'
+    const refreshed = refreshedStatus === null
+      ? []
+      : [{ ...base, status: refreshedStatus as never }]
+
+    const result = await lifecycle.fail(
+      { status: 409, message: 'base changed' },
+      'derive failed',
+      form,
+      base,
+      async () => refreshed,
+    )
+
+    assert.equal(result.form, form)
+    assert.equal(result.base, null)
+    assert.equal(result.baseUnavailable, true)
+    assert.equal(result.command, null)
+    assert.equal(lifecycle.currentCommand, null)
+  }
 })
 
 test('non-conflict failure preserves input without refresh and success refreshes then clears command', async () => {

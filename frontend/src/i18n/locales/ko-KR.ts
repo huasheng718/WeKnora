@@ -64,7 +64,7 @@ export default {
       activateTitle: "문서 유형을 활성화할까요?", activateBody: "{name} v{version}을 활성화하고 같은 code의 현재 활성 버전을 사용 중지합니다.", drawerTitle: "문서 유형 초안 만들기",
       created: "문서 유형 초안을 만들었습니다.", activated: "문서 유형을 활성화했습니다.", createFailed: "문서 유형을 만들지 못했습니다.", activateFailed: "문서 유형을 활성화하지 못했습니다.",
       viewConfiguration: "구성 보기", configurationTitle: "문서 유형 구성", deriveDraft: "초안 파생", deriveTitle: "문서 유형 초안 파생",
-      derived: "파생 초안을 만들었습니다.", deriveFailed: "문서 유형 초안을 파생하지 못했습니다.", deriveRetryHint: "입력은 유지됩니다. 변경하지 않고 다시 시도하면 같은 명령을 재사용합니다.",
+      derived: "파생 초안을 만들었습니다.", deriveFailed: "문서 유형 초안을 파생하지 못했습니다.", deriveRetryHint: "입력은 유지됩니다. 변경하지 않고 다시 시도하면 같은 명령을 재사용합니다.", deriveBaseUnavailable: "기준 문서 유형이 변경되었거나 사용할 수 없습니다. 입력은 참고용으로 유지됩니다. 이 패널을 닫고 새로 고친 목록에서 다시 선택하세요.",
       generatedVersion: "서버에서 생성", baseVersion: "기준 버전", lineageTitle: "계보 및 버전", summaryTitle: "거버넌스 요약", rawConfigurationTitle: "원본 JSON 구성",
       notConfigured: "구성되지 않음", requiredValue: "필수", notRequiredValue: "필수 아님",
       invalidJson: "{field}에 올바른 JSON을 입력하세요.", invalidSchemaVersion: "Schema 버전은 0보다 큰 정수여야 합니다.", required: "{field}을(를) 입력하세요.",

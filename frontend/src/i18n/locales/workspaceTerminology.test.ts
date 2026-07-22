@@ -81,7 +81,7 @@ test('document type management copy is complete in every locale', () => {
     'loadFailedTitle', 'loadFailed', 'readonlyHint', 'activate', 'activateTitle', 'activateBody',
     'created', 'activated', 'createFailed', 'activateFailed', 'invalidJson',
     'viewConfiguration', 'configurationTitle', 'deriveDraft', 'deriveTitle',
-    'derived', 'deriveFailed', 'deriveRetryHint', 'generatedVersion', 'baseVersion',
+    'derived', 'deriveFailed', 'deriveRetryHint', 'deriveBaseUnavailable', 'generatedVersion', 'baseVersion',
     'lineageTitle', 'summaryTitle', 'rawConfigurationTitle', 'notConfigured',
   ]
   const requiredNestedKeys = {
