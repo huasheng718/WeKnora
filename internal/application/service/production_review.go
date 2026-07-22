@@ -232,6 +232,10 @@ func (s *productionReviewService) Submit(
 			(documentType.Status != types.ProductionDocumentTypeActive && documentType.Status != types.ProductionDocumentTypeRetired) {
 			return types.ErrProductionDocumentTypeInactive
 		}
+		documentTypeConfig, configErr := productionDocumentTypeConfig(documentType)
+		if configErr != nil {
+			return errors.Join(types.ErrProductionReviewPolicyInvalid, configErr)
+		}
 		blocking, loadErr := s.reviews.CountOpenBlocking(txCtx, tenantID, versionID)
 		if loadErr != nil {
 			return loadErr
@@ -249,7 +253,7 @@ func (s *productionReviewService) Submit(
 			digestMismatch = errors.Join(types.ErrProductionContentDigestMismatch, verifyErr)
 			return digestMismatch
 		}
-		steps, policyErr := materializeProductionReviewPolicy(documentType.ReviewPolicy, request)
+		steps, policyErr := materializeProductionReviewPolicy(documentTypeConfig.Canonical.ReviewPolicy, request)
 		if policyErr != nil {
 			return policyErr
 		}

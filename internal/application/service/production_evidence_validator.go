@@ -222,11 +222,15 @@ func ValidateProductionVersion(
 	for _, gate := range qualityRules.Gates {
 		gates[gate] = struct{}{}
 	}
+	missingSections := make(map[string]struct{}, len(blockSchema.RequiredSections))
 	appendMissingSection := func(section string) {
-		if _, present := presentSections[section]; !present {
+		_, present := presentSections[section]
+		_, reported := missingSections[section]
+		if !present && !reported {
 			result.Errors = append(result.Errors, ProductionValidationIssue{
 				Code: "required_section_missing", Message: fmt.Sprintf("required section %q is missing", section), Section: section,
 			})
+			missingSections[section] = struct{}{}
 		}
 	}
 	if _, enabled := gates["section_completeness"]; enabled {

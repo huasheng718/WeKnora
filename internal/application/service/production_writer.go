@@ -14,7 +14,6 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/Tencent/WeKnora/internal/utils"
-	"github.com/google/uuid"
 )
 
 const (
@@ -235,7 +234,7 @@ func (w *ProductionWriter) Write(
 }
 
 func productionRunVersionID(runID string) string {
-	return uuid.NewSHA1(uuid.MustParse("9bc0c43e-38f0-475a-aab3-a1d2c194c93f"), []byte(runID+":ai-version")).String()
+	return types.ProductionRunVersionID(runID)
 }
 
 func productionWriterAuditedResponse(run *types.ProductionRun) (string, string, bool, error) {
@@ -332,8 +331,8 @@ func productionDocumentTypeConfig(documentType *types.ProductionDocumentType) (t
 
 func isLegacyProductionDocumentTypeConfig(input types.ProductionDocumentTypeConfigInput) bool {
 	for _, raw := range []types.JSON{
-		input.BlockSchema, input.SourceRequirements, input.QualityRules,
-		input.ReviewPolicy, input.PublicationPolicy,
+		input.BlockSchema, input.SourceRequirements, input.SkillBindings, input.WorkflowPlan,
+		input.QualityRules, input.ReviewPolicy, input.PublicationPolicy,
 	} {
 		if !isEmptyProductionJSONObject(raw) {
 			return false
@@ -364,12 +363,6 @@ func canonicalLegacyProductionDocumentTypeConfig(
 	legacyInput, err := productionDocumentTypeConfigInput(legacy)
 	if err != nil {
 		return types.ProductionDocumentTypeConfig{}, true, err
-	}
-	if !isEmptyProductionJSONObject(input.SkillBindings) {
-		legacyInput.SkillBindings = input.SkillBindings
-	}
-	if !isEmptyProductionJSONObject(input.WorkflowPlan) {
-		legacyInput.WorkflowPlan = input.WorkflowPlan
 	}
 	config, err := types.CanonicalProductionDocumentTypeConfig(legacyInput)
 	return config, true, err

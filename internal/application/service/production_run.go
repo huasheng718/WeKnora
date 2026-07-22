@@ -362,14 +362,7 @@ func newProductionRun(
 	runType types.ProductionRunType,
 	inputVersionID *string,
 ) *types.ProductionRun {
-	snapshot, _ := canonicalProductionValue(map[string]any{
-		"id": documentType.ID, "code": documentType.Code, "name": documentType.Name,
-		"schema_version": documentType.SchemaVersion, "block_schema": productionJSONValue(documentType.BlockSchema),
-		"source_requirements": productionJSONValue(documentType.SourceRequirements),
-		"skill_bindings":      productionJSONValue(documentType.SkillBindings), "workflow_plan": productionJSONValue(documentType.WorkflowPlan),
-		"quality_rules": productionJSONValue(documentType.QualityRules),
-		"review_policy": productionJSONValue(documentType.ReviewPolicy), "publication_policy": productionJSONValue(documentType.PublicationPolicy),
-	})
+	snapshot := productionDocumentTypeSnapshot(documentType)
 	projectID := sourceSet.ProjectID
 	documentID := types.ProductionDocumentID("")
 	if document != nil {
@@ -384,6 +377,21 @@ func newProductionRun(
 		InputVersionID: inputVersionID,
 		IdempotencyKey: uuid.NewString(),
 	}
+}
+
+func productionDocumentTypeSnapshot(documentType *types.ProductionDocumentType) types.JSON {
+	if documentType == nil {
+		return nil
+	}
+	snapshot, _ := canonicalProductionValue(map[string]any{
+		"id": documentType.ID, "code": documentType.Code, "name": documentType.Name,
+		"schema_version": documentType.SchemaVersion, "block_schema": productionJSONValue(documentType.BlockSchema),
+		"source_requirements": productionJSONValue(documentType.SourceRequirements),
+		"skill_bindings":      productionJSONValue(documentType.SkillBindings), "workflow_plan": productionJSONValue(documentType.WorkflowPlan),
+		"quality_rules": productionJSONValue(documentType.QualityRules),
+		"review_policy": productionJSONValue(documentType.ReviewPolicy), "publication_policy": productionJSONValue(documentType.PublicationPolicy),
+	})
+	return snapshot
 }
 
 func productionJSONValue(raw types.JSON) any {

@@ -718,6 +718,28 @@ func productionReleaseContext() context.Context {
 	return ctx
 }
 
+func productionReleaseTestDocumentType(
+	t *testing.T,
+	id string,
+	schemaVersion int,
+	status types.ProductionDocumentTypeStatus,
+	publicationPolicy types.JSON,
+) *types.ProductionDocumentType {
+	t.Helper()
+	config, ok := legacyProductionDocumentTypeConfig("software-development-baseline")
+	require.True(t, ok)
+	input, err := productionDocumentTypeConfigInput(config)
+	require.NoError(t, err)
+	input.PublicationPolicy = publicationPolicy
+	return &types.ProductionDocumentType{
+		ID: id, TenantID: 7, Code: "software-development-baseline", Name: "Baseline", SchemaVersion: schemaVersion,
+		BlockSchema: input.BlockSchema, SourceRequirements: input.SourceRequirements,
+		SkillBindings: input.SkillBindings, WorkflowPlan: input.WorkflowPlan,
+		QualityRules: input.QualityRules, ReviewPolicy: input.ReviewPolicy, PublicationPolicy: input.PublicationPolicy,
+		Status: status,
+	}
+}
+
 func newProductionReleaseServiceFixture(t *testing.T) (*ProductionReleaseService, *productionReleaseRepoStub, *[]string) {
 	t.Helper()
 	events := make([]string, 0)
@@ -739,10 +761,10 @@ func newProductionReleaseServiceFixture(t *testing.T) (*ProductionReleaseService
 		releases: repo,
 		documents: &productionReleaseDocumentsStub{document: &types.ProductionDocument{ID: "document-1", TenantID: 7, ProjectID: "project-1", DocumentTypeID: "type-1", DocumentTypeSchemaVersion: 1, LatestApprovedVersionID: productionStringPtr("version-3")},
 			version: &types.ProductionDocumentVersion{ID: "version-3", DocumentID: "document-1", TenantID: 7, ProjectID: "project-1", FrozenAt: productionTimePtr(time.Now())}},
-		documentTypes: &productionReleaseDocumentTypeRepoStub{documentType: &types.ProductionDocumentType{
-			ID: "type-1", TenantID: 7, SchemaVersion: 1, Status: types.ProductionDocumentTypeActive,
-			PublicationPolicy: types.JSON(`{"version":1,"target_type":"knowledge_base","chunking":"inherit_target","knowledge_graph":"inherit_target","require_approved_review":true}`),
-		}},
+		documentTypes: &productionReleaseDocumentTypeRepoStub{documentType: productionReleaseTestDocumentType(
+			t, "type-1", 1, types.ProductionDocumentTypeActive,
+			types.JSON(`{"version":1,"target_type":"knowledge_base","chunking":"inherit_target","knowledge_graph":"inherit_target","require_approved_review":true}`),
+		)},
 		reviews:    &productionReleaseReviewsStub{review: &types.ProductionReviewRequest{ID: "review-1", TenantID: 7, ProjectID: "project-1", DocumentID: "document-1", VersionID: "version-3", Status: types.ProductionReviewApproved}},
 		authorizer: productionReleaseAuthorizerStub{}, members: productionReleaseMembershipStub{role: types.TenantRoleContributor},
 		tenants: productionReleaseTenantRepoStub{tenant: &types.Tenant{
@@ -782,22 +804,22 @@ func TestProductionReleasePrepareEnforcesExactBoundPublicationPolicy(t *testing.
 		{
 			name:       "non knowledge base target",
 			policy:     types.JSON(`{"version":1,"target_type":"wiki","chunking":"inherit_target","knowledge_graph":"inherit_target","require_approved_review":true}`),
-			wantReason: "publication_target_type_invalid",
+			wantReason: "publication_policy_invalid",
 		},
 		{
 			name:       "chunking override",
 			policy:     types.JSON(`{"version":1,"target_type":"knowledge_base","chunking":"fixed","knowledge_graph":"inherit_target","require_approved_review":true}`),
-			wantReason: "publication_chunking_mode_invalid",
+			wantReason: "publication_policy_invalid",
 		},
 		{
 			name:       "knowledge graph override",
 			policy:     types.JSON(`{"version":1,"target_type":"knowledge_base","chunking":"inherit_target","knowledge_graph":"disabled","require_approved_review":true}`),
-			wantReason: "publication_knowledge_graph_mode_invalid",
+			wantReason: "publication_policy_invalid",
 		},
 		{
 			name:       "approved review disabled",
 			policy:     types.JSON(`{"version":1,"target_type":"knowledge_base","chunking":"inherit_target","knowledge_graph":"inherit_target","require_approved_review":false}`),
-			wantReason: "publication_approved_review_required",
+			wantReason: "publication_policy_invalid",
 		},
 	}
 
@@ -808,10 +830,9 @@ func TestProductionReleasePrepareEnforcesExactBoundPublicationPolicy(t *testing.
 			document := svc.documents.(*productionReleaseDocumentsStub).document
 			document.DocumentTypeID = "type-bound"
 			document.DocumentTypeSchemaVersion = 4
-			svc.documentTypes = &productionReleaseDocumentTypeRepoStub{documentType: &types.ProductionDocumentType{
-				ID: "type-bound", TenantID: 7, SchemaVersion: 4, Status: types.ProductionDocumentTypeActive,
-				PublicationPolicy: test.policy,
-			}}
+			svc.documentTypes = &productionReleaseDocumentTypeRepoStub{documentType: productionReleaseTestDocumentType(
+				t, "type-bound", 4, types.ProductionDocumentTypeActive, test.policy,
+			)}
 
 			release, err := svc.Prepare(productionReleaseContext(), "document-1", "version-3", []string{"kb-1"})
 
@@ -829,10 +850,10 @@ func TestProductionReleasePrepareUsesRetiredExactBoundPublicationPolicy(t *testi
 	document := svc.documents.(*productionReleaseDocumentsStub).document
 	document.DocumentTypeID = "type-bound"
 	document.DocumentTypeSchemaVersion = 4
-	typesRepo := &productionReleaseDocumentTypeRepoStub{documentType: &types.ProductionDocumentType{
-		ID: "type-bound", TenantID: 7, SchemaVersion: 4, Status: types.ProductionDocumentTypeRetired,
-		PublicationPolicy: types.JSON(`{"version":1,"target_type":"knowledge_base","chunking":"inherit_target","knowledge_graph":"inherit_target","require_approved_review":true}`),
-	}}
+	typesRepo := &productionReleaseDocumentTypeRepoStub{documentType: productionReleaseTestDocumentType(
+		t, "type-bound", 4, types.ProductionDocumentTypeRetired,
+		types.JSON(`{"version":1,"target_type":"knowledge_base","chunking":"inherit_target","knowledge_graph":"inherit_target","require_approved_review":true}`),
+	)}
 	svc.documentTypes = typesRepo
 
 	release, err := svc.Prepare(productionReleaseContext(), "document-1", "version-3", []string{"kb-1"})
@@ -840,6 +861,44 @@ func TestProductionReleasePrepareUsesRetiredExactBoundPublicationPolicy(t *testi
 	require.NoError(t, err)
 	require.NotNil(t, release)
 	require.Equal(t, "type-bound", typesRepo.requestedID)
+}
+
+func TestProductionReleasePrepareCompletesWithAllEmptyLegacyGovernance(t *testing.T) {
+	svc, _, _ := newProductionReleaseServiceFixture(t)
+	svc.kbs = productionReleaseKBStub{kb: configuredProductionReleaseTargetKB()}
+	typeRepo := svc.documentTypes.(*productionReleaseDocumentTypeRepoStub)
+	typeRepo.documentType.Code = "software-development-baseline"
+	typeRepo.documentType.BlockSchema = types.JSON(`{}`)
+	typeRepo.documentType.SourceRequirements = types.JSON(`{}`)
+	typeRepo.documentType.SkillBindings = types.JSON(`{}`)
+	typeRepo.documentType.WorkflowPlan = types.JSON(`{}`)
+	typeRepo.documentType.QualityRules = types.JSON(`{}`)
+	typeRepo.documentType.ReviewPolicy = types.JSON(`{}`)
+	typeRepo.documentType.PublicationPolicy = types.JSON(`{}`)
+
+	release, err := svc.Prepare(productionReleaseContext(), "document-1", "version-3", []string{"kb-1"})
+
+	require.NoError(t, err)
+	require.NotNil(t, release)
+}
+
+func TestProductionReleasePrepareRejectsPartialLegacyGovernance(t *testing.T) {
+	svc, _, _ := newProductionReleaseServiceFixture(t)
+	svc.kbs = productionReleaseKBStub{kb: configuredProductionReleaseTargetKB()}
+	typeRepo := svc.documentTypes.(*productionReleaseDocumentTypeRepoStub)
+	typeRepo.documentType.Code = "software-development-baseline"
+	typeRepo.documentType.BlockSchema = types.JSON(`{}`)
+	typeRepo.documentType.SourceRequirements = types.JSON(`{}`)
+	typeRepo.documentType.SkillBindings = types.JSON(`{"version":1,"skills":[]}`)
+	typeRepo.documentType.WorkflowPlan = types.JSON(`{}`)
+	typeRepo.documentType.QualityRules = types.JSON(`{}`)
+	typeRepo.documentType.ReviewPolicy = types.JSON(`{}`)
+	typeRepo.documentType.PublicationPolicy = types.JSON(`{}`)
+
+	release, err := svc.Prepare(productionReleaseContext(), "document-1", "version-3", []string{"kb-1"})
+
+	require.Nil(t, release)
+	require.ErrorIs(t, err, types.ErrProductionReleaseInvalid)
 }
 
 func TestProductionReleasePrepareNormalizesMissingDocumentTypeBinding(t *testing.T) {

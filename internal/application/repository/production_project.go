@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/database"
@@ -268,17 +269,26 @@ func (r *productionProjectRepository) HasLiveRoleAssignee(
 	projectID string,
 	role types.ProductionRole,
 ) (bool, error) {
-	var count int64
-	err := database.DBFromContext(ctx, r.db).WithContext(ctx).
-		Table("production_project_members AS member").
-		Joins("JOIN production_projects AS project ON project.id = member.project_id").
-		Joins("JOIN tenant_members AS tenant_member ON tenant_member.tenant_id = project.tenant_id AND tenant_member.user_id = member.user_id").
-		Where("project.tenant_id = ? AND project.id = ? AND project.status = ?", tenantID, projectID, types.ProductionProjectActive).
-		Where("project.deleted_at IS NULL AND member.deleted_at IS NULL AND tenant_member.deleted_at IS NULL").
-		Where("member.role = ? AND tenant_member.status = ?", role, types.TenantMemberStatusActive).
-		Limit(1).
-		Count(&count).Error
-	return count > 0, err
+	db := database.DBFromContext(ctx, r.db).WithContext(ctx)
+	args := []any{tenantID, projectID, types.ProductionProjectActive, role, types.TenantMemberStatusActive}
+	candidates := `SELECT member.user_id
+FROM production_project_members AS member
+JOIN production_projects AS project ON project.id = member.project_id
+JOIN tenant_members AS tenant_member
+  ON tenant_member.tenant_id = project.tenant_id AND tenant_member.user_id = member.user_id
+WHERE project.tenant_id = ? AND project.id = ? AND project.status = ?
+  AND project.deleted_at IS NULL AND member.deleted_at IS NULL AND tenant_member.deleted_at IS NULL
+  AND member.role = ? AND tenant_member.status = ?
+ORDER BY member.user_id`
+	if db.Dialector.Name() == "postgres" {
+		var userIDs []string
+		err := db.Raw(candidates+"\nFOR UPDATE OF member, tenant_member", args...).Scan(&userIDs).Error
+		return len(userIDs) > 0, err
+	}
+	result := db.Exec(`UPDATE production_project_members
+SET created_at = created_at
+WHERE rowid IN (`+strings.Replace(candidates, "member.user_id", "member.rowid", 1)+`)`, args...)
+	return result.RowsAffected > 0, result.Error
 }
 
 var _ interfaces.ProductionProjectRepository = (*productionProjectRepository)(nil)

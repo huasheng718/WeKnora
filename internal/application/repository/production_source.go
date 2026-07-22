@@ -216,6 +216,33 @@ func (r *productionSourceRepository) GetEvidence(
 	return &evidence, &item, &sourceSet, nil
 }
 
+func (r *productionSourceRepository) LockFreezeGovernance(
+	ctx context.Context,
+	tenantID uint64,
+	projectID, sourceSetID string,
+) (*types.ProductionSourceSet, *types.ProductionDocumentType, error) {
+	db := database.DBFromContext(ctx, r.db).WithContext(ctx)
+	sourceSet, err := lockProductionSourceSet(db, tenantID, sourceSetID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if sourceSet.ProjectID != projectID {
+		return nil, nil, gorm.ErrRecordNotFound
+	}
+	if sourceSet.Status == types.ProductionSourceSetFrozen {
+		return nil, nil, types.ErrProductionSourceSetFrozen
+	}
+	typeQuery := db.Where("tenant_id = ? AND id = ?", tenantID, sourceSet.DocumentTypeID)
+	if db.Dialector.Name() == "postgres" {
+		typeQuery = typeQuery.Clauses(clause.Locking{Strength: "SHARE"})
+	}
+	var documentType types.ProductionDocumentType
+	if err := typeQuery.First(&documentType).Error; err != nil {
+		return nil, nil, err
+	}
+	return sourceSet, &documentType, nil
+}
+
 func (r *productionSourceRepository) ListAcceptedEvidence(
 	ctx context.Context,
 	tenantID uint64,

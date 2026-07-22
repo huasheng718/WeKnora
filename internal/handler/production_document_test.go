@@ -382,7 +382,8 @@ func newProductionDocumentsHTTPFixture(t *testing.T) *productionDocumentsHTTPFix
 	require.NoError(t, db.Create(&types.ProductionDocumentType{
 		ID: fixture.typeID, TenantID: 7, Code: "software-development-baseline", Name: "Baseline", SchemaVersion: 1,
 		BlockSchema: types.JSON(`{}`), SourceRequirements: types.JSON(`{}`), SkillBindings: types.JSON(`{}`),
-		QualityRules: types.JSON(`{}`), ReviewPolicy: types.JSON(`{}`), PublicationPolicy: types.JSON(`{}`),
+		WorkflowPlan: types.JSON(`{}`), QualityRules: types.JSON(`{}`),
+		ReviewPolicy: types.JSON(`{}`), PublicationPolicy: types.JSON(`{}`),
 		Status: types.ProductionDocumentTypeActive, CreatedBy: "author-1",
 	}).Error)
 	fixture.sources = apprepository.NewProductionSourceRepository(db)
@@ -408,6 +409,7 @@ func newProductionDocumentsHTTPFixture(t *testing.T) *productionDocumentsHTTPFix
 	documentService := appservice.NewProductionDocumentService(
 		fixture.documents, fixture.sources, apprepository.NewProductionDocumentTypeRepository(db), authorizer, nil, fixture.audit, uow,
 		apprepository.NewProductionReviewRepository(db),
+		apprepository.NewProductionRunRepository(db),
 	)
 	idempotency := apprepository.NewProductionIdempotencyRepository(db)
 	fixture.completion = &productionCompletionFailingRepo{ProductionIdempotencyRepository: idempotency}

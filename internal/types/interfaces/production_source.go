@@ -49,6 +49,7 @@ type ProductionSourceRepository interface {
 	CreateItem(ctx context.Context, tenantID uint64, sourceSetID string, item *types.ProductionSourceItem) error
 	GetItem(ctx context.Context, tenantID uint64, itemID string) (*types.ProductionSourceItem, *types.ProductionSourceSet, error)
 	GetEvidence(ctx context.Context, tenantID uint64, evidenceID string) (*types.ProductionEvidenceSnapshot, *types.ProductionSourceItem, *types.ProductionSourceSet, error)
+	LockFreezeGovernance(ctx context.Context, tenantID uint64, projectID, sourceSetID string) (*types.ProductionSourceSet, *types.ProductionDocumentType, error)
 	ListAcceptedEvidence(ctx context.Context, tenantID uint64, projectID, sourceSetID string) ([]*types.ProductionEvidenceSnapshot, error)
 	ListAcceptedSourceKinds(ctx context.Context, tenantID uint64, projectID, sourceSetID string) ([]types.ProductionSourceKind, error)
 	DecideItem(ctx context.Context, tenantID uint64, itemID string, decision types.ProductionSourceItemStatus) error

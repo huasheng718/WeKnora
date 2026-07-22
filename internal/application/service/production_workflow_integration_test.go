@@ -155,6 +155,7 @@ func newProductionWorkflowGraph(
 	documentService := NewProductionDocumentService(
 		documents, sources, documentTypes, authorizer, nil, audit, uow,
 		repository.NewProductionReviewRepository(db),
+		runs,
 	)
 	mcpService := &types.MCPService{
 		ID: workflowE2EMCPServiceID, TenantID: 7, Name: "workflow-mcp", Enabled: true,
@@ -226,15 +227,21 @@ func TestProductionWorkflowSQLiteApprovalReplayAndGovernedWrite(t *testing.T) {
 	skillBindings := types.JSON(`{"version":1,"skills":[]}`)
 	workflow, err := canonicalProductionWorkflowPlan(types.JSON(`{"version":1,"steps":[{"provider_type":"mcp","provider_id":"`+workflowE2EMCPServiceID+`","tool_name":"lookup","request":{"source_item_id":"`+workflowE2ESourceItemID+`","arguments":{"query":"status"}}}]}`), skillBindings)
 	require.NoError(t, err)
+	config, ok := legacyProductionDocumentTypeConfig("software-development-baseline")
+	require.True(t, ok)
+	configInput, err := productionDocumentTypeConfigInput(config)
+	require.NoError(t, err)
+	configInput.SkillBindings = skillBindings
+	configInput.WorkflowPlan = workflow
 	require.NoError(t, initial.db.Create(&types.ProductionProject{
 		ID: workflowE2EProjectID, TenantID: 7, Name: "Workflow E2E", OwnerUserID: workflowE2EActorID,
 		Status: types.ProductionProjectActive,
 	}).Error)
 	require.NoError(t, initial.db.Create(&types.ProductionDocumentType{
 		ID: workflowE2ETypeID, TenantID: 7, Code: "software-development-baseline", Name: "Baseline",
-		SchemaVersion: 3, BlockSchema: types.JSON(`{}`), SourceRequirements: types.JSON(`{}`),
-		SkillBindings: skillBindings, WorkflowPlan: workflow, QualityRules: types.JSON(`{}`),
-		ReviewPolicy: types.JSON(`{}`), PublicationPolicy: types.JSON(`{}`),
+		SchemaVersion: 3, BlockSchema: configInput.BlockSchema, SourceRequirements: configInput.SourceRequirements,
+		SkillBindings: configInput.SkillBindings, WorkflowPlan: configInput.WorkflowPlan, QualityRules: configInput.QualityRules,
+		ReviewPolicy: configInput.ReviewPolicy, PublicationPolicy: configInput.PublicationPolicy,
 		Status: types.ProductionDocumentTypeActive, CreatedBy: workflowE2EActorID,
 	}).Error)
 	frozenAt := time.Now().UTC()

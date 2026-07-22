@@ -1,7 +1,9 @@
 package repository
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -259,7 +261,7 @@ func validateProductionAppendDependencies(
 	document *types.ProductionDocument,
 	sourceSetID string,
 	allowRetired bool,
-) error {
+) (*types.ProductionDocumentType, error) {
 	typeQuery := db.Where(
 		"id = ? AND tenant_id = ? AND schema_version = ?",
 		document.DocumentTypeID, document.TenantID, document.DocumentTypeSchemaVersion,
@@ -277,9 +279,9 @@ func validateProductionAppendDependencies(
 	var documentType types.ProductionDocumentType
 	if err := typeQuery.First(&documentType).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return types.ErrProductionDocumentTypeInactive
+			return nil, types.ErrProductionDocumentTypeInactive
 		}
-		return err
+		return nil, err
 	}
 
 	sourceQuery := db.Where(
@@ -292,11 +294,11 @@ func validateProductionAppendDependencies(
 	var sourceSet types.ProductionSourceSet
 	if err := sourceQuery.First(&sourceSet).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return types.ErrProductionDocumentSourceSetInvalid
+			return nil, types.ErrProductionDocumentSourceSetInvalid
 		}
-		return err
+		return nil, err
 	}
-	return nil
+	return &documentType, nil
 }
 
 func lockProductionCreateDependencies(
@@ -332,7 +334,104 @@ func lockProductionCreateDependencies(
 			return types.ErrProductionDocumentSourceSetInvalid
 		}
 	}
-	return validateProductionAppendDependencies(db, document, sourceSetID, false)
+	_, err := validateProductionAppendDependencies(db, document, sourceSetID, false)
+	return err
+}
+
+type productionAppendRunDocumentTypeSnapshot struct {
+	ID                 string          `json:"id"`
+	Code               string          `json:"code"`
+	Name               string          `json:"name"`
+	SchemaVersion      int             `json:"schema_version"`
+	BlockSchema        json.RawMessage `json:"block_schema"`
+	SourceRequirements json.RawMessage `json:"source_requirements"`
+	SkillBindings      json.RawMessage `json:"skill_bindings"`
+	WorkflowPlan       json.RawMessage `json:"workflow_plan"`
+	QualityRules       json.RawMessage `json:"quality_rules"`
+	ReviewPolicy       json.RawMessage `json:"review_policy"`
+	PublicationPolicy  json.RawMessage `json:"publication_policy"`
+}
+
+func lockProductionInternalAppendRun(
+	db *gorm.DB,
+	principal types.ProductionInternalPrincipal,
+	version *types.ProductionDocumentVersion,
+) (*types.ProductionRun, error) {
+	parentID := normalizeProductionParent(version.ParentVersionID)
+	if !principal.Matches(principal.TenantID, principal.ProjectID, principal.RunID) ||
+		version.Origin != types.ProductionDocumentOriginAI || version.CreatedBy != types.ProductionSystemActorID ||
+		version.ID != types.ProductionRunVersionID(principal.RunID) || parentID == "" {
+		return nil, types.ErrProductionForbidden
+	}
+	query := func() *gorm.DB {
+		return db.Where(
+			"tenant_id = ? AND id = ? AND project_id = ? AND document_id = ? AND source_set_id = ? AND status = ? AND run_type IN ? AND input_version_id = ?",
+			principal.TenantID, principal.RunID, principal.ProjectID, version.DocumentID, version.SourceSetID,
+			types.ProductionRunRunning, []types.ProductionRunType{types.ProductionRunWrite, types.ProductionRunRewrite}, parentID,
+		)
+	}
+	if db.Dialector.Name() != "postgres" {
+		result := query().Model(&types.ProductionRun{}).UpdateColumn("status", gorm.Expr("status"))
+		if result.Error != nil {
+			return nil, result.Error
+		}
+		if result.RowsAffected != 1 {
+			return nil, types.ErrProductionForbidden
+		}
+	}
+	lockedQuery := query()
+	if db.Dialector.Name() == "postgres" {
+		lockedQuery = lockedQuery.Clauses(clause.Locking{Strength: "SHARE"})
+	}
+	var run types.ProductionRun
+	if err := lockedQuery.First(&run).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, types.ErrProductionForbidden
+		}
+		return nil, err
+	}
+	if run.OutputVersionID != nil && *run.OutputVersionID != version.ID {
+		return nil, types.ErrProductionForbidden
+	}
+	return &run, nil
+}
+
+func productionAppendRunSnapshotMatchesDocumentType(
+	run *types.ProductionRun,
+	documentType *types.ProductionDocumentType,
+) bool {
+	if run == nil || documentType == nil {
+		return false
+	}
+	var snapshot productionAppendRunDocumentTypeSnapshot
+	if err := json.Unmarshal(run.DocumentTypeSnapshot, &snapshot); err != nil ||
+		snapshot.ID != documentType.ID || snapshot.Code != documentType.Code || snapshot.Name != documentType.Name ||
+		snapshot.SchemaVersion != documentType.SchemaVersion {
+		return false
+	}
+	pairs := []struct {
+		snapshot json.RawMessage
+		current  types.JSON
+	}{
+		{snapshot.BlockSchema, documentType.BlockSchema},
+		{snapshot.SourceRequirements, documentType.SourceRequirements},
+		{snapshot.SkillBindings, documentType.SkillBindings},
+		{snapshot.WorkflowPlan, documentType.WorkflowPlan},
+		{snapshot.QualityRules, documentType.QualityRules},
+		{snapshot.ReviewPolicy, documentType.ReviewPolicy},
+		{snapshot.PublicationPolicy, documentType.PublicationPolicy},
+	}
+	for _, pair := range pairs {
+		if len(pair.snapshot) == 0 || len(pair.current) == 0 {
+			return false
+		}
+		canonicalSnapshot, snapshotErr := types.CanonicalProductionJSON(types.JSON(pair.snapshot))
+		canonicalCurrent, currentErr := types.CanonicalProductionJSON(pair.current)
+		if snapshotErr != nil || currentErr != nil || !bytes.Equal(canonicalSnapshot, canonicalCurrent) {
+			return false
+		}
+	}
+	return true
 }
 
 func prepareProductionBlocks(version *types.ProductionDocumentVersion, blocks []*types.ProductionDocumentBlock) error {
@@ -410,16 +509,27 @@ func (r *productionDocumentRepository) AppendVersion(
 
 	err := database.WithTransactionContext(ctx, r.db, func(txCtx context.Context) error {
 		db := database.DBFromContext(txCtx, r.db).WithContext(txCtx)
+		principal, internal := types.ProductionInternalPrincipalFromContext(txCtx)
+		var run *types.ProductionRun
+		var err error
+		if internal {
+			run, err = lockProductionInternalAppendRun(db, principal, version)
+			if err != nil {
+				return err
+			}
+		}
 		document, err := lockProductionDocumentHead(db, version.DocumentID)
 		if err != nil {
 			return err
 		}
 
-		principal, internal := types.ProductionInternalPrincipalFromContext(txCtx)
-		allowRetired := internal && principal.Matches(document.TenantID, document.ProjectID, principal.RunID) &&
-			version.Origin == types.ProductionDocumentOriginAI && version.CreatedBy == types.ProductionSystemActorID
-		if err := validateProductionAppendDependencies(db, document, version.SourceSetID, allowRetired); err != nil {
+		allowRetired := internal && principal.Matches(document.TenantID, document.ProjectID, principal.RunID)
+		documentType, err := validateProductionAppendDependencies(db, document, version.SourceSetID, allowRetired)
+		if err != nil {
 			return err
+		}
+		if internal && !productionAppendRunSnapshotMatchesDocumentType(run, documentType) {
+			return types.ErrProductionForbidden
 		}
 		version.TenantID = document.TenantID
 		version.ProjectID = document.ProjectID

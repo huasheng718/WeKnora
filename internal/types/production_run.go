@@ -189,6 +189,15 @@ type ProductionRun struct {
 
 func (ProductionRun) TableName() string { return "production_runs" }
 
+// ProductionRunVersionID derives the only document-version identity an
+// internal writer run may materialize.
+func ProductionRunVersionID(runID string) string {
+	return uuid.NewSHA1(
+		uuid.MustParse("9bc0c43e-38f0-475a-aab3-a1d2c194c93f"),
+		[]byte(runID+":ai-version"),
+	).String()
+}
+
 // ProductionToolCall is one durable, tenant-scoped invocation within a run.
 type ProductionToolCall struct {
 	ID                           string                       `json:"id" gorm:"type:varchar(36);primaryKey"`

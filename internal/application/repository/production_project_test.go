@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"database/sql/driver"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -9,9 +10,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -329,6 +332,27 @@ func TestProductionProjectRepositoryRequiresLiveTenantMemberForRoleAvailability(
 	available, err = repo.HasLiveRoleAssignee(context.Background(), 8, "project-1", types.ProductionRoleBusinessReviewer)
 	require.NoError(t, err)
 	require.False(t, available)
+}
+
+func TestProductionProjectRepositoryPostgresLocksLiveReviewerRows(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+
+	args := []driver.Value{uint64(7), "project-1", types.ProductionProjectActive, types.ProductionRoleEngineeringReviewer, types.TenantMemberStatusActive}
+	mock.ExpectQuery(`SELECT member.user_id FROM production_project_members AS member .* FOR UPDATE OF member, tenant_member`).
+		WithArgs(args...).
+		WillReturnRows(sqlmock.NewRows([]string{"user_id"}).AddRow("reviewer-1"))
+
+	available, err := NewProductionProjectRepository(db).HasLiveRoleAssignee(
+		context.Background(), 7, "project-1", types.ProductionRoleEngineeringReviewer,
+	)
+
+	require.NoError(t, err)
+	require.True(t, available)
+	require.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestProductionProjectRepositoryAssignRoleRejectsNilMember(t *testing.T) {

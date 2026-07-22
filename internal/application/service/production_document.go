@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -23,6 +24,7 @@ type productionDocumentService struct {
 	audit         interfaces.AuditLogService
 	uow           interfaces.ProductionUnitOfWork
 	reviews       interfaces.ProductionReviewRepository
+	runs          interfaces.ProductionRunRepository
 }
 
 func NewProductionDocumentService(
@@ -34,10 +36,11 @@ func NewProductionDocumentService(
 	audit interfaces.AuditLogService,
 	uow interfaces.ProductionUnitOfWork,
 	reviews interfaces.ProductionReviewRepository,
+	runs interfaces.ProductionRunRepository,
 ) *productionDocumentService {
 	return &productionDocumentService{
 		documents: documents, sources: sources, documentTypes: documentTypes, projects: projects,
-		resources: resources, audit: audit, uow: uow, reviews: reviews,
+		resources: resources, audit: audit, uow: uow, reviews: reviews, runs: runs,
 	}
 }
 
@@ -314,6 +317,30 @@ func requireProductionInternalAppendScope(
 	return nil
 }
 
+func validateProductionInternalAppendRun(
+	run *types.ProductionRun,
+	principal types.ProductionInternalPrincipal,
+	document *types.ProductionDocument,
+	sourceSet *types.ProductionSourceSet,
+	documentType *types.ProductionDocumentType,
+	versionID, parentVersionID string,
+) error {
+	if run == nil || document == nil || sourceSet == nil || documentType == nil ||
+		!principal.Matches(run.TenantID, run.ProjectID, run.ID) ||
+		run.DocumentID != types.ProductionDocumentID(document.ID) || run.SourceSetID != sourceSet.ID ||
+		(run.RunType != types.ProductionRunWrite && run.RunType != types.ProductionRunRewrite) ||
+		run.Status != types.ProductionRunRunning || run.InputVersionID == nil || *run.InputVersionID != parentVersionID ||
+		versionID != types.ProductionRunVersionID(run.ID) ||
+		(run.OutputVersionID != nil && *run.OutputVersionID != versionID) {
+		return types.ErrProductionForbidden
+	}
+	canonicalSnapshot, err := types.CanonicalProductionJSON(run.DocumentTypeSnapshot)
+	if err != nil || !bytes.Equal(canonicalSnapshot, productionDocumentTypeSnapshot(documentType)) {
+		return types.ErrProductionForbidden
+	}
+	return nil
+}
+
 func buildProductionBlockLineage(
 	parentVersionID, versionID string,
 	inputs []types.ProductionBlockLineageInput,
@@ -460,6 +487,21 @@ func (s *productionDocumentService) AppendVersion(
 	if internal {
 		if input.VersionID == "" || input.VersionID != productionRunVersionID(principal.RunID) {
 			return nil, types.ErrProductionForbidden
+		}
+		if s.runs == nil {
+			return nil, errors.New("production run repository is required")
+		}
+		run, runErr := s.runs.Get(ctx, tenantID, principal.RunID)
+		if runErr != nil {
+			if errors.Is(runErr, gorm.ErrRecordNotFound) {
+				return nil, types.ErrProductionForbidden
+			}
+			return nil, runErr
+		}
+		if err := validateProductionInternalAppendRun(
+			run, principal, document, sourceSet, documentType, input.VersionID, input.ParentVersionID,
+		); err != nil {
+			return nil, err
 		}
 		versionID = input.VersionID
 	} else if input.VersionID != "" {

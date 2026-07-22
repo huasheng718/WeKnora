@@ -14,6 +14,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/database"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -554,6 +555,76 @@ func TestProductionDocumentRepositoryCreateRejectsRetiredTypeAtomically(t *testi
 	var count int64
 	require.NoError(t, db.Model(&types.ProductionDocument{}).Count(&count).Error)
 	require.Zero(t, count)
+}
+
+func TestProductionDocumentRepositoryRetiredInternalAppendRequiresPersistedRun(t *testing.T) {
+	repo, _, db := newProductionDocumentRepoFixture(t)
+	first := createDocumentAndFirstVersion(t, repo)
+	require.NoError(t, db.Model(&types.ProductionDocumentType{}).
+		Where("id = ?", sourceTypeID).
+		UpdateColumn("status", types.ProductionDocumentTypeRetired).Error)
+	runID := "77000000-0000-4000-8000-000000000097"
+	versionID := uuid.NewSHA1(
+		uuid.MustParse("9bc0c43e-38f0-475a-aab3-a1d2c194c93f"),
+		[]byte(runID+":ai-version"),
+	).String()
+	version := productionVersion(versionID, stringPointer(first.ID), productionBlock("block-run", "block-run", `"ai"`))
+	version.Origin = types.ProductionDocumentOriginAI
+	version.CreatedBy = types.ProductionSystemActorID
+	version.ContentDigest = types.ComputeProductionVersionDigest(version)
+	ctx, err := types.WithProductionInternalPrincipal(context.Background(), types.ProductionInternalPrincipal{
+		ActorID: types.ProductionSystemActorID, ActorKind: types.ProductionInternalActorWorker,
+		TenantID: 7, ProjectID: sourceProjectID, RunID: runID,
+	})
+	require.NoError(t, err)
+
+	err = repo.AppendVersion(ctx, version, version.Blocks, nil)
+
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
+	var count int64
+	require.NoError(t, db.Model(&types.ProductionDocumentVersion{}).Count(&count).Error)
+	require.Equal(t, int64(2), count)
+}
+
+func TestProductionDocumentRepositoryPostgresLocksInternalAppendRun(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	runID := "77000000-0000-4000-8000-000000000096"
+	versionID := uuid.NewSHA1(
+		uuid.MustParse("9bc0c43e-38f0-475a-aab3-a1d2c194c93f"),
+		[]byte(runID+":ai-version"),
+	).String()
+	version := productionVersion(versionID, stringPointer(firstVersionID), productionBlock("block-run", "block-run", `"ai"`))
+	version.Origin = types.ProductionDocumentOriginAI
+	version.CreatedBy = types.ProductionSystemActorID
+	version.ContentDigest = types.ComputeProductionVersionDigest(version)
+	ctx, err := types.WithProductionInternalPrincipal(context.Background(), types.ProductionInternalPrincipal{
+		ActorID: types.ProductionSystemActorID, ActorKind: types.ProductionInternalActorWorker,
+		TenantID: 7, ProjectID: sourceProjectID, RunID: runID,
+	})
+	require.NoError(t, err)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT \* FROM "production_runs" .*FOR SHARE`).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "tenant_id", "project_id", "document_id", "source_set_id", "run_type", "status", "input_version_id", "document_type_snapshot",
+		}).AddRow(runID, 7, sourceProjectID, documentID, sourceSetID, string(types.ProductionRunWrite), string(types.ProductionRunRunning), firstVersionID, `{}`))
+	mock.ExpectQuery(`SELECT \* FROM "production_documents" WHERE id = \$1.*FOR UPDATE`).
+		WithArgs(documentID, 1).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "tenant_id", "project_id", "document_type_id", "document_type_schema_version", "title", "status", "created_by",
+		}).AddRow(documentID, 7, sourceProjectID, sourceTypeID, 1, "Baseline", string(types.ProductionDocumentDraft), "author"))
+	forced := errors.New("forced type lock failure")
+	mock.ExpectQuery(`SELECT \* FROM "production_document_types" .*FOR SHARE`).WillReturnError(forced)
+	mock.ExpectRollback()
+
+	err = NewProductionDocumentRepository(db).AppendVersion(ctx, version, version.Blocks, nil)
+
+	require.ErrorIs(t, err, forced)
+	require.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestProductionDocumentRepositoryPostgresCreateLocksDependenciesAndRollsBack(t *testing.T) {

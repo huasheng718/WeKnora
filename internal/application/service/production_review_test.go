@@ -64,6 +64,21 @@ type revokingProfessionalMutationRepository struct {
 	removeOnDecide  bool
 }
 
+type productionReviewTransactionBarrierUOW struct {
+	interfaces.ProductionUnitOfWork
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (u *productionReviewTransactionBarrierUOW) WithinTransaction(
+	ctx context.Context,
+	fn func(context.Context) error,
+) error {
+	close(u.entered)
+	<-u.release
+	return u.ProductionUnitOfWork.WithinTransaction(ctx, fn)
+}
+
 func (r *revokingProfessionalMutationRepository) LockCurrentReviewVersion(
 	ctx context.Context, request *types.ProductionReviewRequest,
 ) error {
@@ -147,6 +162,10 @@ func (r *retiringProductionDocumentTypeRepository) GetActiveByIDForReview(
 }
 
 func newProductionReviewFixture(t *testing.T) *productionReviewFixture {
+	return newProductionReviewFixtureWithDocumentType(t, nil)
+}
+
+func newProductionReviewFixtureWithDocumentType(t *testing.T, documentType *types.ProductionDocumentType) *productionReviewFixture {
 	t.Helper()
 	dsn := "file:" + filepath.Join(t.TempDir(), "production-review-service.db") +
 		"?_foreign_keys=1&_busy_timeout=5000&_journal_mode=WAL"
@@ -172,7 +191,7 @@ func newProductionReviewFixture(t *testing.T) *productionReviewFixture {
 	require.NoError(t, db.Exec(`ALTER TABLE production_document_types ADD COLUMN origin VARCHAR(16) NOT NULL DEFAULT 'custom'`).Error)
 	require.NoError(t, db.AutoMigrate(&types.AuditLog{}, &types.TenantMember{}))
 
-	seedProductionReviewServiceScope(t, db)
+	seedProductionReviewServiceScope(t, db, documentType)
 	members := newProductionMemberServiceStub()
 	for actor, role := range map[string]types.TenantRole{
 		productionReviewAuthorID:      types.TenantRoleContributor,
@@ -200,20 +219,31 @@ func newProductionReviewFixture(t *testing.T) *productionReviewFixture {
 	return &productionReviewFixture{svc: svc, db: db, reviews: reviews, documents: documents, members: members, audit: audit}
 }
 
-func seedProductionReviewServiceScope(t *testing.T, db *gorm.DB) {
+func seedProductionReviewServiceScope(t *testing.T, db *gorm.DB, documentType *types.ProductionDocumentType) {
 	t.Helper()
 	now := time.Now().UTC()
-	policy := types.JSON(`{"steps":["business_reviewer","engineering_reviewer"]}`)
 	require.NoError(t, db.Create(&types.ProductionProject{
 		ID: productionReviewProjectID, TenantID: productionReviewTenantID, Name: "Governed review",
 		OwnerUserID: productionReviewTenantOwnerID, Status: types.ProductionProjectActive,
 	}).Error)
-	require.NoError(t, db.Create(&types.ProductionDocumentType{
-		ID: productionReviewTypeID, TenantID: productionReviewTenantID, Code: "review", Name: "Review", SchemaVersion: 1,
-		BlockSchema: types.JSON(`{}`), SourceRequirements: types.JSON(`{}`), SkillBindings: types.JSON(`{}`),
-		QualityRules: types.JSON(`{}`), ReviewPolicy: policy, PublicationPolicy: types.JSON(`{}`),
-		Status: types.ProductionDocumentTypeActive, CreatedBy: productionReviewTenantOwnerID,
-	}).Error)
+	if documentType == nil {
+		config, ok := legacyProductionDocumentTypeConfig("software-development-baseline")
+		require.True(t, ok)
+		config.ReviewPolicy.Steps = []types.ProductionRole{
+			types.ProductionRoleBusinessReviewer,
+			types.ProductionRoleEngineeringReviewer,
+		}
+		configInput, err := productionDocumentTypeConfigInput(config)
+		require.NoError(t, err)
+		documentType = &types.ProductionDocumentType{
+			ID: productionReviewTypeID, TenantID: productionReviewTenantID, Code: "review", Name: "Review", SchemaVersion: 1,
+			BlockSchema: configInput.BlockSchema, SourceRequirements: configInput.SourceRequirements,
+			SkillBindings: configInput.SkillBindings, WorkflowPlan: configInput.WorkflowPlan,
+			QualityRules: configInput.QualityRules, ReviewPolicy: configInput.ReviewPolicy, PublicationPolicy: configInput.PublicationPolicy,
+			Status: types.ProductionDocumentTypeActive, CreatedBy: productionReviewTenantOwnerID,
+		}
+	}
+	require.NoError(t, db.Create(documentType).Error)
 	require.NoError(t, db.Create(&types.ProductionSourceSet{
 		ID: productionReviewSourceSetID, TenantID: productionReviewTenantID, ProjectID: productionReviewProjectID,
 		DocumentTypeID: productionReviewTypeID, Status: types.ProductionSourceSetCollecting,
@@ -520,6 +550,65 @@ func TestProductionReviewSubmissionRequiresExactCurrentVersion(t *testing.T) {
 	require.ErrorIs(t, err, types.ErrProductionReviewScopeInvalid)
 }
 
+func TestProductionReviewSubmissionRevalidatesReviewerAfterConcurrentRevocationWins(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, *gorm.DB)
+	}{
+		{
+			name: "project role removal",
+			mutate: func(t *testing.T, db *gorm.DB) {
+				require.NoError(t, db.Where(
+					"project_id = ? AND user_id = ? AND role = ?",
+					productionReviewProjectID, productionReviewEngineeringID, types.ProductionRoleEngineeringReviewer,
+				).Delete(&types.ProductionProjectMember{}).Error)
+			},
+		},
+		{
+			name: "tenant member suspension",
+			mutate: func(t *testing.T, db *gorm.DB) {
+				require.NoError(t, db.Model(&types.TenantMember{}).Where(
+					"tenant_id = ? AND user_id = ?", productionReviewTenantID, productionReviewEngineeringID,
+				).UpdateColumn("status", types.TenantMemberStatusSuspended).Error)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newProductionReviewFixture(t)
+			barrier := &productionReviewTransactionBarrierUOW{
+				ProductionUnitOfWork: fixture.svc.uow,
+				entered:              make(chan struct{}),
+				release:              make(chan struct{}),
+			}
+			fixture.svc.uow = barrier
+			fixture.svc.projects = NewProductionProjectService(
+				apprepository.NewProductionProjectRepository(fixture.db), fixture.members, nil,
+			)
+			type result struct {
+				request *types.ProductionReviewRequest
+				err     error
+			}
+			done := make(chan result, 1)
+			go func() {
+				request, err := fixture.svc.Submit(
+					productionReviewServiceContext(productionReviewAuthorID, types.TenantRoleContributor),
+					productionReviewDocumentID, productionReviewVersionID,
+				)
+				done <- result{request: request, err: err}
+			}()
+			<-barrier.entered
+			test.mutate(t, fixture.db)
+			close(barrier.release)
+
+			outcome := <-done
+			require.Nil(t, outcome.request)
+			require.ErrorIs(t, outcome.err, types.ErrProductionReviewPolicyInvalid)
+			require.ErrorContains(t, outcome.err, "reviewer_role_unavailable:engineering_reviewer")
+			require.Zero(t, countServiceRows(t, fixture.db, &types.ProductionReviewRequest{}))
+		})
+	}
+}
+
 func TestProductionReviewSubmissionUsesExactTypeRetiredAfterInitialRead(t *testing.T) {
 	fixture := newProductionReviewFixture(t)
 	fixture.svc.documentTypes = &retiringProductionDocumentTypeRepository{
@@ -536,6 +625,43 @@ func TestProductionReviewSubmissionUsesExactTypeRetiredAfterInitialRead(t *testi
 	require.NotNil(t, request)
 	require.Equal(t, types.JSON(`{"steps":["business_reviewer","engineering_reviewer"]}`), request.PolicySnapshot)
 	require.Equal(t, int64(1), countServiceRows(t, fixture.db, &types.ProductionReviewRequest{}))
+}
+
+func TestProductionReviewSubmissionCompletesWithAllEmptyLegacyGovernance(t *testing.T) {
+	fixture := newProductionReviewFixtureWithDocumentType(t, &types.ProductionDocumentType{
+		ID: productionReviewTypeID, TenantID: productionReviewTenantID, Code: "software-development-baseline",
+		Name: "Legacy baseline", SchemaVersion: 1, BlockSchema: types.JSON(`{}`), SourceRequirements: types.JSON(`{}`),
+		SkillBindings: types.JSON(`{}`), WorkflowPlan: types.JSON(`{}`), QualityRules: types.JSON(`{}`),
+		ReviewPolicy: types.JSON(`{}`), PublicationPolicy: types.JSON(`{}`),
+		Status: types.ProductionDocumentTypeRetired, CreatedBy: productionReviewTenantOwnerID,
+	})
+
+	request, err := fixture.svc.Submit(
+		productionReviewServiceContext(productionReviewAuthorID, types.TenantRoleContributor),
+		productionReviewDocumentID, productionReviewVersionID,
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, request)
+	require.Equal(t, types.JSON(`{"steps":["business_reviewer"]}`), request.PolicySnapshot)
+}
+
+func TestProductionReviewSubmissionRejectsPartialLegacyGovernance(t *testing.T) {
+	fixture := newProductionReviewFixtureWithDocumentType(t, &types.ProductionDocumentType{
+		ID: productionReviewTypeID, TenantID: productionReviewTenantID, Code: "software-development-baseline",
+		Name: "Partial legacy baseline", SchemaVersion: 1, BlockSchema: types.JSON(`{}`), SourceRequirements: types.JSON(`{}`),
+		SkillBindings: types.JSON(`{"version":1,"skills":[]}`), WorkflowPlan: types.JSON(`{}`), QualityRules: types.JSON(`{}`),
+		ReviewPolicy: types.JSON(`{}`), PublicationPolicy: types.JSON(`{}`),
+		Status: types.ProductionDocumentTypeRetired, CreatedBy: productionReviewTenantOwnerID,
+	})
+
+	request, err := fixture.svc.Submit(
+		productionReviewServiceContext(productionReviewAuthorID, types.TenantRoleContributor),
+		productionReviewDocumentID, productionReviewVersionID,
+	)
+
+	require.Nil(t, request)
+	require.ErrorIs(t, err, types.ErrProductionReviewPolicyInvalid)
 }
 
 func TestProductionReviewRevokedSubmitterRoleAtMutationBoundaryCannotSubmit(t *testing.T) {

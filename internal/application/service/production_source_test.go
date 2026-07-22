@@ -22,6 +22,20 @@ import (
 	"gorm.io/gorm/logger"
 )
 
+type productionSourceFreezeBarrierRepository struct {
+	interfaces.ProductionSourceRepository
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (r *productionSourceFreezeBarrierRepository) LockFreezeGovernance(
+	ctx context.Context, tenantID uint64, projectID, sourceSetID string,
+) (*types.ProductionSourceSet, *types.ProductionDocumentType, error) {
+	close(r.entered)
+	<-r.release
+	return r.ProductionSourceRepository.LockFreezeGovernance(ctx, tenantID, projectID, sourceSetID)
+}
+
 const (
 	serviceProjectID = "aaaaaaaa-1111-4111-8111-111111111111"
 	serviceTypeID    = "22222222-2222-4222-8222-222222222222"
@@ -104,12 +118,12 @@ func newProductionSourceServiceFixture(t *testing.T) (*productionSourceService, 
 	require.NoError(t, db.Create(&types.ProductionProject{
 		ID: serviceProjectID, TenantID: 7, Name: "Project", OwnerUserID: "owner", Status: types.ProductionProjectActive,
 	}).Error)
+	config := productionSourceTestDocumentTypeConfig(t)
 	require.NoError(t, db.Create(&types.ProductionDocumentType{
-		ID: serviceTypeID, TenantID: 7, Code: "type", Name: "Type", SchemaVersion: 1,
-		BlockSchema:        types.JSON(`{}`),
-		SourceRequirements: types.JSON(`{"version":1,"min_accepted_evidence":1,"allowed_source_kinds":["manual"],"require_evidence_section":true,"allow_unsupported_facts":false}`),
-		SkillBindings:      types.JSON(`{}`),
-		QualityRules:       types.JSON(`{}`), ReviewPolicy: types.JSON(`{}`), PublicationPolicy: types.JSON(`{}`),
+		ID: serviceTypeID, TenantID: 7, Code: "software-development-baseline", Name: "Type", SchemaVersion: 1,
+		BlockSchema: config.BlockSchema, SourceRequirements: config.SourceRequirements,
+		SkillBindings: config.SkillBindings, WorkflowPlan: config.WorkflowPlan,
+		QualityRules: config.QualityRules, ReviewPolicy: config.ReviewPolicy, PublicationPolicy: config.PublicationPolicy,
 		Status: types.ProductionDocumentTypeActive, CreatedBy: "owner",
 	}).Error)
 	repo := apprepository.NewProductionSourceRepository(db)
@@ -119,6 +133,16 @@ func newProductionSourceServiceFixture(t *testing.T) (*productionSourceService, 
 		repo, apprepository.NewProductionDocumentTypeRepository(db), authorizer, resources,
 		&productionAuditServiceStub{}, apprepository.NewProductionUnitOfWork(db),
 	), repo, db, authorizer, resources
+}
+
+func productionSourceTestDocumentTypeConfig(t *testing.T) types.ProductionDocumentTypeConfigInput {
+	t.Helper()
+	config, ok := legacyProductionDocumentTypeConfig("software-development-baseline")
+	require.True(t, ok)
+	config.SourceRequirements.AllowedSourceKinds = []types.ProductionSourceKind{types.ProductionSourceKindManual}
+	input, err := productionDocumentTypeConfigInput(config)
+	require.NoError(t, err)
+	return input
 }
 
 func sourceServiceContext(tenantID uint64) context.Context {
@@ -743,10 +767,13 @@ func TestProductionSourceServiceEnforcesSnapshottedSourceRequirements(t *testing
 		t.Run(test.name, func(t *testing.T) {
 			svc, repo, db, _, _ := newProductionSourceServiceFixture(t)
 			documentTypeID := "22222222-2222-4222-8222-222222222223"
+			config := productionSourceTestDocumentTypeConfig(t)
+			config.SourceRequirements = test.requirements
 			require.NoError(t, db.Create(&types.ProductionDocumentType{
 				ID: documentTypeID, TenantID: 7, Code: "governed-source", Name: "Governed source", SchemaVersion: 1,
-				BlockSchema: types.JSON(`{}`), SourceRequirements: test.requirements, SkillBindings: types.JSON(`{}`),
-				QualityRules: types.JSON(`{}`), ReviewPolicy: types.JSON(`{}`), PublicationPolicy: types.JSON(`{}`),
+				BlockSchema: config.BlockSchema, SourceRequirements: config.SourceRequirements,
+				SkillBindings: config.SkillBindings, WorkflowPlan: config.WorkflowPlan,
+				QualityRules: config.QualityRules, ReviewPolicy: config.ReviewPolicy, PublicationPolicy: config.PublicationPolicy,
 				Status: types.ProductionDocumentTypeActive, CreatedBy: "owner",
 			}).Error)
 			require.NoError(t, repo.CreateSet(context.Background(), &types.ProductionSourceSet{
@@ -768,6 +795,86 @@ func TestProductionSourceServiceEnforcesSnapshottedSourceRequirements(t *testing
 			require.Equal(t, types.ProductionSourceSetCollecting, persisted.Status)
 		})
 	}
+}
+
+func TestProductionSourceServiceFreezeRevalidatesGovernanceAfterWinningLock(t *testing.T) {
+	t.Run("forbidden accepted kind commits before lock", func(t *testing.T) {
+		svc, repo, _, _, _ := newProductionSourceServiceFixture(t)
+		createServiceSourceSet(t, repo, types.ProductionSourceSetCollecting)
+		seedServiceAcceptedEvidence(t, svc, repo)
+		uploadID := "44444444-4444-4444-8444-444444444445"
+		require.NoError(t, repo.CreateItem(context.Background(), 7, serviceSetID, &types.ProductionSourceItem{
+			ID: uploadID, SourceKind: types.ProductionSourceKindUpload, Title: "Upload", MimeType: "text/plain",
+			ContentDigest: strings.Repeat("b", 64), CapturedAt: time.Now().UTC(), Metadata: types.JSON(`{}`),
+			Status: types.ProductionSourceItemCandidate,
+		}))
+		require.NoError(t, repo.CreateEvidence(context.Background(), 7, uploadID, &types.ProductionEvidenceSnapshot{
+			ID: "55555555-5555-4555-8555-555555555556", SnapshotType: types.ProductionEvidenceSnapshotText,
+			InlineContent: types.JSON(`"upload evidence"`), ContentDigest: strings.Repeat("c", 64), RedactionMetadata: types.JSON(`{}`),
+		}))
+		barrier := &productionSourceFreezeBarrierRepository{
+			ProductionSourceRepository: repo, entered: make(chan struct{}), release: make(chan struct{}),
+		}
+		svc.repo = barrier
+		freezeDone := make(chan error, 1)
+		go func() { freezeDone <- svc.Freeze(sourceServiceContext(7), serviceSetID) }()
+		<-barrier.entered
+		require.NoError(t, repo.DecideItem(context.Background(), 7, uploadID, types.ProductionSourceItemAccepted))
+		close(barrier.release)
+
+		err := <-freezeDone
+		require.ErrorIs(t, err, types.ErrProductionDocumentSourceSetInvalid)
+		require.ErrorContains(t, err, productionSourceReasonKindNotAllowed)
+		persisted, getErr := repo.GetSet(context.Background(), 7, serviceSetID)
+		require.NoError(t, getErr)
+		require.Equal(t, types.ProductionSourceSetCollecting, persisted.Status)
+	})
+
+	t.Run("accepted evidence removal commits before lock", func(t *testing.T) {
+		svc, repo, _, _, _ := newProductionSourceServiceFixture(t)
+		createServiceSourceSet(t, repo, types.ProductionSourceSetCollecting)
+		seedServiceAcceptedEvidence(t, svc, repo)
+		barrier := &productionSourceFreezeBarrierRepository{
+			ProductionSourceRepository: repo, entered: make(chan struct{}), release: make(chan struct{}),
+		}
+		svc.repo = barrier
+		freezeDone := make(chan error, 1)
+		go func() { freezeDone <- svc.Freeze(sourceServiceContext(7), serviceSetID) }()
+		<-barrier.entered
+		require.NoError(t, repo.DecideItem(context.Background(), 7, serviceItemID, types.ProductionSourceItemRejected))
+		close(barrier.release)
+
+		err := <-freezeDone
+		require.ErrorIs(t, err, types.ErrProductionDocumentSourceSetInvalid)
+		require.ErrorContains(t, err, productionSourceReasonMinimumNotMet)
+		persisted, getErr := repo.GetSet(context.Background(), 7, serviceSetID)
+		require.NoError(t, getErr)
+		require.Equal(t, types.ProductionSourceSetCollecting, persisted.Status)
+	})
+
+	t.Run("document type retirement commits before lock", func(t *testing.T) {
+		svc, repo, db, _, _ := newProductionSourceServiceFixture(t)
+		createServiceSourceSet(t, repo, types.ProductionSourceSetCollecting)
+		seedServiceAcceptedEvidence(t, svc, repo)
+		barrier := &productionSourceFreezeBarrierRepository{
+			ProductionSourceRepository: repo, entered: make(chan struct{}), release: make(chan struct{}),
+		}
+		svc.repo = barrier
+		freezeDone := make(chan error, 1)
+		go func() { freezeDone <- svc.Freeze(sourceServiceContext(7), serviceSetID) }()
+		<-barrier.entered
+		require.NoError(t, db.Model(&types.ProductionDocumentType{}).
+			Where("tenant_id = ? AND id = ?", uint64(7), serviceTypeID).
+			UpdateColumn("status", types.ProductionDocumentTypeRetired).Error)
+		close(barrier.release)
+
+		err := <-freezeDone
+		require.ErrorIs(t, err, types.ErrProductionDocumentSourceSetInvalid)
+		require.ErrorContains(t, err, productionSourceReasonConfigInvalid)
+		persisted, getErr := repo.GetSet(context.Background(), 7, serviceSetID)
+		require.NoError(t, getErr)
+		require.Equal(t, types.ProductionSourceSetCollecting, persisted.Status)
+	})
 }
 
 func TestProductionSourceDirectServiceAuditFailureRollsBackFreeze(t *testing.T) {

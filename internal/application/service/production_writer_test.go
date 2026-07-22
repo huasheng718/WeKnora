@@ -242,7 +242,7 @@ func newProductionWriterFixture(t *testing.T, modelResponse string) *productionW
 		ID: uuid.NewString(), TenantID: 7, ProjectID: writerProjectID, DocumentID: writerDocumentID,
 		SourceSetID: writerSourceID, RunType: types.ProductionRunWrite, Status: types.ProductionRunRunning,
 		Attempt: 1, CurrentStep: 2, WakeupVersion: 3, ModelID: "model-1", InputVersionID: stringPointer(writerVersionID),
-		DocumentTypeSnapshot: types.JSON(`{"id":"` + writerTypeID + `","code":"software-development-baseline","schema_version":3,"block_schema":{},"skill_bindings":{"version":1,"skills":[{"name":"baseline","digest":"` + strings.Repeat("a", 64) + `"}]}}`),
+		DocumentTypeSnapshot: productionWriterTestDocumentTypeSnapshot(t, types.JSON(`{"version":1,"skills":[{"name":"baseline","digest":"`+strings.Repeat("a", 64)+`"}]}`)),
 	}
 	events := []string{}
 	chatStub := &productionWriterChatStub{response: &types.ChatResponse{Content: modelResponse}}
@@ -276,6 +276,21 @@ func newProductionWriterFixture(t *testing.T, modelResponse string) *productionW
 		writer: writer, run: run, chat: chatStub, runs: runs, sources: sources,
 		documents: documents, service: documentService, events: &events,
 	}
+}
+
+func productionWriterTestDocumentTypeSnapshot(t *testing.T, skillBindings types.JSON) types.JSON {
+	t.Helper()
+	config, ok := legacyProductionDocumentTypeConfig("software-development-baseline")
+	require.True(t, ok)
+	input, err := productionDocumentTypeConfigInput(config)
+	require.NoError(t, err)
+	input.SkillBindings = skillBindings
+	return productionDocumentTypeSnapshot(&types.ProductionDocumentType{
+		ID: writerTypeID, Code: "software-development-baseline", Name: "Baseline", SchemaVersion: 3,
+		BlockSchema: input.BlockSchema, SourceRequirements: input.SourceRequirements,
+		SkillBindings: input.SkillBindings, WorkflowPlan: input.WorkflowPlan,
+		QualityRules: input.QualityRules, ReviewPolicy: input.ReviewPolicy, PublicationPolicy: input.PublicationPolicy,
+	})
 }
 
 func stringPointer(value string) *string { return &value }
@@ -680,20 +695,25 @@ func TestProductionDocumentTypeConfigRejectsInvalidGovernanceForLegacyCode(t *te
 	require.ErrorIs(t, err, types.ErrProductionDocumentTypeConfigInvalid)
 }
 
-func TestProductionWriterLegacyAdapterPreservesSnapshottedWorkflow(t *testing.T) {
-	raw := types.JSON(`{
+func TestProductionLegacyAdapterRequiresEveryGovernanceFieldEmpty(t *testing.T) {
+	allEmpty := types.JSON(`{
 		"id":"22222222-2222-4222-8222-222222222222","code":"software-development-baseline","schema_version":3,
-		"block_schema":{},"source_requirements":{},"skill_bindings":{"version":1,"skills":[]},
-		"workflow_plan":{"version":1,"steps":[{"provider_type":"mcp","provider_id":"33333333-3333-4333-8333-333333333333","tool_name":"lookup","request":{"source_item_id":"44444444-4444-4444-8444-444444444444","arguments":{"query":"status"}}}]},
+		"block_schema":{},"source_requirements":{},"skill_bindings":{},"workflow_plan":{},
 		"quality_rules":{},"review_policy":{},"publication_policy":{}
 	}`)
-
-	snapshot, err := decodeProductionWriterDocumentType(raw)
-
+	snapshot, err := decodeProductionWriterDocumentType(allEmpty)
 	require.NoError(t, err)
-	require.Len(t, snapshot.WorkflowPlan.Steps, 1)
-	require.Equal(t, types.ProductionToolProviderMCP, snapshot.WorkflowPlan.Steps[0].ProviderType)
-	require.Equal(t, "lookup", snapshot.WorkflowPlan.Steps[0].ToolName)
+	require.Equal(t, 1, snapshot.BlockSchema.Version)
+	require.Equal(t, 1, snapshot.PublicationPolicy.Version)
+
+	partial := types.JSON(`{
+		"id":"22222222-2222-4222-8222-222222222222","code":"software-development-baseline","schema_version":3,
+		"block_schema":{},"source_requirements":{},"skill_bindings":{"version":1,"skills":[]},"workflow_plan":{},
+		"quality_rules":{},"review_policy":{},"publication_policy":{}
+	}`)
+	_, err = decodeProductionWriterDocumentType(partial)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "invalid document type governance snapshot")
 }
 
 func TestProductionWriterPromptUsesExactSnapshotGovernance(t *testing.T) {

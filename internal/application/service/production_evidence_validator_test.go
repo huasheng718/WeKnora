@@ -110,6 +110,20 @@ func TestValidateProductionVersionAppliesEverySnapshotTypeSpecificQualityGate(t 
 	}
 }
 
+func TestValidateProductionVersionDeduplicatesMissingSectionAcrossQualityGates(t *testing.T) {
+	blockSchema := types.ProductionBlockSchemaV1{
+		Version: 1, RequiredSections: []string{"异常处理"}, AllowedBlockTypes: []string{"heading"},
+	}
+	qualityRules := types.ProductionQualityRulesV1{
+		Version: 1, Gates: []string{"section_completeness", "sop_exception_path"},
+	}
+
+	result := ValidateProductionVersion(&types.ProductionDocumentVersion{}, nil, blockSchema, qualityRules)
+
+	require.Equal(t, []string{"required_section_missing"}, productionIssueCodes(result.Errors))
+	require.Equal(t, "异常处理", result.Errors[0].Section)
+}
+
 func TestProductionEvidenceValidatorLegacyAdapterRequiresKnownFixtureCode(t *testing.T) {
 	missing := productionBaselineVersion()
 	missing.DocumentTypeCode = ""

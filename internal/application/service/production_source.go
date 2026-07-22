@@ -48,33 +48,6 @@ func invalidProductionSourceSet(reason string) error {
 	return errors.Join(types.ErrProductionDocumentSourceSetInvalid, errors.New(reason))
 }
 
-func productionSourceRequirements(documentType *types.ProductionDocumentType) (types.ProductionSourceRequirementsV1, error) {
-	if documentType == nil {
-		return types.ProductionSourceRequirementsV1{}, invalidProductionSourceSet(productionSourceReasonConfigInvalid)
-	}
-	var requirements types.ProductionSourceRequirementsV1
-	if err := decodeProductionJSON(documentType.SourceRequirements, &requirements, true); err == nil &&
-		requirements.Version == 1 && requirements.MinAcceptedEvidence >= 1 && len(requirements.AllowedSourceKinds) > 0 {
-		seen := make(map[types.ProductionSourceKind]struct{}, len(requirements.AllowedSourceKinds))
-		for _, kind := range requirements.AllowedSourceKinds {
-			if !kind.IsValid() {
-				return types.ProductionSourceRequirementsV1{}, invalidProductionSourceSet(productionSourceReasonConfigInvalid)
-			}
-			if _, duplicate := seen[kind]; duplicate {
-				return types.ProductionSourceRequirementsV1{}, invalidProductionSourceSet(productionSourceReasonConfigInvalid)
-			}
-			seen[kind] = struct{}{}
-		}
-		return requirements, nil
-	}
-	if isEmptyProductionJSONObject(documentType.SourceRequirements) {
-		if legacy, ok := legacyProductionDocumentTypeConfig(documentType.Code); ok {
-			return legacy.SourceRequirements, nil
-		}
-	}
-	return types.ProductionSourceRequirementsV1{}, invalidProductionSourceSet(productionSourceReasonConfigInvalid)
-}
-
 func canonicalProductionSourceID(value, name string, rejectNonCanonical bool) (string, error) {
 	parsed, err := uuid.Parse(value)
 	if err != nil {
@@ -459,21 +432,20 @@ func (s *productionSourceService) Freeze(ctx context.Context, sourceSetID string
 		return errors.New("production unit of work is required")
 	}
 	return s.uow.WithinTransaction(ctx, func(txCtx context.Context) error {
-		if s.documentTypes == nil {
-			return errors.New("production document type repository is required")
-		}
-		documentType, loadErr := s.documentTypes.GetByID(txCtx, tenantID, sourceSet.DocumentTypeID)
+		lockedSet, documentType, loadErr := s.repo.LockFreezeGovernance(txCtx, tenantID, sourceSet.ProjectID, sourceSetID)
 		if loadErr != nil {
 			return loadErr
 		}
-		if documentType == nil || documentType.ID != sourceSet.DocumentTypeID || documentType.TenantID != tenantID ||
+		if lockedSet == nil || lockedSet.ID != sourceSetID || lockedSet.TenantID != tenantID ||
+			lockedSet.ProjectID != sourceSet.ProjectID || documentType == nil || documentType.ID != lockedSet.DocumentTypeID || documentType.TenantID != tenantID ||
 			documentType.Status != types.ProductionDocumentTypeActive {
 			return invalidProductionSourceSet(productionSourceReasonConfigInvalid)
 		}
-		requirements, decodeErr := productionSourceRequirements(documentType)
-		if decodeErr != nil {
-			return decodeErr
+		config, configErr := productionDocumentTypeConfig(documentType)
+		if configErr != nil {
+			return invalidProductionSourceSet(productionSourceReasonConfigInvalid)
 		}
+		requirements := config.SourceRequirements
 		evidence, listErr := s.repo.ListAcceptedEvidence(txCtx, tenantID, sourceSet.ProjectID, sourceSetID)
 		if listErr != nil {
 			return listErr

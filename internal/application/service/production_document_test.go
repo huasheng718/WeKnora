@@ -66,6 +66,7 @@ func newProductionDocumentServiceFixtureWithEvidenceDigest(t *testing.T, evidenc
 	for _, name := range []string{
 		"000001_knowledge_production_foundation.up.sql",
 		"000002_knowledge_production_documents.up.sql",
+		"000003_knowledge_production_runs.up.sql",
 		"000004_knowledge_production_reviews.up.sql",
 	} {
 		migration, readErr := os.ReadFile(filepath.Join(filepath.Dir(filename), "../../../migrations/sqlite", name))
@@ -78,10 +79,15 @@ func newProductionDocumentServiceFixtureWithEvidenceDigest(t *testing.T, evidenc
 	require.NoError(t, db.Create(&types.ProductionProject{
 		ID: documentServiceProjectID, TenantID: 7, Name: "Project", OwnerUserID: "owner", Status: types.ProductionProjectActive,
 	}).Error)
+	config, ok := legacyProductionDocumentTypeConfig("software-development-baseline")
+	require.True(t, ok)
+	configInput, err := productionDocumentTypeConfigInput(config)
+	require.NoError(t, err)
 	require.NoError(t, db.Create(&types.ProductionDocumentType{
 		ID: documentServiceTypeID, TenantID: 7, Code: "software-development-baseline", Name: "Baseline", SchemaVersion: 3,
-		BlockSchema: types.JSON(`{}`), SourceRequirements: types.JSON(`{}`), SkillBindings: types.JSON(`{}`),
-		QualityRules: types.JSON(`{}`), ReviewPolicy: types.JSON(`{}`), PublicationPolicy: types.JSON(`{}`),
+		BlockSchema: configInput.BlockSchema, SourceRequirements: configInput.SourceRequirements,
+		SkillBindings: configInput.SkillBindings, WorkflowPlan: configInput.WorkflowPlan,
+		QualityRules: configInput.QualityRules, ReviewPolicy: configInput.ReviewPolicy, PublicationPolicy: configInput.PublicationPolicy,
 		Status: types.ProductionDocumentTypeActive, CreatedBy: "owner",
 	}).Error)
 	require.NoError(t, db.Create(&types.ProductionSourceSet{
@@ -119,6 +125,7 @@ func newProductionDocumentServiceFixtureWithEvidenceDigest(t *testing.T, evidenc
 		audit,
 		apprepository.NewProductionUnitOfWork(db),
 		apprepository.NewProductionReviewRepository(db),
+		apprepository.NewProductionRunRepository(db),
 	)
 	return service, documents, db, authorizer
 }
@@ -406,6 +413,7 @@ func TestProductionDocumentServiceBindsInternalPrincipalToAIProvenance(t *testin
 	document := createServiceDocument(t, svc)
 	authorizer.err = types.ErrProductionForbidden
 	runID := "77000000-0000-4000-8000-000000000001"
+	persistServiceInternalRun(t, svc, db, document, runID)
 	blocks := governedServiceBlocks(governedServiceParagraph("claim", `"governed claim"`))
 	for index := range blocks {
 		blocks[index].AIProvenance = types.JSON(`{"run_id":"` + runID + `"}`)
@@ -436,13 +444,89 @@ func TestProductionDocumentServiceBindsInternalPrincipalToAIProvenance(t *testin
 	require.Equal(t, int64(2), countServiceRows(t, db, &types.ProductionDocumentVersion{}))
 }
 
+func TestProductionDocumentServiceInternalAppendRequiresPersistedRun(t *testing.T) {
+	svc, _, db, authorizer := newProductionDocumentServiceFixture(t)
+	document := createServiceDocument(t, svc)
+	authorizer.err = types.ErrProductionForbidden
+	runID := "77000000-0000-4000-8000-000000000098"
+	blocks := governedServiceBlocks(governedServiceParagraph("claim", `"governed claim"`))
+	for index := range blocks {
+		blocks[index].AIProvenance = types.JSON(`{"run_id":"` + runID + `"}`)
+	}
+	ctx, err := types.WithProductionInternalPrincipal(context.Background(), types.ProductionInternalPrincipal{
+		ActorID: types.ProductionSystemActorID, ActorKind: types.ProductionInternalActorWorker,
+		TenantID: 7, ProjectID: documentServiceProjectID, RunID: runID,
+	})
+	require.NoError(t, err)
+
+	version, err := svc.AppendVersion(ctx, document.ID, interfaces.AppendProductionVersionInput{
+		VersionID: productionRunVersionID(runID), ParentVersionID: *document.CurrentVersionID,
+		SourceSetID: documentServiceSetID, Origin: types.ProductionDocumentOriginAI, Blocks: blocks,
+	})
+
+	require.Nil(t, version)
+	require.ErrorIs(t, err, types.ErrProductionForbidden)
+	require.Equal(t, int64(1), countServiceRows(t, db, &types.ProductionDocumentVersion{}))
+}
+
+func TestProductionDocumentServiceInternalAppendRejectsStaleOrMismatchedRun(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*types.ProductionRun)
+	}{
+		{
+			name: "terminal run",
+			mutate: func(run *types.ProductionRun) {
+				now := time.Now().UTC()
+				run.Status = types.ProductionRunFailed
+				run.CompletedAt = &now
+			},
+		},
+		{
+			name: "mismatched document type snapshot",
+			mutate: func(run *types.ProductionRun) {
+				run.DocumentTypeSnapshot = types.JSON(`{"id":"99999999-9999-4999-8999-999999999999"}`)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			svc, _, db, authorizer := newProductionDocumentServiceFixture(t)
+			document := createServiceDocument(t, svc)
+			authorizer.err = types.ErrProductionForbidden
+			runID := "77000000-0000-4000-8000-000000000095"
+			run := serviceInternalRun(t, db, document, runID)
+			test.mutate(run)
+			require.NoError(t, svc.runs.Create(context.Background(), run))
+			blocks := governedServiceBlocks(governedServiceParagraph("claim", `"governed claim"`))
+			for index := range blocks {
+				blocks[index].AIProvenance = types.JSON(`{"run_id":"` + runID + `"}`)
+			}
+			ctx, err := types.WithProductionInternalPrincipal(context.Background(), types.ProductionInternalPrincipal{
+				ActorID: types.ProductionSystemActorID, ActorKind: types.ProductionInternalActorWorker,
+				TenantID: 7, ProjectID: documentServiceProjectID, RunID: runID,
+			})
+			require.NoError(t, err)
+
+			version, err := svc.AppendVersion(ctx, document.ID, interfaces.AppendProductionVersionInput{
+				VersionID: productionRunVersionID(runID), ParentVersionID: *document.CurrentVersionID,
+				SourceSetID: documentServiceSetID, Origin: types.ProductionDocumentOriginAI, Blocks: blocks,
+			})
+
+			require.Nil(t, version)
+			require.ErrorIs(t, err, types.ErrProductionForbidden)
+			require.Equal(t, int64(1), countServiceRows(t, db, &types.ProductionDocumentVersion{}))
+		})
+	}
+}
+
 func TestProductionDocumentServiceInternalAppendUsesRetiredExactBoundType(t *testing.T) {
 	svc, _, db, authorizer := newProductionDocumentServiceFixture(t)
 	document := createServiceDocument(t, svc)
+	runID := "77000000-0000-4000-8000-000000000002"
+	persistServiceInternalRun(t, svc, db, document, runID)
 	require.NoError(t, db.Model(&types.ProductionDocumentType{}).Where("id = ?", documentServiceTypeID).
 		Update("status", types.ProductionDocumentTypeRetired).Error)
 
-	runID := "77000000-0000-4000-8000-000000000002"
 	blocks := governedServiceBlocks(governedServiceParagraph("claim", `"governed claim"`))
 	for index := range blocks {
 		blocks[index].AIProvenance = types.JSON(`{"run_id":"` + runID + `"}`)
@@ -475,6 +559,7 @@ func TestProductionDocumentServiceIdempotentlyReplaysExactInternalRunVersion(t *
 	svc, repo, db, _ := newProductionDocumentServiceFixture(t)
 	document := createServiceDocument(t, svc)
 	runID := "77000000-0000-4000-8000-000000000010"
+	persistServiceInternalRun(t, svc, db, document, runID)
 	blocks := governedServiceBlocks(governedServiceParagraph("claim", `"governed claim"`))
 	for index := range blocks {
 		blocks[index].AIProvenance = types.JSON(`{"run_id":"` + runID + `"}`)
@@ -689,6 +774,38 @@ func createServiceDocument(t *testing.T, svc *productionDocumentService) *types.
 	})
 	require.NoError(t, err)
 	return document
+}
+
+func serviceInternalRun(
+	t *testing.T,
+	db *gorm.DB,
+	document *types.ProductionDocument,
+	runID string,
+) *types.ProductionRun {
+	t.Helper()
+	var sourceSet types.ProductionSourceSet
+	require.NoError(t, db.First(&sourceSet, "id = ?", documentServiceSetID).Error)
+	var documentType types.ProductionDocumentType
+	require.NoError(t, db.First(&documentType, "id = ?", documentServiceTypeID).Error)
+	run := newProductionRun(
+		7, document, &sourceSet, &documentType, "model-1", types.ProductionRunWrite, document.CurrentVersionID,
+	)
+	run.ID = runID
+	run.Status = types.ProductionRunRunning
+	return run
+}
+
+func persistServiceInternalRun(
+	t *testing.T,
+	svc *productionDocumentService,
+	db *gorm.DB,
+	document *types.ProductionDocument,
+	runID string,
+) *types.ProductionRun {
+	t.Helper()
+	run := serviceInternalRun(t, db, document, runID)
+	require.NoError(t, svc.runs.Create(context.Background(), run))
+	return run
 }
 
 func serviceParagraph(logicalID, content string) types.ProductionDocumentBlockInput {

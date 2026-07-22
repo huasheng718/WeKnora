@@ -518,6 +518,38 @@ func TestProductionSourceRepositoryPostgresLocksSourceSetForUpdate(t *testing.T)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestProductionSourceRepositoryPostgresLocksFreezeGovernanceInOrder(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	repo := NewProductionSourceRepository(db)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT * FROM "production_source_sets" WHERE tenant_id = $1 AND id = $2 ORDER BY "production_source_sets"."id" LIMIT $3 FOR UPDATE`)).
+		WithArgs(uint64(7), sourceSetID, 1).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "project_id", "document_type_id", "status", "created_by"}).
+			AddRow(sourceSetID, 7, sourceProjectID, sourceTypeID, string(types.ProductionSourceSetCollecting), "author"))
+	mock.ExpectQuery(`SELECT \* FROM "production_document_types" .* FOR SHARE`).
+		WithArgs(uint64(7), sourceTypeID, 1).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "code", "schema_version", "status"}).
+			AddRow(sourceTypeID, 7, "sop", 1, string(types.ProductionDocumentTypeActive)))
+	mock.ExpectCommit()
+
+	var lockedSet *types.ProductionSourceSet
+	var lockedType *types.ProductionDocumentType
+	err = database.WithTransactionContext(context.Background(), db, func(txCtx context.Context) error {
+		lockedSet, lockedType, err = repo.LockFreezeGovernance(txCtx, 7, sourceProjectID, sourceSetID)
+		return err
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, sourceSetID, lockedSet.ID)
+	require.Equal(t, sourceTypeID, lockedType.ID)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestProductionEvidenceSnapshotDatabaseRowsAreImmutable(t *testing.T) {
 	repo, db := newProductionSourceRepoTestDB(t)
 	createProductionSourceSet(t, repo, types.ProductionSourceSetCollecting)

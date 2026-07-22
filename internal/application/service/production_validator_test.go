@@ -45,7 +45,7 @@ func productionValidatorFixture(t *testing.T) (*ProductionValidator, *types.Prod
 		ID: mcpAdapterRunID, TenantID: 7, ProjectID: writerProjectID, DocumentID: writerDocumentID,
 		SourceSetID: writerSourceID, RunType: types.ProductionRunValidate, Status: types.ProductionRunRunning,
 		Attempt: 1, InputVersionID: stringPointer(writerVersionID),
-		DocumentTypeSnapshot: types.JSON(`{"id":"` + writerTypeID + `","code":"software-development-baseline","schema_version":3,"block_schema":{},"skill_bindings":{"skills":[],"version":1}}`),
+		DocumentTypeSnapshot: productionWriterTestDocumentTypeSnapshot(t, types.JSON(`{"skills":[],"version":1}`)),
 	}
 	return NewProductionValidator(documents, sources, nil), run, documents, sources
 }

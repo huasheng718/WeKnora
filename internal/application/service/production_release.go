@@ -405,10 +405,11 @@ func (s *ProductionReleaseService) requireBoundPublicationPolicy(
 		(documentType.Status != types.ProductionDocumentTypeActive && documentType.Status != types.ProductionDocumentTypeRetired) {
 		return errors.Join(types.ErrProductionReleaseInvalid, errors.New("publication_document_type_binding_invalid"))
 	}
-	var policy types.ProductionPublicationPolicyV1
-	if err := decodeProductionJSON(documentType.PublicationPolicy, &policy, true); err != nil || policy.Version != 1 {
+	config, err := productionDocumentTypeConfig(documentType)
+	if err != nil {
 		return errors.Join(types.ErrProductionReleaseInvalid, errors.New("publication_policy_invalid"))
 	}
+	policy := config.PublicationPolicy
 	switch {
 	case policy.TargetType != "knowledge_base":
 		return errors.Join(types.ErrProductionReleaseInvalid, errors.New("publication_target_type_invalid"))
